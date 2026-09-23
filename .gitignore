@@ -1,0 +1,7 @@
+data/
+.env
+*.log
+node_modules/
+buleto-main.reference.js
+.DS_Store
+Thumbs.db

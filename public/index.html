@@ -1,0 +1,388 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#0b0d0f">
+    <meta name="color-scheme" content="dark">
+    <meta name="description" content="Онлайн-монитор результатов рулетки и циклов исключения чисел от 0 до 36">
+    <title>Круг 37 — монитор результатов</title>
+    <link rel="stylesheet" href="/styles.css?v=9">
+    <script type="module" src="/app.js?v=10"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">Перейти к содержимому</a>
+
+    <header class="topbar">
+      <div class="topbar__inner">
+        <a class="brand" href="/" aria-label="Круг 37 — главная">
+          <span class="brand__mark" aria-hidden="true"><span>37</span></span>
+          <span class="brand__copy">
+            <span class="brand__name">Круг 37</span>
+            <span class="brand__caption">Монитор выпадений</span>
+          </span>
+        </a>
+
+        <div class="topbar__actions">
+          <div class="connection" id="connection-status" data-state="connecting" role="status" aria-live="polite">
+            <span class="connection__dot" aria-hidden="true"></span>
+            <span id="connection-label">Подключение…</span>
+          </div>
+          <button class="icon-button" id="refresh-button" type="button" aria-label="Обновить данные" title="Обновить данные">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M20 11a8.1 8.1 0 0 0-15.5-2M4 4v5h5M4 13a8.1 8.1 0 0 0 15.5 2M20 20v-5h-5"/>
+            </svg>
+          </button>
+        </div>
+      </div>
+    </header>
+
+    <main class="page" id="main-content">
+      <section class="gap-alert" id="gap-alert" role="alert" hidden>
+        <span class="gap-alert__icon" aria-hidden="true">!</span>
+        <div>
+          <strong>В истории обнаружен пропуск</strong>
+          <p id="gap-message">Расчёт текущего цикла временно нельзя считать полным.</p>
+        </div>
+      </section>
+
+      <div class="page-heading">
+        <div>
+          <p class="eyebrow">Прямой эфир · 0–36</p>
+          <h1>Текущий цикл</h1>
+          <p class="page-heading__subtitle">Число исключается после первого выпадения. Повторы сохраняются, но не меняют остаток.</p>
+        </div>
+        <div class="collector-card" id="collector-card" data-state="unknown">
+          <span class="collector-card__pulse" aria-hidden="true"></span>
+          <span>
+            <span class="collector-card__label">Сбор данных</span>
+            <strong id="collector-status">Проверяем состояние</strong>
+          </span>
+        </div>
+      </div>
+
+      <section class="overview-grid" aria-label="Сводка текущего цикла">
+        <article class="panel last-result-card" aria-labelledby="last-result-title">
+          <div class="panel__topline">
+            <div>
+              <p class="eyebrow">Последнее выпадение</p>
+              <h2 id="last-result-title">Новый результат</h2>
+            </div>
+            <span class="live-badge"><span aria-hidden="true"></span> Live</span>
+          </div>
+
+          <div class="last-result-card__content" id="last-result" aria-live="polite">
+            <div class="result-ball result-ball--empty" id="last-number" aria-label="Результат пока не получен">—</div>
+            <div class="result-meta">
+              <div>
+                <span>Время</span>
+                <strong id="last-time">—</strong>
+              </div>
+              <div>
+                <span>Цена фиксации</span>
+                <strong id="last-price">—</strong>
+              </div>
+              <div>
+                <span>Раунд</span>
+                <strong id="last-round">—</strong>
+              </div>
+            </div>
+          </div>
+        </article>
+
+        <article class="panel progress-card" aria-labelledby="progress-title">
+          <div class="panel__topline">
+            <div>
+              <p class="eyebrow">Прогресс исключения</p>
+              <h2 id="progress-title">До одного числа</h2>
+            </div>
+            <span class="cycle-id" id="cycle-id">Цикл —</span>
+          </div>
+
+          <div class="progress-card__content">
+            <div class="progress-ring" id="progress-ring" style="--progress: 0" aria-hidden="true">
+              <div class="progress-ring__inside">
+                <strong id="progress-value">0</strong>
+                <span>из 36</span>
+              </div>
+            </div>
+
+            <div class="progress-details">
+              <div class="progress-details__lead">
+                <strong id="remaining-count">37</strong>
+                <span id="remaining-label">чисел осталось</span>
+              </div>
+              <progress id="cycle-progress" max="36" value="0">0 из 36</progress>
+              <div class="stats-row">
+                <div><span>Ходов</span><strong id="draw-count">0</strong></div>
+                <div><span>Повторов</span><strong id="repeat-count">0</strong></div>
+                <div><span>Старт</span><strong id="cycle-start">—</strong></div>
+              </div>
+            </div>
+          </div>
+        </article>
+      </section>
+
+      <section class="panel number-board" aria-labelledby="number-board-title">
+        <div class="panel__topline number-board__header">
+          <div>
+            <p class="eyebrow">Поле цикла</p>
+            <h2 id="number-board-title">Числа 0–36</h2>
+          </div>
+          <div class="legend" aria-label="Обозначения">
+            <span><i class="legend__sample legend__sample--remaining" aria-hidden="true"></i> Осталось</span>
+            <span><i class="legend__sample legend__sample--eliminated" aria-hidden="true"></i> Исключено</span>
+          </div>
+        </div>
+        <section class="overdue-strip" aria-labelledby="overdue-title" aria-describedby="overdue-description">
+          <div class="overdue-strip__copy">
+            <p class="eyebrow">По всей истории</p>
+            <h3 id="overdue-title">Дольше всего не выпадали</h3>
+            <p id="overdue-description">Время и раунды с последнего сохранённого выпадения · не прогноз</p>
+          </div>
+          <ol class="overdue-list" id="overdue-list" aria-label="Три числа, которые дольше всего не выпадали" aria-busy="true">
+            <li class="empty-state">Считаем время ожидания…</li>
+          </ol>
+        </section>
+        <ul class="number-grid" id="number-grid" aria-label="Состояние чисел текущего цикла"></ul>
+        <p class="board-note" id="board-note">Ожидаем данные активного цикла.</p>
+      </section>
+
+      <section class="panel triples-panel" aria-labelledby="triples-title" aria-describedby="triples-description">
+        <div class="panel__topline">
+          <div>
+            <p class="eyebrow">Совпадения в истории</p>
+            <h2 id="triples-title">Повторяющиеся тройки</h2>
+          </div>
+          <span class="count-badge" id="triples-count">0 троек</span>
+        </div>
+        <p class="triples-description" id="triples-description">Три результата подряд в точном порядке, встретившиеся не менее двух раз.</p>
+        <ul class="triples-list" id="triples-list" aria-label="Повторяющиеся последовательности из трёх чисел" aria-busy="true">
+          <li class="empty-state">Ищем повторяющиеся тройки…</li>
+        </ul>
+        <div class="triples-footer">
+          <button class="triples-toggle" id="triples-toggle" type="button" aria-controls="triples-list" aria-expanded="false" hidden>Показать ещё</button>
+          <p>Совпадения по сохранённым непрерывным участкам истории не являются прогнозом.</p>
+        </div>
+      </section>
+
+      <div class="data-grid">
+        <section class="panel history-panel" aria-labelledby="history-title">
+          <div class="panel__topline">
+            <div>
+              <p class="eyebrow">Журнал событий</p>
+              <h2 id="history-title">Последние выпадения</h2>
+            </div>
+            <span class="count-badge" id="results-count">0 записей</span>
+          </div>
+
+          <div class="table-wrap" tabindex="0" aria-label="Прокручиваемая таблица последних выпадений">
+            <table>
+              <thead>
+                <tr>
+                  <th scope="col">Число</th>
+                  <th scope="col">Время</th>
+                  <th scope="col">Цена</th>
+                  <th scope="col">Раунд</th>
+                </tr>
+              </thead>
+              <tbody id="results-body">
+                <tr class="empty-row"><td colspan="4">Загрузка результатов…</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel cycles-panel" aria-labelledby="cycles-title">
+          <div class="panel__topline">
+            <div>
+              <p class="eyebrow">Архив</p>
+              <h2 id="cycles-title">Завершённые циклы</h2>
+            </div>
+            <span class="count-badge" id="cycles-count">0</span>
+          </div>
+          <ol class="cycles-list" id="cycles-list">
+            <li class="empty-state">Загрузка циклов…</li>
+          </ol>
+        </section>
+      </div>
+
+      <section class="panel virtual-panel" id="virtual-panel" data-state="loading" aria-labelledby="virtual-title" aria-describedby="virtual-safety virtual-rule-note">
+        <div class="panel__topline virtual-panel__header">
+          <div>
+            <p class="eyebrow">Автотест · только наблюдение</p>
+            <h2 id="virtual-title">Виртуальный эксперимент</h2>
+          </div>
+          <div class="virtual-panel__badges" aria-label="Режим и состояние эксперимента">
+            <span class="virtual-mode-badge">ВИРТУАЛЬНАЯ СИМУЛЯЦИЯ</span>
+            <span class="count-badge" id="virtual-status-badge">Загрузка…</span>
+          </div>
+        </div>
+
+        <p class="virtual-safety" id="virtual-safety">
+          <strong>Реальных действий нет.</strong>
+          Эта панель не делает ставок, не нажимает кнопки на сайте и не использует баланс аккаунта. Все ставки, выплаты и результаты существуют только внутри симуляции.
+        </p>
+
+        <div class="virtual-layout">
+          <section class="virtual-state-card" aria-labelledby="virtual-status-title">
+            <p class="eyebrow">Состояние автотеста</p>
+            <h3 id="virtual-status-title">Получаем состояние…</h3>
+            <p class="virtual-status-copy" id="virtual-status-copy" role="status" aria-live="polite" aria-atomic="true">Ожидаем данные безопасного режима симуляции.</p>
+
+            <div class="virtual-progress-block">
+              <div class="virtual-progress-block__label">
+                <span id="virtual-progress-label">Прогресс до условия запуска</span>
+                <strong id="virtual-progress-value">— из 200</strong>
+              </div>
+              <progress id="virtual-progress" max="200" value="0" aria-labelledby="virtual-progress-label">0 из 200</progress>
+            </div>
+
+            <div class="virtual-candidate" id="virtual-candidate" hidden>
+              <span class="history-number virtual-candidate__number" id="virtual-candidate-number" aria-hidden="true">—</span>
+              <span class="virtual-candidate__copy">
+                <strong id="virtual-candidate-title">Самая длинная серия</strong>
+                <span id="virtual-candidate-meta">—</span>
+              </span>
+            </div>
+
+            <p class="virtual-model-summary" id="virtual-model-summary">Ступенчатая модель: старт 10 · шаг +10 · максимум 2 500 · валовая выплата ×36.</p>
+          </section>
+
+          <section class="virtual-session-card" id="virtual-session" aria-labelledby="virtual-session-title" hidden>
+            <div class="virtual-session__lead">
+              <span class="history-number virtual-session__target" id="virtual-target-number" aria-hidden="true">—</span>
+              <span>
+                <span class="virtual-session__kicker">Зафиксированная цель</span>
+                <strong id="virtual-session-title">Число —</strong>
+                <span id="virtual-target-summary">Цель не меняется до завершения сессии.</span>
+              </span>
+            </div>
+
+            <dl class="virtual-trigger-facts" aria-label="Условие запуска виртуальной сессии">
+              <div><dt>Серия при выборе</dt><dd id="virtual-trigger-rounds">—</dd></div>
+              <div><dt>Цель выбрана</dt><dd><time id="virtual-selected-at">—</time></dd></div>
+              <div><dt>Первая виртуальная ставка</dt><dd><time id="virtual-started-at">Ещё не началась</time></dd></div>
+            </dl>
+
+            <div class="virtual-session__divider" aria-hidden="true"></div>
+            <p class="eyebrow">Только шаги после выбора цели</p>
+            <dl class="virtual-session__metrics" aria-label="Показатели активной виртуальной сессии">
+              <div><dt>Виртуальных ставок</dt><dd id="virtual-attempt-count">0</dd></div>
+              <div><dt>Промахов в сессии</dt><dd id="virtual-miss-count">0</dd></div>
+              <div><dt>Всего виртуально поставлено</dt><dd id="virtual-total-staked">0</dd></div>
+              <div><dt>Следующий виртуальный шаг</dt><dd id="virtual-next-stake">—</dd></div>
+              <div><dt>Валовая выплата при совпадении</dt><dd id="virtual-projected-gross">—</dd></div>
+              <div class="virtual-session__outcome" id="virtual-projected-net-card"><dt>Итог сессии при совпадении</dt><dd id="virtual-projected-net">—</dd></div>
+            </dl>
+          </section>
+        </div>
+
+        <section class="virtual-history" aria-labelledby="virtual-history-title">
+          <div class="virtual-history__heading">
+            <div>
+              <p class="eyebrow">Журнал симуляции</p>
+              <h3 id="virtual-history-title">Последние сессии</h3>
+            </div>
+            <span class="count-badge" id="virtual-history-count">0 сессий</span>
+          </div>
+          <ol class="virtual-history__list" id="virtual-history-list" aria-label="Последние виртуальные сессии" aria-busy="true">
+            <li class="empty-state">Загрузка истории виртуального эксперимента…</li>
+          </ol>
+
+          <div class="virtual-lifetime" aria-labelledby="virtual-lifetime-title">
+            <p class="eyebrow" id="virtual-lifetime-title">Все известные виртуальные шаги</p>
+            <dl class="virtual-lifetime__metrics">
+              <div><dt>Сессий создано</dt><dd id="virtual-lifetime-sessions">—</dd></div>
+              <div><dt>Виртуальных ставок</dt><dd id="virtual-lifetime-bets">—</dd></div>
+              <div><dt>Всего условно поставлено</dt><dd id="virtual-lifetime-staked">—</dd></div>
+              <div id="virtual-lifetime-net-card"><dt>Суммарный известный P&amp;L</dt><dd id="virtual-lifetime-net">—</dd></div>
+            </dl>
+            <p>При разрыве учитываются уже рассчитанные шаги до него; неизвестные раунды не моделируются.</p>
+          </div>
+        </section>
+
+        <p class="virtual-rule-note" id="virtual-rule-note">
+          Раунд, на котором число достигает порога, служит только для выбора цели — ставки в нём нет. Первый виртуальный шаг считается со следующего сохранённого раунда. Известный пропуск данных прерывает подтверждённую серию и сбрасывает отсчёт. Серия из 200 прошлых раундов не меняет вероятность следующего числа: в модели независимой честной рулетки она остаётся 1 из 37 (2,70%).
+        </p>
+      </section>
+
+      <section class="panel risk-panel" aria-labelledby="risk-title" aria-describedby="risk-warning risk-basis-note">
+        <div class="panel__topline">
+          <div>
+            <p class="eyebrow">Учебный расчёт</p>
+            <h2 id="risk-title">Ступенчатая схема на одно число</h2>
+          </div>
+          <span class="count-badge">Модель: 1 из 37 · 2,70%</span>
+        </div>
+
+        <p class="risk-warning" id="risk-warning">
+          <strong>Это арифметический пример, а не прогноз и не рекомендация делать ставки.</strong>
+          Прошлые выпадения не повышают вероятность числа в следующем раунде. Равные шансы 1 из 37 действуют только в модели независимой честной рулетки и не подтверждают механику сайта.
+        </p>
+
+        <div class="risk-layout">
+          <div class="risk-controls">
+            <label class="risk-input" for="risk-rounds">
+              <span>Пропущено сохранённых раундов</span>
+              <input id="risk-rounds" name="risk-rounds" type="number" min="0" max="1000000" step="1" inputmode="numeric" value="143" aria-describedby="risk-input-help">
+            </label>
+            <p id="risk-input-help">Введите, сколько раундов подряд число не выпадало. Если вы в это время только наблюдали и не ставили, денежный результат ожидания равен 0; для расчёта начала ставок только сейчас установите 0.</p>
+
+            <dl class="risk-model" aria-label="Параметры модели ставок">
+              <div><dt>Первая ставка</dt><dd>10</dd></div>
+              <div><dt>Шаг уровня</dt><dd>+10</dd></div>
+              <div><dt>Максимум одной ставки</dt><dd>2 500</dd></div>
+              <div><dt>Валовая выплата</dt><dd>×36</dd></div>
+            </dl>
+          </div>
+
+          <div class="risk-results" aria-label="Результат расчёта">
+            <p class="eyebrow">Если ставка делалась каждый раунд</p>
+            <div class="risk-metrics">
+              <div class="risk-metric">
+                <span id="risk-next-label">Следующий шаг модели</span>
+                <output id="risk-next-stake" for="risk-rounds">—</output>
+              </div>
+              <div class="risk-metric">
+                <span>Уже потеряно в модели</span>
+                <output id="risk-prior-loss" for="risk-rounds">—</output>
+              </div>
+              <div class="risk-metric">
+                <span>Всего под риском после ставки</span>
+                <output id="risk-total-risk" for="risk-rounds">—</output>
+              </div>
+              <div class="risk-metric">
+                <span>Валовая выплата при попадании</span>
+                <output id="risk-gross-payout" for="risk-rounds">—</output>
+              </div>
+              <div class="risk-metric risk-metric--result" id="risk-hit-card">
+                <span>Итог серии при попадании</span>
+                <output id="risk-hit-result" for="risk-rounds">—</output>
+              </div>
+              <div class="risk-metric risk-metric--result risk-metric--loss">
+                <span>Итог серии при новом промахе</span>
+                <output id="risk-miss-result" for="risk-rounds">—</output>
+              </div>
+            </div>
+            <p class="risk-verdict" id="risk-verdict" role="status" aria-live="polite">Введите целое число раундов.</p>
+          </div>
+        </div>
+
+        <p class="risk-basis-note" id="risk-basis-note">
+          Модель повторяет ставку 10, пока она ещё покрывает накопленный убыток: после 36 промахов накоплено 360 и следующий уровень становится 20; при накопленных 720 — 30. Далее выбирается минимальная ставка, кратная 10, для которой валовая выплата ×36 покрывает прошлый убыток вместе с текущей ставкой; если один промах пересёк несколько порогов, модель сразу переходит к этому минимальному уровню. После достижения 2 500 ставка остаётся 2 500. Лимит ограничивает одну ставку, но не общий убыток; ×36 включает возврат ставки, поэтому чистая прибыль отдельной успешной ставки равна ×35.
+        </p>
+      </section>
+
+      <footer class="page-footer">
+        <p>Оставшееся число показывает статистику текущего цикла и не является прогнозом следующего результата.</p>
+        <p id="last-sync">Данные ещё не синхронизированы</p>
+      </footer>
+    </main>
+
+    <div class="sr-only" id="live-region" role="status" aria-live="polite" aria-atomic="true"></div>
+    <noscript>
+      <div class="noscript">Для работы онлайн-панели необходимо включить JavaScript.</div>
+    </noscript>
+  </body>
+</html>

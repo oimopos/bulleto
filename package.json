@@ -1,0 +1,16 @@
+{
+  "name": "buleto-roulette-tracker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Онлайн-сборщик результатов Buleto и циклов исключения рулетки 0–36",
+  "type": "module",
+  "scripts": {
+    "start": "node --env-file-if-exists=.env src/server.js",
+    "dev": "node --env-file-if-exists=.env --watch src/server.js",
+    "test": "node --test",
+    "check": "node --check src/server.js && node --check src/collector.js && node --check src/database.js && node --check src/domain.js && node --check src/result-pipeline.js && node --check src/virtual-bettor.js && node --check public/app.js"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  }
+}
