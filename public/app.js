@@ -44,6 +44,20 @@ import { BET_RISK_MODEL, calculateBetRisk } from "./risk-calculator.js?v=2";
     virtualStatusBadge: document.getElementById("virtual-status-badge"),
     virtualStatusTitle: document.getElementById("virtual-status-title"),
     virtualStatusCopy: document.getElementById("virtual-status-copy"),
+    virtualBank: document.getElementById("virtual-bank"),
+    virtualBankStatus: document.getElementById("virtual-bank-status"),
+    virtualBankInitial: document.getElementById("virtual-bank-initial"),
+    virtualBankCurrentCard: document.getElementById("virtual-bank-current-card"),
+    virtualBankCurrent: document.getElementById("virtual-bank-current"),
+    virtualBankPnlCard: document.getElementById("virtual-bank-pnl-card"),
+    virtualBankPnl: document.getElementById("virtual-bank-pnl"),
+    virtualBankNextCard: document.getElementById("virtual-bank-next-card"),
+    virtualBankNext: document.getElementById("virtual-bank-next"),
+    virtualBankNextState: document.getElementById("virtual-bank-next-state"),
+    virtualBankStartedAt: document.getElementById("virtual-bank-started-at"),
+    virtualBankExhaustedWrap: document.getElementById("virtual-bank-exhausted-wrap"),
+    virtualBankExhaustedAt: document.getElementById("virtual-bank-exhausted-at"),
+    virtualBankMessage: document.getElementById("virtual-bank-message"),
     virtualProgressLabel: document.getElementById("virtual-progress-label"),
     virtualProgressValue: document.getElementById("virtual-progress-value"),
     virtualProgress: document.getElementById("virtual-progress"),
@@ -270,6 +284,192 @@ import { BET_RISK_MODEL, calculateBetRisk } from "./risk-calculator.js?v=2";
     }).format(date);
   }
 
+  function renderVirtualBank(testBank, {
+    virtualAvailable = false,
+    safeSimulation = false,
+    topStatus = ""
+  } = {}) {
+    const resetValues = () => {
+      elements.virtualBankInitial.textContent = "—";
+      elements.virtualBankCurrent.textContent = "—";
+      elements.virtualBankPnl.textContent = "—";
+      elements.virtualBankNext.textContent = "—";
+      elements.virtualBankNextState.textContent = "Данных нет";
+      elements.virtualBankCurrentCard.classList.remove("is-exhausted");
+      elements.virtualBankPnlCard.classList.remove("is-positive", "is-loss");
+      elements.virtualBankNextCard.classList.remove("is-available", "is-unavailable");
+      setVirtualTime(elements.virtualBankStartedAt, null);
+      setVirtualTime(elements.virtualBankExhaustedAt, null);
+      elements.virtualBankExhaustedWrap.hidden = true;
+    };
+
+    const showUnavailable = (state, badge, message, busy = false) => {
+      elements.virtualBank.dataset.state = state;
+      delete elements.virtualBank.dataset.stale;
+      elements.virtualBank.setAttribute("aria-busy", String(busy));
+      elements.virtualBankStatus.textContent = badge;
+      resetValues();
+      setTextIfChanged(elements.virtualBankMessage, message);
+    };
+
+    if (!virtualAvailable) {
+      if (!store.stateLoaded && !store.stateError) {
+        showUnavailable("loading", "Загрузка…", "Получаем состояние виртуального банка.", true);
+      } else if (store.stateError) {
+        showUnavailable(
+          "error",
+          "Недоступно",
+          "Не удалось получить состояние виртуального банка. Повторим запрос автоматически; реальных действий по-прежнему нет."
+        );
+      } else {
+        showUnavailable("error", "Нет данных", "Сервер не передал состояние виртуального банка.");
+      }
+      return;
+    }
+
+    if (!safeSimulation) {
+      showUnavailable(
+        "error",
+        "Режим не подтверждён",
+        "Сервер не подтвердил безопасный режим simulation и запрет исполнения. Значения виртуального банка скрыты."
+      );
+      return;
+    }
+
+    if (!testBank || typeof testBank !== "object") {
+      showUnavailable(
+        store.stateError ? "stale" : "error",
+        store.stateError ? "Не обновлено" : "Нет данных банка",
+        store.stateError
+          ? "Состояние не обновлено, а последнее полученное состояние виртуального банка отсутствует."
+          : "Сервер не передал testBank. Виртуальные суммы не вычисляются в браузере."
+      );
+      return;
+    }
+
+    if (testBank.mode !== "simulation") {
+      showUnavailable(
+        "error",
+        "Режим не подтверждён",
+        "Сервер не подтвердил режим simulation для виртуального банка. Значения скрыты для безопасности."
+      );
+      return;
+    }
+
+    const bankStatus = String(testBank.status || "").toLowerCase();
+    const topLevelStatus = String(topStatus || "").toLowerCase();
+    const exhausted = bankStatus === "exhausted" || topLevelStatus === "bankroll_exhausted";
+    const waitingForTarget = topLevelStatus === "waiting";
+    const recognizedStatus = bankStatus === "running" || bankStatus === "exhausted";
+    const initialBalance = asOptionalFiniteNumber(testBank.initialBalance);
+    const currentBalance = asOptionalFiniteNumber(testBank.currentBalance);
+    const netResult = asOptionalFiniteNumber(testBank.netResult);
+    const nextStakeValue = asOptionalFiniteNumber(testBank.nextStake);
+    const nextStake = nextStakeValue !== null && nextStakeValue > 0 ? nextStakeValue : null;
+    const shortfallValue = asOptionalFiniteNumber(testBank.shortfall);
+    const shortfall = shortfallValue !== null && shortfallValue >= 0 ? shortfallValue : null;
+    const canAffordNext = typeof testBank.canAffordNext === "boolean"
+      ? testBank.canAffordNext
+      : null;
+    const dataCompleteKnown = typeof testBank.dataComplete === "boolean";
+    const dataComplete = testBank.dataComplete === true;
+    const amountsValid = initialBalance !== null
+      && initialBalance >= 0
+      && currentBalance !== null
+      && currentBalance >= 0
+      && netResult !== null;
+
+    if (!recognizedStatus || !amountsValid || !dataCompleteKnown) {
+      showUnavailable(
+        "error",
+        "Неполные данные",
+        "Сервер передал неполное или некорректное состояние виртуального банка. Значения не показаны, чтобы не создавать ложное впечатление о доступном остатке."
+      );
+      return;
+    }
+
+    const stale = store.stateError;
+    let state = exhausted ? "exhausted" : dataComplete ? "running" : "gap";
+    if (stale && !exhausted) state = "stale";
+    elements.virtualBank.dataset.state = state;
+    if (stale) elements.virtualBank.dataset.stale = "true";
+    else delete elements.virtualBank.dataset.stale;
+    elements.virtualBank.setAttribute("aria-busy", "false");
+
+    let badge = exhausted
+      ? "Банк исчерпан"
+      : dataComplete
+        ? "Банк активен"
+        : "Неполные данные";
+    if (stale) badge = `Не обновлено · ${badge.toLowerCase()}`;
+    elements.virtualBankStatus.textContent = badge;
+
+    elements.virtualBankInitial.textContent = formatVirtualAmount(initialBalance);
+    elements.virtualBankCurrent.textContent = formatVirtualAmount(currentBalance);
+    elements.virtualBankPnl.textContent = formatVirtualOutcome(netResult);
+    elements.virtualBankPnlCard.classList.remove("is-positive", "is-loss");
+    if (netResult > 0) elements.virtualBankPnlCard.classList.add("is-positive");
+    else if (netResult < 0) elements.virtualBankPnlCard.classList.add("is-loss");
+    elements.virtualBankCurrentCard.classList.toggle("is-exhausted", exhausted);
+
+    elements.virtualBankNext.textContent = nextStake === null
+      ? "—"
+      : formatVirtualAmount(nextStake);
+    elements.virtualBankNextCard.classList.remove("is-available", "is-unavailable");
+    if (exhausted || canAffordNext === false) {
+      elements.virtualBankNextState.textContent = "Недоступен";
+      elements.virtualBankNextCard.classList.add("is-unavailable");
+    } else if (waitingForTarget && nextStake !== null) {
+      elements.virtualBankNextState.textContent = "После выбора цели";
+    } else if (nextStake === null) {
+      elements.virtualBankNextState.textContent = "Не запланирован";
+    } else if (canAffordNext === true) {
+      elements.virtualBankNextState.textContent = "Доступен";
+      elements.virtualBankNextCard.classList.add("is-available");
+    } else {
+      elements.virtualBankNextState.textContent = "Доступность неизвестна";
+    }
+
+    setVirtualTime(elements.virtualBankStartedAt, testBank.startedAt, "Не указано");
+    const exhaustedAt = parseDate(testBank.exhaustedAt);
+    elements.virtualBankExhaustedWrap.hidden = !exhaustedAt;
+    setVirtualTime(elements.virtualBankExhaustedAt, exhaustedAt);
+
+    let message;
+    if (exhausted) {
+      const nextText = nextStake === null
+        ? "Следующий виртуальный шаг больше недоступен"
+        : `Следующий виртуальный шаг ${formatVirtualAmount(nextStake)} недоступен при остатке ${formatVirtualAmount(currentBalance)}`;
+      const shortfallText = shortfall && shortfall > 0
+        ? `; не хватает ${formatVirtualAmount(shortfall)}`
+        : "";
+      message = `Виртуальный банк исчерпан. ${nextText}${shortfallText}. Новые виртуальные ставки не рассчитываются.`;
+    } else if (waitingForTarget) {
+      message = nextStake === null
+        ? "Виртуальный банк активен. Цель ещё не выбрана, поэтому виртуальных списаний нет."
+        : `Виртуальный банк активен. Цель ещё не выбрана; первый шаг ${formatVirtualAmount(nextStake)} будет рассчитан только после достижения порога.`;
+    } else if (nextStake === null) {
+      message = "Виртуальный банк активен. Пока цель не выбрана, следующий шаг не запланирован.";
+    } else if (canAffordNext === true) {
+      message = `Следующий виртуальный шаг ${formatVirtualAmount(nextStake)} доступен при текущем виртуальном остатке ${formatVirtualAmount(currentBalance)}.`;
+    } else if (canAffordNext === false) {
+      const shortfallText = shortfall && shortfall > 0
+        ? ` Не хватает ${formatVirtualAmount(shortfall)}.`
+        : "";
+      message = `Следующий виртуальный шаг ${formatVirtualAmount(nextStake)} недоступен при текущем виртуальном остатке ${formatVirtualAmount(currentBalance)}.${shortfallText}`;
+    } else {
+      message = "Сервер не передал доступность следующего виртуального шага.";
+    }
+
+    if (!dataComplete) {
+      message += " В истории есть разрыв: баланс и P&L учитывают только подтверждённые сохранённые шаги.";
+    }
+    if (stale) {
+      message = `Не удалось обновить состояние; показаны последние полученные значения. ${message}`;
+    }
+    setTextIfChanged(elements.virtualBankMessage, message);
+  }
+
   function setVirtualNumberBall(element, number, className) {
     element.className = `history-number ${className}`;
     if (number === null) {
@@ -285,10 +485,17 @@ import { BET_RISK_MODEL, calculateBetRisk } from "./risk-calculator.js?v=2";
     return status.includes("gap") || status.includes("invalid") || status.includes("integrity");
   }
 
-  function virtualHistoryStatus(value) {
+  function virtualHistoryStatus(value, endReason) {
     const status = String(value || "").toLowerCase();
-    if (isGapInvalidStatus(status)) {
+    const reason = String(endReason || "").toLowerCase();
+    if (reason === "integrity_gap" || isGapInvalidStatus(status)) {
       return { state: "invalid", text: "Неполная · разрыв истории" };
+    }
+    if (reason === "bankroll_exhausted" || status.includes("bankroll_exhausted")) {
+      return { state: "stopped", text: "Остановлена · виртуальный банк исчерпан" };
+    }
+    if (reason === "hit") {
+      return { state: "complete", text: "Завершена · цель выпала" };
     }
     if (["won", "hit", "completed", "complete", "success"].some((part) => status.includes(part))) {
       return { state: "complete", text: "Завершена · цель выпала" };
@@ -326,7 +533,7 @@ import { BET_RISK_MODEL, calculateBetRisk } from "./risk-calculator.js?v=2";
     const fragment = document.createDocumentFragment();
     items.forEach((session) => {
       const targetNumber = asRouletteNumber(session.targetNumber);
-      const status = virtualHistoryStatus(session.status);
+      const status = virtualHistoryStatus(session.status, session.endReason);
       const isInvalid = status.state === "invalid";
       const item = createElement("li", "virtual-history-card");
       item.dataset.state = status.state;
@@ -411,6 +618,11 @@ import { BET_RISK_MODEL, calculateBetRisk } from "./risk-calculator.js?v=2";
     const safeSimulation = available
       && virtualBettor.mode === "simulation"
       && virtualBettor.executionEnabled === false;
+    renderVirtualBank(available ? virtualBettor.testBank : null, {
+      virtualAvailable: available,
+      safeSimulation,
+      topStatus: virtualBettor?.status
+    });
 
     if (!available) {
       const missingFromState = store.stateLoaded && !store.stateError;
@@ -486,6 +698,8 @@ import { BET_RISK_MODEL, calculateBetRisk } from "./risk-calculator.js?v=2";
     const targetNumber = asRouletteNumber(activeSession?.targetNumber);
     const triggerRounds = asOptionalNonNegativeInteger(activeSession?.triggerRoundsMissed);
     const rawStatus = String(virtualBettor.status || "").toLowerCase();
+    const bankStatus = String(virtualBettor.testBank?.status || "").toLowerCase();
+    const bankExhausted = rawStatus === "bankroll_exhausted" || bankStatus === "exhausted";
     const sessionHasGap = isGapInvalidStatus(activeSession?.status);
     const hasSession = activeSession !== null && targetNumber !== null;
     const progressRounds = hasSession ? triggerRounds : candidateRounds;
@@ -498,7 +712,12 @@ import { BET_RISK_MODEL, calculateBetRisk } from "./risk-calculator.js?v=2";
     let title = "Состояние автотеста не распознано";
     let copy = "Ожидаем корректное состояние от сервера.";
 
-    if (sessionHasGap || isGapInvalidStatus(rawStatus)) {
+    if (bankExhausted) {
+      panelState = "exhausted";
+      badge = "Банк исчерпан";
+      title = "Виртуальный банк исчерпан";
+      copy = "Тестовая симуляция остановлена: доступного виртуального остатка недостаточно для следующего шага. Реальных действий и списаний не было.";
+    } else if (sessionHasGap || isGapInvalidStatus(rawStatus)) {
       panelState = "invalid";
       badge = "Разрыв истории";
       title = "Сессия не засчитана";
@@ -525,7 +744,7 @@ import { BET_RISK_MODEL, calculateBetRisk } from "./risk-calculator.js?v=2";
     }
 
     if (store.stateError && panelState !== "invalid") {
-      panelState = "stale";
+      if (panelState !== "exhausted") panelState = "stale";
       badge = `Не обновлено · ${badge.toLowerCase()}`;
     }
 

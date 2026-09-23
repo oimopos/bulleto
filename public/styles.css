@@ -1094,6 +1094,7 @@ progress::-moz-progress-bar {
 }
 
 .virtual-panel[data-state="invalid"] #virtual-status-badge,
+.virtual-panel[data-state="exhausted"] #virtual-status-badge,
 .virtual-panel[data-state="error"] #virtual-status-badge {
   border-color: rgba(232, 102, 102, 0.3);
   color: #f2b0b0;
@@ -1113,6 +1114,152 @@ progress::-moz-progress-bar {
 
 .virtual-safety strong {
   color: #b9f0dc;
+}
+
+.virtual-bank {
+  min-width: 0;
+  margin-top: 18px;
+  padding: 18px;
+  border: 1px solid var(--border-soft);
+  border-radius: 15px;
+  background: #111519;
+}
+
+.virtual-bank__heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.virtual-bank h3 {
+  margin: 0;
+  color: var(--text);
+  font-size: 16px;
+  line-height: 1.25;
+}
+
+.virtual-bank__note {
+  margin: 9px 0 0;
+  color: var(--muted-strong);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.virtual-bank__metrics {
+  display: grid;
+  margin: 16px 0 0;
+  padding: 0;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.virtual-bank__metrics > div {
+  min-width: 0;
+  padding: 11px;
+  border: 1px solid var(--border-soft);
+  border-radius: 11px;
+  background: rgba(255, 255, 255, 0.018);
+}
+
+.virtual-bank__metrics dt {
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.35;
+}
+
+.virtual-bank__metrics dd {
+  margin: 6px 0 0;
+  color: var(--text);
+  font-size: 15px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 780;
+  line-height: 1.25;
+}
+
+.virtual-bank__availability {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1.3;
+}
+
+.virtual-bank__metrics .is-positive dd,
+.virtual-bank__metrics .is-available .virtual-bank__availability {
+  color: var(--green-bright);
+}
+
+.virtual-bank__metrics .is-loss dd,
+.virtual-bank__metrics .is-exhausted dd,
+.virtual-bank__metrics .is-unavailable .virtual-bank__availability {
+  color: #ef8585;
+}
+
+.virtual-bank__timing {
+  display: flex;
+  margin: 12px 0 0;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px 16px;
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.4;
+}
+
+.virtual-bank__timing time {
+  color: var(--muted-strong);
+  font-variant-numeric: tabular-nums;
+}
+
+.virtual-bank__message {
+  margin: 10px 0 0;
+  padding: 11px 13px;
+  border-radius: 10px;
+  color: var(--muted-strong);
+  background: rgba(255, 255, 255, 0.025);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.virtual-bank[data-state="running"] {
+  border-color: rgba(43, 196, 141, 0.22);
+}
+
+.virtual-bank[data-state="running"] #virtual-bank-status {
+  border-color: rgba(43, 196, 141, 0.28);
+  color: #a4e7cd;
+  background: rgba(43, 196, 141, 0.08);
+}
+
+.virtual-bank[data-state="gap"],
+.virtual-bank[data-state="stale"] {
+  border-color: rgba(239, 173, 84, 0.24);
+}
+
+.virtual-bank[data-state="gap"] #virtual-bank-status,
+.virtual-bank[data-state="stale"] #virtual-bank-status {
+  border-color: rgba(239, 173, 84, 0.28);
+  color: #f2d5a8;
+  background: rgba(239, 173, 84, 0.07);
+}
+
+.virtual-bank[data-state="error"],
+.virtual-bank[data-state="exhausted"] {
+  border-color: rgba(232, 102, 102, 0.3);
+}
+
+.virtual-bank[data-state="error"] #virtual-bank-status,
+.virtual-bank[data-state="exhausted"] #virtual-bank-status {
+  border-color: rgba(232, 102, 102, 0.3);
+  color: #f2b0b0;
+  background: rgba(232, 102, 102, 0.08);
+}
+
+.virtual-bank[data-state="exhausted"] .virtual-bank__message {
+  color: #f2b0b0;
+  background: rgba(232, 102, 102, 0.055);
 }
 
 .virtual-layout {
@@ -2132,6 +2279,10 @@ tbody tr:first-child {
     justify-content: flex-start;
   }
 
+  .virtual-bank__metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .virtual-history-card__metrics,
   .virtual-lifetime__metrics {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -2183,6 +2334,16 @@ tbody tr:first-child {
     padding: 14px;
   }
 
+  .virtual-bank {
+    padding: 14px;
+  }
+
+  .virtual-bank__heading {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 10px;
+  }
+
   .virtual-trigger-facts,
   .virtual-session__metrics,
   .virtual-history-card__metrics,
@@ -2227,6 +2388,12 @@ tbody tr:first-child {
 
   .cycle-item__draws {
     display: none;
+  }
+}
+
+@media (max-width: 360px) {
+  .virtual-bank__metrics {
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 

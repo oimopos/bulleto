@@ -13,6 +13,7 @@ import {
 
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 500;
+const DEFAULT_VIRTUAL_STARTING_BALANCE = 87_700;
 
 function asNonEmptyText(value, fallback, label) {
   const candidate = value ?? fallback;
@@ -95,6 +96,31 @@ function normalizedGapSeconds(value, fallback = 135) {
     throw new RangeError("gapThresholdSeconds must be an integer between 1 and 86400");
   }
   return seconds;
+}
+
+function normalizedVirtualStartingBalance(
+  value,
+  fallback = DEFAULT_VIRTUAL_STARTING_BALANCE,
+) {
+  const balance = value === undefined ? fallback : Number(value);
+  if (
+    !Number.isSafeInteger(balance) ||
+    balance < 0 ||
+    balance > Number.MAX_SAFE_INTEGER
+  ) {
+    throw new RangeError(
+      "virtualStartingBalance must be a non-negative safe integer",
+    );
+  }
+  return balance;
+}
+
+function clampedSafeBalance(value) {
+  const balance = Number(value);
+  if (!Number.isFinite(balance)) {
+    return balance > 0 ? Number.MAX_SAFE_INTEGER : 0;
+  }
+  return Math.max(0, Math.min(Number.MAX_SAFE_INTEGER, Math.trunc(balance)));
 }
 
 function numericRoundId(value) {
@@ -235,6 +261,13 @@ function mapVirtualBetSession(row) {
     continuityEpoch: Number(row.continuity_epoch),
     targetNumber: Number(row.target_number),
     status: row.status,
+    endReason:
+      row.end_reason ??
+      (row.status === "completed"
+        ? "hit"
+        : row.status === "invalid_gap"
+          ? "integrity_gap"
+          : null),
     triggerRoundsMissed: Number(row.trigger_rounds_missed),
     activatedAfterResultId: Number(row.activated_after_result_id),
     attemptCount: Number(row.attempt_count),
@@ -281,13 +314,21 @@ function emitLog(logger, level, payload, message) {
 }
 
 export class RouletteDatabase {
-  constructor({ path = ":memory:", logger = null, gapThresholdSeconds = 135 } = {}) {
+  constructor({
+    path = ":memory:",
+    logger = null,
+    gapThresholdSeconds = 135,
+    virtualStartingBalance = DEFAULT_VIRTUAL_STARTING_BALANCE,
+  } = {}) {
     if (typeof path !== "string" || path.trim() === "") {
       throw new TypeError("path must be a non-empty string");
     }
 
     this.logger = logger;
     this.gapThresholdMs = normalizedGapSeconds(gapThresholdSeconds) * 1_000;
+    this.virtualStartingBalance = normalizedVirtualStartingBalance(
+      virtualStartingBalance,
+    );
     this.closed = false;
     this.sqlite = new DatabaseSync(path);
 
@@ -558,9 +599,71 @@ export class RouletteDatabase {
       CREATE INDEX IF NOT EXISTS virtual_bets_session_idx
         ON virtual_bets(session_id, attempt_number);
 
-      PRAGMA user_version = 7;
       COMMIT;
     `);
+
+    // Version 8 adds a durable, stream-scoped paper bankroll. The column is
+    // added separately so existing v7 databases keep every session and bet.
+    // SQLite applies ALTER TABLE transactionally, making an interrupted
+    // migration safe to retry on the next start.
+    const virtualSessionColumns = this.sqlite
+      .prepare("PRAGMA table_info(virtual_bet_sessions)")
+      .all();
+    const hasEndReason = virtualSessionColumns.some(
+      (column) => column.name === "end_reason",
+    );
+    this.sqlite.exec("BEGIN IMMEDIATE");
+    try {
+      if (!hasEndReason) {
+        this.sqlite.exec(`
+          ALTER TABLE virtual_bet_sessions
+          ADD COLUMN end_reason TEXT CHECK (
+            end_reason IS NULL OR end_reason IN (
+              'hit', 'integrity_gap', 'bankroll_exhausted'
+            )
+          )
+        `);
+      }
+      this.sqlite.exec(`
+        UPDATE virtual_bet_sessions
+        SET end_reason = CASE
+          WHEN status = 'completed' THEN 'hit'
+          WHEN status = 'invalid_gap' THEN 'integrity_gap'
+          ELSE end_reason
+        END
+        WHERE end_reason IS NULL
+          AND status IN ('completed', 'invalid_gap');
+
+        CREATE TABLE IF NOT EXISTS virtual_bankrolls (
+          source TEXT NOT NULL,
+          instrument TEXT NOT NULL,
+          status TEXT NOT NULL CHECK (status IN ('running', 'exhausted')),
+          initial_balance INTEGER NOT NULL CHECK (initial_balance >= 0),
+          current_balance INTEGER NOT NULL CHECK (current_balance >= 0),
+          next_stake INTEGER CHECK (next_stake IS NULL OR next_stake > 0),
+          started_at TEXT NOT NULL,
+          exhausted_at TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY (source, instrument),
+          CHECK (
+            (status = 'running' AND exhausted_at IS NULL AND next_stake IS NULL)
+            OR
+            (status = 'exhausted' AND exhausted_at IS NOT NULL AND next_stake IS NOT NULL)
+          )
+        );
+
+        PRAGMA user_version = 8;
+        COMMIT;
+      `);
+    } catch (error) {
+      try {
+        this.sqlite.exec("ROLLBACK");
+      } catch {
+        // Preserve the migration error.
+      }
+      throw error;
+    }
   }
 
   #backfillContinuityEpochs() {
@@ -737,6 +840,122 @@ export class RouletteDatabase {
     return Number(row.continuity_epoch);
   }
 
+  #virtualBankrollRow(source, instrument) {
+    return this.sqlite
+      .prepare(`
+        SELECT *
+        FROM virtual_bankrolls
+        WHERE source = ? AND instrument = ?
+      `)
+      .get(source, instrument);
+  }
+
+  #ensureVirtualBankrollInTransaction(source, instrument, now) {
+    const existing = this.#virtualBankrollRow(source, instrument);
+    if (existing) return existing;
+
+    // A v7 database can already contain paper bets. Seed the durable balance
+    // from their known cash flow exactly once, so deploying v8 never resets a
+    // running experiment or discards its profit/loss.
+    const history = this.sqlite
+      .prepare(`
+        SELECT
+          COALESCE(SUM(bets.gross_payout - bets.stake), 0) AS net_result,
+          MIN(sessions.created_at) AS first_session_at
+        FROM virtual_bet_sessions AS sessions
+        LEFT JOIN virtual_bets AS bets ON bets.session_id = sessions.id
+        WHERE sessions.source = ? AND sessions.instrument = ?
+      `)
+      .get(source, instrument);
+    const currentBalance = clampedSafeBalance(
+      this.virtualStartingBalance + Number(history.net_result),
+    );
+    const startedAt = history.first_session_at ?? now;
+
+    this.sqlite
+      .prepare(`
+        INSERT INTO virtual_bankrolls (
+          source,
+          instrument,
+          status,
+          initial_balance,
+          current_balance,
+          next_stake,
+          started_at,
+          exhausted_at,
+          created_at,
+          updated_at
+        ) VALUES (?, ?, 'running', ?, ?, NULL, ?, NULL, ?, ?)
+        ON CONFLICT(source, instrument) DO NOTHING
+      `)
+      .run(
+        source,
+        instrument,
+        this.virtualStartingBalance,
+        currentBalance,
+        startedAt,
+        now,
+        now,
+      );
+    let bankroll = this.#virtualBankrollRow(source, instrument);
+    const live = this.#liveVirtualBetSessionRow(source, instrument);
+    if (
+      live &&
+      Number(live.next_stake) > Number(bankroll.current_balance)
+    ) {
+      this.#exhaustVirtualBankrollForLiveSession(
+        bankroll,
+        live,
+        Number(live.next_stake),
+        now,
+      );
+      bankroll = this.#virtualBankrollRow(source, instrument);
+    }
+    return bankroll;
+  }
+
+  #exhaustVirtualBankrollForLiveSession(
+    bankroll,
+    live,
+    requiredStake,
+    completedAt,
+  ) {
+    this.sqlite
+      .prepare(`
+        UPDATE virtual_bankrolls
+        SET
+          status = 'exhausted',
+          next_stake = ?,
+          exhausted_at = ?,
+          updated_at = ?
+        WHERE source = ? AND instrument = ? AND status = 'running'
+      `)
+      .run(
+        requiredStake,
+        completedAt,
+        completedAt,
+        bankroll.source,
+        bankroll.instrument,
+      );
+
+    if (live) {
+      this.sqlite
+        .prepare(`
+          UPDATE virtual_bet_sessions
+          SET
+            status = 'completed',
+            end_reason = 'bankroll_exhausted',
+            next_stake = NULL,
+            completed_result_id = COALESCE(completed_result_id, last_bet_result_id),
+            net_result = -total_staked + gross_payout,
+            last_event_at = ?,
+            completed_at = ?
+          WHERE id = ? AND status IN ('armed', 'active')
+        `)
+        .run(completedAt, completedAt, Number(live.id));
+    }
+  }
+
   #liveVirtualBetSessionRow(source, instrument) {
     return this.sqlite
       .prepare(`
@@ -865,8 +1084,27 @@ export class RouletteDatabase {
     now,
     { excludeResultId = null } = {},
   ) {
+    const bankroll = this.#ensureVirtualBankrollInTransaction(
+      source,
+      instrument,
+      now,
+    );
+    if (bankroll.status === "exhausted") return null;
+
     const live = this.#liveVirtualBetSessionRow(source, instrument);
-    if (live) return live;
+    if (live) {
+      const requiredStake = Number(live.next_stake);
+      if (requiredStake > Number(bankroll.current_balance)) {
+        this.#exhaustVirtualBankrollForLiveSession(
+          bankroll,
+          live,
+          requiredStake,
+          now,
+        );
+        return null;
+      }
+      return live;
+    }
 
     const continuityEpoch = this.#continuityEpoch(source, instrument);
     const boundary = this.#latestResultInEpoch(
@@ -886,6 +1124,15 @@ export class RouletteDatabase {
     if (!candidate?.eligible) return null;
 
     const initialStake = calculateNextVirtualStake(0);
+    if (initialStake > Number(bankroll.current_balance)) {
+      this.#exhaustVirtualBankrollForLiveSession(
+        bankroll,
+        null,
+        initialStake,
+        boundary.settled_at,
+      );
+      return null;
+    }
     const insertion = this.sqlite
       .prepare(`
         INSERT INTO virtual_bet_sessions (
@@ -953,10 +1200,28 @@ export class RouletteDatabase {
       return null;
     }
 
+    const bankroll = this.#ensureVirtualBankrollInTransaction(
+      resultRow.source,
+      resultRow.instrument,
+      now,
+    );
+    if (bankroll.status === "exhausted") return null;
+
+    const stake = Number(live.next_stake);
+    if (stake > Number(bankroll.current_balance)) {
+      this.#exhaustVirtualBankrollForLiveSession(
+        bankroll,
+        live,
+        stake,
+        resultRow.settled_at,
+      );
+      return null;
+    }
+
     const settlement = settleVirtualBet({
       targetNumber: Number(live.target_number),
       resultNumber: Number(resultRow.result_number),
-      stake: Number(live.next_stake),
+      stake,
       priorTotalStaked: Number(live.total_staked),
       // Continue an already armed session with the exact rules persisted when
       // it started, even if a later deployment changes the global defaults.
@@ -992,7 +1257,7 @@ export class RouletteDatabase {
         Number(live.id),
         Number(resultRow.id),
         attemptNumber,
-        Number(live.next_stake),
+        stake,
         Number(resultRow.result_number),
         settlement.outcome,
         settlement.grossPayout,
@@ -1004,12 +1269,40 @@ export class RouletteDatabase {
         now,
       );
 
+    const currentBalance = clampedSafeBalance(
+      Number(bankroll.current_balance) - stake + settlement.grossPayout,
+    );
+    const bankrollExhausted =
+      settlement.outcome === "miss" &&
+      settlement.nextStake > currentBalance;
+    this.sqlite
+      .prepare(`
+        UPDATE virtual_bankrolls
+        SET
+          status = ?,
+          current_balance = ?,
+          next_stake = ?,
+          exhausted_at = ?,
+          updated_at = ?
+        WHERE source = ? AND instrument = ? AND status = 'running'
+      `)
+      .run(
+        bankrollExhausted ? "exhausted" : "running",
+        currentBalance,
+        bankrollExhausted ? settlement.nextStake : null,
+        bankrollExhausted ? resultRow.settled_at : null,
+        resultRow.settled_at,
+        resultRow.source,
+        resultRow.instrument,
+      );
+
     if (settlement.outcome === "hit") {
       this.sqlite
         .prepare(`
           UPDATE virtual_bet_sessions
           SET
             status = 'completed',
+            end_reason = 'hit',
             attempt_count = ?,
             total_staked = ?,
             next_stake = NULL,
@@ -1027,6 +1320,35 @@ export class RouletteDatabase {
           Number(resultRow.id),
           Number(resultRow.id),
           settlement.grossPayout,
+          settlement.netResult,
+          resultRow.settled_at,
+          resultRow.settled_at,
+          Number(live.id),
+        );
+    } else if (bankrollExhausted) {
+      this.sqlite
+        .prepare(`
+          UPDATE virtual_bet_sessions
+          SET
+            status = 'completed',
+            end_reason = 'bankroll_exhausted',
+            attempt_count = ?,
+            miss_count = miss_count + 1,
+            total_staked = ?,
+            next_stake = NULL,
+            last_bet_result_id = ?,
+            completed_result_id = ?,
+            gross_payout = 0,
+            net_result = ?,
+            last_event_at = ?,
+            completed_at = ?
+          WHERE id = ? AND status IN ('armed', 'active')
+        `)
+        .run(
+          attemptNumber,
+          settlement.totalStaked,
+          Number(resultRow.id),
+          Number(resultRow.id),
           settlement.netResult,
           resultRow.settled_at,
           resultRow.settled_at,
@@ -1085,6 +1407,7 @@ export class RouletteDatabase {
         UPDATE virtual_bet_sessions
         SET
           status = 'invalid_gap',
+          end_reason = 'integrity_gap',
           next_stake = NULL,
           gross_payout = 0,
           net_result = -total_staked,
@@ -1941,6 +2264,13 @@ export class RouletteDatabase {
     this.#assertOpen();
     const safeSource = asNonEmptyText(source, undefined, "source");
     const safeInstrument = asNonEmptyText(instrument, undefined, "instrument");
+    const bankroll = this.#transaction(() =>
+      this.#ensureVirtualBankrollInTransaction(
+        safeSource,
+        safeInstrument,
+        new Date().toISOString(),
+      ),
+    );
     const epochRow = this.sqlite
       .prepare(`
         SELECT continuity_epoch
@@ -1989,13 +2319,49 @@ export class RouletteDatabase {
       .get(safeSource, safeInstrument);
     const totalStaked = Number(lifetime.total_staked);
     const grossPayout = Number(lifetime.gross_payout);
+    const invalidGapSessions = Number(
+      this.sqlite
+        .prepare(`
+          SELECT COUNT(*) AS count
+          FROM virtual_bet_sessions
+          WHERE source = ?
+            AND instrument = ?
+            AND (
+              status = 'invalid_gap'
+              OR end_reason = 'integrity_gap'
+            )
+        `)
+        .get(safeSource, safeInstrument).count,
+    );
+    const nextStake = liveRow
+      ? Number(liveRow.next_stake)
+      : bankroll.status === "exhausted"
+        ? Number(bankroll.next_stake)
+        : VIRTUAL_BET_MODEL.initialStake;
+    const initialBalance = Number(bankroll.initial_balance);
+    const currentBalance = Number(bankroll.current_balance);
 
     return {
       mode: "simulation",
       executionEnabled: false,
-      status: liveRow?.status ?? "waiting",
+      status:
+        liveRow?.status ??
+        (bankroll.status === "exhausted" ? "bankroll_exhausted" : "waiting"),
       triggerThreshold: VIRTUAL_BET_MODEL.triggerThreshold,
       model: { ...VIRTUAL_BET_MODEL },
+      testBank: {
+        mode: "simulation",
+        status: bankroll.status,
+        initialBalance,
+        currentBalance,
+        netResult: currentBalance - initialBalance,
+        nextStake,
+        canAffordNext: currentBalance >= nextStake,
+        shortfall: Math.max(0, nextStake - currentBalance),
+        startedAt: bankroll.started_at,
+        exhaustedAt: bankroll.exhausted_at ?? null,
+        dataComplete: invalidGapSessions === 0,
+      },
       longestCandidate: this.#longestVirtualCandidate(
         safeSource,
         safeInstrument,

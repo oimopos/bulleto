@@ -69,9 +69,17 @@ test("143 missed rounds use the gradual recovery ladder", () => {
 });
 
 test("maximum stake eventually prevents full recovery while losses keep growing", () => {
-  assert.equal(calculateBetRisk(216).nextStake, 2440);
-  assert.equal(calculateBetRisk(216).netIfNextHits, 140);
-  assert.equal(calculateBetRisk(216).recoveryPossible, true);
+  assert.deepEqual(calculateBetRisk(216), {
+    roundsMissed: 216,
+    nextAttempt: 217,
+    nextStake: 2440,
+    simulatedPriorLoss: 85260,
+    totalLossIfNextMiss: 87700,
+    grossPayoutIfHit: 87840,
+    netIfNextHits: 140,
+    capped: false,
+    recoveryPossible: true,
+  });
 
   assert.deepEqual(calculateBetRisk(217), {
     roundsMissed: 217,

@@ -1,4 +1,11 @@
-import { createReadStream, existsSync, mkdirSync, statSync } from 'node:fs';
+import {
+  constants as fsConstants,
+  copyFileSync,
+  createReadStream,
+  existsSync,
+  mkdirSync,
+  statSync,
+} from 'node:fs';
 import { createServer } from 'node:http';
 import { dirname, extname, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -34,6 +41,10 @@ const config = {
     process.env.DATABASE_PATH === ':memory:'
       ? ':memory:'
       : resolve(ROOT_DIR, process.env.DATABASE_PATH || './data/buleto.sqlite'),
+  databaseSeedPath:
+    process.env.DATABASE_SEED_PATH
+      ? resolve(ROOT_DIR, process.env.DATABASE_SEED_PATH)
+      : null,
   wsUrl: process.env.BULETO_WS_URL || 'wss://buleto.com/ws',
   instrument: process.env.BULETO_INSTRUMENT || 'XPM/RUB',
   collectorEnabled: booleanEnv('COLLECTOR_ENABLED', true),
@@ -41,6 +52,10 @@ const config = {
   reconnectMinMs: integerEnv('RECONNECT_MIN_MS', 1_000, { min: 100, max: 60_000 }),
   reconnectMaxMs: integerEnv('RECONNECT_MAX_MS', 30_000, { min: 1_000, max: 600_000 }),
   staleAfterMs: integerEnv('STALE_AFTER_MS', 180_000, { min: 30_000, max: 3_600_000 }),
+  virtualStartingBalance: integerEnv('VIRTUAL_STARTING_BALANCE', 87_700, {
+    min: 0,
+    max: Number.MAX_SAFE_INTEGER,
+  }),
 };
 
 if (config.reconnectMaxMs < config.reconnectMinMs) {
@@ -49,12 +64,30 @@ if (config.reconnectMaxMs < config.reconnectMinMs) {
 
 if (config.databasePath !== ':memory:') {
   mkdirSync(dirname(config.databasePath), { recursive: true });
+  if (
+    config.databaseSeedPath !== null &&
+    existsSync(config.databaseSeedPath) &&
+    !existsSync(config.databasePath)
+  ) {
+    try {
+      copyFileSync(
+        config.databaseSeedPath,
+        config.databasePath,
+        fsConstants.COPYFILE_EXCL,
+      );
+    } catch (error) {
+      // Another process may have initialized the persistent disk after the
+      // existence check. Never replace that database with the seed.
+      if (error?.code !== 'EEXIST') throw error;
+    }
+  }
 }
 
 const db = createDatabase({
   path: config.databasePath,
   logger: console,
   gapThresholdSeconds: config.gapThresholdSeconds,
+  virtualStartingBalance: config.virtualStartingBalance,
 });
 const collector = new BuletoCollector({
   url: config.wsUrl,

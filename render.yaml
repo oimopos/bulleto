@@ -21,12 +21,16 @@ services:
         value: 0.0.0.0
       - key: DATABASE_PATH
         value: /app/data/buleto.sqlite
+      - key: DATABASE_SEED_PATH
+        value: /app/seed/buleto.sqlite
       - key: BULETO_WS_URL
         value: wss://buleto.com/ws
       - key: BULETO_INSTRUMENT
         value: XPM/RUB
       - key: COLLECTOR_ENABLED
         value: "true"
+      - key: VIRTUAL_STARTING_BALANCE
+        value: "87700"
       - key: GAP_THRESHOLD_SECONDS
         value: "135"
       - key: RECONNECT_MIN_MS

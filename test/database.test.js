@@ -66,10 +66,11 @@ test("schema contains all persistence tables", () => {
       "incidents",
       "round_results",
       "stream_state",
+      "virtual_bankrolls",
       "virtual_bet_sessions",
       "virtual_bets",
     ]);
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 7);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 8);
   } finally {
     database.close();
   }
@@ -145,7 +146,7 @@ test("version 5 history is backfilled into continuity epochs before migration co
 
   const database = createDatabase({ path });
   try {
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 7);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 8);
     assert.deepEqual(
       database.sqlite
         .prepare("SELECT continuity_epoch FROM round_results ORDER BY settled_at, id")
@@ -723,6 +724,19 @@ test("virtual bettor arms at 200 misses and starts betting only on the next tail
     assert.equal(state.activeSession.nextStake, 10);
     assert.equal(state.activeSession.selectedAt, "2026-09-21T00:03:20.000Z");
     assert.equal(state.activeSession.startedAt, null);
+    assert.deepEqual(state.testBank, {
+      mode: "simulation",
+      status: "running",
+      initialBalance: 87_700,
+      currentBalance: 87_700,
+      netResult: 0,
+      nextStake: 10,
+      canAffordNext: true,
+      shortfall: 0,
+      startedAt: state.testBank.startedAt,
+      exhaustedAt: null,
+      dataComplete: true,
+    });
     assert.equal(database.sqlite.prepare("SELECT COUNT(*) AS count FROM virtual_bets").get().count, 0);
 
     const initialized = database.initializeVirtualBettor(
@@ -743,6 +757,8 @@ test("virtual bettor arms at 200 misses and starts betting only on the next tail
     assert.equal(state.activeSession.totalStaked, 10);
     assert.equal(state.activeSession.nextStake, 10);
     assert.equal(state.activeSession.startedAt, "2026-09-21T00:03:21.000Z");
+    assert.equal(state.testBank.currentBalance, 87_690);
+    assert.equal(state.testBank.netResult, -10);
 
     database.ingestBatch([event(3, "virtual-first-miss", 202)]);
     database.ingestBatch([event(4, "virtual-late-history", 50)]);
@@ -766,6 +782,9 @@ test("virtual bettor arms at 200 misses and starts betting only on the next tail
     assert.equal(state.recentSessions[0].totalStaked, 20);
     assert.equal(state.recentSessions[0].grossPayout, 360);
     assert.equal(state.recentSessions[0].netResult, 340);
+    assert.equal(state.recentSessions[0].endReason, "hit");
+    assert.equal(state.testBank.currentBalance, 88_040);
+    assert.equal(state.testBank.netResult, 340);
     assert.deepEqual(state.lifetime, {
       totalSessions: 1,
       completedSessions: 1,
@@ -880,6 +899,10 @@ test("a novel gap invalidates a live virtual session and a duplicate gap is iner
     assert.equal(state.recentSessions[0].attemptCount, 1);
     assert.equal(state.recentSessions[0].totalStaked, 10);
     assert.equal(state.recentSessions[0].netResult, -10);
+    assert.equal(state.recentSessions[0].endReason, "integrity_gap");
+    assert.equal(state.testBank.currentBalance, 87_690);
+    assert.equal(state.testBank.status, "running");
+    assert.equal(state.testBank.dataComplete, false);
     assert.equal(state.lifetime.totalBets, 1);
     assert.equal(state.lifetime.totalStaked, 10);
     assert.equal(state.lifetime.netResult, -10);
@@ -933,6 +956,7 @@ test("virtual bet settlement rolls back with the result and can be retried", () 
     assert.equal(state.status, "armed");
     assert.equal(state.activeSession.attemptCount, 0);
     assert.equal(state.lifetime.totalBets, 0);
+    assert.equal(state.testBank.currentBalance, 87_700);
 
     database.sqlite.exec("DROP TRIGGER fail_virtual_bet");
     const retry = database.ingestBatch([event(3, "virtual-atomic-next", 201)]);
@@ -944,6 +968,7 @@ test("virtual bet settlement rolls back with the result and can be retried", () 
     assert.equal(state.status, "active");
     assert.equal(state.activeSession.attemptCount, 1);
     assert.equal(state.lifetime.totalBets, 1);
+    assert.equal(state.testBank.currentBalance, 87_690);
   } finally {
     database.close();
   }
@@ -982,6 +1007,7 @@ test("virtual bettor state persists and resumes after reopening the database", (
     assert.equal(state.activeSession.attemptCount, 1);
     assert.equal(state.activeSession.totalStaked, 10);
     assert.equal(state.lifetime.totalBets, 1);
+    assert.equal(state.testBank.currentBalance, 87_690);
   } finally {
     database.close();
     rmSync(directory, { recursive: true, force: true });
@@ -1026,6 +1052,8 @@ test("database settlement follows the recovery ladder and isolates instruments",
     assert.equal(other.status, "armed");
     assert.equal(other.activeSession.attemptCount, 0);
     assert.equal(other.activeSession.totalStaked, 0);
+    assert.equal(primary.testBank.currentBalance, 87_340);
+    assert.equal(other.testBank.currentBalance, 87_700);
 
     database.ingestBatch(
       Array.from({ length: 18 }, (_, index) =>
@@ -1043,5 +1071,240 @@ test("database settlement follows the recovery ladder and isolates instruments",
     assert.equal(primary.lifetime.totalStaked, 720);
   } finally {
     database.close();
+  }
+});
+
+test("a one-stake bankroll exhausts after one miss and cannot place more paper bets", () => {
+  const database = createDatabase({
+    path: ":memory:",
+    virtualStartingBalance: 10,
+  });
+  try {
+    database.ingestBatch(virtualTriggerEvents("virtual-bankroll-exhaust"));
+    let state = database.getVirtualBettorState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    assert.equal(state.status, "armed");
+    assert.equal(state.testBank.currentBalance, 10);
+
+    database.ingestBatch([event(3, "virtual-bankroll-exhaust-miss", 201)]);
+    state = database.getVirtualBettorState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    assert.equal(state.status, "bankroll_exhausted");
+    assert.equal(state.activeSession, null);
+    assert.deepEqual(state.testBank, {
+      mode: "simulation",
+      status: "exhausted",
+      initialBalance: 10,
+      currentBalance: 0,
+      netResult: -10,
+      nextStake: 10,
+      canAffordNext: false,
+      shortfall: 10,
+      startedAt: state.testBank.startedAt,
+      exhaustedAt: "2026-09-21T00:03:21.000Z",
+      dataComplete: true,
+    });
+    assert.equal(state.recentSessions[0].status, "completed");
+    assert.equal(state.recentSessions[0].endReason, "bankroll_exhausted");
+    assert.equal(state.recentSessions[0].attemptCount, 1);
+    assert.equal(state.recentSessions[0].netResult, -10);
+
+    const betCount = state.lifetime.totalBets;
+    const sessionCount = state.lifetime.totalSessions;
+    database.ingestBatch([
+      event(1, "virtual-bankroll-exhaust-later-hit", 202),
+      event(3, "virtual-bankroll-exhaust-later-miss", 203),
+    ]);
+    state = database.getVirtualBettorState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    assert.equal(state.status, "bankroll_exhausted");
+    assert.equal(state.testBank.currentBalance, 0);
+    assert.equal(state.lifetime.totalBets, betCount);
+    assert.equal(state.lifetime.totalSessions, sessionCount);
+  } finally {
+    database.close();
+  }
+});
+
+test("the default 87700 bank funds 216 misses and attempt 217 exactly", () => {
+  const database = createDatabase({ path: ":memory:" });
+  try {
+    database.ingestBatch(virtualTriggerEvents("virtual-bankroll-default-limit"));
+    database.ingestBatch(
+      Array.from({ length: 216 }, (_, index) =>
+        event(
+          3,
+          `virtual-bankroll-default-limit-session-miss-${index}`,
+          201 + index,
+        ),
+      ),
+    );
+
+    let state = database.getVirtualBettorState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    assert.equal(state.status, "active");
+    assert.equal(state.activeSession.attemptCount, 216);
+    assert.equal(state.activeSession.totalStaked, 85_260);
+    assert.equal(state.activeSession.nextStake, 2_440);
+    assert.equal(state.testBank.currentBalance, 2_440);
+    assert.equal(state.testBank.canAffordNext, true);
+
+    database.ingestBatch([
+      event(3, "virtual-bankroll-default-limit-session-miss-216", 417),
+    ]);
+    state = database.getVirtualBettorState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    assert.equal(state.status, "bankroll_exhausted");
+    assert.equal(state.testBank.currentBalance, 0);
+    assert.equal(state.testBank.nextStake, 2_500);
+    assert.equal(state.testBank.shortfall, 2_500);
+    assert.equal(state.recentSessions[0].attemptCount, 217);
+    assert.equal(state.recentSessions[0].totalStaked, 87_700);
+    assert.equal(state.recentSessions[0].netResult, -87_700);
+    assert.equal(state.recentSessions[0].endReason, "bankroll_exhausted");
+  } finally {
+    database.close();
+  }
+});
+
+test("duplicate results never charge the virtual bankroll twice", () => {
+  const database = createDatabase({
+    path: ":memory:",
+    virtualStartingBalance: 100,
+  });
+  try {
+    database.ingestBatch(virtualTriggerEvents("virtual-bankroll-duplicate"));
+    const next = event(3, "virtual-bankroll-duplicate-next", 201);
+    database.ingestBatch([next]);
+    const duplicate = database.ingestBatch([next]);
+    const state = database.getVirtualBettorState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    assert.equal(duplicate.inserted, 0);
+    assert.equal(duplicate.duplicates, 1);
+    assert.equal(state.lifetime.totalBets, 1);
+    assert.equal(state.testBank.currentBalance, 90);
+  } finally {
+    database.close();
+  }
+});
+
+test("v7 paper history initializes v8 bankroll with all known net results exactly once", () => {
+  const directory = mkdtempSync(join(tmpdir(), "roulette-bankroll-v7-"));
+  const path = join(directory, "paper-bankroll.sqlite");
+  let database = createDatabase({ path });
+  try {
+    database.ingestBatch(virtualTriggerEvents("virtual-bankroll-migrate"));
+    database.ingestBatch([
+      ...Array.from({ length: 14 }, (_, index) =>
+        event(3, `virtual-bankroll-migrate-next-miss-${index}`, 201 + index),
+      ),
+      event(1, "virtual-bankroll-migrate-hit", 215),
+    ]);
+    let state = database.getVirtualBettorState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    assert.equal(state.lifetime.netResult, 210);
+    assert.equal(state.testBank.currentBalance, 87_910);
+    database.close();
+
+    const legacy = new DatabaseSync(path);
+    try {
+      legacy.exec(`
+        DROP TABLE virtual_bankrolls;
+        UPDATE virtual_bet_sessions SET end_reason = NULL;
+        PRAGMA user_version = 7;
+      `);
+    } finally {
+      legacy.close();
+    }
+
+    database = createDatabase({ path, virtualStartingBalance: 87_700 });
+    state = database.initializeVirtualBettor(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 8);
+    assert.equal(state.testBank.initialBalance, 87_700);
+    assert.equal(state.testBank.currentBalance, 87_910);
+    assert.equal(state.testBank.netResult, 210);
+    assert.equal(state.recentSessions[0].endReason, "hit");
+    assert.equal(
+      database.sqlite
+        .prepare("SELECT COUNT(*) AS count FROM virtual_bankrolls")
+        .get().count,
+      1,
+    );
+    database.close();
+
+    database = createDatabase({ path, virtualStartingBalance: 1 });
+    state = database.getVirtualBettorState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    assert.equal(state.testBank.initialBalance, 87_700);
+    assert.equal(state.testBank.currentBalance, 87_910);
+  } finally {
+    database.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("virtual bankroll persists across reopen and remains isolated per stream", () => {
+  const directory = mkdtempSync(join(tmpdir(), "roulette-bankroll-streams-"));
+  const path = join(directory, "paper-bankroll.sqlite");
+  let database = createDatabase({ path, virtualStartingBalance: 50 });
+  try {
+    database.ingestBatch(virtualTriggerEvents("virtual-bankroll-primary"));
+    database.ingestBatch(
+      virtualTriggerEvents("virtual-bankroll-other", 7, 8, {
+        instrument: "OTHER",
+      }),
+    );
+    database.ingestBatch([event(3, "virtual-bankroll-primary-miss", 201)]);
+    database.ingestBatch([
+      event(7, "virtual-bankroll-other-hit", 201, { instrument: "OTHER" }),
+    ]);
+
+    let primary = database.getVirtualBettorState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    let other = database.getVirtualBettorState("buleto", "OTHER");
+    assert.equal(primary.testBank.currentBalance, 40);
+    assert.equal(other.testBank.currentBalance, 400);
+    database.close();
+
+    database = createDatabase({ path, virtualStartingBalance: 999 });
+    primary = database.getVirtualBettorState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    other = database.getVirtualBettorState("buleto", "OTHER");
+    assert.equal(primary.testBank.initialBalance, 50);
+    assert.equal(primary.testBank.currentBalance, 40);
+    assert.equal(other.testBank.initialBalance, 50);
+    assert.equal(other.testBank.currentBalance, 400);
+    assert.equal(
+      database.sqlite
+        .prepare("SELECT COUNT(*) AS count FROM virtual_bankrolls")
+        .get().count,
+      2,
+    );
+  } finally {
+    database.close();
+    rmSync(directory, { recursive: true, force: true });
   }
 });

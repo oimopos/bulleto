@@ -10,6 +10,7 @@ services:
       BULETO_WS_URL: wss://buleto.com/ws
       BULETO_INSTRUMENT: XPM/RUB
       COLLECTOR_ENABLED: "true"
+      VIRTUAL_STARTING_BALANCE: 87700
       GAP_THRESHOLD_SECONDS: 135
     ports:
       - "${PORT:-8787}:8787"

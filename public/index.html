@@ -7,8 +7,8 @@
     <meta name="color-scheme" content="dark">
     <meta name="description" content="Онлайн-монитор результатов рулетки и циклов исключения чисел от 0 до 36">
     <title>Круг 37 — монитор результатов</title>
-    <link rel="stylesheet" href="/styles.css?v=9">
-    <script type="module" src="/app.js?v=10"></script>
+    <link rel="stylesheet" href="/styles.css?v=10">
+    <script type="module" src="/app.js?v=11"></script>
   </head>
   <body>
     <a class="skip-link" href="#main-content">Перейти к содержимому</a>
@@ -224,6 +224,48 @@
           Эта панель не делает ставок, не нажимает кнопки на сайте и не использует баланс аккаунта. Все ставки, выплаты и результаты существуют только внутри симуляции.
         </p>
 
+        <section class="virtual-bank" id="virtual-bank" data-state="loading" aria-labelledby="virtual-bank-title" aria-describedby="virtual-bank-note virtual-bank-message" aria-busy="true">
+          <div class="virtual-bank__heading">
+            <div>
+              <p class="eyebrow">Тестовый лимит · только наблюдение</p>
+              <h3 id="virtual-bank-title">Виртуальный банк</h3>
+            </div>
+            <span class="count-badge" id="virtual-bank-status" role="status" aria-live="polite" aria-atomic="true">Загрузка…</span>
+          </div>
+
+          <p class="virtual-bank__note" id="virtual-bank-note">
+            Стартовый лимит 87 700 — это условные единицы симуляции, а не реальные деньги и не баланс аккаунта. Пополнений, реальных ставок и действий на сайте нет.
+          </p>
+
+          <dl class="virtual-bank__metrics" aria-label="Состояние виртуального банка">
+            <div>
+              <dt>Стартовый виртуальный банк</dt>
+              <dd id="virtual-bank-initial">—</dd>
+            </div>
+            <div id="virtual-bank-current-card">
+              <dt>Текущий виртуальный баланс</dt>
+              <dd id="virtual-bank-current">—</dd>
+            </div>
+            <div id="virtual-bank-pnl-card">
+              <dt>P&amp;L текущего теста</dt>
+              <dd id="virtual-bank-pnl">—</dd>
+            </div>
+            <div id="virtual-bank-next-card">
+              <dt>Следующий виртуальный шаг</dt>
+              <dd>
+                <span id="virtual-bank-next">—</span>
+                <span class="virtual-bank__availability" id="virtual-bank-next-state">Ожидаем данные</span>
+              </dd>
+            </div>
+          </dl>
+
+          <p class="virtual-bank__timing">
+            <span>Тест начат: <time id="virtual-bank-started-at">—</time></span>
+            <span id="virtual-bank-exhausted-wrap" hidden>Банк исчерпан: <time id="virtual-bank-exhausted-at">—</time></span>
+          </p>
+          <p class="virtual-bank__message" id="virtual-bank-message">Получаем состояние виртуального банка.</p>
+        </section>
+
         <div class="virtual-layout">
           <section class="virtual-state-card" aria-labelledby="virtual-status-title">
             <p class="eyebrow">Состояние автотеста</p>
@@ -291,7 +333,7 @@
           </ol>
 
           <div class="virtual-lifetime" aria-labelledby="virtual-lifetime-title">
-            <p class="eyebrow" id="virtual-lifetime-title">Все известные виртуальные шаги</p>
+            <p class="eyebrow" id="virtual-lifetime-title">За всё время</p>
             <dl class="virtual-lifetime__metrics">
               <div><dt>Сессий создано</dt><dd id="virtual-lifetime-sessions">—</dd></div>
               <div><dt>Виртуальных ставок</dt><dd id="virtual-lifetime-bets">—</dd></div>
