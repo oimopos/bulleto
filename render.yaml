@@ -7,7 +7,6 @@ services:
     numInstances: 1
     autoDeployTrigger: commit
     healthCheckPath: /api/live
-    maxShutdownDelaySeconds: 30
     dockerfilePath: ./Dockerfile
     dockerContext: .
     disk:
