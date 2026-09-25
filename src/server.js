@@ -322,6 +322,32 @@ const server = createServer((request, response) => {
       return;
     }
 
+    if (pathname === '/api/pairs') {
+      const source = 'buleto';
+      const instrument = config.instrument;
+      const items = db.getPairStats(source, instrument);
+      const totalResults = db
+        .getNumberStats(source, instrument)
+        .reduce((total, item) => total + item.occurrenceCount, 0);
+      const totalPairOccurrences = items.reduce(
+        (total, item) => total + item.occurrenceCount,
+        0,
+      );
+      sendJson(response, 200, {
+        length: 2,
+        ordered: true,
+        source,
+        instrument,
+        totalResults,
+        totalPairOccurrences,
+        distinctPairCount: items.length,
+        continuitySegmentCount: totalResults - totalPairOccurrences,
+        hasMore: false,
+        items,
+      });
+      return;
+    }
+
     if (pathname === '/api/cycles') {
       const limit = clampLimit(url.searchParams.get('limit'), 10, 100);
       sendJson(response, 200, { items: db.getCompletedCycles(limit).map(cycleForApi) });

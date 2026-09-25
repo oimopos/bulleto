@@ -2439,6 +2439,48 @@ export class RouletteDatabase {
       }));
   }
 
+  getPairStats(source = "buleto", instrument = "default") {
+    this.#assertOpen();
+    const safeSource = asNonEmptyText(source, undefined, "source");
+    const safeInstrument = asNonEmptyText(instrument, undefined, "instrument");
+    return this.sqlite
+      .prepare(`
+        WITH ordered AS (
+          SELECT
+            result_number AS first_number,
+            LEAD(result_number, 1) OVER stream_order AS second_number,
+            LEAD(settled_at, 1) OVER stream_order AS occurred_at
+          FROM round_results
+          WHERE source = ? AND instrument = ?
+          WINDOW stream_order AS (
+            PARTITION BY continuity_epoch
+            ORDER BY settled_at, id
+          )
+        )
+        SELECT
+          first_number,
+          second_number,
+          COUNT(*) AS occurrence_count,
+          MIN(occurred_at) AS first_occurred_at,
+          MAX(occurred_at) AS last_occurred_at
+        FROM ordered
+        WHERE second_number IS NOT NULL
+        GROUP BY first_number, second_number
+        ORDER BY
+          occurrence_count DESC,
+          last_occurred_at DESC,
+          first_number,
+          second_number
+      `)
+      .all(safeSource, safeInstrument)
+      .map((row) => ({
+        numbers: [Number(row.first_number), Number(row.second_number)],
+        occurrenceCount: Number(row.occurrence_count),
+        firstOccurredAt: row.first_occurred_at,
+        lastOccurredAt: row.last_occurred_at,
+      }));
+  }
+
   enrichKnownResults(events) {
     this.#assertOpen();
     if (!Array.isArray(events)) throw new TypeError("events must be an array");

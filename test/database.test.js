@@ -270,6 +270,121 @@ test("number statistics always cover 0 through 36 and use the latest saved resul
   }
 });
 
+test("pair statistics preserve order, count overlaps, and include every observed pair", () => {
+  const database = createDatabase({ path: ":memory:" });
+  try {
+    const numbers = [3, 20, 3, 20, 3, 7, 7, 7];
+    database.ingestBatch(
+      numbers.map((number, index) => event(number, `pair-${index}`, index)),
+    );
+
+    assert.deepEqual(
+      database.getPairStats("buleto", "PRIMECOIN(XPM)/RUB"),
+      [
+        {
+          numbers: [7, 7],
+          occurrenceCount: 2,
+          firstOccurredAt: "2026-09-21T00:00:06.000Z",
+          lastOccurredAt: "2026-09-21T00:00:07.000Z",
+        },
+        {
+          numbers: [20, 3],
+          occurrenceCount: 2,
+          firstOccurredAt: "2026-09-21T00:00:02.000Z",
+          lastOccurredAt: "2026-09-21T00:00:04.000Z",
+        },
+        {
+          numbers: [3, 20],
+          occurrenceCount: 2,
+          firstOccurredAt: "2026-09-21T00:00:01.000Z",
+          lastOccurredAt: "2026-09-21T00:00:03.000Z",
+        },
+        {
+          numbers: [3, 7],
+          occurrenceCount: 1,
+          firstOccurredAt: "2026-09-21T00:00:05.000Z",
+          lastOccurredAt: "2026-09-21T00:00:05.000Z",
+        },
+      ],
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test("pair statistics cover history beyond the latest 500 results", () => {
+  const database = createDatabase({ path: ":memory:" });
+  try {
+    const numbers = [31, 32, ...Array.from({ length: 501 }, () => 7)];
+    database.ingestBatch(
+      numbers.map((number, index) => event(number, `long-pair-${index}`, index)),
+    );
+
+    assert.deepEqual(
+      database
+        .getPairStats("buleto", "PRIMECOIN(XPM)/RUB")
+        .find((item) => item.numbers[0] === 31 && item.numbers[1] === 32),
+      {
+        numbers: [31, 32],
+        occurrenceCount: 1,
+        firstOccurredAt: "2026-09-21T00:00:01.000Z",
+        lastOccurredAt: "2026-09-21T00:00:01.000Z",
+      },
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test("an integrity gap prevents pair statistics from joining continuity epochs", () => {
+  const database = createDatabase({ path: ":memory:" });
+  const gap = {
+    source: "buleto",
+    instrument: "PRIMECOIN(XPM)/RUB",
+    incidentKey: "pair-gap",
+    detectedAt: "2026-09-21T00:00:02.000Z",
+    message: "known missing result",
+  };
+  try {
+    database.ingestBatch([
+      event(1, "gap-pair-0", 0),
+      event(2, "gap-pair-1", 1),
+    ]);
+    database.ingestBatchAfterGap(gap, [
+      event(3, "gap-pair-2", 2),
+      event(1, "gap-pair-3", 3),
+      event(2, "gap-pair-4", 4),
+      event(3, "gap-pair-5", 5),
+    ]);
+
+    assert.deepEqual(
+      database.getPairStats("buleto", "PRIMECOIN(XPM)/RUB"),
+      [
+        {
+          numbers: [1, 2],
+          occurrenceCount: 2,
+          firstOccurredAt: "2026-09-21T00:00:01.000Z",
+          lastOccurredAt: "2026-09-21T00:00:04.000Z",
+        },
+        {
+          numbers: [2, 3],
+          occurrenceCount: 1,
+          firstOccurredAt: "2026-09-21T00:00:05.000Z",
+          lastOccurredAt: "2026-09-21T00:00:05.000Z",
+        },
+        {
+          numbers: [3, 1],
+          occurrenceCount: 1,
+          firstOccurredAt: "2026-09-21T00:00:03.000Z",
+          lastOccurredAt: "2026-09-21T00:00:03.000Z",
+        },
+      ],
+    );
+  } finally {
+    database.close();
+  }
+});
+
 test("repeated triples preserve order and count overlapping appearances", () => {
   const database = createDatabase({ path: ":memory:" });
   try {
