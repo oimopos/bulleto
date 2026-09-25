@@ -241,9 +241,168 @@ function mapIncident(row) {
   };
 }
 
+function mapForecastPairHistory(row) {
+  if (!row?.pair_status) return null;
+  const allowedStatuses = new Set(["ready", "no_anchor", "no_samples"]);
+  if (!allowedStatuses.has(row.pair_status)) return null;
+
+  const sampleSize = Number(row.pair_sample_size);
+  const observedFollowerCount = Number(row.pair_observed_follower_count);
+  if (
+    !Number.isSafeInteger(sampleSize) ||
+    sampleSize < 0 ||
+    !Number.isSafeInteger(observedFollowerCount) ||
+    observedFollowerCount < 0 ||
+    observedFollowerCount > 37
+  ) {
+    return null;
+  }
+  const rawTop3 = deserializeJson(row.pair_top3_json);
+  if (!Array.isArray(rawTop3) || rawTop3.length > 3) return null;
+  const top3 = [];
+  for (const [index, item] of rawTop3.entries()) {
+    const number = Number(item?.number);
+    const occurrenceCount = Number(item?.occurrenceCount);
+    if (
+      !Number.isInteger(number) ||
+      number < 0 ||
+      number > 36 ||
+      !Number.isSafeInteger(occurrenceCount) ||
+      occurrenceCount <= 0
+    ) {
+      return null;
+    }
+    top3.push({
+      rank: index + 1,
+      number,
+      occurrenceCount,
+      share: sampleSize > 0 ? occurrenceCount / sampleSize : null,
+      firstOccurredAt: item.firstOccurredAt ?? null,
+      lastOccurredAt: item.lastOccurredAt ?? null,
+    });
+  }
+  const storedModelTop3 = deserializeJson(row.pair_model_top3_json);
+  if (!Array.isArray(storedModelTop3) || storedModelTop3.length !== 3) return null;
+  const modelTop3 = storedModelTop3.map(Number);
+  if (
+    modelTop3.some(
+      (number) => !Number.isInteger(number) || number < 0 || number > 36,
+    ) ||
+    new Set(modelTop3).size !== 3
+  ) {
+    return null;
+  }
+  const storedOverlap = deserializeJson(row.pair_overlap_numbers_json);
+  if (!Array.isArray(storedOverlap) || storedOverlap.length > 3) return null;
+  const overlapNumbers = storedOverlap.map(Number);
+  const storedOverlapCount = Number(row.pair_overlap_count);
+  if (
+    overlapNumbers.some(
+      (number) => !Number.isInteger(number) || number < 0 || number > 36,
+    ) ||
+    new Set(overlapNumbers).size !== overlapNumbers.length ||
+    !Number.isSafeInteger(storedOverlapCount) ||
+    storedOverlapCount !== overlapNumbers.length
+  ) {
+    return null;
+  }
+  const anchor = row.pair_anchor_result_id == null
+    ? null
+    : {
+        resultId: Number(row.pair_anchor_result_id),
+        number: Number(row.pair_anchor_number),
+        settledAt: row.pair_anchor_settled_at,
+        continuityEpoch: Number(row.pair_anchor_continuity_epoch),
+      };
+  const schemaVersion = Number(row.pair_schema_version);
+  const historyMaxResultId = row.pair_history_max_result_id == null
+    ? null
+    : Number(row.pair_history_max_result_id);
+  if (
+    schemaVersion !== 1 ||
+    !Number.isFinite(Date.parse(row.pair_history_cutoff_at)) ||
+    !Number.isFinite(Date.parse(row.pair_captured_at)) ||
+    (historyMaxResultId !== null &&
+      (!Number.isSafeInteger(historyMaxResultId) || historyMaxResultId <= 0)) ||
+    (anchor !== null &&
+      (!Number.isSafeInteger(anchor.resultId) ||
+        anchor.resultId <= 0 ||
+        !Number.isInteger(anchor.number) ||
+        anchor.number < 0 ||
+        anchor.number > 36 ||
+        !Number.isFinite(Date.parse(anchor.settledAt)) ||
+        !Number.isSafeInteger(anchor.continuityEpoch) ||
+        anchor.continuityEpoch < 0))
+  ) {
+    return null;
+  }
+  if (
+    (row.pair_status === "ready" && (anchor === null || sampleSize <= 0 || top3.length === 0)) ||
+    (row.pair_status === "no_samples" && (anchor === null || sampleSize !== 0 || top3.length !== 0)) ||
+    (row.pair_status === "no_anchor" && (anchor !== null || sampleSize !== 0 || top3.length !== 0))
+  ) {
+    return null;
+  }
+  const pairNumbers = top3.map((item) => item.number);
+  if (
+    new Set(pairNumbers).size !== pairNumbers.length ||
+    observedFollowerCount < pairNumbers.length ||
+    top3.reduce((sum, item) => sum + item.occurrenceCount, 0) > sampleSize
+  ) {
+    return null;
+  }
+  const expectedOverlap = modelTop3.filter((number) => pairNumbers.includes(number));
+  if (
+    expectedOverlap.length !== overlapNumbers.length ||
+    expectedOverlap.some((number, index) => number !== overlapNumbers[index])
+  ) {
+    return null;
+  }
+  const expectedSameTop1 = pairNumbers.length === 0
+    ? null
+    : modelTop3[0] === pairNumbers[0];
+  const storedSameTop1 = row.pair_same_top1 == null
+    ? null
+    : Boolean(row.pair_same_top1);
+  const expectedExactOrder =
+    pairNumbers.length === modelTop3.length &&
+    pairNumbers.every((number, index) => number === modelTop3[index]);
+  if (
+    storedSameTop1 !== expectedSameTop1 ||
+    Boolean(row.pair_exact_order) !== expectedExactOrder
+  ) {
+    return null;
+  }
+
+  return {
+    schemaVersion,
+    status: row.pair_status,
+    historyCutoffAt: row.pair_history_cutoff_at,
+    capturedAt: row.pair_captured_at,
+    historyMaxResultId,
+    anchor,
+    sampleSize,
+    observedFollowerCount,
+    top3,
+    definition: "adjacent-within-continuity-epoch",
+    tieBreak: "count-desc,last-seen-desc,number-asc",
+    comparison: {
+      modelTop3,
+      pairTop3: top3.map((item) => item.number),
+      overlapNumbers,
+      overlapCount: storedOverlapCount,
+      sameTop1: storedSameTop1,
+      exactOrder: expectedExactOrder,
+    },
+  };
+}
+
 function mapPrecloseForecast(row) {
   if (!row) return null;
-  const rankedNumbers = deserializeJson(row.ranked_numbers_json);
+  const rawRankedNumbers = deserializeJson(row.ranked_numbers_json);
+  const rankedNumbers = Array.isArray(rawRankedNumbers)
+    ? rawRankedNumbers.map(Number)
+    : [];
   return {
     id: Number(row.forecast_id ?? row.id),
     snapshotId: Number(row.snapshot_id),
@@ -263,11 +422,10 @@ function mapPrecloseForecast(row) {
     currentNumber: Number(row.current_number),
     projectedPrice: Number(row.predicted_price),
     predictedNumber: Number(row.predicted_number),
-    rankedNumbers: Array.isArray(rankedNumbers)
-      ? rankedNumbers.map(Number)
-      : [],
+    rankedNumbers,
     modelVersion: row.model_version,
     features: deserializeJson(row.features_json),
+    pairHistory: mapForecastPairHistory(row),
     settlement:
       row.actual_number === null || row.actual_number === undefined
         ? null
@@ -715,6 +873,7 @@ export class RouletteDatabase {
 
     this.#migrateContinuityReconciliationV9();
     this.#migratePrecloseForecastsV10();
+    this.#migrateForecastPairSnapshotsV11();
   }
 
   #migratePrecloseForecastsV10() {
@@ -774,6 +933,52 @@ export class RouletteDatabase {
       );
 
       PRAGMA user_version = 10;
+      COMMIT;
+    `);
+  }
+
+  #migrateForecastPairSnapshotsV11() {
+    this.sqlite.exec(`
+      BEGIN IMMEDIATE;
+
+      CREATE TABLE IF NOT EXISTS forecast_pair_snapshots (
+        forecast_id INTEGER PRIMARY KEY REFERENCES round_forecasts(id),
+        schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+        status TEXT NOT NULL CHECK (
+          status IN ('ready', 'no_anchor', 'no_samples')
+        ),
+        history_cutoff_at TEXT NOT NULL,
+        captured_at TEXT NOT NULL,
+        history_max_result_id INTEGER REFERENCES round_results(id),
+        anchor_result_id INTEGER REFERENCES round_results(id),
+        anchor_number INTEGER CHECK (
+          anchor_number IS NULL OR anchor_number BETWEEN 0 AND 36
+        ),
+        anchor_settled_at TEXT,
+        anchor_continuity_epoch INTEGER CHECK (
+          anchor_continuity_epoch IS NULL OR anchor_continuity_epoch >= 0
+        ),
+        sample_size INTEGER NOT NULL CHECK (sample_size >= 0),
+        observed_follower_count INTEGER NOT NULL CHECK (
+          observed_follower_count BETWEEN 0 AND 37
+        ),
+        pair_top3_json TEXT NOT NULL,
+        model_top3_json TEXT NOT NULL,
+        overlap_numbers_json TEXT NOT NULL,
+        overlap_count INTEGER NOT NULL CHECK (overlap_count BETWEEN 0 AND 3),
+        same_top1 INTEGER CHECK (same_top1 IS NULL OR same_top1 IN (0, 1)),
+        exact_order INTEGER NOT NULL CHECK (exact_order IN (0, 1)),
+        created_at TEXT NOT NULL,
+        CHECK (
+          (status = 'no_anchor' AND anchor_result_id IS NULL AND sample_size = 0)
+          OR
+          (status = 'no_samples' AND anchor_result_id IS NOT NULL AND sample_size = 0)
+          OR
+          (status = 'ready' AND anchor_result_id IS NOT NULL AND sample_size > 0)
+        )
+      );
+
+      PRAGMA user_version = 11;
       COMMIT;
     `);
   }
@@ -3015,6 +3220,202 @@ export class RouletteDatabase {
       }));
   }
 
+  #buildForecastPairSnapshot({
+    source,
+    instrument,
+    externalRoundId,
+    lockedAt,
+    modelTop3,
+  }) {
+    const eligibility = `
+      source = ?
+      AND instrument = ?
+      AND created_at <= ?
+      AND observed_at <= ?
+      AND settled_at < ?
+    `;
+    const historyMaxRow = this.sqlite
+      .prepare(`
+        SELECT MAX(id) AS max_result_id
+        FROM round_results
+        WHERE ${eligibility}
+      `)
+      .get(source, instrument, lockedAt, lockedAt, lockedAt);
+    const historyMaxResultId = historyMaxRow?.max_result_id == null
+      ? null
+      : Number(historyMaxRow.max_result_id);
+    const base = {
+      schemaVersion: 1,
+      historyCutoffAt: lockedAt,
+      historyMaxResultId,
+      anchor: null,
+      sampleSize: 0,
+      observedFollowerCount: 0,
+      pairTop3: [],
+      modelTop3: [...modelTop3],
+      overlapNumbers: [],
+      overlapCount: 0,
+      sameTop1: null,
+      exactOrder: false,
+    };
+    if (historyMaxResultId === null) {
+      return { ...base, status: "no_anchor" };
+    }
+
+    const anchor = this.sqlite
+      .prepare(`
+        SELECT
+          id,
+          result_number,
+          settled_at,
+          continuity_epoch,
+          external_round_id
+        FROM round_results
+        WHERE ${eligibility}
+          AND id <= ?
+        ORDER BY settled_at DESC, id DESC
+        LIMIT 1
+      `)
+      .get(
+        source,
+        instrument,
+        lockedAt,
+        lockedAt,
+        lockedAt,
+        historyMaxResultId,
+      );
+    const forecastRoundId = numericRoundId(externalRoundId);
+    const anchorRoundId = numericRoundId(anchor?.external_round_id);
+    if (
+      !anchor ||
+      forecastRoundId === null ||
+      anchorRoundId === null ||
+      forecastRoundId !== anchorRoundId + 1n
+    ) {
+      return { ...base, status: "no_anchor" };
+    }
+
+    const safeAnchor = {
+      resultId: Number(anchor.id),
+      number: Number(anchor.result_number),
+      settledAt: anchor.settled_at,
+      continuityEpoch: Number(anchor.continuity_epoch),
+    };
+    const rows = this.sqlite
+      .prepare(`
+        WITH eligible_results AS (
+          SELECT id, result_number, settled_at, continuity_epoch
+          FROM round_results
+          WHERE ${eligibility}
+            AND id <= ?
+        ), ordered AS (
+          SELECT
+            result_number AS first_number,
+            LEAD(result_number, 1) OVER stream_order AS second_number,
+            LEAD(settled_at, 1) OVER stream_order AS occurred_at
+          FROM eligible_results
+          WINDOW stream_order AS (
+            PARTITION BY continuity_epoch
+            ORDER BY settled_at, id
+          )
+        ), followers AS (
+          SELECT
+            second_number AS number,
+            COUNT(*) AS occurrence_count,
+            MIN(occurred_at) AS first_occurred_at,
+            MAX(occurred_at) AS last_occurred_at
+          FROM ordered
+          WHERE first_number = ? AND second_number IS NOT NULL
+          GROUP BY second_number
+        )
+        SELECT
+          number,
+          occurrence_count,
+          first_occurred_at,
+          last_occurred_at,
+          SUM(occurrence_count) OVER () AS sample_size,
+          COUNT(*) OVER () AS observed_follower_count
+        FROM followers
+        ORDER BY occurrence_count DESC, last_occurred_at DESC, number
+        LIMIT 3
+      `)
+      .all(
+        source,
+        instrument,
+        lockedAt,
+        lockedAt,
+        lockedAt,
+        historyMaxResultId,
+        safeAnchor.number,
+      );
+    if (rows.length === 0) {
+      return {
+        ...base,
+        status: "no_samples",
+        anchor: safeAnchor,
+      };
+    }
+
+    const pairTop3 = rows.map((row) => ({
+      number: Number(row.number),
+      occurrenceCount: Number(row.occurrence_count),
+      firstOccurredAt: row.first_occurred_at,
+      lastOccurredAt: row.last_occurred_at,
+    }));
+    const pairNumbers = pairTop3.map((item) => item.number);
+    const pairSet = new Set(pairNumbers);
+    const overlapNumbers = modelTop3.filter((number) => pairSet.has(number));
+    return {
+      ...base,
+      status: "ready",
+      anchor: safeAnchor,
+      sampleSize: Number(rows[0].sample_size),
+      observedFollowerCount: Number(rows[0].observed_follower_count),
+      pairTop3,
+      overlapNumbers,
+      overlapCount: overlapNumbers.length,
+      sameTop1: modelTop3[0] === pairNumbers[0],
+      exactOrder:
+        pairNumbers.length === modelTop3.length &&
+        pairNumbers.every((number, index) => number === modelTop3[index]),
+    };
+  }
+
+  #insertForecastPairSnapshot(forecastId, snapshot, capturedAt) {
+    this.sqlite
+      .prepare(`
+        INSERT INTO forecast_pair_snapshots (
+          forecast_id, schema_version, status,
+          history_cutoff_at, captured_at, history_max_result_id,
+          anchor_result_id, anchor_number, anchor_settled_at,
+          anchor_continuity_epoch, sample_size, observed_follower_count,
+          pair_top3_json, model_top3_json, overlap_numbers_json,
+          overlap_count, same_top1, exact_order, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        forecastId,
+        snapshot.schemaVersion,
+        snapshot.status,
+        snapshot.historyCutoffAt,
+        capturedAt,
+        snapshot.historyMaxResultId,
+        snapshot.anchor?.resultId ?? null,
+        snapshot.anchor?.number ?? null,
+        snapshot.anchor?.settledAt ?? null,
+        snapshot.anchor?.continuityEpoch ?? null,
+        snapshot.sampleSize,
+        snapshot.observedFollowerCount,
+        JSON.stringify(snapshot.pairTop3),
+        JSON.stringify(snapshot.modelTop3),
+        JSON.stringify(snapshot.overlapNumbers),
+        snapshot.overlapCount,
+        snapshot.sameTop1 === null ? null : snapshot.sameTop1 ? 1 : 0,
+        snapshot.exactOrder ? 1 : 0,
+        capturedAt,
+      );
+  }
+
   recordPrecloseForecast(attempt) {
     this.#assertOpen();
     if (!attempt || typeof attempt !== "object" || Array.isArray(attempt)) {
@@ -3147,6 +3548,28 @@ export class RouletteDatabase {
     );
 
     return this.#transaction(() => {
+      const existing = this.sqlite
+        .prepare(`
+          SELECT id
+          FROM forecast_snapshots
+          WHERE source = ?
+            AND instrument = ?
+            AND external_round_id = ?
+            AND horizon_seconds = ?
+          LIMIT 1
+        `)
+        .get(source, instrument, externalRoundId, horizonSeconds);
+      if (existing) {
+        return { inserted: false, roundId: externalRoundId };
+      }
+
+      const pairSnapshot = this.#buildForecastPairSnapshot({
+        source,
+        instrument,
+        externalRoundId,
+        lockedAt,
+        modelTop3: rankedNumbers,
+      });
       const persistedAt = asTimestamp(this.clock(), undefined, "forecast persistedAt");
       const persistedAtMs = Date.parse(persistedAt);
       const persistedLeadTimeMs = closesMs - persistedAtMs;
@@ -3192,7 +3615,7 @@ export class RouletteDatabase {
       }
 
       const snapshotId = Number(insertion.lastInsertRowid);
-      this.sqlite
+      const forecastInsertion = this.sqlite
         .prepare(`
           INSERT INTO round_forecasts (
             snapshot_id, model_version, predicted_price, predicted_number,
@@ -3207,6 +3630,21 @@ export class RouletteDatabase {
           JSON.stringify(rankedNumbers),
           persistedAt,
         );
+      this.#insertForecastPairSnapshot(
+        Number(forecastInsertion.lastInsertRowid),
+        pairSnapshot,
+        persistedAt,
+      );
+      const commitCheckedAt = asTimestamp(
+        this.clock(),
+        undefined,
+        "forecast commitCheckedAt",
+      );
+      if (closesMs - Date.parse(commitCheckedAt) < 5_000) {
+        throw new RangeError(
+          "forecast transaction must finish at least five seconds before betting closes",
+        );
+      }
       return { inserted: true, roundId: externalRoundId };
     });
   }
@@ -3361,11 +3799,30 @@ export class RouletteDatabase {
           settlements.top1_hit,
           settlements.top3_hit,
           settlements.current_cell_hit,
-          settlements.created_at AS settlement_created_at
+          settlements.created_at AS settlement_created_at,
+          pair_snapshots.schema_version AS pair_schema_version,
+          pair_snapshots.status AS pair_status,
+          pair_snapshots.history_cutoff_at AS pair_history_cutoff_at,
+          pair_snapshots.captured_at AS pair_captured_at,
+          pair_snapshots.history_max_result_id AS pair_history_max_result_id,
+          pair_snapshots.anchor_result_id AS pair_anchor_result_id,
+          pair_snapshots.anchor_number AS pair_anchor_number,
+          pair_snapshots.anchor_settled_at AS pair_anchor_settled_at,
+          pair_snapshots.anchor_continuity_epoch AS pair_anchor_continuity_epoch,
+          pair_snapshots.sample_size AS pair_sample_size,
+          pair_snapshots.observed_follower_count AS pair_observed_follower_count,
+          pair_snapshots.pair_top3_json,
+          pair_snapshots.model_top3_json AS pair_model_top3_json,
+          pair_snapshots.overlap_numbers_json AS pair_overlap_numbers_json,
+          pair_snapshots.overlap_count AS pair_overlap_count,
+          pair_snapshots.same_top1 AS pair_same_top1,
+          pair_snapshots.exact_order AS pair_exact_order
         FROM round_forecasts AS forecasts
         JOIN forecast_snapshots AS snapshots ON snapshots.id = forecasts.snapshot_id
         LEFT JOIN forecast_settlements AS settlements
           ON settlements.forecast_id = forecasts.id
+        LEFT JOIN forecast_pair_snapshots AS pair_snapshots
+          ON pair_snapshots.forecast_id = forecasts.id
         WHERE snapshots.source = ? AND snapshots.instrument = ?
         ORDER BY snapshots.locked_at DESC, forecasts.id DESC
         LIMIT 1

@@ -7,8 +7,8 @@
     <meta name="color-scheme" content="dark">
     <meta name="description" content="Онлайн-монитор результатов рулетки и циклов исключения чисел от 0 до 36">
     <title>Круг 37 — монитор результатов</title>
-    <link rel="stylesheet" href="/styles.css?v=12">
-    <script type="module" src="/app.js?v=13"></script>
+    <link rel="stylesheet" href="/styles.css?v=13">
+    <script type="module" src="/app.js?v=14"></script>
   </head>
   <body>
     <a class="skip-link" href="#main-content">Перейти к содержимому</a>
@@ -148,6 +148,42 @@
             <div><dt>Попадание top‑3</dt><dd id="preclose-top3-rate">—</dd></div>
           </dl>
         </div>
+
+        <section class="preclose-comparison" id="preclose-comparison" data-state="waiting" aria-labelledby="preclose-comparison-title" aria-describedby="preclose-comparison-status preclose-comparison-warning preclose-comparison-note" aria-busy="true">
+          <div class="preclose-comparison__header">
+            <div>
+              <p class="eyebrow">Снимок в момент прогноза</p>
+              <h3 id="preclose-comparison-title">Сравнение двух top‑3</h3>
+            </div>
+            <span class="preclose-comparison__badge" id="preclose-comparison-badge">Ждём прогноз</span>
+          </div>
+
+          <div class="preclose-comparison__lists">
+            <section class="preclose-comparison__method" aria-labelledby="preclose-comparison-model-label">
+              <div class="preclose-comparison__method-heading">
+                <strong id="preclose-comparison-model-label">Ценовая модель</strong>
+                <span>до красной линии</span>
+              </div>
+              <ol class="preclose-comparison__ranking" id="preclose-comparison-model" aria-label="Top-3 ценовой модели">
+                <li class="empty-state">Прогноз не зафиксирован</li>
+              </ol>
+            </section>
+
+            <section class="preclose-comparison__method" aria-labelledby="preclose-comparison-history-label">
+              <div class="preclose-comparison__method-heading">
+                <strong id="preclose-comparison-history-label">История переходов</strong>
+                <span id="preclose-comparison-sample">выборка не готова</span>
+              </div>
+              <ol class="preclose-comparison__ranking" id="preclose-comparison-history" aria-label="Исторический top-3 следующих чисел">
+                <li class="empty-state">Исторический снимок не готов</li>
+              </ol>
+            </section>
+          </div>
+
+          <p class="preclose-comparison__status" id="preclose-comparison-status" role="status" aria-live="polite" aria-atomic="true">Сравнение появится после фиксации прогноза.</p>
+          <p class="preclose-comparison__warning" id="preclose-comparison-warning" hidden></p>
+          <p class="preclose-comparison__note" id="preclose-comparison-note">Совпадение списков не является вероятностью и не доказывает более высокий шанс выпадения.</p>
+        </section>
 
         <p class="preclose-note" id="preclose-note">Прогноз сохраняется до <code>bcd</code> и после блокировки не меняется. Случайная база для top‑3 — 3 из 37 (≈8,1%); выводы делаем только после 100 проверок. Метрика считает только успешно зафиксированные снимки, пропущенные окна в неё не входят. Это эксперимент, не рекомендация для ставки и не обещание выигрыша.</p>
       </section>

@@ -32,6 +32,14 @@ import { buildFollowerStats } from "./pair-followers.js?v=1";
     precloseProjectedPrice: document.getElementById("preclose-projected-price"),
     precloseSampleCount: document.getElementById("preclose-sample-count"),
     precloseTop3Rate: document.getElementById("preclose-top3-rate"),
+    precloseComparison: document.getElementById("preclose-comparison"),
+    precloseComparisonBadge: document.getElementById("preclose-comparison-badge"),
+    precloseComparisonModel: document.getElementById("preclose-comparison-model"),
+    precloseComparisonHistory: document.getElementById("preclose-comparison-history"),
+    precloseComparisonHistoryLabel: document.getElementById("preclose-comparison-history-label"),
+    precloseComparisonSample: document.getElementById("preclose-comparison-sample"),
+    precloseComparisonStatus: document.getElementById("preclose-comparison-status"),
+    precloseComparisonWarning: document.getElementById("preclose-comparison-warning"),
     followerPanel: document.getElementById("follower-panel"),
     followerTitle: document.getElementById("follower-title"),
     followerSource: document.getElementById("follower-source"),
@@ -1161,6 +1169,252 @@ import { buildFollowerStats } from "./pair-followers.js?v=1";
     store.hasCompletedInitialRender = true;
   }
 
+  function uniqueComparisonNumbers(value) {
+    if (!Array.isArray(value)) return [];
+    const numbers = value.map(asRouletteNumber);
+    if (numbers.some((number) => number === null)) return [];
+    if (new Set(numbers).size !== numbers.length) return [];
+    return numbers;
+  }
+
+  function comparisonNumbersLabel(numbers) {
+    if (numbers.length === 0) return "";
+    if (numbers.length === 1) return String(numbers[0]);
+    if (numbers.length === 2) return `${numbers[0]} и ${numbers[1]}`;
+    return `${numbers.slice(0, -1).join(", ")} и ${numbers.at(-1)}`;
+  }
+
+  function comparisonEmptyItem(message) {
+    return createElement("li", "empty-state", message);
+  }
+
+  function comparisonPick(item, index, { historical = false, overlap = false, sampleSize = 0 } = {}) {
+    const pick = createElement("li", "preclose-comparison__pick");
+    if (overlap) pick.classList.add("is-overlap");
+    const rank = Number.isInteger(item.rank) ? item.rank : index + 1;
+    const count = asOptionalNonNegativeInteger(item.occurrenceCount);
+    const rankLabel = createElement("span", "preclose-comparison__rank", `#${rank}`);
+    const ball = createElement(
+      "span",
+      `preclose-comparison__number ${rouletteColorClass(item.number)}`,
+      item.number,
+    );
+    ball.setAttribute("aria-hidden", "true");
+    const meta = createElement(
+      "span",
+      "preclose-comparison__meta",
+      historical && count !== null
+        ? `${count} ${pluralForm(count, "раз", "раза", "раз")}`
+        : "модель",
+    );
+    pick.append(rankLabel, ball, meta);
+
+    if (overlap) {
+      const common = createElement("span", "preclose-comparison__common", "общее");
+      common.setAttribute("aria-hidden", "true");
+      pick.append(common);
+    }
+
+    const parts = [
+      `${historical ? "Исторический список" : "Ценовая модель"}, ${rank} место: число ${item.number}, ${rouletteColorLabel(item.number)}`,
+    ];
+    if (historical && count !== null) {
+      parts.push(`${count} ${pluralForm(count, "переход", "перехода", "переходов")} из ${sampleSize}`);
+    }
+    if (overlap) parts.push("число присутствует в обоих списках");
+    pick.setAttribute("aria-label", parts.join("; "));
+    if (historical && item.lastOccurredAt) {
+      pick.title = `Последний такой переход: ${formatDateTime(item.lastOccurredAt, { alwaysShowDate: true })}`;
+    }
+    return pick;
+  }
+
+  function renderComparisonRankings(modelNumbers, historicalItems, overlapNumbers, sampleSize) {
+    const overlap = new Set(overlapNumbers);
+    const modelPicks = modelNumbers.map((number, index) => comparisonPick(
+      { number, rank: index + 1 },
+      index,
+      { overlap: overlap.has(number) },
+    ));
+    const historicalPicks = historicalItems.map((item, index) => comparisonPick(
+      item,
+      index,
+      { historical: true, overlap: overlap.has(item.number), sampleSize },
+    ));
+    elements.precloseComparisonModel.replaceChildren(
+      ...(modelPicks.length
+        ? modelPicks
+        : [comparisonEmptyItem("Ценовой top‑3 недоступен")]),
+    );
+    elements.precloseComparisonHistory.replaceChildren(
+      ...(historicalPicks.length
+        ? historicalPicks
+        : [comparisonEmptyItem("Исторический top‑3 недоступен")]),
+    );
+  }
+
+  function setComparisonWarning(messages) {
+    const warning = messages.filter(Boolean).join(" ");
+    elements.precloseComparisonWarning.hidden = warning === "";
+    elements.precloseComparisonWarning.textContent = warning;
+  }
+
+  function renderPrecloseComparison(latest) {
+    elements.precloseComparison.removeAttribute("title");
+    setComparisonWarning([]);
+
+    if (!latest) {
+      elements.precloseComparison.dataset.state = "waiting";
+      elements.precloseComparison.setAttribute("aria-busy", "true");
+      elements.precloseComparisonBadge.textContent = "Ждём прогноз";
+      elements.precloseComparisonHistoryLabel.textContent = "История переходов";
+      elements.precloseComparisonSample.textContent = "выборка не готова";
+      elements.precloseComparisonStatus.textContent = "Сравнение появится после фиксации прогноза.";
+      renderComparisonRankings([], [], [], 0);
+      return;
+    }
+
+    const pairHistory = latest.pairHistory;
+    const fallbackModelNumbers = uniqueComparisonNumbers(latest.rankedNumbers).slice(0, 3);
+    if (!pairHistory || typeof pairHistory !== "object" || Array.isArray(pairHistory)) {
+      elements.precloseComparison.dataset.state = "unavailable";
+      elements.precloseComparison.setAttribute("aria-busy", "false");
+      elements.precloseComparisonBadge.textContent = "Нет снимка";
+      elements.precloseComparisonHistoryLabel.textContent = "История переходов";
+      elements.precloseComparisonSample.textContent = "legacy-прогноз";
+      elements.precloseComparisonStatus.textContent = "Для этого прогноза историческое сравнение не сохранялось и задним числом не пересчитывается.";
+      renderComparisonRankings(fallbackModelNumbers, [], [], 0);
+      return;
+    }
+
+    const status = String(pairHistory.status || "");
+    const comparison = pairHistory.comparison && typeof pairHistory.comparison === "object"
+      ? pairHistory.comparison
+      : {};
+    const modelNumbers = uniqueComparisonNumbers(comparison.modelTop3).slice(0, 3);
+    const displayedModelNumbers = modelNumbers.length ? modelNumbers : fallbackModelNumbers;
+    const anchorNumber = asRouletteNumber(pairHistory.anchor?.number);
+    const sampleSize = asOptionalNonNegativeInteger(pairHistory.sampleSize);
+    const observedFollowerCount = asOptionalNonNegativeInteger(pairHistory.observedFollowerCount);
+
+    if (status === "no_anchor") {
+      elements.precloseComparison.dataset.state = "unavailable";
+      elements.precloseComparison.setAttribute("aria-busy", "false");
+      elements.precloseComparisonBadge.textContent = "Нет подтверждённого предшественника";
+      elements.precloseComparisonHistoryLabel.textContent = "История переходов";
+      elements.precloseComparisonSample.textContent = "непрерывность не доказана";
+      elements.precloseComparisonStatus.textContent = "Не удалось подтвердить непрерывный предыдущий результат, поэтому исторический top‑3 для этого раунда не строится.";
+      renderComparisonRankings(displayedModelNumbers, [], [], 0);
+      return;
+    }
+
+    if (status === "no_samples") {
+      elements.precloseComparison.dataset.state = "unavailable";
+      elements.precloseComparison.setAttribute("aria-busy", "false");
+      elements.precloseComparisonBadge.textContent = "Нет выборки";
+      elements.precloseComparisonHistoryLabel.textContent = anchorNumber === null
+        ? "История переходов"
+        : `История после ${anchorNumber}`;
+      elements.precloseComparisonSample.textContent = "0 переходов";
+      elements.precloseComparisonStatus.textContent = anchorNumber === null
+        ? "В сохранённом снимке нет исторических переходов для сравнения."
+        : `После числа ${anchorNumber} до момента прогноза ещё не было сохранённых продолжений.`;
+      renderComparisonRankings(displayedModelNumbers, [], [], 0);
+      return;
+    }
+
+    const pairNumbers = uniqueComparisonNumbers(comparison.pairTop3).slice(0, 3);
+    const overlapNumbers = uniqueComparisonNumbers(comparison.overlapNumbers).slice(0, 3);
+    const overlapCount = asOptionalNonNegativeInteger(comparison.overlapCount);
+    const rawTop3 = Array.isArray(pairHistory.top3) ? pairHistory.top3 : [];
+    const historicalByNumber = new Map();
+    rawTop3.forEach((item, index) => {
+      const number = asRouletteNumber(item?.number);
+      const occurrenceCount = asOptionalNonNegativeInteger(item?.occurrenceCount);
+      if (number === null || occurrenceCount === null || occurrenceCount <= 0 || historicalByNumber.has(number)) return;
+      historicalByNumber.set(number, {
+        number,
+        rank: asOptionalNonNegativeInteger(item?.rank) || index + 1,
+        occurrenceCount,
+        share: Number.isFinite(Number(item?.share)) ? Number(item.share) : null,
+        lastOccurredAt: item?.lastOccurredAt || null,
+      });
+    });
+    const historicalItems = pairNumbers
+      .map((number, index) => {
+        const item = historicalByNumber.get(number);
+        return item ? { ...item, rank: index + 1 } : null;
+      })
+      .filter(Boolean);
+    const overlapIsConsistent = overlapCount !== null
+      && overlapCount === overlapNumbers.length
+      && overlapNumbers.every((number) => modelNumbers.includes(number) && pairNumbers.includes(number));
+    const ready = status === "ready"
+      && anchorNumber !== null
+      && sampleSize !== null
+      && sampleSize > 0
+      && observedFollowerCount !== null
+      && modelNumbers.length === 3
+      && pairNumbers.length > 0
+      && historicalItems.length === pairNumbers.length
+      && overlapIsConsistent;
+
+    if (!ready) {
+      elements.precloseComparison.dataset.state = "unavailable";
+      elements.precloseComparison.setAttribute("aria-busy", "false");
+      elements.precloseComparisonBadge.textContent = "Нет сравнения";
+      elements.precloseComparisonHistoryLabel.textContent = "История переходов";
+      elements.precloseComparisonSample.textContent = "снимок неполный";
+      elements.precloseComparisonStatus.textContent = "Сохранённое сравнение неполно и не показано, чтобы не создавать ложный вывод.";
+      renderComparisonRankings(displayedModelNumbers, [], [], 0);
+      return;
+    }
+
+    elements.precloseComparison.dataset.state = "ready";
+    elements.precloseComparison.setAttribute("aria-busy", "false");
+    elements.precloseComparisonHistoryLabel.textContent = `История после ${anchorNumber}`;
+    elements.precloseComparisonSample.textContent = `${sampleSize} ${pluralForm(sampleSize, "переход", "перехода", "переходов")}`;
+    if (overlapCount === 0) {
+      elements.precloseComparisonBadge.textContent = "Общих чисел нет";
+    } else if (overlapCount === 1) {
+      elements.precloseComparisonBadge.textContent = `1 общее число: ${overlapNumbers[0]}`;
+    } else if (overlapCount === 3) {
+      elements.precloseComparisonBadge.textContent = `Все 3 числа общие`;
+    } else {
+      elements.precloseComparisonBadge.textContent = `${overlapCount} общих числа: ${comparisonNumbersLabel(overlapNumbers)}`;
+    }
+
+    const exactOrder = comparison.exactOrder === true;
+    const sameTop1 = comparison.sameTop1 === true;
+    const agreement = exactOrder
+      ? "Состав и порядок списков совпали."
+      : sameTop1
+        ? "Первое число в обоих списках совпало."
+        : "Сравнивается только состав двух списков.";
+    elements.precloseComparisonStatus.textContent = `${agreement} Исторический снимок зафиксирован до результата раунда.`;
+    renderComparisonRankings(modelNumbers, historicalItems, overlapNumbers, sampleSize);
+
+    const warnings = [];
+    if (sampleSize < 30) {
+      warnings.push(`Очень малая выборка: ${sampleSize} ${pluralForm(sampleSize, "переход", "перехода", "переходов")}. Сравнение неинформативно.`);
+    } else if (sampleSize < 100) {
+      warnings.push(`Мало данных: ${sampleSize} переходов. Трактуйте совпадение осторожно.`);
+    }
+    if (observedFollowerCount < 3 || pairNumbers.length < 3) {
+      warnings.push(`Найдено только ${observedFollowerCount} ${pluralForm(observedFollowerCount, "разное продолжение", "разных продолжения", "разных продолжений")}; исторический top‑3 неполный.`);
+    }
+    setComparisonWarning(warnings);
+
+    const snapshotDetails = [];
+    if (pairHistory.historyCutoffAt) {
+      snapshotDetails.push(`История учтена по ${formatDateTime(pairHistory.historyCutoffAt, { alwaysShowDate: true })}`);
+    }
+    if (pairHistory.capturedAt) {
+      snapshotDetails.push(`снимок сохранён ${formatDateTime(pairHistory.capturedAt, { alwaysShowDate: true })}`);
+    }
+    elements.precloseComparison.title = snapshotDetails.join("; ");
+  }
+
   function renderPrecloseForecast() {
     const forecastState = store.state?.precloseForecast || null;
     const latest = forecastState?.latest || null;
@@ -1190,6 +1444,7 @@ import { buildFollowerStats } from "./pair-followers.js?v=1";
     elements.precloseTop3Rate.textContent = settledCount >= 100 && Number.isFinite(top3Rate)
       ? `${top3Hits} из ${settledCount} · ${(top3Rate * 100).toFixed(1).replace(".", ",")}%`
       : `${top3Hits} из ${settledCount} · мало данных`;
+    renderPrecloseComparison(matchesCurrent ? latest : null);
 
     if (!matchesCurrent) {
       elements.precloseRanking.setAttribute("aria-busy", "true");

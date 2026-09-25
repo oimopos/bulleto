@@ -63,6 +63,16 @@ function precloseForecast(externalRoundId, overrides = {}) {
   };
 }
 
+function markResultsCreatedAtObservation(database, fingerprintPrefix) {
+  database.sqlite
+    .prepare(`
+      UPDATE round_results
+      SET created_at = observed_at
+      WHERE fingerprint LIKE ?
+    `)
+    .run(`${fingerprintPrefix}%`);
+}
+
 function virtualTriggerEvents(
   prefix,
   targetNumber = 1,
@@ -102,6 +112,7 @@ test("schema contains all persistence tables", () => {
       "cycle_events",
       "cycle_numbers",
       "cycles",
+      "forecast_pair_snapshots",
       "forecast_settlements",
       "forecast_snapshots",
       "incident_resolutions",
@@ -113,7 +124,34 @@ test("schema contains all persistence tables", () => {
       "virtual_bet_sessions",
       "virtual_bets",
     ]);
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 10);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 11);
+    assert.deepEqual(
+      database.sqlite
+        .prepare("PRAGMA table_info(forecast_pair_snapshots)")
+        .all()
+        .map((column) => column.name),
+      [
+        "forecast_id",
+        "schema_version",
+        "status",
+        "history_cutoff_at",
+        "captured_at",
+        "history_max_result_id",
+        "anchor_result_id",
+        "anchor_number",
+        "anchor_settled_at",
+        "anchor_continuity_epoch",
+        "sample_size",
+        "observed_follower_count",
+        "pair_top3_json",
+        "model_top3_json",
+        "overlap_numbers_json",
+        "overlap_count",
+        "same_top1",
+        "exact_order",
+        "created_at",
+      ],
+    );
   } finally {
     database.close();
   }
@@ -144,6 +182,19 @@ test("pre-close forecasts enforce the five-second lock boundary and fresh factor
     assert.equal(state.latest.factorAt, valid.factorAt);
     assert.equal(state.latest.lockedAt, valid.lockedAt);
     assert.equal(state.latest.settlement, null);
+    assert.equal(state.latest.pairHistory.status, "no_anchor");
+    assert.equal(state.latest.pairHistory.historyMaxResultId, null);
+    assert.equal(state.latest.pairHistory.anchor, null);
+    assert.equal(state.latest.pairHistory.sampleSize, 0);
+    assert.deepEqual(state.latest.pairHistory.top3, []);
+    assert.deepEqual(state.latest.pairHistory.comparison, {
+      modelTop3: valid.rankedNumbers,
+      pairTop3: [],
+      overlapNumbers: [],
+      overlapCount: 0,
+      sameTop1: null,
+      exactOrder: false,
+    });
 
     const lateLockedAt = new Date(
       Date.parse(valid.bettingClosesAt) - 7_999,
@@ -206,6 +257,36 @@ test("pre-close forecasts enforce the five-second lock boundary and fresh factor
   }
 });
 
+test("pre-close forecast rolls back when the transaction finishes inside the five-second boundary", () => {
+  let clockCalls = 0;
+  const database = createDatabase({
+    path: ":memory:",
+    clock: () => {
+      clockCalls += 1;
+      return new Date(BASE_TIME + (clockCalls === 1 ? 52_000 : 56_000));
+    },
+  });
+  try {
+    assert.throws(
+      () => database.recordPrecloseForecast(precloseForecast("commit-too-late")),
+      /transaction must finish at least five seconds/,
+    );
+    for (const table of [
+      "forecast_snapshots",
+      "round_forecasts",
+      "forecast_pair_snapshots",
+    ]) {
+      assert.equal(
+        database.sqlite.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get().count,
+        0,
+        `${table} must roll back with the late transaction`,
+      );
+    }
+  } finally {
+    database.close();
+  }
+});
+
 test("pre-close forecast recording is idempotent across database reopen", () => {
   const directory = mkdtempSync(join(tmpdir(), "roulette-preclose-"));
   const path = join(directory, "preclose.sqlite");
@@ -238,6 +319,341 @@ test("pre-close forecast recording is idempotent across database reopen", () => 
       database.getPrecloseForecastState("buleto", "PRIMECOIN(XPM)/RUB")
         .latest.roundId,
       "forecast-persisted",
+    );
+  } finally {
+    database.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("forecast pair snapshot fixes deterministic anchor, ranking, ties, and overlap at lock", () => {
+  let clockMs = BASE_TIME + 40_000;
+  const database = createDatabase({
+    path: ":memory:",
+    clock: () => new Date(clockMs),
+  });
+  const numbers = [9, 12, 9, 16, 9, 32, 9, 12, 9, 16, 9, 32, 9, 12, 9];
+  const attempt = precloseForecast("7015", {
+    predictedNumber: 12,
+    rankedNumbers: [12, 16, 7],
+  });
+
+  try {
+    database.ingestBatch(
+      numbers.map((number, index) =>
+        event(number, `pair-ready-${index}`, index, {
+          externalRoundId: String(7000 + index),
+        }),
+      ),
+    );
+    markResultsCreatedAtObservation(database, "pair-ready-");
+    const anchorRow = database.sqlite
+      .prepare(`
+        SELECT id, settled_at, continuity_epoch
+        FROM round_results
+        WHERE fingerprint = 'pair-ready-14'
+      `)
+      .get();
+
+    clockMs = BASE_TIME + 52_000;
+    assert.deepEqual(database.recordPrecloseForecast(attempt), {
+      inserted: true,
+      roundId: "7015",
+    });
+
+    const state = database.getPrecloseForecastState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    const pairHistory = state.latest.pairHistory;
+    assert.equal(pairHistory.schemaVersion, 1);
+    assert.equal(pairHistory.status, "ready");
+    assert.equal(pairHistory.historyCutoffAt, attempt.lockedAt);
+    assert.equal(pairHistory.capturedAt, new Date(clockMs).toISOString());
+    assert.equal(pairHistory.historyMaxResultId, Number(anchorRow.id));
+    assert.deepEqual(pairHistory.anchor, {
+      resultId: Number(anchorRow.id),
+      number: 9,
+      settledAt: anchorRow.settled_at,
+      continuityEpoch: Number(anchorRow.continuity_epoch),
+    });
+    assert.equal(pairHistory.sampleSize, 7);
+    assert.equal(pairHistory.observedFollowerCount, 3);
+    assert.deepEqual(pairHistory.top3, [
+      {
+        rank: 1,
+        number: 12,
+        occurrenceCount: 3,
+        share: 3 / 7,
+        firstOccurredAt: new Date(BASE_TIME + 1_000).toISOString(),
+        lastOccurredAt: new Date(BASE_TIME + 13_000).toISOString(),
+      },
+      {
+        rank: 2,
+        number: 32,
+        occurrenceCount: 2,
+        share: 2 / 7,
+        firstOccurredAt: new Date(BASE_TIME + 5_000).toISOString(),
+        lastOccurredAt: new Date(BASE_TIME + 11_000).toISOString(),
+      },
+      {
+        rank: 3,
+        number: 16,
+        occurrenceCount: 2,
+        share: 2 / 7,
+        firstOccurredAt: new Date(BASE_TIME + 3_000).toISOString(),
+        lastOccurredAt: new Date(BASE_TIME + 9_000).toISOString(),
+      },
+    ]);
+    assert.deepEqual(pairHistory.comparison, {
+      modelTop3: [12, 16, 7],
+      pairTop3: [12, 32, 16],
+      overlapNumbers: [12, 16],
+      overlapCount: 2,
+      sameTop1: true,
+      exactOrder: false,
+    });
+
+    const storedBefore = {
+      ...database.sqlite.prepare("SELECT * FROM forecast_pair_snapshots").get(),
+    };
+    assert.deepEqual(database.recordPrecloseForecast(attempt), {
+      inserted: false,
+      roundId: "7015",
+    });
+    assert.deepEqual(
+      { ...database.sqlite.prepare("SELECT * FROM forecast_pair_snapshots").get() },
+      storedBefore,
+      "a duplicate forecast cannot replace its pair snapshot",
+    );
+
+    clockMs = BASE_TIME + 200_000;
+    database.ingestBatch([
+      event(32, "pair-ready-later-result", 99, { externalRoundId: "7015" }),
+      event(9, "pair-ready-later-anchor", 110, { externalRoundId: "7016" }),
+      event(16, "pair-ready-later-follower", 120, { externalRoundId: "7017" }),
+    ]);
+    assert.deepEqual(
+      database.settlePrecloseForecasts("buleto", "PRIMECOIN(XPM)/RUB"),
+      { settled: 1 },
+    );
+    assert.deepEqual(
+      { ...database.sqlite.prepare("SELECT * FROM forecast_pair_snapshots").get() },
+      storedBefore,
+      "later ingestion and settlement must not rewrite the locked snapshot",
+    );
+    const settledState = database.getPrecloseForecastState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    assert.deepEqual(settledState.latest.pairHistory, pairHistory);
+    assert.equal(settledState.latest.settlement.actualNumber, 32);
+  } finally {
+    database.close();
+  }
+});
+
+test("forecast pair snapshot never creates a transition across an integrity gap", () => {
+  let clockMs = BASE_TIME + 40_000;
+  const database = createDatabase({
+    path: ":memory:",
+    clock: () => new Date(clockMs),
+  });
+
+  try {
+    database.ingestBatch([
+      event(9, "pair-gap-left", 0, { externalRoundId: "8100" }),
+    ]);
+    database.ingestBatchAfterGap(
+      {
+        source: "buleto",
+        instrument: "PRIMECOIN(XPM)/RUB",
+        reason: "round-result-not-confirmed-by-snapshot",
+        incidentKey: "pair-gap-boundary",
+        detectedAt: new Date(BASE_TIME + 5_000).toISOString(),
+      },
+      [
+        event(12, "pair-gap-right-first", 10, { externalRoundId: "8101" }),
+        event(9, "pair-gap-anchor", 20, { externalRoundId: "8102" }),
+      ],
+    );
+    markResultsCreatedAtObservation(database, "pair-gap-");
+    clockMs = BASE_TIME + 52_000;
+    database.recordPrecloseForecast(precloseForecast("8103"));
+
+    const pairHistory = database.getPrecloseForecastState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    ).latest.pairHistory;
+    assert.equal(pairHistory.status, "no_samples");
+    assert.equal(pairHistory.anchor.number, 9);
+    assert.equal(pairHistory.anchor.continuityEpoch, 1);
+    assert.equal(pairHistory.sampleSize, 0);
+    assert.equal(pairHistory.observedFollowerCount, 0);
+    assert.deepEqual(pairHistory.top3, []);
+    assert.deepEqual(pairHistory.comparison.pairTop3, []);
+    assert.equal(pairHistory.comparison.sameTop1, null);
+    assert.equal(pairHistory.comparison.exactOrder, false);
+    assert.deepEqual(
+      database.sqlite
+        .prepare("SELECT continuity_epoch FROM round_results ORDER BY settled_at, id")
+        .all()
+        .map((row) => Number(row.continuity_epoch)),
+      [0, 1, 1],
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test("forecast pair snapshot rejects a stale numeric anchor when a round id was skipped", () => {
+  let clockMs = BASE_TIME + 40_000;
+  const database = createDatabase({
+    path: ":memory:",
+    clock: () => new Date(clockMs),
+  });
+
+  try {
+    database.ingestBatch([
+      event(9, "pair-skipped-0", 1, { externalRoundId: "8200" }),
+      event(4, "pair-skipped-1", 2, { externalRoundId: "8201" }),
+      event(9, "pair-skipped-anchor", 3, { externalRoundId: "8202" }),
+    ]);
+    markResultsCreatedAtObservation(database, "pair-skipped-");
+    const historyMaxResultId = Number(
+      database.sqlite.prepare("SELECT MAX(id) AS id FROM round_results").get().id,
+    );
+    clockMs = BASE_TIME + 52_000;
+    database.recordPrecloseForecast(precloseForecast("8204"));
+
+    const pairHistory = database.getPrecloseForecastState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    ).latest.pairHistory;
+    assert.equal(pairHistory.status, "no_anchor");
+    assert.equal(pairHistory.historyMaxResultId, historyMaxResultId);
+    assert.equal(pairHistory.anchor, null);
+    assert.equal(pairHistory.sampleSize, 0);
+    assert.deepEqual(pairHistory.top3, []);
+    assert.equal(pairHistory.comparison.sameTop1, null);
+  } finally {
+    database.close();
+  }
+});
+
+test("forecast pair cutoff excludes future-observed and future-created results", () => {
+  let clockMs = BASE_TIME + 40_000;
+  const database = createDatabase({
+    path: ":memory:",
+    clock: () => new Date(clockMs),
+  });
+
+  try {
+    database.ingestBatch([
+      event(9, "pair-cutoff-valid-0", 1, { externalRoundId: "9000" }),
+      event(4, "pair-cutoff-valid-1", 2, { externalRoundId: "9001" }),
+      event(9, "pair-cutoff-anchor", 3, { externalRoundId: "9002" }),
+    ]);
+    markResultsCreatedAtObservation(database, "pair-cutoff-valid-");
+    markResultsCreatedAtObservation(database, "pair-cutoff-anchor");
+    const anchorId = Number(
+      database.sqlite
+        .prepare("SELECT id FROM round_results WHERE fingerprint = 'pair-cutoff-anchor'")
+        .get().id,
+    );
+
+    clockMs = BASE_TIME + 52_000;
+    database.ingestBatch([
+      event(12, "pair-cutoff-future-observed", 4, {
+        externalRoundId: "9003",
+        observedAt: new Date(BASE_TIME + 52_000).toISOString(),
+      }),
+      event(16, "pair-cutoff-future-created", 5, {
+        externalRoundId: "9004",
+      }),
+    ]);
+    database.sqlite
+      .prepare(`
+        UPDATE round_results
+        SET created_at = ?
+        WHERE fingerprint = 'pair-cutoff-future-observed'
+      `)
+      .run(new Date(BASE_TIME + 40_000).toISOString());
+
+    database.recordPrecloseForecast(
+      precloseForecast("9003", {
+        predictedNumber: 4,
+        rankedNumbers: [4, 12, 16],
+      }),
+    );
+    const pairHistory = database.getPrecloseForecastState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    ).latest.pairHistory;
+    assert.equal(pairHistory.status, "ready");
+    assert.equal(pairHistory.historyMaxResultId, anchorId);
+    assert.equal(pairHistory.anchor.resultId, anchorId);
+    assert.equal(pairHistory.anchor.number, 9);
+    assert.equal(pairHistory.sampleSize, 1);
+    assert.equal(pairHistory.observedFollowerCount, 1);
+    assert.deepEqual(pairHistory.top3.map((item) => item.number), [4]);
+    assert.deepEqual(pairHistory.comparison, {
+      modelTop3: [4, 12, 16],
+      pairTop3: [4],
+      overlapNumbers: [4],
+      overlapCount: 1,
+      sameTop1: true,
+      exactOrder: false,
+    });
+  } finally {
+    database.close();
+  }
+});
+
+test("version 11 leaves legacy forecasts without a pair snapshot instead of backfilling", () => {
+  const directory = mkdtempSync(join(tmpdir(), "roulette-pair-v10-"));
+  const path = join(directory, "legacy-forecast.sqlite");
+  const attempt = precloseForecast("legacy-forecast");
+  let database = createDatabase({
+    path,
+    clock: () => new Date(BASE_TIME + 52_000),
+  });
+
+  try {
+    assert.equal(database.recordPrecloseForecast(attempt).inserted, true);
+    database.sqlite.exec(`
+      DROP TABLE forecast_pair_snapshots;
+      PRAGMA user_version = 10;
+    `);
+    database.close();
+
+    database = createDatabase({
+      path,
+      clock: () => new Date(BASE_TIME + 52_000),
+    });
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 11);
+    assert.equal(
+      Number(
+        database.sqlite
+          .prepare("SELECT COUNT(*) AS count FROM forecast_pair_snapshots")
+          .get().count,
+      ),
+      0,
+    );
+    assert.equal(
+      database.getPrecloseForecastState("buleto", "PRIMECOIN(XPM)/RUB")
+        .latest.pairHistory,
+      null,
+    );
+    assert.equal(database.recordPrecloseForecast(attempt).inserted, false);
+    assert.equal(
+      Number(
+        database.sqlite
+          .prepare("SELECT COUNT(*) AS count FROM forecast_pair_snapshots")
+          .get().count,
+      ),
+      0,
+      "reading or replaying a legacy forecast must not backfill mutable history",
     );
   } finally {
     database.close();
@@ -436,7 +852,7 @@ test("version 5 history is backfilled into continuity epochs before migration co
 
   const database = createDatabase({ path });
   try {
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 10);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 11);
     assert.deepEqual(
       database.sqlite
         .prepare("SELECT continuity_epoch FROM round_results ORDER BY settled_at, id")
@@ -496,7 +912,7 @@ test("version 9 reconciles a proven contiguous shutdown boundary without deletin
 
     database = createDatabase({ path, gapThresholdSeconds: 135 });
     const state = database.getDashboardState();
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 10);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 11);
     assert.equal(state.totals.results, 5, "raw results are never recreated or deleted");
     assert.equal(state.totals.cycles, 1);
     assert.equal(state.totals.invalidCycles, 0);
@@ -1921,7 +2337,7 @@ test("v7 paper history initializes v8 bankroll with all known net results exactl
       "buleto",
       "PRIMECOIN(XPM)/RUB",
     );
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 10);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 11);
     assert.equal(state.testBank.initialBalance, 87_700);
     assert.equal(state.testBank.currentBalance, 87_910);
     assert.equal(state.testBank.netResult, 210);

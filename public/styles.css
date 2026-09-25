@@ -579,6 +579,185 @@ h2 {
   text-overflow: ellipsis;
 }
 
+.preclose-comparison {
+  margin-top: 18px;
+  padding: 16px;
+  border: 1px solid var(--border-soft);
+  border-radius: 16px;
+  background:
+    linear-gradient(135deg, rgba(228, 189, 115, 0.035), transparent 46%),
+    rgba(0, 0, 0, 0.12);
+}
+
+.preclose-comparison__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.preclose-comparison__header h3 {
+  margin: 4px 0 0;
+  font-size: 16px;
+  line-height: 1.3;
+}
+
+.preclose-comparison__badge {
+  display: inline-flex;
+  min-height: 28px;
+  padding: 0 10px;
+  align-items: center;
+  flex: 0 0 auto;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--muted-strong);
+  background: rgba(255, 255, 255, 0.025);
+  font-size: 10px;
+  font-weight: 760;
+}
+
+.preclose-comparison[data-state="ready"] .preclose-comparison__badge {
+  border-color: rgba(228, 189, 115, 0.3);
+  color: var(--gold-bright);
+  background: var(--gold-soft);
+}
+
+.preclose-comparison__lists {
+  display: grid;
+  margin-top: 13px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.preclose-comparison__method {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: 13px;
+  background: rgba(255, 255, 255, 0.014);
+}
+
+.preclose-comparison__method-heading {
+  display: flex;
+  min-height: 18px;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.preclose-comparison__method-heading strong {
+  color: var(--muted-strong);
+  font-size: 11px;
+  font-weight: 760;
+}
+
+.preclose-comparison__method-heading span {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.preclose-comparison__ranking {
+  display: grid;
+  margin: 10px 0 0;
+  padding: 0;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 7px;
+  list-style: none;
+}
+
+.preclose-comparison__ranking > .empty-state {
+  grid-column: 1 / -1;
+  min-height: 50px;
+  padding: 10px;
+  border: 1px dashed var(--border);
+  border-radius: 10px;
+  font-size: 10px;
+}
+
+.preclose-comparison__pick {
+  position: relative;
+  display: grid;
+  min-width: 0;
+  min-height: 68px;
+  padding: 7px 5px;
+  place-items: center;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.13);
+  gap: 3px;
+}
+
+.preclose-comparison__pick.is-overlap {
+  border-color: rgba(228, 189, 115, 0.42);
+  box-shadow: inset 0 0 0 1px rgba(228, 189, 115, 0.08);
+}
+
+.preclose-comparison__rank,
+.preclose-comparison__meta {
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.2;
+}
+
+.preclose-comparison__rank {
+  color: var(--gold);
+  font-weight: 800;
+}
+
+.preclose-comparison__number {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  place-items: center;
+  border-radius: 50%;
+  color: #fff;
+  font-size: 12px;
+  font-weight: 800;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.13);
+}
+
+.preclose-comparison__common {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  color: var(--gold-bright);
+  font-size: 8px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.preclose-comparison__status,
+.preclose-comparison__warning,
+.preclose-comparison__note {
+  margin: 10px 0 0;
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.preclose-comparison__status {
+  color: var(--muted-strong);
+}
+
+.preclose-comparison__warning {
+  padding: 8px 10px;
+  border: 1px solid rgba(239, 173, 84, 0.24);
+  border-radius: 9px;
+  color: #edc78f;
+  background: rgba(239, 173, 84, 0.06);
+}
+
+.preclose-comparison__warning[hidden] {
+  display: none;
+}
+
+.preclose-comparison__note {
+  color: #71797e;
+}
+
 .preclose-note {
   margin: 15px 0 0;
   color: #71797e;
@@ -2564,6 +2743,10 @@ tbody tr:first-child {
     gap: 14px;
   }
 
+  .preclose-comparison__lists {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
   .follower-source-label {
     width: 100%;
   }
@@ -2697,7 +2880,8 @@ tbody tr:first-child {
 }
 
 @media (max-width: 430px) {
-  .preclose-panel__header {
+  .preclose-panel__header,
+  .preclose-comparison__header {
     align-items: flex-start;
     flex-direction: column;
   }
