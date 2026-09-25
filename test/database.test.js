@@ -560,6 +560,39 @@ test("pair statistics preserve order, count overlaps, and include every observed
   }
 });
 
+test("pair statistics count only known continuations after a selected number", () => {
+  const database = createDatabase({ path: ":memory:" });
+  try {
+    const numbers = [3, 20, 3, 20, 3, 7, 3];
+    database.ingestBatch(
+      numbers.map((number, index) => event(number, `follower-${index}`, index)),
+    );
+
+    const followers = database
+      .getPairStats("buleto", "PRIMECOIN(XPM)/RUB")
+      .filter((item) => item.numbers[0] === 3);
+    const sampleSize = followers.reduce(
+      (total, item) => total + item.occurrenceCount,
+      0,
+    );
+
+    assert.equal(sampleSize, 3);
+    assert.deepEqual(
+      followers.map((item) => ({
+        number: item.numbers[1],
+        occurrenceCount: item.occurrenceCount,
+        share: item.occurrenceCount / sampleSize,
+      })),
+      [
+        { number: 20, occurrenceCount: 2, share: 2 / 3 },
+        { number: 7, occurrenceCount: 1, share: 1 / 3 },
+      ],
+    );
+  } finally {
+    database.close();
+  }
+});
+
 test("pair statistics cover history beyond the latest 500 results", () => {
   const database = createDatabase({ path: ":memory:" });
   try {

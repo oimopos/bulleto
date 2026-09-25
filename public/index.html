@@ -7,8 +7,8 @@
     <meta name="color-scheme" content="dark">
     <meta name="description" content="Онлайн-монитор результатов рулетки и циклов исключения чисел от 0 до 36">
     <title>Круг 37 — монитор результатов</title>
-    <link rel="stylesheet" href="/styles.css?v=10">
-    <script type="module" src="/app.js?v=11"></script>
+    <link rel="stylesheet" href="/styles.css?v=11">
+    <script type="module" src="/app.js?v=12"></script>
   </head>
   <body>
     <a class="skip-link" href="#main-content">Перейти к содержимому</a>
@@ -121,6 +121,69 @@
             </div>
           </div>
         </article>
+      </section>
+
+      <section class="panel follower-panel" id="follower-panel" data-state="loading" aria-labelledby="follower-title" aria-describedby="follower-description follower-note">
+        <div class="panel__topline follower-panel__header">
+          <div>
+            <p class="eyebrow">Переходы по всей истории</p>
+            <h2 id="follower-title">Что выпадало следующим</h2>
+          </div>
+          <span class="count-badge" id="follower-count">Загрузка…</span>
+        </div>
+        <div class="follower-panel__intro">
+          <p class="follower-description" id="follower-description">Показываем, какие числа шли сразу после выбранного результата внутри сохранённых непрерывных участков.</p>
+          <label class="follower-source-label" for="follower-source">
+            <span>После числа</span>
+            <select id="follower-source" name="follower-source" aria-label="Исходное число для анализа">
+              <option value="" selected disabled>—</option>
+              <option value="0">0</option>
+              <option value="1">1</option>
+              <option value="2">2</option>
+              <option value="3">3</option>
+              <option value="4">4</option>
+              <option value="5">5</option>
+              <option value="6">6</option>
+              <option value="7">7</option>
+              <option value="8">8</option>
+              <option value="9">9</option>
+              <option value="10">10</option>
+              <option value="11">11</option>
+              <option value="12">12</option>
+              <option value="13">13</option>
+              <option value="14">14</option>
+              <option value="15">15</option>
+              <option value="16">16</option>
+              <option value="17">17</option>
+              <option value="18">18</option>
+              <option value="19">19</option>
+              <option value="20">20</option>
+              <option value="21">21</option>
+              <option value="22">22</option>
+              <option value="23">23</option>
+              <option value="24">24</option>
+              <option value="25">25</option>
+              <option value="26">26</option>
+              <option value="27">27</option>
+              <option value="28">28</option>
+              <option value="29">29</option>
+              <option value="30">30</option>
+              <option value="31">31</option>
+              <option value="32">32</option>
+              <option value="33">33</option>
+              <option value="34">34</option>
+              <option value="35">35</option>
+              <option value="36">36</option>
+            </select>
+          </label>
+        </div>
+        <ol class="follower-list" id="follower-list" aria-label="Числа, выпадавшие следующими в сохранённой истории" aria-busy="true">
+          <li class="empty-state">Считаем исторические переходы…</li>
+        </ol>
+        <div class="follower-footer">
+          <button class="follower-toggle" id="follower-toggle" type="button" aria-controls="follower-list" aria-expanded="false" hidden>Показать все</button>
+          <p id="follower-note">Историческая частота, а не прогноз. Для независимого результата шанс каждого числа остаётся 1 из 37 (≈2,7%).</p>
+        </div>
       </section>
 
       <section class="panel number-board" aria-labelledby="number-board-title">

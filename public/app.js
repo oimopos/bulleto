@@ -1,4 +1,5 @@
 import { BET_RISK_MODEL, calculateBetRisk } from "./risk-calculator.js?v=2";
+import { buildFollowerStats } from "./pair-followers.js?v=1";
 
 (() => {
   "use strict";
@@ -7,6 +8,7 @@ import { BET_RISK_MODEL, calculateBetRisk } from "./risk-calculator.js?v=2";
   const ALL_NUMBERS = Array.from({ length: 37 }, (_, number) => number);
   const REFRESH_INTERVAL_MS = 45_000;
   const AGE_UPDATE_INTERVAL_MS = 30_000;
+  const FOLLOWER_COLLAPSED_LIMIT = 5;
 
   const elements = {
     main: document.querySelector("main"),
@@ -21,6 +23,14 @@ import { BET_RISK_MODEL, calculateBetRisk } from "./risk-calculator.js?v=2";
     lastTime: document.getElementById("last-time"),
     lastPrice: document.getElementById("last-price"),
     lastRound: document.getElementById("last-round"),
+    followerPanel: document.getElementById("follower-panel"),
+    followerTitle: document.getElementById("follower-title"),
+    followerSource: document.getElementById("follower-source"),
+    followerCount: document.getElementById("follower-count"),
+    followerList: document.getElementById("follower-list"),
+    followerDescription: document.getElementById("follower-description"),
+    followerNote: document.getElementById("follower-note"),
+    followerToggle: document.getElementById("follower-toggle"),
     cycleId: document.getElementById("cycle-id"),
     progressRing: document.getElementById("progress-ring"),
     progressValue: document.getElementById("progress-value"),
@@ -112,6 +122,12 @@ import { BET_RISK_MODEL, calculateBetRisk } from "./risk-calculator.js?v=2";
     triplesError: false,
     triplesHasMore: false,
     triplesVisibleCount: 8,
+    pairs: [],
+    pairsLoaded: false,
+    pairsError: false,
+    followerSourceNumber: null,
+    followerSourceLocked: false,
+    followerVisibleCount: FOLLOWER_COLLAPSED_LIMIT,
     lastSyncAt: null,
     refreshing: false,
     refreshQueued: false,
@@ -969,6 +985,17 @@ import { BET_RISK_MODEL, calculateBetRisk } from "./risk-calculator.js?v=2";
     return element;
   }
 
+  function initializeFollowerSource() {
+    const fragment = document.createDocumentFragment();
+    ALL_NUMBERS.forEach((number) => {
+      const option = createElement("option", null, number);
+      option.value = String(number);
+      fragment.appendChild(option);
+    });
+    elements.followerSource.replaceChildren(fragment);
+    elements.followerSource.disabled = true;
+  }
+
   function setConnection(state, label) {
     elements.connection.dataset.state = state;
     elements.connectionLabel.textContent = label;
@@ -1017,7 +1044,8 @@ import { BET_RISK_MODEL, calculateBetRisk } from "./risk-calculator.js?v=2";
       fetchJson("/api/state"),
       fetchJson("/api/results?limit=80"),
       fetchJson("/api/cycles?limit=10"),
-      fetchJson("/api/sequences?limit=50")
+      fetchJson("/api/sequences?limit=50"),
+      fetchJson("/api/pairs")
     ]);
 
     let successfulRequests = 0;
@@ -1047,6 +1075,14 @@ import { BET_RISK_MODEL, calculateBetRisk } from "./risk-calculator.js?v=2";
       successfulRequests += 1;
     } else {
       store.triplesError = true;
+    }
+    if (requests[4].status === "fulfilled") {
+      store.pairs = extractItems(requests[4].value);
+      store.pairsLoaded = true;
+      store.pairsError = false;
+      successfulRequests += 1;
+    } else {
+      store.pairsError = true;
     }
 
     if (successfulRequests > 0) {
@@ -1082,19 +1118,29 @@ import { BET_RISK_MODEL, calculateBetRisk } from "./risk-calculator.js?v=2";
       elements.triplesCount.textContent = "— · ошибка";
       elements.triplesCount.title = "Не удалось загрузить повторяющиеся тройки";
       elements.triplesToggle.hidden = true;
+      elements.followerList.replaceChildren(createElement("li", "empty-state", "Не удалось загрузить исторические переходы. Повторим автоматически."));
+      elements.followerList.setAttribute("aria-busy", "false");
+      elements.followerCount.textContent = "— · ошибка";
+      elements.followerCount.title = "Не удалось загрузить исторические переходы";
+      elements.followerToggle.hidden = true;
       elements.overdueList.replaceChildren(createElement("li", "empty-state", "Не удалось рассчитать давность выпадений."));
       elements.overdueList.setAttribute("aria-busy", "false");
       elements.collectorCard.dataset.state = "error";
       elements.collectorStatus.textContent = "Нет связи с сервером";
       elements.boardNote.textContent = "Не удалось получить состояние активного цикла.";
     }
+    if (store.hasCompletedInitialRender) {
+      renderFollowers(store.state?.latestResult || store.results[0] || null);
+    }
     renderVirtualBettor(store.state?.virtualBettor || null);
   }
 
   function renderAll() {
+    const latestResult = store.state?.latestResult || store.results[0] || null;
     renderCollector(store.state?.collector);
     renderGapWarning(store.state);
-    renderLatestResult(store.state?.latestResult || store.results[0] || null);
+    renderLatestResult(latestResult);
+    renderFollowers(latestResult);
     renderOverdueNumbers();
     renderActiveCycle(store.state?.activeCycle || null);
     renderTriples();
@@ -1194,6 +1240,144 @@ import { BET_RISK_MODEL, calculateBetRisk } from "./risk-calculator.js?v=2";
       announce(`Новое выпадение: ${number}, ${rouletteColorLabel(number)}`);
     }
     store.lastRenderedResultKey = resultKey;
+  }
+
+  const historicalPercentFormatter = new Intl.NumberFormat("ru-RU", {
+    style: "percent",
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 1
+  });
+
+  function renderFollowers(latestResult) {
+    const latestNumber = asRouletteNumber(latestResult?.number);
+    if (!store.followerSourceLocked && latestNumber !== null) {
+      if (store.followerSourceNumber !== latestNumber) {
+        store.followerVisibleCount = FOLLOWER_COLLAPSED_LIMIT;
+      }
+      store.followerSourceNumber = latestNumber;
+    }
+
+    const sourceNumber = asRouletteNumber(store.followerSourceNumber);
+    elements.followerSource.disabled = sourceNumber === null && latestNumber === null;
+    if (sourceNumber === null) {
+      elements.followerPanel.dataset.state = "empty";
+      elements.followerTitle.textContent = "Что выпадало следующим";
+      elements.followerCount.textContent = "0 переходов";
+      elements.followerList.replaceChildren(createElement("li", "empty-state", "Ждём первое сохранённое выпадение."));
+      elements.followerList.setAttribute("aria-busy", "false");
+      elements.followerToggle.hidden = true;
+      return;
+    }
+
+    elements.followerSource.value = String(sourceNumber);
+    elements.followerTitle.textContent = `Что выпадало после ${sourceNumber}`;
+    elements.followerDescription.textContent = `Следующие сохранённые результаты после числа ${sourceNumber} внутри непрерывных участков истории.`;
+
+    if (!store.pairsLoaded) {
+      elements.followerPanel.dataset.state = store.pairsError ? "error" : "loading";
+      elements.followerCount.textContent = store.pairsError ? "— · ошибка" : "Считаем…";
+      elements.followerCount.title = store.pairsError
+        ? "Не удалось загрузить исторические переходы"
+        : "";
+      elements.followerList.replaceChildren(createElement(
+        "li",
+        "empty-state",
+        store.pairsError
+          ? "Не удалось загрузить исторические переходы. Повторим автоматически."
+          : `Считаем, что выпадало после ${sourceNumber}…`
+      ));
+      elements.followerList.setAttribute("aria-busy", String(!store.pairsError));
+      elements.followerToggle.hidden = true;
+      return;
+    }
+
+    const stats = buildFollowerStats(store.pairs, sourceNumber);
+    elements.followerPanel.dataset.state = store.pairsError ? "stale" : "ready";
+    const sampleLabel = `${stats.sampleSize} ${pluralForm(stats.sampleSize, "переход", "перехода", "переходов")}`;
+    elements.followerCount.textContent = store.pairsError
+      ? `${sampleLabel} · не обновлено`
+      : sampleLabel;
+    elements.followerCount.title = store.pairsError
+      ? "Показаны последние успешно загруженные данные"
+      : `Выборка известных следующих результатов после ${sourceNumber}`;
+    elements.followerList.setAttribute("aria-busy", "false");
+
+    if (stats.sampleSize === 0) {
+      elements.followerPanel.dataset.state = "empty";
+      elements.followerList.replaceChildren(createElement(
+        "li",
+        "empty-state",
+        `После ${sourceNumber} ещё нет сохранённого следующего результата.`
+      ));
+      elements.followerToggle.hidden = true;
+      return;
+    }
+
+    const visibleCount = Math.max(
+      FOLLOWER_COLLAPSED_LIMIT,
+      Math.min(store.followerVisibleCount, stats.items.length)
+    );
+    const fragment = document.createDocumentFragment();
+
+    stats.items.slice(0, visibleCount).forEach((item, index) => {
+      const card = createElement("li", "follower-card");
+      if (item.occurrenceCount === 0) card.classList.add("is-unseen");
+      card.dataset.rank = String(index + 1);
+
+      const sequence = createElement("div", "follower-card__sequence");
+      sequence.setAttribute("aria-hidden", "true");
+      const sourceBall = createElement(
+        "span",
+        `history-number follower-card__number ${rouletteColorClass(sourceNumber)}`,
+        sourceNumber
+      );
+      const arrow = createElement("span", "follower-card__arrow", "→");
+      const followerBall = createElement(
+        "span",
+        `history-number follower-card__number ${rouletteColorClass(item.number)}`,
+        item.number
+      );
+      sequence.append(sourceBall, arrow, followerBall);
+
+      const copy = createElement("div", "follower-card__copy");
+      const share = createElement(
+        "strong",
+        "follower-card__share",
+        item.occurrenceCount > 0 ? historicalPercentFormatter.format(item.share) : "0%"
+      );
+      const count = createElement(
+        "span",
+        "follower-card__count",
+        item.occurrenceCount > 0
+          ? `${item.occurrenceCount} из ${stats.sampleSize} переходов`
+          : `0 из ${stats.sampleSize} · не встречалось`
+      );
+      const last = createElement(
+        "time",
+        "follower-card__last",
+        item.lastOccurredAt
+          ? `Последний раз: ${formatDateTime(item.lastOccurredAt, { alwaysShowDate: true })}`
+          : "В истории ещё не встречалось"
+      );
+      if (item.lastOccurredAt) last.dateTime = item.lastOccurredAt;
+      copy.append(share, count, last);
+      card.setAttribute(
+        "aria-label",
+        item.occurrenceCount > 0
+          ? `После числа ${sourceNumber} число ${item.number} встретилось ${item.occurrenceCount} ${pluralForm(item.occurrenceCount, "раз", "раза", "раз")} из ${stats.sampleSize}; историческая доля ${historicalPercentFormatter.format(item.share)}`
+          : `После числа ${sourceNumber} число ${item.number} в сохранённой выборке ещё не встречалось, но остаётся возможным`
+      );
+      card.append(sequence, copy);
+      fragment.appendChild(card);
+    });
+
+    elements.followerList.replaceChildren(fragment);
+    const expanded = visibleCount >= stats.items.length;
+    elements.followerToggle.hidden = stats.items.length <= FOLLOWER_COLLAPSED_LIMIT;
+    elements.followerToggle.setAttribute("aria-expanded", String(expanded));
+    elements.followerToggle.textContent = expanded
+      ? `Показать топ-${FOLLOWER_COLLAPSED_LIMIT}`
+      : `Показать все ${stats.items.length}`;
   }
 
   function normalizedCycleNumbers(cycle) {
@@ -1725,6 +1909,20 @@ import { BET_RISK_MODEL, calculateBetRisk } from "./risk-calculator.js?v=2";
   }
 
   elements.refreshButton.addEventListener("click", () => refreshAll({ notify: true }));
+  elements.followerSource.addEventListener("change", () => {
+    const sourceNumber = asRouletteNumber(elements.followerSource.value);
+    if (sourceNumber === null) return;
+    store.followerSourceNumber = sourceNumber;
+    store.followerSourceLocked = true;
+    store.followerVisibleCount = FOLLOWER_COLLAPSED_LIMIT;
+    renderFollowers(store.state?.latestResult || store.results[0] || null);
+  });
+  elements.followerToggle.addEventListener("click", () => {
+    store.followerVisibleCount = store.followerVisibleCount >= ALL_NUMBERS.length
+      ? FOLLOWER_COLLAPSED_LIMIT
+      : ALL_NUMBERS.length;
+    renderFollowers(store.state?.latestResult || store.results[0] || null);
+  });
   elements.riskRounds.addEventListener("input", renderRiskCalculator);
   elements.triplesToggle.addEventListener("click", () => {
     const total = normalizedTriples().length;
@@ -1738,6 +1936,7 @@ import { BET_RISK_MODEL, calculateBetRisk } from "./risk-calculator.js?v=2";
   });
   window.addEventListener("beforeunload", () => store.eventSource?.close());
 
+  initializeFollowerSource();
   renderNumberGrid(null);
   renderRiskCalculator();
   connectEventStream();
