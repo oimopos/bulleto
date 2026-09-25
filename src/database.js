@@ -664,6 +664,420 @@ export class RouletteDatabase {
       }
       throw error;
     }
+
+    this.#migrateContinuityReconciliationV9();
+  }
+
+  #migrateContinuityReconciliationV9() {
+    this.sqlite.exec("BEGIN IMMEDIATE");
+    try {
+      this.sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS incident_resolutions (
+          incident_id INTEGER PRIMARY KEY REFERENCES incidents(id),
+          resolution TEXT NOT NULL CHECK (
+            resolution IN ('reconciled_contiguous')
+          ),
+          resolved_at TEXT NOT NULL,
+          evidence_json TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+      `);
+
+      this.#reconcileProvenShutdownGaps(new Date().toISOString());
+      this.sqlite.exec(`
+        PRAGMA user_version = 9;
+        COMMIT;
+      `);
+    } catch (error) {
+      try {
+        this.sqlite.exec("ROLLBACK");
+      } catch {
+        // Preserve the migration error.
+      }
+      throw error;
+    }
+  }
+
+  #reconcileProvenShutdownGaps(now) {
+    const candidates = this.sqlite
+      .prepare(`
+        SELECT incidents.*
+        FROM incidents
+        LEFT JOIN incident_resolutions
+          ON incident_resolutions.incident_id = incidents.id
+        WHERE incidents.kind = 'gap'
+          AND incidents.cycle_id IS NOT NULL
+          AND incident_resolutions.incident_id IS NULL
+        ORDER BY incidents.detected_at DESC, incidents.id DESC
+      `)
+      .all();
+
+    const cycleById = this.sqlite.prepare("SELECT * FROM cycles WHERE id = ?");
+    const lastCycleResult = this.sqlite.prepare(`
+      SELECT *
+      FROM round_results
+      WHERE source = ? AND instrument = ? AND cycle_id = ?
+      ORDER BY settled_at DESC, id DESC
+      LIMIT 1
+    `);
+    const firstEpochResult = this.sqlite.prepare(`
+      SELECT *
+      FROM round_results
+      WHERE source = ? AND instrument = ? AND continuity_epoch = ?
+      ORDER BY settled_at, id
+      LIMIT 1
+    `);
+    const epochState = this.sqlite.prepare(`
+      SELECT continuity_epoch
+      FROM stream_state
+      WHERE source = ? AND instrument = ?
+    `);
+    const epochShape = this.sqlite.prepare(`
+      SELECT
+        COUNT(*) AS result_count,
+        COUNT(DISTINCT cycle_id) AS cycle_count,
+        MIN(cycle_id) AS only_cycle_id,
+        SUM(CASE WHEN cycle_id IS NULL THEN 1 ELSE 0 END) AS null_cycle_count
+      FROM round_results
+      WHERE source = ? AND instrument = ? AND continuity_epoch = ?
+    `);
+    const cycleShape = this.sqlite.prepare(`
+      SELECT
+        COUNT(*) AS result_count,
+        COUNT(DISTINCT result_number) AS distinct_count,
+        MIN(settled_at) AS first_settled_at,
+        MAX(settled_at) AS last_settled_at
+      FROM round_results
+      WHERE cycle_id IN (?, ?)
+    `);
+    const cycleResultCount = this.sqlite.prepare(`
+      SELECT COUNT(*) AS count
+      FROM round_results
+      WHERE cycle_id = ?
+    `);
+    const cycleEventCount = this.sqlite.prepare(`
+      SELECT COUNT(*) AS count
+      FROM cycle_events
+      WHERE cycle_id = ?
+    `);
+    const cycleNumberCount = this.sqlite.prepare(`
+      SELECT COUNT(*) AS count
+      FROM cycle_numbers
+      WHERE cycle_id = ?
+    `);
+    const rightEpochVirtualSessions = this.sqlite.prepare(`
+      SELECT COUNT(*) AS count
+      FROM virtual_bet_sessions
+      WHERE source = ? AND instrument = ? AND continuity_epoch = ?
+    `);
+    const invalidatedAtIncident = this.sqlite.prepare(`
+      SELECT COUNT(*) AS count
+      FROM virtual_bet_sessions
+      WHERE source = ?
+        AND instrument = ?
+        AND status = 'invalid_gap'
+        AND completed_at = ?
+    `);
+    const unresolvedRightCycleIncidents = this.sqlite.prepare(`
+      SELECT COUNT(*) AS count
+      FROM incidents
+      LEFT JOIN incident_resolutions
+        ON incident_resolutions.incident_id = incidents.id
+      WHERE incidents.cycle_id = ?
+        AND incident_resolutions.incident_id IS NULL
+    `);
+    const moveResults = this.sqlite.prepare(`
+      UPDATE round_results
+      SET cycle_id = ?, continuity_epoch = ?
+      WHERE source = ?
+        AND instrument = ?
+        AND cycle_id = ?
+        AND continuity_epoch = ?
+    `);
+    const moveEvents = this.sqlite.prepare(`
+      UPDATE cycle_events
+      SET cycle_id = ?
+      WHERE cycle_id = ?
+    `);
+    const moveResolvedIncidentReferences = this.sqlite.prepare(`
+      UPDATE incidents
+      SET cycle_id = ?
+      WHERE cycle_id = ?
+        AND EXISTS (
+          SELECT 1
+          FROM incident_resolutions
+          WHERE incident_resolutions.incident_id = incidents.id
+        )
+    `);
+    const orderedCycleEvents = this.sqlite.prepare(`
+      SELECT id, round_result_id, result_number, occurred_at
+      FROM cycle_events
+      WHERE cycle_id = ?
+      ORDER BY occurred_at, id
+    `);
+    const updateCycleEvent = this.sqlite.prepare(`
+      UPDATE cycle_events
+      SET eliminated = ?, remaining_count = ?
+      WHERE id = ?
+    `);
+    const resetCycleNumbers = this.sqlite.prepare(`
+      UPDATE cycle_numbers
+      SET eliminated_at = NULL, eliminated_by_result_id = NULL
+      WHERE cycle_id = ?
+    `);
+    const eliminateCycleNumber = this.sqlite.prepare(`
+      UPDATE cycle_numbers
+      SET eliminated_at = ?, eliminated_by_result_id = ?
+      WHERE cycle_id = ? AND number = ?
+    `);
+    const deleteCycle = this.sqlite.prepare("DELETE FROM cycles WHERE id = ?");
+    const restoreCycle = this.sqlite.prepare(`
+      UPDATE cycles
+      SET
+        status = 'active',
+        last_event_at = ?,
+        completed_at = NULL,
+        survivor_number = NULL,
+        event_count = ?,
+        eliminated_count = ?
+      WHERE id = ? AND status = 'invalid_gap'
+    `);
+    const restoreEpoch = this.sqlite.prepare(`
+      UPDATE stream_state
+      SET continuity_epoch = ?
+      WHERE source = ?
+        AND instrument = ?
+        AND continuity_epoch = ?
+    `);
+    const insertResolution = this.sqlite.prepare(`
+      INSERT INTO incident_resolutions (
+        incident_id,
+        resolution,
+        resolved_at,
+        evidence_json,
+        created_at
+      ) VALUES (?, 'reconciled_contiguous', ?, ?, ?)
+    `);
+
+    for (const incident of candidates) {
+      const details = deserializeJson(incident.details_json);
+      if (
+        !details ||
+        typeof details !== "object" ||
+        Array.isArray(details) ||
+        details.reason !== "shutdown-with-unconfirmed-round-result"
+      ) {
+        continue;
+      }
+
+      const leftCycleId = Number(incident.cycle_id);
+      const leftCycle = cycleById.get(leftCycleId);
+      if (
+        !leftCycle ||
+        leftCycle.source !== incident.source ||
+        leftCycle.instrument !== incident.instrument ||
+        leftCycle.status !== "invalid_gap" ||
+        leftCycle.completed_at !== incident.detected_at
+      ) {
+        continue;
+      }
+
+      const left = lastCycleResult.get(
+        incident.source,
+        incident.instrument,
+        leftCycleId,
+      );
+      if (!left) continue;
+      const leftEpoch = Number(left.continuity_epoch);
+      const rightEpoch = leftEpoch + 1;
+      const right = firstEpochResult.get(
+        incident.source,
+        incident.instrument,
+        rightEpoch,
+      );
+      if (!right || right.cycle_id === null) continue;
+
+      const leftRoundId = numericRoundId(left.external_round_id);
+      const rightRoundId = numericRoundId(right.external_round_id);
+      const elapsedMs = Date.parse(right.settled_at) - Date.parse(left.settled_at);
+      const observationToDetectionMs =
+        Date.parse(incident.detected_at) - Date.parse(right.observed_at);
+      if (
+        leftRoundId === null ||
+        rightRoundId === null ||
+        rightRoundId !== leftRoundId + 1n ||
+        !Number.isFinite(elapsedMs) ||
+        elapsedMs <= 0 ||
+        elapsedMs > this.gapThresholdMs ||
+        !Number.isFinite(observationToDetectionMs) ||
+        observationToDetectionMs < 0 ||
+        observationToDetectionMs > this.gapThresholdMs
+      ) {
+        continue;
+      }
+
+      const rightCycleId = Number(right.cycle_id);
+      const rightCycle = cycleById.get(rightCycleId);
+      const currentEpoch = epochState.get(incident.source, incident.instrument);
+      const epoch = epochShape.get(
+        incident.source,
+        incident.instrument,
+        rightEpoch,
+      );
+      if (
+        rightCycleId === leftCycleId ||
+        !rightCycle ||
+        rightCycle.source !== incident.source ||
+        rightCycle.instrument !== incident.instrument ||
+        rightCycle.status !== "active" ||
+        rightCycle.started_at !== right.settled_at ||
+        Number(currentEpoch?.continuity_epoch) !== rightEpoch ||
+        Number(epoch.result_count) < 1 ||
+        Number(epoch.null_cycle_count) !== 0 ||
+        Number(epoch.cycle_count) !== 1 ||
+        Number(epoch.only_cycle_id) !== rightCycleId
+      ) {
+        continue;
+      }
+
+      const leftResults = Number(cycleResultCount.get(leftCycleId).count);
+      const rightResults = Number(cycleResultCount.get(rightCycleId).count);
+      const leftEvents = Number(cycleEventCount.get(leftCycleId).count);
+      const rightEvents = Number(cycleEventCount.get(rightCycleId).count);
+      const combined = cycleShape.get(leftCycleId, rightCycleId);
+      if (
+        leftResults < 1 ||
+        rightResults < 1 ||
+        leftResults !== leftEvents ||
+        rightResults !== rightEvents ||
+        Number(combined.result_count) !== leftResults + rightResults ||
+        Number(combined.distinct_count) >= 36 ||
+        Number(cycleNumberCount.get(leftCycleId).count) !== 37 ||
+        Number(cycleNumberCount.get(rightCycleId).count) !== 37 ||
+        Number(
+          rightEpochVirtualSessions.get(
+            incident.source,
+            incident.instrument,
+            rightEpoch,
+          ).count,
+        ) !== 0 ||
+        Number(
+          invalidatedAtIncident.get(
+            incident.source,
+            incident.instrument,
+            incident.detected_at,
+          ).count,
+        ) !== 0 ||
+        Number(unresolvedRightCycleIncidents.get(rightCycleId).count) !== 0
+      ) {
+        continue;
+      }
+
+      const movedResults = Number(
+        moveResults.run(
+          leftCycleId,
+          leftEpoch,
+          incident.source,
+          incident.instrument,
+          rightCycleId,
+          rightEpoch,
+        ).changes,
+      );
+      const movedEvents = Number(moveEvents.run(leftCycleId, rightCycleId).changes);
+      if (movedResults !== rightResults || movedEvents !== rightEvents) {
+        throw new Error("continuity reconciliation moved an unexpected row count");
+      }
+
+      moveResolvedIncidentReferences.run(leftCycleId, rightCycleId);
+      const events = orderedCycleEvents.all(leftCycleId);
+      const firstByNumber = new Map();
+      let remainingCount = 37;
+      for (const event of events) {
+        const number = Number(event.result_number);
+        const eliminated = !firstByNumber.has(number);
+        if (eliminated) {
+          firstByNumber.set(number, event);
+          remainingCount -= 1;
+        }
+        updateCycleEvent.run(eliminated ? 1 : 0, remainingCount, Number(event.id));
+      }
+
+      resetCycleNumbers.run(leftCycleId);
+      for (const [number, event] of firstByNumber) {
+        const update = eliminateCycleNumber.run(
+          event.occurred_at,
+          Number(event.round_result_id),
+          leftCycleId,
+          number,
+        );
+        if (Number(update.changes) !== 1) {
+          throw new Error("continuity reconciliation could not rebuild cycle numbers");
+        }
+      }
+
+      if (Number(deleteCycle.run(rightCycleId).changes) !== 1) {
+        throw new Error("continuity reconciliation could not remove derived cycle");
+      }
+      if (
+        Number(
+          restoreCycle.run(
+            events.at(-1).occurred_at,
+            events.length,
+            firstByNumber.size,
+            leftCycleId,
+          ).changes,
+        ) !== 1
+      ) {
+        throw new Error("continuity reconciliation could not restore active cycle");
+      }
+      if (
+        Number(
+          restoreEpoch.run(
+            leftEpoch,
+            incident.source,
+            incident.instrument,
+            rightEpoch,
+          ).changes,
+        ) !== 1
+      ) {
+        throw new Error("continuity reconciliation could not restore stream epoch");
+      }
+
+      const evidence = {
+        proof: "adjacent-external-round-ids",
+        reason: details.reason,
+        incidentId: Number(incident.id),
+        source: incident.source,
+        instrument: incident.instrument,
+        left: {
+          resultId: Number(left.id),
+          externalRoundId: left.external_round_id,
+          settledAt: left.settled_at,
+          continuityEpoch: leftEpoch,
+          cycleId: leftCycleId,
+        },
+        right: {
+          resultId: Number(right.id),
+          externalRoundId: right.external_round_id,
+          settledAt: right.settled_at,
+          continuityEpoch: rightEpoch,
+          cycleId: rightCycleId,
+        },
+        elapsedMs,
+        movedResults,
+        restoredCycle: {
+          id: leftCycleId,
+          eventCount: events.length,
+          eliminatedCount: firstByNumber.size,
+        },
+      };
+      insertResolution.run(
+        Number(incident.id),
+        now,
+        serializeJson(evidence, "incident resolution evidence"),
+        now,
+      );
+    }
   }
 
   #backfillContinuityEpochs() {
@@ -2130,7 +2544,17 @@ export class RouletteDatabase {
       `)
       .get();
     const recentIncidentRows = this.sqlite
-      .prepare("SELECT * FROM incidents ORDER BY detected_at DESC, id DESC LIMIT 10")
+      .prepare(`
+        SELECT incidents.*
+        FROM incidents
+        WHERE NOT EXISTS (
+          SELECT 1
+          FROM incident_resolutions
+          WHERE incident_resolutions.incident_id = incidents.id
+        )
+        ORDER BY incidents.detected_at DESC, incidents.id DESC
+        LIMIT 10
+      `)
       .all();
     const totals = this.sqlite
       .prepare(`

@@ -63,6 +63,7 @@ test("schema contains all persistence tables", () => {
       "cycle_events",
       "cycle_numbers",
       "cycles",
+      "incident_resolutions",
       "incidents",
       "round_results",
       "stream_state",
@@ -70,7 +71,7 @@ test("schema contains all persistence tables", () => {
       "virtual_bet_sessions",
       "virtual_bets",
     ]);
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 8);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 9);
   } finally {
     database.close();
   }
@@ -146,7 +147,7 @@ test("version 5 history is backfilled into continuity epochs before migration co
 
   const database = createDatabase({ path });
   try {
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 8);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 9);
     assert.deepEqual(
       database.sqlite
         .prepare("SELECT continuity_epoch FROM round_results ORDER BY settled_at, id")
@@ -169,6 +170,253 @@ test("version 5 history is backfilled into continuity epochs before migration co
       database.sqlite.prepare("SELECT COUNT(*) AS count FROM virtual_bets").get().count,
       0,
     );
+  } finally {
+    database.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("version 9 reconciles a proven contiguous shutdown boundary without deleting its audit", () => {
+  const directory = mkdtempSync(join(tmpdir(), "roulette-v9-reconcile-"));
+  const path = join(directory, "shutdown-gap.sqlite");
+  let database = createDatabase({ path, gapThresholdSeconds: 135 });
+  try {
+    database.ingestBatch([
+      event(20, "reconcile-left-1", 0, { externalRoundId: "4090229" }),
+      event(14, "reconcile-left-2", 90, { externalRoundId: "4090230" }),
+      event(14, "reconcile-left-3", 180, { externalRoundId: "4090231" }),
+    ]);
+    database.ingestBatchAfterGap(
+      {
+        source: "buleto",
+        instrument: "PRIMECOIN(XPM)/RUB",
+        reason: "shutdown-with-unconfirmed-round-result",
+        incidentKey: "shutdown-reconcile-once",
+        detectedAt: new Date(BASE_TIME + 270_100).toISOString(),
+        message: "planned restart before snapshot confirmation",
+      },
+      [
+        event(31, "reconcile-right-1", 270, { externalRoundId: "4090232" }),
+        event(35, "reconcile-right-2", 360, { externalRoundId: "4090233" }),
+      ],
+    );
+    assert.equal(database.getDashboardState().totals.results, 5);
+    assert.equal(database.getDashboardState().totals.invalidCycles, 1);
+    database.sqlite.exec("PRAGMA user_version = 8");
+    database.close();
+
+    database = createDatabase({ path, gapThresholdSeconds: 135 });
+    const state = database.getDashboardState();
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 9);
+    assert.equal(state.totals.results, 5, "raw results are never recreated or deleted");
+    assert.equal(state.totals.cycles, 1);
+    assert.equal(state.totals.invalidCycles, 0);
+    assert.equal(state.totals.incidents, 1, "the original incident remains as audit");
+    assert.equal(state.recentIncidents.length, 0, "a resolved incident is not an active warning");
+    assert.equal(state.activeCycle.id, 1);
+    assert.equal(state.activeCycle.eventCount, 5);
+    assert.equal(state.activeCycle.eliminatedCount, 4);
+    assert.deepEqual(
+      database.sqlite
+        .prepare("SELECT continuity_epoch FROM round_results ORDER BY settled_at, id")
+        .all()
+        .map((row) => Number(row.continuity_epoch)),
+      [0, 0, 0, 0, 0],
+    );
+    assert.equal(
+      Number(
+        database.sqlite
+          .prepare("SELECT continuity_epoch FROM stream_state")
+          .get().continuity_epoch,
+      ),
+      0,
+    );
+    assert.deepEqual(
+      database.sqlite
+        .prepare(`
+          SELECT result_number, eliminated, remaining_count
+          FROM cycle_events
+          ORDER BY occurred_at, id
+        `)
+        .all()
+        .map((row) => ({
+          number: Number(row.result_number),
+          eliminated: Number(row.eliminated),
+          remaining: Number(row.remaining_count),
+        })),
+      [
+        { number: 20, eliminated: 1, remaining: 36 },
+        { number: 14, eliminated: 1, remaining: 35 },
+        { number: 14, eliminated: 0, remaining: 35 },
+        { number: 31, eliminated: 1, remaining: 34 },
+        { number: 35, eliminated: 1, remaining: 33 },
+      ],
+    );
+    assert.equal(
+      database
+        .getPairStats("buleto", "PRIMECOIN(XPM)/RUB")
+        .some((item) => item.numbers[0] === 14 && item.numbers[1] === 31),
+      true,
+    );
+    const resolution = database.sqlite
+      .prepare("SELECT * FROM incident_resolutions")
+      .get();
+    assert.equal(resolution.resolution, "reconciled_contiguous");
+    const evidence = JSON.parse(resolution.evidence_json);
+    assert.equal(evidence.left.externalRoundId, "4090231");
+    assert.equal(evidence.right.externalRoundId, "4090232");
+    assert.equal(evidence.elapsedMs, 90_000);
+
+    database.close();
+    database = createDatabase({ path, gapThresholdSeconds: 135 });
+    assert.equal(
+      Number(database.sqlite.prepare("SELECT COUNT(*) AS count FROM incident_resolutions").get().count),
+      1,
+      "reopening is idempotent",
+    );
+    assert.equal(database.getDashboardState().totals.cycles, 1);
+  } finally {
+    database.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("version 9 reconciles consecutive shutdown gaps from newest to oldest", () => {
+  const directory = mkdtempSync(join(tmpdir(), "roulette-v9-chain-"));
+  const path = join(directory, "shutdown-chain.sqlite");
+  let database = createDatabase({ path, gapThresholdSeconds: 135 });
+  try {
+    database.ingestBatch([
+      event(1, "chain-left", 0, { externalRoundId: "700" }),
+    ]);
+    database.ingestBatchAfterGap(
+      {
+        source: "buleto",
+        instrument: "PRIMECOIN(XPM)/RUB",
+        reason: "shutdown-with-unconfirmed-round-result",
+        incidentKey: "shutdown-chain-1",
+        detectedAt: new Date(BASE_TIME + 90_100).toISOString(),
+      },
+      [event(2, "chain-middle", 90, { externalRoundId: "701" })],
+    );
+    database.ingestBatchAfterGap(
+      {
+        source: "buleto",
+        instrument: "PRIMECOIN(XPM)/RUB",
+        reason: "shutdown-with-unconfirmed-round-result",
+        incidentKey: "shutdown-chain-2",
+        detectedAt: new Date(BASE_TIME + 180_100).toISOString(),
+      },
+      [event(3, "chain-right", 180, { externalRoundId: "702" })],
+    );
+    assert.equal(database.getDashboardState().totals.cycles, 3);
+    database.sqlite.exec("PRAGMA user_version = 8");
+    database.close();
+
+    database = createDatabase({ path, gapThresholdSeconds: 135 });
+    const state = database.getDashboardState();
+    assert.equal(state.totals.results, 3);
+    assert.equal(state.totals.cycles, 1);
+    assert.equal(state.totals.invalidCycles, 0);
+    assert.equal(state.totals.incidents, 2);
+    assert.equal(state.recentIncidents.length, 0);
+    assert.equal(state.activeCycle.eventCount, 3);
+    assert.deepEqual(
+      database.sqlite
+        .prepare("SELECT DISTINCT continuity_epoch FROM round_results")
+        .all()
+        .map((row) => Number(row.continuity_epoch)),
+      [0],
+    );
+    assert.equal(
+      Number(database.sqlite.prepare("SELECT COUNT(*) AS count FROM incident_resolutions").get().count),
+      2,
+    );
+    assert.deepEqual(
+      database.sqlite
+        .prepare("SELECT DISTINCT cycle_id FROM incidents ORDER BY cycle_id")
+        .all()
+        .map((row) => Number(row.cycle_id)),
+      [1],
+      "resolved incident references follow the surviving derived cycle",
+    );
+  } finally {
+    database.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("version 9 leaves ambiguous and real gaps untouched", () => {
+  const directory = mkdtempSync(join(tmpdir(), "roulette-v9-real-gaps-"));
+  const path = join(directory, "real-gaps.sqlite");
+  let database = createDatabase({ path, gapThresholdSeconds: 135 });
+  try {
+    database.ingestBatch([
+      event(4, "real-jump-left", 0, {
+        instrument: "JUMP",
+        externalRoundId: "100",
+      }),
+      event(6, "real-reason-left", 0, {
+        instrument: "REASON",
+        externalRoundId: "200",
+      }),
+    ]);
+    database.ingestBatchAfterGap(
+      {
+        source: "buleto",
+        instrument: "JUMP",
+        reason: "shutdown-with-unconfirmed-round-result",
+        incidentKey: "real-round-id-jump",
+        detectedAt: new Date(BASE_TIME + 90_100).toISOString(),
+      },
+      [
+        event(5, "real-jump-right", 90, {
+          instrument: "JUMP",
+          externalRoundId: "102",
+        }),
+      ],
+    );
+    database.ingestBatchAfterGap(
+      {
+        source: "buleto",
+        instrument: "REASON",
+        reason: "round-result-not-confirmed-by-snapshot",
+        incidentKey: "real-authoritative-reason",
+        detectedAt: new Date(BASE_TIME + 90_100).toISOString(),
+      },
+      [
+        event(7, "real-reason-right", 90, {
+          instrument: "REASON",
+          externalRoundId: "201",
+        }),
+      ],
+    );
+    database.sqlite.exec("PRAGMA user_version = 8");
+    database.close();
+
+    database = createDatabase({ path, gapThresholdSeconds: 135 });
+    assert.equal(
+      Number(database.sqlite.prepare("SELECT COUNT(*) AS count FROM incident_resolutions").get().count),
+      0,
+    );
+    assert.equal(database.getDashboardState().totals.results, 4);
+    assert.equal(database.getDashboardState().totals.cycles, 4);
+    assert.equal(database.getDashboardState().totals.invalidCycles, 2);
+    assert.equal(database.getDashboardState().recentIncidents.length, 2);
+    for (const instrument of ["JUMP", "REASON"]) {
+      assert.deepEqual(
+        database.sqlite
+          .prepare(`
+            SELECT continuity_epoch
+            FROM round_results
+            WHERE instrument = ?
+            ORDER BY settled_at, id
+          `)
+          .all(instrument)
+          .map((row) => Number(row.continuity_epoch)),
+        [0, 1],
+      );
+    }
   } finally {
     database.close();
     rmSync(directory, { recursive: true, force: true });
@@ -1351,7 +1599,7 @@ test("v7 paper history initializes v8 bankroll with all known net results exactl
       "buleto",
       "PRIMECOIN(XPM)/RUB",
     );
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 8);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 9);
     assert.equal(state.testBank.initialBalance, 87_700);
     assert.equal(state.testBank.currentBalance, 87_910);
     assert.equal(state.testBank.netResult, 210);

@@ -274,7 +274,7 @@ test('unmatched pending round reaches terminal gap policy instead of reconnectin
   );
 });
 
-test('graceful shutdown exposes an unconfirmed round before the socket stops', (t) => {
+test('graceful shutdown persists an unconfirmed round without marking a gap', (t) => {
   const originalWebSocket = globalThis.WebSocket;
   FakeWebSocket.instances = [];
   globalThis.WebSocket = FakeWebSocket;
@@ -293,7 +293,11 @@ test('graceful shutdown exposes an unconfirmed round before the socket stops', (
 
   const order = [];
   const batches = [];
-  collector.on('integrity-gap', () => order.push('gap'));
+  const gaps = [];
+  collector.on('integrity-gap', (gap) => {
+    gaps.push(gap);
+    order.push('gap');
+  });
   collector.on('results', (batch) => {
     order.push('results');
     batches.push(batch);
@@ -317,7 +321,13 @@ test('graceful shutdown exposes an unconfirmed round before the socket stops', (
   });
 
   const outcome = collector.flushPendingForShutdown();
-  assert.deepEqual(outcome, { flushed: 1, markedGap: true });
-  assert.deepEqual(order, ['gap', 'results']);
+  assert.deepEqual(outcome, { flushed: 1, markedGap: false });
+  assert.deepEqual(order, ['results']);
+  assert.deepEqual(gaps, []);
   assert.equal(batches[0][0].externalRoundId, 402);
+  assert.deepEqual(collector.flushPendingForShutdown(), {
+    flushed: 0,
+    markedGap: false,
+  });
+  assert.equal(batches.length, 1);
 });

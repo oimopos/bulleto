@@ -170,9 +170,8 @@ export class BuletoCollector extends EventEmitter {
   }
 
   flushPendingForShutdown() {
-    const hasPendingRound = this.pendingRoundResults.length > 0;
     const hasDeferredSnapshot = this.deferredSnapshotResults.size > 0;
-    if (!hasPendingRound && !hasDeferredSnapshot) {
+    if (this.pendingRoundResults.length === 0 && !hasDeferredSnapshot) {
       return { flushed: 0, markedGap: false };
     }
 
@@ -180,16 +179,11 @@ export class BuletoCollector extends EventEmitter {
       ...this.pendingRoundResults.map((result) => result.fingerprint),
       ...this.deferredSnapshotResults.keys(),
     ]).size;
-    if (hasPendingRound) {
-      this.emit('integrity-gap', {
-        reason: 'shutdown-with-unconfirmed-round-result',
-        detectedAt: new Date().toISOString(),
-        message:
-          'Приложение завершает работу до подтверждения round-результата снимком; граница цикла сохранена как неполная.',
-      });
-    }
+    // A final round message already carries the stable round id and result.
+    // Persist it before a planned shutdown; a restart snapshot will dedupe or
+    // enrich the same row. A controlled deploy is not evidence of a data gap.
     this.#flushPendingRoundResults();
-    return { flushed, markedGap: hasPendingRound };
+    return { flushed, markedGap: false };
   }
 
   stop() {
