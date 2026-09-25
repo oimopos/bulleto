@@ -46,6 +46,53 @@ class FakeWebSocket extends EventTarget {
 
 const quietLogger = { info() {}, warn() {}, error() {} };
 
+function forecastCells() {
+  return Array.from({ length: 38 }, (_, wireCell) => ({
+    c: wireCell,
+    vt: 38 - wireCell,
+    vf: 37 - wireCell,
+  }));
+}
+
+function iso(milliseconds) {
+  return new Date(milliseconds).toISOString();
+}
+
+function forecastRound({ id, bettingClosesAtMs, result } = {}) {
+  const round = {
+    id,
+    s: 2,
+    bcd: iso(bettingClosesAtMs),
+    ed: iso(bettingClosesAtMs + 40_000),
+    sv: 20,
+    cls: forecastCells(),
+  };
+  if (result !== undefined) round.rr = result;
+  return round;
+}
+
+function startFakeCollector(t) {
+  const originalWebSocket = globalThis.WebSocket;
+  FakeWebSocket.instances = [];
+  globalThis.WebSocket = FakeWebSocket;
+  t.after(() => {
+    globalThis.WebSocket = originalWebSocket;
+  });
+
+  const collector = new BuletoCollector({
+    url: 'ws://example.test/ws',
+    connectionTimeoutMs: 10_000,
+    initialSnapshotTimeoutMs: 10_000,
+    resultSnapshotTimeoutMs: 10_000,
+    logger: quietLogger,
+  });
+  t.after(() => collector.stop());
+  collector.start();
+  const socket = FakeWebSocket.instances[0];
+  socket.open();
+  return { collector, socket };
+}
+
 test('Buleto wire cell 37 maps to roulette zero', () => {
   assert.equal(canonicalRouletteNumber(37), 0);
   assert.equal(canonicalRouletteNumber(0), 0);
@@ -112,6 +159,115 @@ test('same settled result has same fingerprint with or without round id', () => 
     { externalRoundId: 123 },
   );
   assert.equal(fromSnapshot.fingerprint, fromRound.fingerprint);
+});
+
+test('collector emits a pre-close forecast in the safe window and ignores future factors', (t) => {
+  const { collector, socket } = startFakeCollector(t);
+  const forecasts = [];
+  const errors = [];
+  collector.on('preclose-forecast', (forecast) => forecasts.push(forecast));
+  collector.on('collector-error', (error) => errors.push(error));
+
+  // Keep the received message near nine seconds before bcd, comfortably inside
+  // the inclusive 8-10 second lock window without replacing the global clock.
+  const factorBaseMs = Date.now() - 250;
+  socket.message({
+    type: 'round',
+    data: forecastRound({ id: 501, bettingClosesAtMs: factorBaseMs + 9_250 }),
+  });
+  socket.message({
+    type: 'factors',
+    data: [
+      { dt: iso(factorBaseMs - 4_000), v: 19.6 },
+      { dt: iso(factorBaseMs - 2_000), v: 19.8 },
+      { dt: iso(factorBaseMs), v: 20 },
+      { dt: iso(factorBaseMs + 2_000), v: 999_999 },
+    ],
+  });
+
+  assert.equal(errors.length, 0);
+  assert.equal(forecasts.length, 1);
+  assert.equal(forecasts[0].round.externalRoundId, '501');
+  assert.ok(forecasts[0].features.leadTimeMs >= 8_000);
+  assert.ok(forecasts[0].features.leadTimeMs <= 10_000);
+  assert.equal(forecasts[0].features.factorCount, 3);
+  assert.equal(forecasts[0].features.latestPrice, 20);
+  assert.equal(
+    forecasts[0].features.factorPoints.some((point) => point.price === 999_999),
+    false,
+  );
+});
+
+test('collector does not emit a forecast after betting is closed', (t) => {
+  const { collector, socket } = startFakeCollector(t);
+  const forecasts = [];
+  collector.on('preclose-forecast', (forecast) => forecasts.push(forecast));
+
+  const factorBaseMs = Date.now() - 250;
+  socket.message({
+    type: 'round',
+    data: forecastRound({ id: 502, bettingClosesAtMs: factorBaseMs - 1_000 }),
+  });
+  socket.message({
+    type: 'factors',
+    data: [
+      { dt: iso(factorBaseMs - 4_000), v: 19.6 },
+      { dt: iso(factorBaseMs - 2_000), v: 19.8 },
+      { dt: iso(factorBaseMs), v: 20 },
+    ],
+  });
+
+  assert.equal(forecasts.length, 0);
+});
+
+test('collector does not emit a forecast when upstream status is closed', (t) => {
+  const { collector, socket } = startFakeCollector(t);
+  const forecasts = [];
+  collector.on('preclose-forecast', (forecast) => forecasts.push(forecast));
+
+  const factorBaseMs = Date.now() - 250;
+  const closedRound = forecastRound({
+    id: 504,
+    bettingClosesAtMs: factorBaseMs + 9_250,
+  });
+  closedRound.s = 4;
+  socket.message({ type: 'round', data: closedRound });
+  socket.message({
+    type: 'factors',
+    data: [
+      { dt: iso(factorBaseMs - 4_000), v: 19.6 },
+      { dt: iso(factorBaseMs - 2_000), v: 19.8 },
+      { dt: iso(factorBaseMs), v: 20 },
+    ],
+  });
+
+  assert.equal(forecasts.length, 0);
+});
+
+test('collector never derives a forecast from a final round carrying rr', (t) => {
+  const { collector, socket } = startFakeCollector(t);
+  const forecasts = [];
+  collector.on('preclose-forecast', (forecast) => forecasts.push(forecast));
+
+  const factorBaseMs = Date.now() - 250;
+  socket.message({
+    type: 'round',
+    data: forecastRound({
+      id: 503,
+      bettingClosesAtMs: factorBaseMs + 9_250,
+      result: { dt: iso(factorBaseMs), c: 3, v: 20 },
+    }),
+  });
+  socket.message({
+    type: 'factors',
+    data: [
+      { dt: iso(factorBaseMs - 4_000), v: 19.6 },
+      { dt: iso(factorBaseMs - 2_000), v: 19.8 },
+      { dt: iso(factorBaseMs), v: 20 },
+    ],
+  });
+
+  assert.equal(forecasts.length, 0);
 });
 
 test('round result waits for matching snapshot and is emitted in chronological order', (t) => {

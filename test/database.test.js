@@ -24,6 +24,45 @@ function event(resultNumber, fingerprint, offsetSeconds = 0, extra = {}) {
   };
 }
 
+function precloseForecast(externalRoundId, overrides = {}) {
+  const bettingClosesAt = new Date(BASE_TIME + 60_000).toISOString();
+  const lockedAt = new Date(BASE_TIME + 51_000).toISOString();
+  const factorAt = lockedAt;
+  return {
+    source: "buleto",
+    instrument: "PRIMECOIN(XPM)/RUB",
+    externalRoundId,
+    horizonSeconds: 8,
+    bettingClosesAt,
+    roundEndsAt: new Date(BASE_TIME + 100_000).toISOString(),
+    factorAt,
+    lockedAt,
+    currentPrice: 5.4,
+    startPrice: 5.35,
+    currentNumber: 11,
+    predictedPrice: 5.41,
+    predictedNumber: 7,
+    rankedNumbers: [7, 11, 19],
+    cells: Array.from({ length: 38 }, (_, code) => ({
+      c: code,
+      vt: 6 - code / 100,
+      vf: 5.99 - code / 100,
+    })),
+    features: {
+      samples: [
+        { dt: new Date(BASE_TIME + 47_000).toISOString(), v: 5.38 },
+        { dt: new Date(BASE_TIME + 49_000).toISOString(), v: 5.39 },
+        { dt: factorAt, v: 5.4 },
+      ],
+      windowSeconds: 4,
+      slopePerSecond: 0.005,
+      secondsToEnd: 46,
+    },
+    modelVersion: "preclose-linear-v1",
+    ...overrides,
+  };
+}
+
 function virtualTriggerEvents(
   prefix,
   targetNumber = 1,
@@ -63,15 +102,265 @@ test("schema contains all persistence tables", () => {
       "cycle_events",
       "cycle_numbers",
       "cycles",
+      "forecast_settlements",
+      "forecast_snapshots",
       "incident_resolutions",
       "incidents",
+      "round_forecasts",
       "round_results",
       "stream_state",
       "virtual_bankrolls",
       "virtual_bet_sessions",
       "virtual_bets",
     ]);
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 9);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 10);
+  } finally {
+    database.close();
+  }
+});
+
+test("pre-close forecasts enforce the five-second lock boundary and fresh factors", () => {
+  const database = createDatabase({
+    path: ":memory:",
+    clock: () => new Date(BASE_TIME + 52_000),
+  });
+  try {
+    const valid = precloseForecast("forecast-valid-t-minus-6");
+    assert.deepEqual(database.recordPrecloseForecast(valid), {
+      inserted: true,
+      roundId: "forecast-valid-t-minus-6",
+    });
+
+    const state = database.getPrecloseForecastState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    assert.equal(state.executionEnabled, false);
+    assert.deepEqual(state.captureLeadSeconds, { min: 8, max: 10 });
+    assert.equal(state.minimumPersistedLeadSeconds, 5);
+    assert.equal(state.latest.roundId, "forecast-valid-t-minus-6");
+    assert.equal(state.latest.leadSeconds, 9);
+    assert.equal(state.latest.availableLeadSeconds, 8);
+    assert.equal(state.latest.factorAt, valid.factorAt);
+    assert.equal(state.latest.lockedAt, valid.lockedAt);
+    assert.equal(state.latest.settlement, null);
+
+    const lateLockedAt = new Date(
+      Date.parse(valid.bettingClosesAt) - 7_999,
+    ).toISOString();
+    assert.throws(
+      () =>
+        database.recordPrecloseForecast(
+          precloseForecast("forecast-too-late", {
+            factorAt: lateLockedAt,
+            lockedAt: lateLockedAt,
+          }),
+        ),
+      /pre-bcd horizon window/,
+    );
+
+    assert.throws(
+      () =>
+        database.recordPrecloseForecast(
+          precloseForecast("forecast-future-factor", {
+            factorAt: new Date(Date.parse(valid.lockedAt) + 1).toISOString(),
+          }),
+        ),
+      /factor must be fresh and observed before lock/,
+    );
+    assert.throws(
+      () =>
+        database.recordPrecloseForecast(
+          precloseForecast("forecast-stale-factor", {
+            factorAt: new Date(Date.parse(valid.lockedAt) - 5_001).toISOString(),
+          }),
+        ),
+      /factor must be fresh and observed before lock/,
+    );
+
+    const lateDatabase = createDatabase({
+      path: ":memory:",
+      clock: () => new Date(Date.parse(valid.bettingClosesAt) - 4_999),
+    });
+    try {
+      assert.throws(
+        () => lateDatabase.recordPrecloseForecast(valid),
+        /durably stored at least five seconds/,
+      );
+    } finally {
+      lateDatabase.close();
+    }
+
+    assert.equal(
+      database.sqlite.prepare("SELECT COUNT(*) AS count FROM forecast_snapshots").get()
+        .count,
+      1,
+    );
+    assert.equal(
+      database.sqlite.prepare("SELECT COUNT(*) AS count FROM round_forecasts").get()
+        .count,
+      1,
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test("pre-close forecast recording is idempotent across database reopen", () => {
+  const directory = mkdtempSync(join(tmpdir(), "roulette-preclose-"));
+  const path = join(directory, "preclose.sqlite");
+  const attempt = precloseForecast("forecast-persisted");
+  let database = createDatabase({
+    path,
+    clock: () => new Date(BASE_TIME + 52_000),
+  });
+  try {
+    assert.equal(database.recordPrecloseForecast(attempt).inserted, true);
+    assert.equal(database.recordPrecloseForecast(attempt).inserted, false);
+    database.close();
+
+    database = createDatabase({
+      path,
+      clock: () => new Date(BASE_TIME + 52_000),
+    });
+    assert.equal(database.recordPrecloseForecast(attempt).inserted, false);
+    assert.equal(
+      database.sqlite.prepare("SELECT COUNT(*) AS count FROM forecast_snapshots").get()
+        .count,
+      1,
+    );
+    assert.equal(
+      database.sqlite.prepare("SELECT COUNT(*) AS count FROM round_forecasts").get()
+        .count,
+      1,
+    );
+    assert.equal(
+      database.getPrecloseForecastState("buleto", "PRIMECOIN(XPM)/RUB")
+        .latest.roundId,
+      "forecast-persisted",
+    );
+  } finally {
+    database.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("pre-close settlement requires the exact stream and round and reports hit metrics", () => {
+  const database = createDatabase({
+    path: ":memory:",
+    clock: () => new Date(BASE_TIME + 52_000),
+  });
+  try {
+    database.recordPrecloseForecast(precloseForecast("forecast-top1"));
+    database.recordPrecloseForecast(precloseForecast("forecast-top3"));
+    database.recordPrecloseForecast(
+      precloseForecast("forecast-current", {
+        rankedNumbers: [7, 19, 22],
+      }),
+    );
+    database.recordPrecloseForecast(
+      precloseForecast("forecast-anonymous", {
+        roundEndsAt: new Date(BASE_TIME + 300_000).toISOString(),
+      }),
+    );
+    database.recordPrecloseForecast(precloseForecast("forecast-pending"));
+
+    database.ingestBatch([
+      event(7, "forecast-result-top1", 200, {
+        externalRoundId: "forecast-top1",
+      }),
+      event(19, "forecast-result-top3", 201, {
+        externalRoundId: "forecast-top3",
+      }),
+      event(11, "forecast-result-current", 202, {
+        externalRoundId: "forecast-current",
+      }),
+      event(11, "forecast-result-wrong-instrument", 203, {
+        instrument: "OTHER",
+        externalRoundId: "forecast-pending",
+      }),
+      event(11, "forecast-result-wrong-source", 204, {
+        source: "other-source",
+        externalRoundId: "forecast-pending",
+      }),
+      event(7, "forecast-result-anonymous", 299),
+    ]);
+
+    assert.deepEqual(
+      database.settlePrecloseForecasts("buleto", "PRIMECOIN(XPM)/RUB"),
+      { settled: 4 },
+    );
+    assert.deepEqual(
+      database.settlePrecloseForecasts("buleto", "PRIMECOIN(XPM)/RUB"),
+      { settled: 0 },
+      "settlement is idempotent",
+    );
+
+    assert.deepEqual(
+      database.sqlite
+        .prepare(`
+          SELECT
+            snapshots.external_round_id,
+            settlements.top1_hit,
+            settlements.top3_hit,
+            settlements.current_cell_hit
+          FROM forecast_settlements AS settlements
+          JOIN round_forecasts AS forecasts ON forecasts.id = settlements.forecast_id
+          JOIN forecast_snapshots AS snapshots ON snapshots.id = forecasts.snapshot_id
+          ORDER BY snapshots.external_round_id
+        `)
+        .all()
+        .map((row) => ({
+          roundId: row.external_round_id,
+          top1Hit: Number(row.top1_hit),
+          top3Hit: Number(row.top3_hit),
+          currentCellHit: Number(row.current_cell_hit),
+        })),
+      [
+        {
+          roundId: "forecast-anonymous",
+          top1Hit: 1,
+          top3Hit: 1,
+          currentCellHit: 0,
+        },
+        {
+          roundId: "forecast-current",
+          top1Hit: 0,
+          top3Hit: 0,
+          currentCellHit: 1,
+        },
+        {
+          roundId: "forecast-top1",
+          top1Hit: 1,
+          top3Hit: 1,
+          currentCellHit: 0,
+        },
+        {
+          roundId: "forecast-top3",
+          top1Hit: 0,
+          top3Hit: 1,
+          currentCellHit: 0,
+        },
+      ],
+    );
+
+    const state = database.getPrecloseForecastState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    assert.equal(state.latest.roundId, "forecast-pending");
+    assert.equal(state.latest.settlement, null);
+    assert.deepEqual(state.metrics, {
+      forecastCount: 5,
+      settledCount: 4,
+      pendingCount: 1,
+      top1Hits: 2,
+      top3Hits: 3,
+      currentCellHits: 1,
+      top1Rate: 1 / 2,
+      top3Rate: 3 / 4,
+      currentCellRate: 1 / 4,
+    });
   } finally {
     database.close();
   }
@@ -147,7 +436,7 @@ test("version 5 history is backfilled into continuity epochs before migration co
 
   const database = createDatabase({ path });
   try {
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 9);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 10);
     assert.deepEqual(
       database.sqlite
         .prepare("SELECT continuity_epoch FROM round_results ORDER BY settled_at, id")
@@ -207,7 +496,7 @@ test("version 9 reconciles a proven contiguous shutdown boundary without deletin
 
     database = createDatabase({ path, gapThresholdSeconds: 135 });
     const state = database.getDashboardState();
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 9);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 10);
     assert.equal(state.totals.results, 5, "raw results are never recreated or deleted");
     assert.equal(state.totals.cycles, 1);
     assert.equal(state.totals.invalidCycles, 0);
@@ -1632,7 +1921,7 @@ test("v7 paper history initializes v8 bankroll with all known net results exactl
       "buleto",
       "PRIMECOIN(XPM)/RUB",
     );
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 9);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 10);
     assert.equal(state.testBank.initialBalance, 87_700);
     assert.equal(state.testBank.currentBalance, 87_910);
     assert.equal(state.testBank.netResult, 210);

@@ -7,8 +7,8 @@
     <meta name="color-scheme" content="dark">
     <meta name="description" content="Онлайн-монитор результатов рулетки и циклов исключения чисел от 0 до 36">
     <title>Круг 37 — монитор результатов</title>
-    <link rel="stylesheet" href="/styles.css?v=11">
-    <script type="module" src="/app.js?v=12"></script>
+    <link rel="stylesheet" href="/styles.css?v=12">
+    <script type="module" src="/app.js?v=13"></script>
   </head>
   <body>
     <a class="skip-link" href="#main-content">Перейти к содержимому</a>
@@ -121,6 +121,35 @@
             </div>
           </div>
         </article>
+      </section>
+
+      <section class="panel preclose-panel" id="preclose-panel" data-state="waiting" aria-labelledby="preclose-title" aria-describedby="preclose-note">
+        <div class="panel__topline preclose-panel__header">
+          <div>
+            <p class="eyebrow">До красной линии · только наблюдение</p>
+            <h2 id="preclose-title">Экспериментальный прогноз</h2>
+          </div>
+          <span class="preclose-badge" id="preclose-badge">Ждём раунд</span>
+        </div>
+
+        <div class="preclose-layout">
+          <div class="preclose-signal">
+            <p class="preclose-status" id="preclose-status">Собираем цену до блокировки ставок.</p>
+            <ol class="preclose-ranking" id="preclose-ranking" aria-label="Три числа экспериментального прогноза" aria-busy="true">
+              <li class="empty-state">Прогноз появится только до красной линии.</li>
+            </ol>
+            <p class="preclose-timing" id="preclose-timing">Фиксация выполняется примерно за 8–10 секунд до bcd.</p>
+          </div>
+
+          <dl class="preclose-facts">
+            <div><dt>Живая цена</dt><dd id="preclose-live-price">—</dd></div>
+            <div><dt>Расчётная цена</dt><dd id="preclose-projected-price">—</dd></div>
+            <div><dt>Проверено раундов</dt><dd id="preclose-sample-count">0</dd></div>
+            <div><dt>Попадание top‑3</dt><dd id="preclose-top3-rate">—</dd></div>
+          </dl>
+        </div>
+
+        <p class="preclose-note" id="preclose-note">Прогноз сохраняется до <code>bcd</code> и после блокировки не меняется. Случайная база для top‑3 — 3 из 37 (≈8,1%); выводы делаем только после 100 проверок. Метрика считает только успешно зафиксированные снимки, пропущенные окна в неё не входят. Это эксперимент, не рекомендация для ставки и не обещание выигрыша.</p>
       </section>
 
       <section class="panel follower-panel" id="follower-panel" data-state="loading" aria-labelledby="follower-title" aria-describedby="follower-description follower-note">

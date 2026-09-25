@@ -23,6 +23,15 @@ import { buildFollowerStats } from "./pair-followers.js?v=1";
     lastTime: document.getElementById("last-time"),
     lastPrice: document.getElementById("last-price"),
     lastRound: document.getElementById("last-round"),
+    preclosePanel: document.getElementById("preclose-panel"),
+    precloseBadge: document.getElementById("preclose-badge"),
+    precloseStatus: document.getElementById("preclose-status"),
+    precloseRanking: document.getElementById("preclose-ranking"),
+    precloseTiming: document.getElementById("preclose-timing"),
+    precloseLivePrice: document.getElementById("preclose-live-price"),
+    precloseProjectedPrice: document.getElementById("preclose-projected-price"),
+    precloseSampleCount: document.getElementById("preclose-sample-count"),
+    precloseTop3Rate: document.getElementById("preclose-top3-rate"),
     followerPanel: document.getElementById("follower-panel"),
     followerTitle: document.getElementById("follower-title"),
     followerSource: document.getElementById("follower-source"),
@@ -1140,6 +1149,7 @@ import { buildFollowerStats } from "./pair-followers.js?v=1";
     renderCollector(store.state?.collector);
     renderGapWarning(store.state);
     renderLatestResult(latestResult);
+    renderPrecloseForecast();
     renderFollowers(latestResult);
     renderOverdueNumbers();
     renderActiveCycle(store.state?.activeCycle || null);
@@ -1149,6 +1159,136 @@ import { buildFollowerStats } from "./pair-followers.js?v=1";
     renderVirtualBettor(store.state?.virtualBettor || null);
     updateLastSync();
     store.hasCompletedInitialRender = true;
+  }
+
+  function renderPrecloseForecast() {
+    const forecastState = store.state?.precloseForecast || null;
+    const latest = forecastState?.latest || null;
+    const metrics = forecastState?.metrics || {};
+    const currentRound = store.state?.collector?.currentRound || null;
+    const currentRoundId = currentRound?.id == null ? null : String(currentRound.id);
+    const latestRoundId = latest?.roundId == null ? null : String(latest.roundId);
+    const closesAt = currentRound?.bettingClosesAt || currentRound?.closesAt || null;
+    const closesMs = parseDate(closesAt)?.getTime() ?? null;
+    const nowMs = currentTimeMs();
+    const secondsUntilClose = closesMs === null
+      ? null
+      : Math.max(0, Math.ceil((closesMs - nowMs) / 1_000));
+    const matchesCurrent = latest !== null
+      && currentRoundId !== null
+      && latestRoundId === currentRoundId;
+    const settledCount = asNonNegativeInteger(metrics.settledCount, 0);
+    const forecastCount = asNonNegativeInteger(metrics.forecastCount, settledCount);
+    const pendingCount = asNonNegativeInteger(metrics.pendingCount, Math.max(0, forecastCount - settledCount));
+    const top3Hits = asNonNegativeInteger(metrics.top3Hits, 0);
+    const top3Rate = Number(metrics.top3Rate);
+
+    elements.precloseSampleCount.textContent = settledCount < 100
+      ? `${settledCount} из 100`
+      : `${settledCount} проверено`;
+    elements.precloseSampleCount.title = `Зафиксировано: ${forecastCount}; ожидают результата: ${pendingCount}`;
+    elements.precloseTop3Rate.textContent = settledCount >= 100 && Number.isFinite(top3Rate)
+      ? `${top3Hits} из ${settledCount} · ${(top3Rate * 100).toFixed(1).replace(".", ",")}%`
+      : `${top3Hits} из ${settledCount} · мало данных`;
+
+    if (!matchesCurrent) {
+      elements.precloseRanking.setAttribute("aria-busy", "true");
+      elements.precloseRanking.replaceChildren(
+        createElement("li", "empty-state", "Прогноз этого раунда ещё не зафиксирован."),
+      );
+      elements.precloseLivePrice.textContent = "—";
+      elements.precloseProjectedPrice.textContent = "—";
+
+      if (closesMs === null || currentRoundId === null) {
+        elements.preclosePanel.dataset.state = "waiting";
+        elements.precloseBadge.textContent = "Ждём раунд";
+        elements.precloseStatus.textContent = "Собираем живую цену до блокировки ставок.";
+        elements.precloseTiming.textContent = "Фиксация выполняется примерно за 8–10 секунд до bcd.";
+        return;
+      }
+
+      if (nowMs < closesMs - 10_000) {
+        const secondsToCapture = Math.max(1, Math.ceil((closesMs - 10_000 - nowMs) / 1_000));
+        elements.preclosePanel.dataset.state = "waiting";
+        elements.precloseBadge.textContent = `Открыто · ${secondsUntilClose}с`;
+        elements.precloseStatus.textContent = `Раунд ${compactId(currentRoundId)}: цена поступает, прогноз ещё не зафиксирован.`;
+        elements.precloseTiming.textContent = `До окна фиксации примерно ${secondsToCapture} сек.`;
+      } else if (nowMs < closesMs) {
+        elements.preclosePanel.dataset.state = "capturing";
+        elements.precloseBadge.textContent = `Открыто · ${secondsUntilClose}с`;
+        elements.precloseStatus.textContent = "Фиксируем последний допустимый ценовой снимок…";
+        elements.precloseTiming.textContent = "Будут использованы только данные, полученные до bcd.";
+      } else {
+        elements.preclosePanel.dataset.state = "locked";
+        elements.precloseBadge.textContent = "Ставки закрыты";
+        elements.precloseStatus.textContent = "Красная линия пройдена. Для этого раунда новый прогноз уже не создаётся.";
+        elements.precloseTiming.textContent = "Пропущенный снимок задним числом не восстанавливается.";
+      }
+      return;
+    }
+
+    const rankedNumbers = Array.isArray(latest.rankedNumbers)
+      ? latest.rankedNumbers.map(asRouletteNumber).filter((number) => number !== null)
+      : [];
+    const ranking = rankedNumbers.map((number, index) => {
+      const item = createElement("li", "preclose-pick");
+      item.setAttribute(
+        "aria-label",
+        `${index + 1} место: число ${number}, ${rouletteColorLabel(number)}`,
+      );
+      item.append(
+        createElement("span", "preclose-pick__rank", `#${index + 1}`),
+      );
+      const ball = createElement(
+        "span",
+        `preclose-pick__number ${rouletteColorClass(number)}`,
+        number,
+      );
+      ball.setAttribute("aria-hidden", "true");
+      item.append(ball);
+      if (latest.settlement) {
+        const actual = asRouletteNumber(latest.settlement.actualNumber);
+        const marker = createElement(
+          "span",
+          `preclose-pick__result${actual === number ? " is-hit" : ""}`,
+          actual === number ? "попало" : "",
+        );
+        item.append(marker);
+      }
+      return item;
+    });
+    elements.precloseRanking.replaceChildren(
+      ...(ranking.length
+        ? ranking
+        : [createElement("li", "empty-state", "Зафиксированный прогноз повреждён.")]),
+    );
+    elements.precloseRanking.setAttribute("aria-busy", "false");
+    elements.precloseLivePrice.textContent = Number.isFinite(Number(latest.currentPrice))
+      ? Number(latest.currentPrice).toFixed(5)
+      : "—";
+    elements.precloseProjectedPrice.textContent = Number.isFinite(Number(latest.projectedPrice))
+      ? Number(latest.projectedPrice).toFixed(5)
+      : "—";
+    const availableLead = Number(latest.availableLeadSeconds);
+    const availableLeadText = Number.isFinite(availableLead)
+      ? `${availableLead.toFixed(1).replace(".", ",")} сек.`
+      : "неизвестно";
+    elements.precloseTiming.textContent = `Цена получена ${formatDateTime(latest.lockedAt)}, запись сохранена ${formatDateTime(latest.persistedAt)} · за ${availableLeadText} до bcd.`;
+
+    if (latest.settlement) {
+      const actual = asRouletteNumber(latest.settlement.actualNumber);
+      elements.preclosePanel.dataset.state = latest.settlement.top3Hit ? "hit" : "miss";
+      elements.precloseBadge.textContent = latest.settlement.top3Hit ? "Top‑3 попал" : "Top‑3 не попал";
+      elements.precloseStatus.textContent = `Раунд ${compactId(latestRoundId)} проверен: выпало ${actual ?? "—"}. Прогноз был неизменно сохранён до блокировки.`;
+    } else if (closesMs !== null && nowMs < closesMs) {
+      elements.preclosePanel.dataset.state = "open";
+      elements.precloseBadge.textContent = `Открыто · ${secondsUntilClose}с`;
+      elements.precloseStatus.textContent = `Раунд ${compactId(latestRoundId)}: прогноз уже зафиксирован, ставки пока открыты.`;
+    } else {
+      elements.preclosePanel.dataset.state = "locked";
+      elements.precloseBadge.textContent = "Ставки закрыты";
+      elements.precloseStatus.textContent = `Раунд ${compactId(latestRoundId)}: прогноз сохранён, но красная линия уже пройдена. Ждём результат.`;
+    }
   }
 
   function renderCollector(collector) {
@@ -1942,6 +2082,9 @@ import { buildFollowerStats } from "./pair-followers.js?v=1";
   connectEventStream();
   refreshAll();
   window.setInterval(() => refreshAll(), REFRESH_INTERVAL_MS);
+  window.setInterval(() => {
+    if (store.stateLoaded) renderPrecloseForecast();
+  }, 1_000);
   window.setInterval(() => {
     updateLastSync();
     updateNumberAges();

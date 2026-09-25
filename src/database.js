@@ -241,6 +241,49 @@ function mapIncident(row) {
   };
 }
 
+function mapPrecloseForecast(row) {
+  if (!row) return null;
+  const rankedNumbers = deserializeJson(row.ranked_numbers_json);
+  return {
+    id: Number(row.forecast_id ?? row.id),
+    snapshotId: Number(row.snapshot_id),
+    source: row.source,
+    instrument: row.instrument,
+    roundId: row.external_round_id,
+    horizonSeconds: Number(row.horizon_seconds),
+    bettingClosesAt: row.betting_closes_at,
+    roundEndsAt: row.round_ends_at,
+    factorAt: row.factor_at,
+    lockedAt: row.locked_at,
+    leadSeconds: Number(row.lead_time_ms) / 1_000,
+    persistedAt: row.persisted_at,
+    availableLeadSeconds: Number(row.persisted_lead_time_ms) / 1_000,
+    currentPrice: Number(row.current_price),
+    startPrice: Number(row.start_price),
+    currentNumber: Number(row.current_number),
+    projectedPrice: Number(row.predicted_price),
+    predictedNumber: Number(row.predicted_number),
+    rankedNumbers: Array.isArray(rankedNumbers)
+      ? rankedNumbers.map(Number)
+      : [],
+    modelVersion: row.model_version,
+    features: deserializeJson(row.features_json),
+    settlement:
+      row.actual_number === null || row.actual_number === undefined
+        ? null
+        : {
+            resultId: Number(row.round_result_id),
+            actualNumber: Number(row.actual_number),
+            settledAt: row.settled_at,
+            top1Hit: Boolean(row.top1_hit),
+            top3Hit: Boolean(row.top3_hit),
+            currentCellHit: Boolean(row.current_cell_hit),
+            createdAt: row.settlement_created_at,
+          },
+    createdAt: row.forecast_created_at ?? row.created_at,
+  };
+}
+
 function mapVirtualBetSession(row) {
   if (!row) return null;
   const nextStake = row.next_stake == null ? null : Number(row.next_stake);
@@ -319,12 +362,17 @@ export class RouletteDatabase {
     logger = null,
     gapThresholdSeconds = 135,
     virtualStartingBalance = DEFAULT_VIRTUAL_STARTING_BALANCE,
+    clock = () => new Date(),
   } = {}) {
     if (typeof path !== "string" || path.trim() === "") {
       throw new TypeError("path must be a non-empty string");
     }
+    if (typeof clock !== "function") {
+      throw new TypeError("clock must be a function");
+    }
 
     this.logger = logger;
+    this.clock = clock;
     this.gapThresholdMs = normalizedGapSeconds(gapThresholdSeconds) * 1_000;
     this.virtualStartingBalance = normalizedVirtualStartingBalance(
       virtualStartingBalance,
@@ -666,6 +714,68 @@ export class RouletteDatabase {
     }
 
     this.#migrateContinuityReconciliationV9();
+    this.#migratePrecloseForecastsV10();
+  }
+
+  #migratePrecloseForecastsV10() {
+    this.sqlite.exec(`
+      BEGIN IMMEDIATE;
+
+      CREATE TABLE IF NOT EXISTS forecast_snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source TEXT NOT NULL,
+        instrument TEXT NOT NULL,
+        external_round_id TEXT NOT NULL,
+        horizon_seconds INTEGER NOT NULL CHECK (horizon_seconds BETWEEN 5 AND 60),
+        betting_closes_at TEXT NOT NULL,
+        round_ends_at TEXT NOT NULL,
+        factor_at TEXT NOT NULL,
+        locked_at TEXT NOT NULL,
+        lead_time_ms INTEGER NOT NULL CHECK (lead_time_ms >= 5000),
+        persisted_at TEXT NOT NULL,
+        persisted_lead_time_ms INTEGER NOT NULL CHECK (persisted_lead_time_ms >= 5000),
+        current_price REAL NOT NULL,
+        start_price REAL NOT NULL,
+        current_number INTEGER NOT NULL CHECK (current_number BETWEEN 0 AND 36),
+        cells_json TEXT NOT NULL,
+        features_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(source, instrument, external_round_id, horizon_seconds),
+        CHECK (factor_at <= locked_at),
+        CHECK (locked_at <= persisted_at),
+        CHECK (persisted_at < betting_closes_at)
+      );
+
+      CREATE INDEX IF NOT EXISTS forecast_snapshots_stream_time_idx
+        ON forecast_snapshots(source, instrument, locked_at DESC, id DESC);
+
+      CREATE TABLE IF NOT EXISTS round_forecasts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        snapshot_id INTEGER NOT NULL UNIQUE REFERENCES forecast_snapshots(id),
+        model_version TEXT NOT NULL,
+        predicted_price REAL NOT NULL,
+        predicted_number INTEGER NOT NULL CHECK (predicted_number BETWEEN 0 AND 36),
+        ranked_numbers_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS round_forecasts_model_idx
+        ON round_forecasts(model_version, id DESC);
+
+      CREATE TABLE IF NOT EXISTS forecast_settlements (
+        forecast_id INTEGER PRIMARY KEY REFERENCES round_forecasts(id),
+        round_result_id INTEGER NOT NULL UNIQUE REFERENCES round_results(id),
+        actual_number INTEGER NOT NULL CHECK (actual_number BETWEEN 0 AND 36),
+        settled_at TEXT NOT NULL,
+        top1_hit INTEGER NOT NULL CHECK (top1_hit IN (0, 1)),
+        top3_hit INTEGER NOT NULL CHECK (top3_hit IN (0, 1)),
+        current_cell_hit INTEGER NOT NULL CHECK (current_cell_hit IN (0, 1)),
+        created_at TEXT NOT NULL
+      );
+
+      PRAGMA user_version = 10;
+      COMMIT;
+    `);
   }
 
   #migrateContinuityReconciliationV9() {
@@ -2903,6 +3013,418 @@ export class RouletteDatabase {
         firstOccurredAt: row.first_occurred_at,
         lastOccurredAt: row.last_occurred_at,
       }));
+  }
+
+  recordPrecloseForecast(attempt) {
+    this.#assertOpen();
+    if (!attempt || typeof attempt !== "object" || Array.isArray(attempt)) {
+      throw new TypeError("forecast attempt must be an object");
+    }
+
+    const source = asNonEmptyText(attempt.source, "buleto", "source");
+    const instrument = asNonEmptyText(
+      attempt.instrument,
+      "default",
+      "instrument",
+    );
+    const externalRoundId = asNonEmptyText(
+      String(attempt.externalRoundId ?? ""),
+      undefined,
+      "externalRoundId",
+    );
+    const horizonSeconds = Number(attempt.horizonSeconds);
+    if (!Number.isInteger(horizonSeconds) || horizonSeconds < 5 || horizonSeconds > 60) {
+      throw new RangeError("horizonSeconds must be an integer between 5 and 60");
+    }
+
+    const bettingClosesAt = asTimestamp(
+      attempt.bettingClosesAt,
+      undefined,
+      "bettingClosesAt",
+    );
+    const roundEndsAt = asTimestamp(attempt.roundEndsAt, undefined, "roundEndsAt");
+    const factorAt = asTimestamp(attempt.factorAt, undefined, "factorAt");
+    const lockedAt = asTimestamp(attempt.lockedAt, undefined, "lockedAt");
+    const closesMs = Date.parse(bettingClosesAt);
+    const lockedMs = Date.parse(lockedAt);
+    const factorMs = Date.parse(factorAt);
+    const roundEndsMs = Date.parse(roundEndsAt);
+    const leadTimeMs = closesMs - lockedMs;
+    if (
+      leadTimeMs < 5_000 ||
+      leadTimeMs < horizonSeconds * 1_000 ||
+      leadTimeMs > (horizonSeconds + 2.5) * 1_000
+    ) {
+      throw new RangeError("forecast must be locked inside its pre-bcd horizon window");
+    }
+    if (factorMs > lockedMs || lockedMs - factorMs > 5_000) {
+      throw new RangeError("forecast factor must be fresh and observed before lock");
+    }
+    if (roundEndsMs <= lockedMs) {
+      throw new RangeError("roundEndsAt must be after lockedAt");
+    }
+
+    const currentPrice = asPrice(attempt.currentPrice);
+    const startPrice = asPrice(attempt.startPrice);
+    const predictedPrice = asPrice(attempt.predictedPrice);
+    if (currentPrice === null || startPrice === null || predictedPrice === null) {
+      throw new TypeError("forecast prices must be finite numbers");
+    }
+    const currentNumber = canonicalRouletteNumber(attempt.currentNumber);
+    const predictedNumber = canonicalRouletteNumber(attempt.predictedNumber);
+    if (!Array.isArray(attempt.rankedNumbers) || attempt.rankedNumbers.length !== 3) {
+      throw new TypeError("rankedNumbers must contain exactly three numbers");
+    }
+    const rankedNumbers = attempt.rankedNumbers.map(canonicalRouletteNumber);
+    if (new Set(rankedNumbers).size !== rankedNumbers.length) {
+      throw new TypeError("rankedNumbers must be unique");
+    }
+    if (rankedNumbers[0] !== predictedNumber) {
+      throw new TypeError("predictedNumber must be the first ranked number");
+    }
+
+    if (!Array.isArray(attempt.cells) || attempt.cells.length !== 38) {
+      throw new TypeError("cells must contain all 38 wire price ranges");
+    }
+    const seenCells = new Set();
+    const cells = attempt.cells.map((cell, index) => {
+      const code = Number(cell?.c);
+      const upper = Number(cell?.vt);
+      const lower = Number(cell?.vf);
+      if (
+        !Number.isInteger(code) ||
+        code < 0 ||
+        code > 37 ||
+        !Number.isFinite(upper) ||
+        !Number.isFinite(lower) ||
+        upper < lower ||
+        seenCells.has(code)
+      ) {
+        throw new TypeError(`cells[${index}] is invalid`);
+      }
+      seenCells.add(code);
+      return { c: code, vt: upper, vf: lower };
+    });
+
+    const inputFeatures = attempt.features;
+    if (!inputFeatures || typeof inputFeatures !== "object" || Array.isArray(inputFeatures)) {
+      throw new TypeError("features must be an object");
+    }
+    if (!Array.isArray(inputFeatures.samples) || inputFeatures.samples.length < 3) {
+      throw new TypeError("features.samples must contain at least three prices");
+    }
+    const samples = inputFeatures.samples.map((sample, index) => {
+      const at = asTimestamp(sample?.dt, undefined, `features.samples[${index}].dt`);
+      const price = asPrice(sample?.v);
+      if (price === null || Date.parse(at) > factorMs) {
+        throw new RangeError(`features.samples[${index}] is after the locked factor`);
+      }
+      return { dt: at, v: price };
+    });
+    const slopePerSecond = Number(inputFeatures.slopePerSecond);
+    const windowSeconds = Number(inputFeatures.windowSeconds);
+    const secondsToEnd = Number(inputFeatures.secondsToEnd);
+    if (
+      !Number.isFinite(slopePerSecond) ||
+      !Number.isFinite(windowSeconds) ||
+      windowSeconds <= 0 ||
+      !Number.isFinite(secondsToEnd) ||
+      secondsToEnd <= 0
+    ) {
+      throw new TypeError("forecast feature summary is invalid");
+    }
+    const features = {
+      samples,
+      sampleCount: samples.length,
+      windowSeconds,
+      slopePerSecond,
+      secondsToEnd,
+    };
+    const modelVersion = asNonEmptyText(
+      attempt.modelVersion,
+      undefined,
+      "modelVersion",
+    );
+
+    return this.#transaction(() => {
+      const persistedAt = asTimestamp(this.clock(), undefined, "forecast persistedAt");
+      const persistedAtMs = Date.parse(persistedAt);
+      const persistedLeadTimeMs = closesMs - persistedAtMs;
+      if (persistedAtMs < lockedMs || persistedLeadTimeMs < 5_000) {
+        throw new RangeError(
+          "forecast must be durably stored at least five seconds before betting closes",
+        );
+      }
+      const insertion = this.sqlite
+        .prepare(`
+          INSERT INTO forecast_snapshots (
+            source, instrument, external_round_id, horizon_seconds,
+            betting_closes_at, round_ends_at, factor_at, locked_at,
+            lead_time_ms, persisted_at, persisted_lead_time_ms,
+            current_price, start_price, current_number,
+            cells_json, features_json, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(source, instrument, external_round_id, horizon_seconds)
+          DO NOTHING
+        `)
+        .run(
+          source,
+          instrument,
+          externalRoundId,
+          horizonSeconds,
+          bettingClosesAt,
+          roundEndsAt,
+          factorAt,
+          lockedAt,
+          leadTimeMs,
+          persistedAt,
+          persistedLeadTimeMs,
+          currentPrice,
+          startPrice,
+          currentNumber,
+          JSON.stringify(cells),
+          JSON.stringify(features),
+          persistedAt,
+        );
+
+      if (Number(insertion.changes) === 0) {
+        return { inserted: false, roundId: externalRoundId };
+      }
+
+      const snapshotId = Number(insertion.lastInsertRowid);
+      this.sqlite
+        .prepare(`
+          INSERT INTO round_forecasts (
+            snapshot_id, model_version, predicted_price, predicted_number,
+            ranked_numbers_json, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?)
+        `)
+        .run(
+          snapshotId,
+          modelVersion,
+          predictedPrice,
+          predictedNumber,
+          JSON.stringify(rankedNumbers),
+          persistedAt,
+        );
+      return { inserted: true, roundId: externalRoundId };
+    });
+  }
+
+  settlePrecloseForecasts(source = "buleto", instrument = "default") {
+    this.#assertOpen();
+    const safeSource = asNonEmptyText(source, undefined, "source");
+    const safeInstrument = asNonEmptyText(instrument, undefined, "instrument");
+    const now = new Date().toISOString();
+    return this.#transaction(() => {
+      const rows = this.sqlite
+        .prepare(`
+          SELECT
+            forecasts.id AS forecast_id,
+            snapshots.source,
+            snapshots.instrument,
+            snapshots.external_round_id,
+            snapshots.round_ends_at,
+            snapshots.current_number,
+            forecasts.ranked_numbers_json
+          FROM round_forecasts AS forecasts
+          JOIN forecast_snapshots AS snapshots ON snapshots.id = forecasts.snapshot_id
+          LEFT JOIN forecast_settlements AS settlements
+            ON settlements.forecast_id = forecasts.id
+          WHERE snapshots.source = ?
+            AND snapshots.instrument = ?
+            AND settlements.forecast_id IS NULL
+          ORDER BY forecasts.id
+        `)
+        .all(safeSource, safeInstrument);
+      const exactResult = this.sqlite.prepare(`
+        SELECT id, result_number, settled_at
+        FROM round_results
+        WHERE source = ? AND instrument = ? AND external_round_id = ?
+        LIMIT 1
+      `);
+      const anonymousResultsNearEnd = this.sqlite.prepare(`
+        SELECT id, result_number, settled_at
+        FROM round_results
+        WHERE source = ?
+          AND instrument = ?
+          AND external_round_id IS NULL
+          AND settled_at >= ?
+          AND settled_at <= ?
+          AND NOT EXISTS (
+            SELECT 1
+            FROM forecast_settlements
+            WHERE forecast_settlements.round_result_id = round_results.id
+          )
+        ORDER BY settled_at, id
+        LIMIT 2
+      `);
+      const unsettledForecastsAtEnd = this.sqlite.prepare(`
+        SELECT COUNT(*) AS count
+        FROM round_forecasts AS forecasts
+        JOIN forecast_snapshots AS snapshots ON snapshots.id = forecasts.snapshot_id
+        LEFT JOIN forecast_settlements AS settlements
+          ON settlements.forecast_id = forecasts.id
+        WHERE snapshots.source = ?
+          AND snapshots.instrument = ?
+          AND snapshots.round_ends_at = ?
+          AND settlements.forecast_id IS NULL
+      `);
+      const insert = this.sqlite.prepare(`
+        INSERT INTO forecast_settlements (
+          forecast_id, round_result_id, actual_number, settled_at,
+          top1_hit, top3_hit, current_cell_hit, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(forecast_id) DO NOTHING
+      `);
+      let inserted = 0;
+      for (const row of rows) {
+        let result = exactResult.get(
+          row.source,
+          row.instrument,
+          row.external_round_id,
+        );
+        if (!result) {
+          const expectedEndMs = Date.parse(row.round_ends_at);
+          const candidates = Number.isFinite(expectedEndMs)
+            ? anonymousResultsNearEnd.all(
+                row.source,
+                row.instrument,
+                new Date(expectedEndMs - 3_000).toISOString(),
+                new Date(expectedEndMs + 1_000).toISOString(),
+              )
+            : [];
+          const unsettledCount = Number(
+            unsettledForecastsAtEnd.get(
+              row.source,
+              row.instrument,
+              row.round_ends_at,
+            ).count,
+          );
+          if (candidates.length === 1 && unsettledCount === 1) result = candidates[0];
+        }
+        if (!result) continue;
+        const ranked = deserializeJson(row.ranked_numbers_json);
+        if (!Array.isArray(ranked) || ranked.length !== 3) {
+          throw new Error("stored forecast ranking is invalid");
+        }
+        const actualNumber = Number(result.result_number);
+        inserted += Number(
+          insert.run(
+            Number(row.forecast_id),
+            Number(result.id),
+            actualNumber,
+            result.settled_at,
+            Number(ranked[0]) === actualNumber ? 1 : 0,
+            ranked.map(Number).includes(actualNumber) ? 1 : 0,
+            Number(row.current_number) === actualNumber ? 1 : 0,
+            now,
+          ).changes,
+        );
+      }
+      return { settled: inserted };
+    });
+  }
+
+  getPrecloseForecastState(source = "buleto", instrument = "default") {
+    this.#assertOpen();
+    const safeSource = asNonEmptyText(source, undefined, "source");
+    const safeInstrument = asNonEmptyText(instrument, undefined, "instrument");
+    const latestRow = this.sqlite
+      .prepare(`
+        SELECT
+          forecasts.id AS forecast_id,
+          forecasts.snapshot_id,
+          forecasts.model_version,
+          forecasts.predicted_price,
+          forecasts.predicted_number,
+          forecasts.ranked_numbers_json,
+          forecasts.created_at AS forecast_created_at,
+          snapshots.source,
+          snapshots.instrument,
+          snapshots.external_round_id,
+          snapshots.horizon_seconds,
+          snapshots.betting_closes_at,
+          snapshots.round_ends_at,
+          snapshots.factor_at,
+          snapshots.locked_at,
+          snapshots.lead_time_ms,
+          snapshots.persisted_at,
+          snapshots.persisted_lead_time_ms,
+          snapshots.current_price,
+          snapshots.start_price,
+          snapshots.current_number,
+          snapshots.features_json,
+          settlements.round_result_id,
+          settlements.actual_number,
+          settlements.settled_at,
+          settlements.top1_hit,
+          settlements.top3_hit,
+          settlements.current_cell_hit,
+          settlements.created_at AS settlement_created_at
+        FROM round_forecasts AS forecasts
+        JOIN forecast_snapshots AS snapshots ON snapshots.id = forecasts.snapshot_id
+        LEFT JOIN forecast_settlements AS settlements
+          ON settlements.forecast_id = forecasts.id
+        WHERE snapshots.source = ? AND snapshots.instrument = ?
+        ORDER BY snapshots.locked_at DESC, forecasts.id DESC
+        LIMIT 1
+      `)
+      .get(safeSource, safeInstrument);
+    const latest = mapPrecloseForecast(latestRow);
+    const metrics = latest
+      ? this.sqlite
+          .prepare(`
+            SELECT
+              COUNT(forecasts.id) AS forecast_count,
+              COUNT(settlements.forecast_id) AS settled_count,
+              COALESCE(SUM(settlements.top1_hit), 0) AS top1_hits,
+              COALESCE(SUM(settlements.top3_hit), 0) AS top3_hits,
+              COALESCE(SUM(settlements.current_cell_hit), 0) AS current_cell_hits
+            FROM round_forecasts AS forecasts
+            JOIN forecast_snapshots AS snapshots ON snapshots.id = forecasts.snapshot_id
+            LEFT JOIN forecast_settlements AS settlements
+              ON settlements.forecast_id = forecasts.id
+            WHERE snapshots.source = ?
+              AND snapshots.instrument = ?
+              AND snapshots.horizon_seconds = ?
+              AND forecasts.model_version = ?
+          `)
+          .get(
+            safeSource,
+            safeInstrument,
+            latest.horizonSeconds,
+            latest.modelVersion,
+          )
+      : {
+          forecast_count: 0,
+          settled_count: 0,
+          top1_hits: 0,
+          top3_hits: 0,
+          current_cell_hits: 0,
+        };
+    const forecastCount = Number(metrics.forecast_count);
+    const settledCount = Number(metrics.settled_count);
+    return {
+      mode: "observation",
+      executionEnabled: false,
+      captureLeadSeconds: { min: 8, max: 10 },
+      minimumPersistedLeadSeconds: 5,
+      latest,
+      metrics: {
+        forecastCount,
+        settledCount,
+        pendingCount: Math.max(0, forecastCount - settledCount),
+        top1Hits: Number(metrics.top1_hits),
+        top3Hits: Number(metrics.top3_hits),
+        currentCellHits: Number(metrics.current_cell_hits),
+        top1Rate: settledCount ? Number(metrics.top1_hits) / settledCount : null,
+        top3Rate: settledCount ? Number(metrics.top3_hits) / settledCount : null,
+        currentCellRate: settledCount
+          ? Number(metrics.current_cell_hits) / settledCount
+          : null,
+      },
+    };
   }
 
   enrichKnownResults(events) {

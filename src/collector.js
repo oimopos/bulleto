@@ -1,5 +1,10 @@
 import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
+import {
+  PRECLOSE_FORECAST_MAX_LEAD_MS,
+  PRECLOSE_FORECAST_MIN_LEAD_MS,
+  buildPrecloseForecast,
+} from './preclose-forecast.js';
 
 const DEFAULT_SOURCE = 'buleto';
 const DEFAULT_INSTRUMENT = 'XPM/RUB';
@@ -138,6 +143,9 @@ export class BuletoCollector extends EventEmitter {
     this.missingSnapshotAttempts = 0;
     this.unmatchedSnapshotCount = 0;
     this.snapshotFailureCounted = false;
+    this.forecastRound = null;
+    this.latestFactors = [];
+    this.forecastErrorRoundId = null;
     this.stopped = true;
     this.generation = 0;
     this.retryAttempt = 0;
@@ -163,6 +171,9 @@ export class BuletoCollector extends EventEmitter {
     this.deferredSnapshotResults = new Map();
     this.missingSnapshotAttempts = 0;
     this.unmatchedSnapshotCount = 0;
+    this.forecastRound = null;
+    this.latestFactors = [];
+    this.forecastErrorRoundId = null;
     this.generation += 1;
     this.#connect(this.generation);
     this.watchdogTimer = setInterval(() => this.#watchdog(), 15_000);
@@ -221,6 +232,9 @@ export class BuletoCollector extends EventEmitter {
     this.connectionTimer = null;
     this.initialSnapshotReceived = false;
     this.snapshotFailureCounted = false;
+    this.forecastRound = null;
+    this.latestFactors = [];
+    this.forecastErrorRoundId = null;
 
     this.#setState({
       status: this.retryAttempt === 0 ? 'connecting' : 'reconnecting',
@@ -400,14 +414,32 @@ export class BuletoCollector extends EventEmitter {
       return;
     }
 
+    if (message.type === 'factors') {
+      if (Array.isArray(message.data)) {
+        this.latestFactors = message.data;
+        this.#tryEmitPrecloseForecast(receivedAt);
+      }
+      return;
+    }
+
     if (message.type === 'round' && message.data && typeof message.data === 'object') {
       this.state.currentRound = {
         id: message.data.id ?? null,
         status: message.data.s ?? null,
         startsAt: message.data.sd ?? null,
-        closesAt: message.data.ed ?? null,
+        bettingClosesAt: message.data.bcd ?? null,
+        closesAt: message.data.bcd ?? null,
+        bettingStopsAt: message.data.btd ?? null,
+        endsAt: message.data.ed ?? null,
       };
       this.emit('round', structuredClone(this.state.currentRound));
+
+      if (!('rr' in message.data) && message.data.s === 2) {
+        this.forecastRound = message.data;
+        this.#tryEmitPrecloseForecast(receivedAt);
+      } else {
+        this.forecastRound = null;
+      }
 
       // В финальном сообщении round поле rr содержит тот же результат, что
       // позже попадёт в last-results, но здесь доступен стабильный id раунда.
@@ -430,6 +462,42 @@ export class BuletoCollector extends EventEmitter {
           this.emit('collector-error', error);
         }
       }
+    }
+  }
+
+  #tryEmitPrecloseForecast(receivedAt) {
+    if (!this.forecastRound || this.latestFactors.length === 0) return;
+    const closesAtMs = Date.parse(this.forecastRound.bcd);
+    const receivedAtMs = receivedAt.getTime();
+    const leadTimeMs = closesAtMs - receivedAtMs;
+    if (
+      !Number.isFinite(leadTimeMs) ||
+      leadTimeMs < PRECLOSE_FORECAST_MIN_LEAD_MS ||
+      leadTimeMs > PRECLOSE_FORECAST_MAX_LEAD_MS
+    ) {
+      return;
+    }
+
+    try {
+      const forecast = buildPrecloseForecast({
+        round: this.forecastRound,
+        factors: this.latestFactors,
+        receivedAt,
+      });
+      this.forecastErrorRoundId = null;
+      this.emit('preclose-forecast', {
+        source: this.source,
+        instrument: this.instrument,
+        ...forecast,
+      });
+    } catch (error) {
+      const roundId = String(this.forecastRound.id ?? 'unknown');
+      if (this.forecastErrorRoundId === roundId) return;
+      this.forecastErrorRoundId = roundId;
+      this.emit(
+        'collector-error',
+        new Error(`Не удалось зафиксировать прогноз раунда ${roundId}`, { cause: error }),
+      );
     }
   }
 

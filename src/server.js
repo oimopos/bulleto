@@ -108,6 +108,7 @@ const resultPipeline = new ResultPipeline({
 // The paper bettor only records a simulation in this local database. It has
 // no credentials, browser automation, payment access, or Buleto write calls.
 db.initializeVirtualBettor('buleto', config.instrument);
+db.settlePrecloseForecasts('buleto', config.instrument);
 
 const sseClients = new Set();
 
@@ -213,6 +214,7 @@ function databaseStateForApi() {
     latestResult: resultForApi(state.latestResult),
     numberStats: db.getNumberStats('buleto', config.instrument),
     virtualBettor: db.getVirtualBettorState('buleto', config.instrument),
+    precloseForecast: db.getPrecloseForecastState('buleto', config.instrument),
     stats: {
       totalResults: totals.totalResults ?? totals.results ?? 0,
       completedCycles: totals.completedCycles ?? 0,
@@ -348,6 +350,15 @@ const server = createServer((request, response) => {
       return;
     }
 
+    if (pathname === '/api/forecasts') {
+      sendJson(
+        response,
+        200,
+        db.getPrecloseForecastState('buleto', config.instrument),
+      );
+      return;
+    }
+
     if (pathname === '/api/cycles') {
       const limit = clampLimit(url.searchParams.get('limit'), 10, 100);
       sendJson(response, 200, { items: db.getCompletedCycles(limit).map(cycleForApi) });
@@ -432,6 +443,12 @@ function publishPipelineOutcome(outcome) {
   }
   if (outcome.gaps > 0) broadcastUpdate('gap');
   if (outcome.changed) broadcastUpdate('results');
+  try {
+    const forecastOutcome = db.settlePrecloseForecasts('buleto', config.instrument);
+    if (forecastOutcome.settled > 0) broadcastUpdate('forecast-settled');
+  } catch (error) {
+    console.error('[forecast] settlement failed; it will be retried', error);
+  }
 }
 
 function schedulePipelineRetry(error) {
@@ -477,6 +494,59 @@ collector.on('results', (results) => {
   } catch (error) {
     schedulePipelineRetry(error);
   }
+});
+
+collector.on('preclose-forecast', (forecast) => {
+  try {
+    const features = forecast.features;
+    const outcome = db.recordPrecloseForecast({
+      source: forecast.source,
+      instrument: forecast.instrument,
+      externalRoundId: forecast.round.externalRoundId,
+      horizonSeconds: forecast.horizonSeconds,
+      bettingClosesAt: forecast.round.bettingClosesAt,
+      roundEndsAt: forecast.round.endsAt,
+      factorAt: features.latestFactorAt,
+      lockedAt: forecast.round.lockedAt,
+      currentPrice: features.latestPrice,
+      startPrice: features.startPrice,
+      currentNumber: features.currentNumber,
+      cells: features.cellBands.map((cell) => ({
+        c: cell.wireCell,
+        vt: cell.upper,
+        vf: cell.lower,
+      })),
+      features: {
+        samples: features.factorPoints.map((point) => ({
+          dt: point.at,
+          v: point.price,
+        })),
+        windowSeconds: features.factorWindowMs / 1_000,
+        slopePerSecond: features.trendPerSecond,
+        secondsToEnd: features.projectionSeconds,
+      },
+      modelVersion: forecast.modelVersion,
+      predictedPrice: features.projectedPrice,
+      predictedNumber: forecast.prediction.number,
+      rankedNumbers: forecast.prediction.top3.map((item) => item.number),
+    });
+    if (outcome.inserted) {
+      console.info(
+        `[forecast] locked round ${outcome.roundId} before betting close`,
+      );
+      broadcastUpdate('forecast');
+    }
+  } catch (error) {
+    console.error('[forecast] persistence failed; waiting for the next pre-close tick', error);
+  }
+});
+
+let lastBroadcastRoundId = null;
+collector.on('round', (round) => {
+  const roundId = round?.id == null ? null : String(round.id);
+  if (roundId === null || roundId === lastBroadcastRoundId) return;
+  lastBroadcastRoundId = roundId;
+  broadcastUpdate('round');
 });
 
 collector.on('status', () => broadcastUpdate('collector-status'));

@@ -9,7 +9,7 @@
     "dev": "node --env-file-if-exists=.env --watch src/server.js",
     "backup": "node scripts/backup-database.js",
     "test": "node --test",
-    "check": "node --check src/server.js && node --check src/collector.js && node --check src/database.js && node --check src/domain.js && node --check src/result-pipeline.js && node --check src/virtual-bettor.js && node --check scripts/backup-database.js && node --check public/pair-followers.js && node --check public/app.js"
+    "check": "node --check src/server.js && node --check src/collector.js && node --check src/database.js && node --check src/domain.js && node --check src/result-pipeline.js && node --check src/preclose-forecast.js && node --check src/virtual-bettor.js && node --check scripts/backup-database.js && node --check public/pair-followers.js && node --check public/app.js"
   },
   "engines": {
     "node": ">=22.5.0"
