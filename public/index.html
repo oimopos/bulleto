@@ -7,8 +7,8 @@
     <meta name="color-scheme" content="dark">
     <meta name="description" content="Онлайн-монитор результатов рулетки и циклов исключения чисел от 0 до 36">
     <title>Круг 37 — монитор результатов</title>
-    <link rel="stylesheet" href="/styles.css?v=13">
-    <script type="module" src="/app.js?v=14"></script>
+    <link rel="stylesheet" href="/styles.css?v=14">
+    <script type="module" src="/app.js?v=15"></script>
   </head>
   <body>
     <a class="skip-link" href="#main-content">Перейти к содержимому</a>
@@ -183,6 +183,20 @@
           <p class="preclose-comparison__status" id="preclose-comparison-status" role="status" aria-live="polite" aria-atomic="true">Сравнение появится после фиксации прогноза.</p>
           <p class="preclose-comparison__warning" id="preclose-comparison-warning" hidden></p>
           <p class="preclose-comparison__note" id="preclose-comparison-note">Совпадение списков не является вероятностью и не доказывает более высокий шанс выпадения.</p>
+        </section>
+
+        <section class="preclose-hit-history" id="preclose-hit-history" data-state="loading" aria-labelledby="preclose-hit-history-title" aria-describedby="preclose-hit-history-status" aria-busy="true">
+          <div class="preclose-hit-history__header">
+            <div>
+              <p class="eyebrow">Сохранённые прогнозы · наблюдение</p>
+              <h3 id="preclose-hit-history-title">История попаданий top‑3</h3>
+            </div>
+            <span class="preclose-hit-history__badge" id="preclose-hit-history-count">Загрузка…</span>
+          </div>
+          <ol class="preclose-hit-history__list" id="preclose-hit-history-list" tabindex="0" aria-label="Последние комбинации top-3, в которые попало выпавшее число">
+            <li class="empty-state">Загружаем историю попаданий…</li>
+          </ol>
+          <p class="preclose-hit-history__status" id="preclose-hit-history-status" role="status" aria-live="polite" aria-atomic="true">Загружаем сохранённые экспериментальные прогнозы с подтверждённым результатом; это наблюдение, не реальные ставки.</p>
         </section>
 
         <p class="preclose-note" id="preclose-note">Прогноз сохраняется до <code>bcd</code> и после блокировки не меняется. Случайная база для top‑3 — 3 из 37 (≈8,1%); выводы делаем только после 100 проверок. Метрика считает только успешно зафиксированные снимки, пропущенные окна в неё не входят. Это эксперимент, не рекомендация для ставки и не обещание выигрыша.</p>

@@ -40,6 +40,10 @@ import { buildFollowerStats } from "./pair-followers.js?v=1";
     precloseComparisonSample: document.getElementById("preclose-comparison-sample"),
     precloseComparisonStatus: document.getElementById("preclose-comparison-status"),
     precloseComparisonWarning: document.getElementById("preclose-comparison-warning"),
+    precloseHitHistory: document.getElementById("preclose-hit-history"),
+    precloseHitHistoryCount: document.getElementById("preclose-hit-history-count"),
+    precloseHitHistoryList: document.getElementById("preclose-hit-history-list"),
+    precloseHitHistoryStatus: document.getElementById("preclose-hit-history-status"),
     followerPanel: document.getElementById("follower-panel"),
     followerTitle: document.getElementById("follower-title"),
     followerSource: document.getElementById("follower-source"),
@@ -142,6 +146,10 @@ import { buildFollowerStats } from "./pair-followers.js?v=1";
     pairs: [],
     pairsLoaded: false,
     pairsError: false,
+    forecastHits: [],
+    forecastHitsLoaded: false,
+    forecastHitsError: false,
+    forecastHitsHasMore: false,
     followerSourceNumber: null,
     followerSourceLocked: false,
     followerVisibleCount: FOLLOWER_COLLAPSED_LIMIT,
@@ -1062,7 +1070,8 @@ import { buildFollowerStats } from "./pair-followers.js?v=1";
       fetchJson("/api/results?limit=80"),
       fetchJson("/api/cycles?limit=10"),
       fetchJson("/api/sequences?limit=50"),
-      fetchJson("/api/pairs")
+      fetchJson("/api/pairs"),
+      fetchJson("/api/forecasts/hits?limit=20")
     ]);
 
     let successfulRequests = 0;
@@ -1100,6 +1109,15 @@ import { buildFollowerStats } from "./pair-followers.js?v=1";
       successfulRequests += 1;
     } else {
       store.pairsError = true;
+    }
+    if (requests[5].status === "fulfilled") {
+      store.forecastHits = extractItems(requests[5].value);
+      store.forecastHitsHasMore = requests[5].value?.hasMore === true;
+      store.forecastHitsLoaded = true;
+      store.forecastHitsError = false;
+      successfulRequests += 1;
+    } else {
+      store.forecastHitsError = true;
     }
 
     if (successfulRequests > 0) {
@@ -1149,6 +1167,7 @@ import { buildFollowerStats } from "./pair-followers.js?v=1";
     if (store.hasCompletedInitialRender) {
       renderFollowers(store.state?.latestResult || store.results[0] || null);
     }
+    renderForecastHitHistory();
     renderVirtualBettor(store.state?.virtualBettor || null);
   }
 
@@ -1158,6 +1177,7 @@ import { buildFollowerStats } from "./pair-followers.js?v=1";
     renderGapWarning(store.state);
     renderLatestResult(latestResult);
     renderPrecloseForecast();
+    renderForecastHitHistory();
     renderFollowers(latestResult);
     renderOverdueNumbers();
     renderActiveCycle(store.state?.activeCycle || null);
@@ -1413,6 +1433,192 @@ import { buildFollowerStats } from "./pair-followers.js?v=1";
       snapshotDetails.push(`снимок сохранён ${formatDateTime(pairHistory.capturedAt, { alwaysShowDate: true })}`);
     }
     elements.precloseComparison.title = snapshotDetails.join("; ");
+  }
+
+  function normalizeForecastHit(value) {
+    const rankedNumbers = Array.isArray(value?.rankedNumbers)
+      ? value.rankedNumbers.map(asRouletteNumber)
+      : [];
+    const actualNumber = asRouletteNumber(value?.actualNumber);
+
+    if (
+      rankedNumbers.length !== 3
+      || rankedNumbers.some((number) => number === null)
+      || new Set(rankedNumbers).size !== 3
+      || actualNumber === null
+      || !rankedNumbers.includes(actualNumber)
+    ) {
+      return null;
+    }
+
+    return {
+      roundId: value?.roundId,
+      rankedNumbers,
+      actualNumber,
+      lockedAt: value?.lockedAt,
+      settledAt: value?.settledAt,
+      modelVersion: value?.modelVersion
+    };
+  }
+
+  function forecastHitPick(number, rank, actualNumber) {
+    const isHit = number === actualNumber;
+    const item = createElement("li", `preclose-hit-card__pick${isHit ? " is-hit" : ""}`);
+    const rankLabel = createElement("span", "preclose-hit-card__rank", `#${rank}`);
+    rankLabel.setAttribute("aria-hidden", "true");
+
+    const ball = createElement(
+      "span",
+      `preclose-hit-card__number ${rouletteColorClass(number)}`,
+      number,
+    );
+    ball.setAttribute("aria-hidden", "true");
+
+    item.append(
+      rankLabel,
+      ball,
+      createElement("span", "sr-only", `${rank} место: число ${number}, ${rouletteColorLabel(number)}${isHit ? ", совпало с результатом" : ""}`),
+    );
+    return item;
+  }
+
+  function forecastHitCard(hit) {
+    const card = createElement("li", "preclose-hit-card");
+    const sequence = createElement("div", "preclose-hit-card__sequence");
+    const ranking = createElement("ol", "preclose-hit-card__ranking");
+    ranking.setAttribute("aria-label", "Зафиксированный top-3");
+    hit.rankedNumbers.forEach((number, index) => {
+      ranking.appendChild(forecastHitPick(number, index + 1, hit.actualNumber));
+    });
+
+    const arrow = createElement("span", "preclose-hit-card__arrow", "→");
+    arrow.setAttribute("aria-hidden", "true");
+
+    const outcome = createElement("div", "preclose-hit-card__outcome");
+    const outcomeLabel = createElement("span", "preclose-hit-card__outcome-label", "выпало");
+    const actualBall = createElement(
+      "span",
+      `preclose-hit-card__actual ${rouletteColorClass(hit.actualNumber)}`,
+      hit.actualNumber,
+    );
+    actualBall.setAttribute("aria-hidden", "true");
+    outcome.append(
+      outcomeLabel,
+      actualBall,
+      createElement("span", "sr-only", `Выпало число ${hit.actualNumber}, ${rouletteColorLabel(hit.actualNumber)}; попадание подтверждено`),
+    );
+
+    sequence.append(ranking, arrow, outcome);
+
+    const meta = createElement("p", "preclose-hit-card__meta");
+    const fullRoundId = hit.roundId === null || hit.roundId === undefined || hit.roundId === ""
+      ? ""
+      : String(hit.roundId);
+    const round = createElement("span", "preclose-hit-card__round", `Раунд ${compactId(hit.roundId)}`);
+    if (fullRoundId) round.title = `Раунд ${fullRoundId}`;
+    meta.appendChild(round);
+
+    const eventAt = hit.settledAt || hit.lockedAt;
+    const eventDate = parseDate(eventAt);
+    if (eventDate) {
+      const time = createElement("time", "preclose-hit-card__time", formatDateTime(eventDate, { alwaysShowDate: true }));
+      const fullDate = new Intl.DateTimeFormat("ru-RU", {
+        dateStyle: "long",
+        timeStyle: "medium"
+      }).format(eventDate);
+      time.dateTime = eventDate.toISOString();
+      time.title = fullDate;
+      time.setAttribute("aria-label", `${hit.settledAt ? "Результат зафиксирован" : "Прогноз зафиксирован"}: ${fullDate}`);
+      meta.appendChild(time);
+    }
+
+    const modelVersion = hit.modelVersion === null || hit.modelVersion === undefined
+      ? ""
+      : String(hit.modelVersion).trim();
+    if (modelVersion) {
+      const model = createElement("span", "preclose-hit-card__model", `Модель ${modelVersion}`);
+      model.title = `Версия модели: ${modelVersion}`;
+      meta.appendChild(model);
+    }
+
+    card.append(sequence, meta);
+    return card;
+  }
+
+  function renderForecastHitHistory() {
+    const history = elements.precloseHitHistory;
+    const list = elements.precloseHitHistoryList;
+
+    if (!store.forecastHitsLoaded) {
+      history.dataset.state = store.forecastHitsError ? "error" : "loading";
+      history.setAttribute("aria-busy", store.forecastHitsError ? "false" : "true");
+      elements.precloseHitHistoryCount.textContent = store.forecastHitsError ? "Ошибка" : "Загрузка…";
+      list.replaceChildren(createElement(
+        "li",
+        "empty-state",
+        store.forecastHitsError
+          ? "Не удалось загрузить историю попаданий."
+          : "Загружаем историю попаданий…",
+      ));
+      setTextIfChanged(
+        elements.precloseHitHistoryStatus,
+        store.forecastHitsError
+          ? "Повторим загрузку автоматически."
+          : "Загружаем сохранённые экспериментальные прогнозы с подтверждённым результатом; это наблюдение, не реальные ставки.",
+      );
+      return;
+    }
+
+    const hits = store.forecastHits
+      .map(normalizeForecastHit)
+      .filter((item) => item !== null)
+      .slice(0, 20);
+
+    history.setAttribute("aria-busy", "false");
+    if (!hits.length) {
+      history.dataset.state = store.forecastHitsError ? "error" : "empty";
+      elements.precloseHitHistoryCount.textContent = store.forecastHitsError ? "Ошибка" : "0 попаданий";
+      list.replaceChildren(createElement(
+        "li",
+        "empty-state",
+        store.forecastHitsError
+          ? "Не удалось обновить историю попаданий."
+          : "Подтверждённых попаданий top-3 пока нет.",
+      ));
+      setTextIfChanged(
+        elements.precloseHitHistoryStatus,
+        store.forecastHitsError
+          ? "Повторим загрузку автоматически."
+          : "Первое подтверждённое попадание сохранённого прогноза появится здесь после проверки результата; это наблюдение, не реальные ставки.",
+      );
+      return;
+    }
+
+    const fragment = document.createDocumentFragment();
+    hits.forEach((hit) => fragment.appendChild(forecastHitCard(hit)));
+    list.replaceChildren(fragment);
+
+    const hitLabel = pluralForm(hits.length, "попадание", "попадания", "попаданий");
+    if (store.forecastHitsError) {
+      history.dataset.state = "stale";
+      elements.precloseHitHistoryCount.textContent = `${hits.length} · не обновлено`;
+      setTextIfChanged(
+        elements.precloseHitHistoryStatus,
+        `Показаны последние загруженные ${hits.length} ${hitLabel} сохранённых прогнозов; свежие данные временно недоступны. Это наблюдение, не реальные ставки.`,
+      );
+      return;
+    }
+
+    history.dataset.state = "ready";
+    elements.precloseHitHistoryCount.textContent = store.forecastHitsHasMore
+      ? `${hits.length} последних`
+      : `${hits.length} ${hitLabel}`;
+    setTextIfChanged(
+      elements.precloseHitHistoryStatus,
+      store.forecastHitsHasMore
+        ? `Показаны ${hits.length} последних ${hitLabel} сохранённых прогнозов; более ранние записи остаются в истории. Это наблюдение, не реальные ставки.`
+        : `Показаны все ${hits.length} ${hitLabel} сохранённых прогнозов на данный момент. Это наблюдение, не реальные ставки.`,
+    );
   }
 
   function renderPrecloseForecast() {

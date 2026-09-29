@@ -782,6 +782,111 @@ test("pre-close settlement requires the exact stream and round and reports hit m
   }
 });
 
+test("pre-close hit history preserves ranked combinations and isolates streams", () => {
+  const database = createDatabase({
+    path: ":memory:",
+    clock: () => new Date(BASE_TIME + 52_000),
+  });
+  try {
+    database.recordPrecloseForecast(precloseForecast("history-hit-old"));
+    database.recordPrecloseForecast(precloseForecast("history-miss"));
+    database.recordPrecloseForecast(
+      precloseForecast("history-hit-new", {
+        predictedNumber: 19,
+        rankedNumbers: [19, 7, 11],
+        modelVersion: "preclose-linear-v2",
+      }),
+    );
+    database.recordPrecloseForecast(
+      precloseForecast("history-other-instrument", { instrument: "OTHER" }),
+    );
+    database.recordPrecloseForecast(
+      precloseForecast("history-other-source", { source: "other-source" }),
+    );
+
+    database.ingestBatch([
+      event(11, "history-result-hit-old", 200, {
+        externalRoundId: "history-hit-old",
+      }),
+      event(22, "history-result-miss", 201, {
+        externalRoundId: "history-miss",
+      }),
+      event(7, "history-result-hit-new", 202, {
+        externalRoundId: "history-hit-new",
+      }),
+      event(7, "history-result-other-instrument", 203, {
+        instrument: "OTHER",
+        externalRoundId: "history-other-instrument",
+      }),
+      event(7, "history-result-other-source", 204, {
+        source: "other-source",
+        externalRoundId: "history-other-source",
+      }),
+    ]);
+
+    assert.deepEqual(
+      database.settlePrecloseForecasts("buleto", "PRIMECOIN(XPM)/RUB"),
+      { settled: 3 },
+    );
+    assert.deepEqual(database.settlePrecloseForecasts("buleto", "OTHER"), {
+      settled: 1,
+    });
+    assert.deepEqual(database.settlePrecloseForecasts("other-source", "PRIMECOIN(XPM)/RUB"), {
+      settled: 1,
+    });
+
+    assert.deepEqual(
+      database.getPrecloseForecastHits("buleto", "PRIMECOIN(XPM)/RUB"),
+      [
+        {
+          roundId: "history-hit-new",
+          rankedNumbers: [19, 7, 11],
+          actualNumber: 7,
+          lockedAt: new Date(BASE_TIME + 51_000).toISOString(),
+          settledAt: new Date(BASE_TIME + 202_000).toISOString(),
+          modelVersion: "preclose-linear-v2",
+        },
+        {
+          roundId: "history-hit-old",
+          rankedNumbers: [7, 11, 19],
+          actualNumber: 11,
+          lockedAt: new Date(BASE_TIME + 51_000).toISOString(),
+          settledAt: new Date(BASE_TIME + 200_000).toISOString(),
+          modelVersion: "preclose-linear-v1",
+        },
+      ],
+    );
+    assert.deepEqual(
+      database.getPrecloseForecastHits("buleto", "PRIMECOIN(XPM)/RUB", 1),
+      [
+        {
+          roundId: "history-hit-new",
+          rankedNumbers: [19, 7, 11],
+          actualNumber: 7,
+          lockedAt: new Date(BASE_TIME + 51_000).toISOString(),
+          settledAt: new Date(BASE_TIME + 202_000).toISOString(),
+          modelVersion: "preclose-linear-v2",
+        },
+      ],
+    );
+    assert.equal(database.getPrecloseForecastHits("buleto", "OTHER").length, 1);
+    assert.equal(
+      database.getPrecloseForecastHits("other-source", "PRIMECOIN(XPM)/RUB").length,
+      1,
+    );
+    assert.throws(
+      () => database.getPrecloseForecastHits("buleto", "PRIMECOIN(XPM)/RUB", 0),
+      /limit must be an integer between 1 and 500/,
+    );
+    assert.throws(
+      () => database.getPrecloseForecastHits("buleto", "PRIMECOIN(XPM)/RUB", 501),
+      /limit must be an integer between 1 and 500/,
+    );
+  } finally {
+    database.close();
+  }
+});
+
 test("version 5 history is backfilled into continuity epochs before migration completes", () => {
   const directory = mkdtempSync(join(tmpdir(), "roulette-v5-"));
   const path = join(directory, "legacy.sqlite");

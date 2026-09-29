@@ -359,6 +359,16 @@ const server = createServer((request, response) => {
       return;
     }
 
+    if (pathname === '/api/forecasts/hits') {
+      const limit = clampLimit(url.searchParams.get('limit'), 20, 100);
+      const matches = db.getPrecloseForecastHits('buleto', config.instrument, limit + 1);
+      sendJson(response, 200, {
+        items: matches.slice(0, limit),
+        hasMore: matches.length > limit,
+      });
+      return;
+    }
+
     if (pathname === '/api/cycles') {
       const limit = clampLimit(url.searchParams.get('limit'), 10, 100);
       sendJson(response, 200, { items: db.getCompletedCycles(limit).map(cycleForApi) });

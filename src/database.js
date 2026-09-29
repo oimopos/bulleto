@@ -442,6 +442,22 @@ function mapPrecloseForecast(row) {
   };
 }
 
+function mapPrecloseForecastHit(row) {
+  const rawRankedNumbers = deserializeJson(row.ranked_numbers_json);
+  if (!Array.isArray(rawRankedNumbers) || rawRankedNumbers.length !== 3) {
+    throw new Error("stored forecast ranking is invalid");
+  }
+
+  return {
+    roundId: row.external_round_id,
+    rankedNumbers: rawRankedNumbers.map(Number),
+    actualNumber: Number(row.actual_number),
+    lockedAt: row.locked_at,
+    settledAt: row.settled_at,
+    modelVersion: row.model_version,
+  };
+}
+
 function mapVirtualBetSession(row) {
   if (!row) return null;
   const nextStake = row.next_stake == null ? null : Number(row.next_stake);
@@ -3882,6 +3898,39 @@ export class RouletteDatabase {
           : null,
       },
     };
+  }
+
+  getPrecloseForecastHits(
+    source = "buleto",
+    instrument = "default",
+    limit = 20,
+  ) {
+    this.#assertOpen();
+    const safeSource = asNonEmptyText(source, undefined, "source");
+    const safeInstrument = asNonEmptyText(instrument, undefined, "instrument");
+    const safeLimit = normalizedLimit(limit, 20);
+    return this.sqlite
+      .prepare(`
+        SELECT
+          snapshots.external_round_id,
+          snapshots.locked_at,
+          forecasts.model_version,
+          forecasts.ranked_numbers_json,
+          settlements.actual_number,
+          settlements.settled_at
+        FROM forecast_settlements AS settlements
+        JOIN round_forecasts AS forecasts
+          ON forecasts.id = settlements.forecast_id
+        JOIN forecast_snapshots AS snapshots
+          ON snapshots.id = forecasts.snapshot_id
+        WHERE snapshots.source = ?
+          AND snapshots.instrument = ?
+          AND settlements.top3_hit = 1
+        ORDER BY settlements.settled_at DESC, forecasts.id DESC
+        LIMIT ?
+      `)
+      .all(safeSource, safeInstrument, safeLimit)
+      .map(mapPrecloseForecastHit);
   }
 
   enrichKnownResults(events) {
