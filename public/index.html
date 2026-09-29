@@ -7,7 +7,7 @@
     <meta name="color-scheme" content="dark">
     <meta name="description" content="Онлайн-монитор результатов рулетки и циклов исключения чисел от 0 до 36">
     <title>Круг 37 — монитор результатов</title>
-    <link rel="stylesheet" href="/styles.css?v=15">
+    <link rel="stylesheet" href="/styles.css?v=16">
     <script type="module" src="/app.js?v=16"></script>
   </head>
   <body>
@@ -163,31 +163,33 @@
           <p class="preclose-comparison__note" id="preclose-comparison-note">На экране показывается только одна итоговая тройка; исходные списки не дублируются.</p>
         </section>
 
-        <section class="preclose-hit-history" id="preclose-hit-history" data-state="loading" aria-labelledby="preclose-hit-history-title" aria-describedby="preclose-hit-history-status" aria-busy="true">
-          <div class="preclose-hit-history__header">
-            <div>
-              <p class="eyebrow">Сохранённые прогнозы · наблюдение</p>
-              <h3 id="preclose-hit-history-title">История попаданий ценового top‑3</h3>
-            </div>
+        <details class="preclose-hit-history disclosure disclosure--inset" id="preclose-hit-history" data-state="loading" aria-labelledby="preclose-hit-history-title" aria-describedby="preclose-hit-history-status" aria-busy="true">
+          <summary class="preclose-hit-history__header disclosure__summary">
+            <span class="disclosure__copy">
+              <span class="eyebrow">Сохранённые прогнозы · наблюдение</span>
+              <span class="disclosure__title disclosure__title--small" id="preclose-hit-history-title" role="heading" aria-level="3">История попаданий ценового top‑3</span>
+            </span>
             <span class="preclose-hit-history__badge" id="preclose-hit-history-count">Загрузка…</span>
-          </div>
+            <span class="disclosure__chevron" aria-hidden="true"></span>
+          </summary>
           <ol class="preclose-hit-history__list" id="preclose-hit-history-list" tabindex="0" aria-label="Последние комбинации ценового top-3, в которые попало выпавшее число">
             <li class="empty-state">Загружаем историю попаданий…</li>
           </ol>
           <p class="preclose-hit-history__status" id="preclose-hit-history-status" role="status" aria-live="polite" aria-atomic="true">Загружаем сохранённые прогнозы ценовой модели с подтверждённым результатом; это наблюдение, не реальные ставки.</p>
-        </section>
+        </details>
 
         <p class="preclose-note" id="preclose-note">Итоговый top‑3 формируется из доступных снимков до <code>bcd</code> и после блокировки не меняется. Случайная база для top‑3 — 3 из 37 (≈8,1%). Показанные точность и история относятся только к ценовой модели; отдельная накопленная статистика итогового списка пока не рассчитана. Это эксперимент, не рекомендация для ставки и не обещание выигрыша.</p>
       </section>
 
-      <section class="panel follower-panel" id="follower-panel" data-state="loading" aria-labelledby="follower-title" aria-describedby="follower-description follower-note">
-        <div class="panel__topline follower-panel__header">
-          <div>
-            <p class="eyebrow">Переходы по всей истории</p>
-            <h2 id="follower-title">Что выпадало следующим</h2>
-          </div>
+      <details class="panel follower-panel disclosure disclosure--panel" id="follower-panel" data-state="loading" aria-labelledby="follower-title" aria-describedby="follower-description follower-note">
+        <summary class="panel__topline follower-panel__header disclosure__summary">
+          <span class="disclosure__copy">
+            <span class="eyebrow">Переходы по всей истории</span>
+            <span class="disclosure__title" id="follower-title" role="heading" aria-level="2">Что выпадало следующим</span>
+          </span>
           <span class="count-badge" id="follower-count">Загрузка…</span>
-        </div>
+          <span class="disclosure__chevron" aria-hidden="true"></span>
+        </summary>
         <div class="follower-panel__intro">
           <p class="follower-description" id="follower-description">Показываем, какие числа шли сразу после выбранного результата внутри сохранённых непрерывных участков.</p>
           <label class="follower-source-label" for="follower-source">
@@ -241,7 +243,7 @@
           <button class="follower-toggle" id="follower-toggle" type="button" aria-controls="follower-list" aria-expanded="false" hidden>Показать все</button>
           <p id="follower-note">Историческая частота, а не прогноз. Для независимого результата шанс каждого числа остаётся 1 из 37 (≈2,7%).</p>
         </div>
-      </section>
+      </details>
 
       <section class="panel number-board" aria-labelledby="number-board-title">
         <div class="panel__topline number-board__header">
@@ -268,14 +270,15 @@
         <p class="board-note" id="board-note">Ожидаем данные активного цикла.</p>
       </section>
 
-      <section class="panel triples-panel" aria-labelledby="triples-title" aria-describedby="triples-description">
-        <div class="panel__topline">
-          <div>
-            <p class="eyebrow">Совпадения в истории</p>
-            <h2 id="triples-title">Повторяющиеся тройки</h2>
-          </div>
+      <details class="panel triples-panel disclosure disclosure--panel" aria-labelledby="triples-title" aria-describedby="triples-description">
+        <summary class="panel__topline disclosure__summary">
+          <span class="disclosure__copy">
+            <span class="eyebrow">Совпадения в истории</span>
+            <span class="disclosure__title" id="triples-title" role="heading" aria-level="2">Повторяющиеся тройки</span>
+          </span>
           <span class="count-badge" id="triples-count">0 троек</span>
-        </div>
+          <span class="disclosure__chevron" aria-hidden="true"></span>
+        </summary>
         <p class="triples-description" id="triples-description">Три результата подряд в точном порядке, встретившиеся не менее двух раз.</p>
         <ul class="triples-list" id="triples-list" aria-label="Повторяющиеся последовательности из трёх чисел" aria-busy="true">
           <li class="empty-state">Ищем повторяющиеся тройки…</li>
@@ -284,17 +287,18 @@
           <button class="triples-toggle" id="triples-toggle" type="button" aria-controls="triples-list" aria-expanded="false" hidden>Показать ещё</button>
           <p>Совпадения по сохранённым непрерывным участкам истории не являются прогнозом.</p>
         </div>
-      </section>
+      </details>
 
       <div class="data-grid">
-        <section class="panel history-panel" aria-labelledby="history-title">
-          <div class="panel__topline">
-            <div>
-              <p class="eyebrow">Журнал событий</p>
-              <h2 id="history-title">Последние выпадения</h2>
-            </div>
+        <details class="panel history-panel disclosure disclosure--panel" aria-labelledby="history-title">
+          <summary class="panel__topline disclosure__summary">
+            <span class="disclosure__copy">
+              <span class="eyebrow">Журнал событий</span>
+              <span class="disclosure__title" id="history-title" role="heading" aria-level="2">Последние выпадения</span>
+            </span>
             <span class="count-badge" id="results-count">0 записей</span>
-          </div>
+            <span class="disclosure__chevron" aria-hidden="true"></span>
+          </summary>
 
           <div class="table-wrap" tabindex="0" aria-label="Прокручиваемая таблица последних выпадений">
             <table>
@@ -311,20 +315,21 @@
               </tbody>
             </table>
           </div>
-        </section>
+        </details>
 
-        <section class="panel cycles-panel" aria-labelledby="cycles-title">
-          <div class="panel__topline">
-            <div>
-              <p class="eyebrow">Архив</p>
-              <h2 id="cycles-title">Завершённые циклы</h2>
-            </div>
+        <details class="panel cycles-panel disclosure disclosure--panel" aria-labelledby="cycles-title">
+          <summary class="panel__topline disclosure__summary">
+            <span class="disclosure__copy">
+              <span class="eyebrow">Архив</span>
+              <span class="disclosure__title" id="cycles-title" role="heading" aria-level="2">Завершённые циклы</span>
+            </span>
             <span class="count-badge" id="cycles-count">0</span>
-          </div>
+            <span class="disclosure__chevron" aria-hidden="true"></span>
+          </summary>
           <ol class="cycles-list" id="cycles-list">
             <li class="empty-state">Загрузка циклов…</li>
           </ol>
-        </section>
+        </details>
       </div>
 
       <section class="panel virtual-panel" id="virtual-panel" data-state="loading" aria-labelledby="virtual-title" aria-describedby="virtual-safety virtual-rule-note">
@@ -441,16 +446,19 @@
         </div>
 
         <section class="virtual-history" aria-labelledby="virtual-history-title">
-          <div class="virtual-history__heading">
-            <div>
-              <p class="eyebrow">Журнал симуляции</p>
-              <h3 id="virtual-history-title">Последние сессии</h3>
-            </div>
-            <span class="count-badge" id="virtual-history-count">0 сессий</span>
-          </div>
-          <ol class="virtual-history__list" id="virtual-history-list" aria-label="Последние виртуальные сессии" aria-busy="true">
-            <li class="empty-state">Загрузка истории виртуального эксперимента…</li>
-          </ol>
+          <details class="disclosure disclosure--embedded">
+            <summary class="virtual-history__heading disclosure__summary">
+              <span class="disclosure__copy">
+                <span class="eyebrow">Журнал симуляции</span>
+                <span class="disclosure__title disclosure__title--small" id="virtual-history-title" role="heading" aria-level="3">Последние сессии</span>
+              </span>
+              <span class="count-badge" id="virtual-history-count">0 сессий</span>
+              <span class="disclosure__chevron" aria-hidden="true"></span>
+            </summary>
+            <ol class="virtual-history__list" id="virtual-history-list" aria-label="Последние виртуальные сессии" aria-busy="true">
+              <li class="empty-state">Загрузка истории виртуального эксперимента…</li>
+            </ol>
+          </details>
 
           <div class="virtual-lifetime" aria-labelledby="virtual-lifetime-title">
             <p class="eyebrow" id="virtual-lifetime-title">За всё время</p>
