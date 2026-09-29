@@ -112,6 +112,7 @@ test("schema contains all persistence tables", () => {
       "cycle_events",
       "cycle_numbers",
       "cycles",
+      "forecast_consensus_snapshots",
       "forecast_pair_snapshots",
       "forecast_settlements",
       "forecast_snapshots",
@@ -124,7 +125,7 @@ test("schema contains all persistence tables", () => {
       "virtual_bet_sessions",
       "virtual_bets",
     ]);
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 11);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 12);
     assert.deepEqual(
       database.sqlite
         .prepare("PRAGMA table_info(forecast_pair_snapshots)")
@@ -149,6 +150,24 @@ test("schema contains all persistence tables", () => {
         "overlap_count",
         "same_top1",
         "exact_order",
+        "created_at",
+      ],
+    );
+    assert.deepEqual(
+      database.sqlite
+        .prepare("PRAGMA table_info(forecast_consensus_snapshots)")
+        .all()
+        .map((column) => column.name),
+      [
+        "forecast_id",
+        "schema_version",
+        "algorithm_version",
+        "status",
+        "top3_json",
+        "inputs_used_json",
+        "pair_sample_size",
+        "derived_from_snapshot_at",
+        "reason",
         "created_at",
       ],
     );
@@ -194,6 +213,15 @@ test("pre-close forecasts enforce the five-second lock boundary and fresh factor
       overlapCount: 0,
       sameTop1: null,
       exactOrder: false,
+    });
+    assert.deepEqual(state.latest.consensus, {
+      status: "model_fallback",
+      top3: valid.rankedNumbers,
+      algorithmVersion: "consensus-borda-v1",
+      pairSampleSize: 0,
+      derivedFromSnapshotAt: new Date(BASE_TIME + 52_000).toISOString(),
+      inputsUsed: ["model"],
+      reason: "pair_not_ready",
     });
 
     const lateLockedAt = new Date(
@@ -257,6 +285,51 @@ test("pre-close forecasts enforce the five-second lock boundary and fresh factor
   }
 });
 
+test("forecast consensus constraints and mapper reject corrupt persisted snapshots", () => {
+  const database = createDatabase({
+    path: ":memory:",
+    clock: () => new Date(BASE_TIME + 52_000),
+  });
+  try {
+    database.recordPrecloseForecast(precloseForecast("consensus-integrity"));
+    assert.throws(
+      () =>
+        database.sqlite
+          .prepare(`
+            UPDATE forecast_consensus_snapshots
+            SET inputs_used_json = '[]'
+          `)
+          .run(),
+      /CHECK constraint failed/,
+    );
+    assert.notEqual(
+      database.getPrecloseForecastState("buleto", "PRIMECOIN(XPM)/RUB")
+        .latest.consensus,
+      null,
+    );
+
+    database.sqlite.exec("PRAGMA ignore_check_constraints = ON");
+    try {
+      database.sqlite
+        .prepare(`
+          UPDATE forecast_consensus_snapshots
+          SET top3_json = '[7,7,19]'
+        `)
+        .run();
+    } finally {
+      database.sqlite.exec("PRAGMA ignore_check_constraints = OFF");
+    }
+    assert.equal(
+      database.getPrecloseForecastState("buleto", "PRIMECOIN(XPM)/RUB")
+        .latest.consensus,
+      null,
+      "invalid persisted combinations are never exposed",
+    );
+  } finally {
+    database.close();
+  }
+});
+
 test("pre-close forecast rolls back when the transaction finishes inside the five-second boundary", () => {
   let clockCalls = 0;
   const database = createDatabase({
@@ -275,6 +348,7 @@ test("pre-close forecast rolls back when the transaction finishes inside the fiv
       "forecast_snapshots",
       "round_forecasts",
       "forecast_pair_snapshots",
+      "forecast_consensus_snapshots",
     ]) {
       assert.equal(
         database.sqlite.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get().count,
@@ -297,7 +371,14 @@ test("pre-close forecast recording is idempotent across database reopen", () => 
   });
   try {
     assert.equal(database.recordPrecloseForecast(attempt).inserted, true);
+    const storedConsensus = {
+      ...database.sqlite.prepare("SELECT * FROM forecast_consensus_snapshots").get(),
+    };
     assert.equal(database.recordPrecloseForecast(attempt).inserted, false);
+    assert.deepEqual(
+      { ...database.sqlite.prepare("SELECT * FROM forecast_consensus_snapshots").get() },
+      storedConsensus,
+    );
     database.close();
 
     database = createDatabase({
@@ -314,6 +395,16 @@ test("pre-close forecast recording is idempotent across database reopen", () => 
       database.sqlite.prepare("SELECT COUNT(*) AS count FROM round_forecasts").get()
         .count,
       1,
+    );
+    assert.equal(
+      database.sqlite
+        .prepare("SELECT COUNT(*) AS count FROM forecast_consensus_snapshots")
+        .get().count,
+      1,
+    );
+    assert.deepEqual(
+      { ...database.sqlite.prepare("SELECT * FROM forecast_consensus_snapshots").get() },
+      storedConsensus,
     );
     assert.equal(
       database.getPrecloseForecastState("buleto", "PRIMECOIN(XPM)/RUB")
@@ -413,9 +504,21 @@ test("forecast pair snapshot fixes deterministic anchor, ranking, ties, and over
       sameTop1: true,
       exactOrder: false,
     });
+    assert.deepEqual(state.latest.consensus, {
+      status: "combined",
+      top3: [12, 16, 32],
+      algorithmVersion: "consensus-borda-v1",
+      pairSampleSize: 7,
+      derivedFromSnapshotAt: new Date(clockMs).toISOString(),
+      inputsUsed: ["model", "pair"],
+      reason: "frozen_model_and_pair",
+    });
 
     const storedBefore = {
       ...database.sqlite.prepare("SELECT * FROM forecast_pair_snapshots").get(),
+    };
+    const storedConsensusBefore = {
+      ...database.sqlite.prepare("SELECT * FROM forecast_consensus_snapshots").get(),
     };
     assert.deepEqual(database.recordPrecloseForecast(attempt), {
       inserted: false,
@@ -425,6 +528,11 @@ test("forecast pair snapshot fixes deterministic anchor, ranking, ties, and over
       { ...database.sqlite.prepare("SELECT * FROM forecast_pair_snapshots").get() },
       storedBefore,
       "a duplicate forecast cannot replace its pair snapshot",
+    );
+    assert.deepEqual(
+      { ...database.sqlite.prepare("SELECT * FROM forecast_consensus_snapshots").get() },
+      storedConsensusBefore,
+      "a duplicate forecast cannot replace its consensus snapshot",
     );
 
     clockMs = BASE_TIME + 200_000;
@@ -442,12 +550,83 @@ test("forecast pair snapshot fixes deterministic anchor, ranking, ties, and over
       storedBefore,
       "later ingestion and settlement must not rewrite the locked snapshot",
     );
+    assert.deepEqual(
+      { ...database.sqlite.prepare("SELECT * FROM forecast_consensus_snapshots").get() },
+      storedConsensusBefore,
+      "settlement must not rewrite the consensus snapshot",
+    );
     const settledState = database.getPrecloseForecastState(
       "buleto",
       "PRIMECOIN(XPM)/RUB",
     );
     assert.deepEqual(settledState.latest.pairHistory, pairHistory);
+    assert.deepEqual(settledState.latest.consensus, state.latest.consensus);
     assert.equal(settledState.latest.settlement.actualNumber, 32);
+  } finally {
+    database.close();
+  }
+});
+
+test("forecast consensus remains immutable when its frozen source snapshot later diverges", () => {
+  let clockMs = BASE_TIME + 40_000;
+  const database = createDatabase({
+    path: ":memory:",
+    clock: () => new Date(clockMs),
+  });
+
+  try {
+    database.ingestBatch(
+      [9, 12, 9, 16, 9].map((number, index) =>
+        event(number, `pair-consensus-mismatch-${index}`, index, {
+          externalRoundId: String(9100 + index),
+        }),
+      ),
+    );
+    markResultsCreatedAtObservation(database, "pair-consensus-mismatch-");
+    clockMs = BASE_TIME + 52_000;
+    database.recordPrecloseForecast(
+      precloseForecast("9105", {
+        predictedNumber: 12,
+        rankedNumbers: [12, 16, 7],
+      }),
+    );
+    const storedConsensus = {
+      ...database.sqlite.prepare("SELECT * FROM forecast_consensus_snapshots").get(),
+    };
+    assert.equal(storedConsensus.algorithm_version, "consensus-borda-v1");
+    assert.equal(storedConsensus.top3_json, "[12,16,7]");
+
+    database.sqlite.exec(`
+      UPDATE forecast_pair_snapshots
+      SET pair_top3_json = '[{"number":32,"occurrenceCount":2,"firstOccurredAt":null,"lastOccurredAt":null}]',
+          overlap_numbers_json = '[]',
+          overlap_count = 0,
+          same_top1 = 0,
+          exact_order = 0
+    `);
+    const latest = database.getPrecloseForecastState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    ).latest;
+
+    assert.equal(latest.pairHistory.status, "ready");
+    assert.deepEqual(latest.pairHistory.comparison.modelTop3, [12, 16, 7]);
+    assert.deepEqual(latest.pairHistory.comparison.pairTop3, [32]);
+    assert.deepEqual(latest.rankedNumbers, [12, 16, 7]);
+    assert.deepEqual(latest.consensus, {
+      status: "combined",
+      top3: [12, 16, 7],
+      algorithmVersion: "consensus-borda-v1",
+      pairSampleSize: 2,
+      derivedFromSnapshotAt: new Date(clockMs).toISOString(),
+      inputsUsed: ["model", "pair"],
+      reason: "frozen_model_and_pair",
+    });
+    assert.deepEqual(
+      { ...database.sqlite.prepare("SELECT * FROM forecast_consensus_snapshots").get() },
+      storedConsensus,
+      "reads never recalculate or rewrite a persisted consensus",
+    );
   } finally {
     database.close();
   }
@@ -605,12 +784,25 @@ test("forecast pair cutoff excludes future-observed and future-created results",
       sameTop1: true,
       exactOrder: false,
     });
+    assert.deepEqual(
+      database.getPrecloseForecastState("buleto", "PRIMECOIN(XPM)/RUB")
+        .latest.consensus,
+      {
+        status: "combined",
+        top3: [4, 12, 16],
+        algorithmVersion: "consensus-borda-v1",
+        pairSampleSize: 1,
+        derivedFromSnapshotAt: new Date(clockMs).toISOString(),
+        inputsUsed: ["model", "pair"],
+        reason: "frozen_model_and_pair",
+      },
+    );
   } finally {
     database.close();
   }
 });
 
-test("version 11 leaves legacy forecasts without a pair snapshot instead of backfilling", () => {
+test("versions 11 and 12 do not backfill derived snapshots for version 10 forecasts", () => {
   const directory = mkdtempSync(join(tmpdir(), "roulette-pair-v10-"));
   const path = join(directory, "legacy-forecast.sqlite");
   const attempt = precloseForecast("legacy-forecast");
@@ -622,6 +814,7 @@ test("version 11 leaves legacy forecasts without a pair snapshot instead of back
   try {
     assert.equal(database.recordPrecloseForecast(attempt).inserted, true);
     database.sqlite.exec(`
+      DROP TABLE forecast_consensus_snapshots;
       DROP TABLE forecast_pair_snapshots;
       PRAGMA user_version = 10;
     `);
@@ -631,7 +824,7 @@ test("version 11 leaves legacy forecasts without a pair snapshot instead of back
       path,
       clock: () => new Date(BASE_TIME + 52_000),
     });
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 11);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 12);
     assert.equal(
       Number(
         database.sqlite
@@ -645,6 +838,19 @@ test("version 11 leaves legacy forecasts without a pair snapshot instead of back
         .latest.pairHistory,
       null,
     );
+    assert.equal(
+      database.getPrecloseForecastState("buleto", "PRIMECOIN(XPM)/RUB")
+        .latest.consensus,
+      null,
+    );
+    assert.equal(
+      Number(
+        database.sqlite
+          .prepare("SELECT COUNT(*) AS count FROM forecast_consensus_snapshots")
+          .get().count,
+      ),
+      0,
+    );
     assert.equal(database.recordPrecloseForecast(attempt).inserted, false);
     assert.equal(
       Number(
@@ -654,6 +860,70 @@ test("version 11 leaves legacy forecasts without a pair snapshot instead of back
       ),
       0,
       "reading or replaying a legacy forecast must not backfill mutable history",
+    );
+    assert.equal(
+      Number(
+        database.sqlite
+          .prepare("SELECT COUNT(*) AS count FROM forecast_consensus_snapshots")
+          .get().count,
+      ),
+      0,
+      "reading or replaying a legacy forecast must not backfill consensus",
+    );
+  } finally {
+    database.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("version 12 does not backfill consensus for legacy version 11 forecasts", () => {
+  const directory = mkdtempSync(join(tmpdir(), "roulette-consensus-v11-"));
+  const path = join(directory, "legacy-consensus.sqlite");
+  const attempt = precloseForecast("legacy-consensus");
+  let database = createDatabase({
+    path,
+    clock: () => new Date(BASE_TIME + 52_000),
+  });
+
+  try {
+    assert.equal(database.recordPrecloseForecast(attempt).inserted, true);
+    assert.equal(
+      database.sqlite
+        .prepare("SELECT COUNT(*) AS count FROM forecast_consensus_snapshots")
+        .get().count,
+      1,
+    );
+    database.sqlite.exec(`
+      DROP TABLE forecast_consensus_snapshots;
+      PRAGMA user_version = 11;
+    `);
+    database.close();
+
+    database = createDatabase({
+      path,
+      clock: () => new Date(BASE_TIME + 52_000),
+    });
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 12);
+    assert.equal(
+      database.sqlite
+        .prepare("SELECT COUNT(*) AS count FROM forecast_consensus_snapshots")
+        .get().count,
+      0,
+    );
+    const latest = database.getPrecloseForecastState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    ).latest;
+    assert.notEqual(latest.pairHistory, null);
+    assert.equal(latest.consensus, null);
+
+    assert.equal(database.recordPrecloseForecast(attempt).inserted, false);
+    assert.equal(
+      database.sqlite
+        .prepare("SELECT COUNT(*) AS count FROM forecast_consensus_snapshots")
+        .get().count,
+      0,
+      "reading or replaying a legacy forecast must not create a consensus",
     );
   } finally {
     database.close();
@@ -957,7 +1227,7 @@ test("version 5 history is backfilled into continuity epochs before migration co
 
   const database = createDatabase({ path });
   try {
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 11);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 12);
     assert.deepEqual(
       database.sqlite
         .prepare("SELECT continuity_epoch FROM round_results ORDER BY settled_at, id")
@@ -1017,7 +1287,7 @@ test("version 9 reconciles a proven contiguous shutdown boundary without deletin
 
     database = createDatabase({ path, gapThresholdSeconds: 135 });
     const state = database.getDashboardState();
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 11);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 12);
     assert.equal(state.totals.results, 5, "raw results are never recreated or deleted");
     assert.equal(state.totals.cycles, 1);
     assert.equal(state.totals.invalidCycles, 0);
@@ -2442,7 +2712,7 @@ test("v7 paper history initializes v8 bankroll with all known net results exactl
       "buleto",
       "PRIMECOIN(XPM)/RUB",
     );
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 11);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 12);
     assert.equal(state.testBank.initialBalance, 87_700);
     assert.equal(state.testBank.currentBalance, 87_910);
     assert.equal(state.testBank.netResult, 210);

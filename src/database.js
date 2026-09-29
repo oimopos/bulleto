@@ -10,6 +10,10 @@ import {
   calculateNextVirtualStake,
   settleVirtualBet,
 } from "./virtual-bettor.js";
+import {
+  FORECAST_CONSENSUS_ALGORITHM_VERSION,
+  combineFrozenTop3,
+} from "./forecast-consensus.js";
 
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 500;
@@ -397,12 +401,103 @@ function mapForecastPairHistory(row) {
   };
 }
 
+function mapForecastConsensus(row, modelTop3) {
+  if (
+    row?.consensus_forecast_id === null ||
+    row?.consensus_forecast_id === undefined
+  ) {
+    return null;
+  }
+  const allowedInputs = new Map([
+    ["combined", ["model", "pair"]],
+    ["model_fallback", ["model"]],
+    ["pair_fallback", ["pair"]],
+    ["unavailable", []],
+  ]);
+  const allowedReasons = new Map([
+    ["combined", new Set(["frozen_model_and_pair"])],
+    [
+      "model_fallback",
+      new Set([
+        "pair_not_ready",
+        "invalid_pair_ranking",
+        "empty_pair_ranking",
+        "pair_snapshot_model_mismatch",
+      ]),
+    ],
+    ["pair_fallback", new Set(["model_unavailable"])],
+    [
+      "unavailable",
+      new Set(["incomplete_model_ranking", "invalid_model_ranking"]),
+    ],
+  ]);
+  const status = row.consensus_status;
+  const top3 = deserializeJson(row.consensus_top3_json);
+  const inputsUsed = deserializeJson(row.consensus_inputs_used_json);
+  const schemaVersion = Number(row.consensus_schema_version);
+  const pairSampleSize = row.consensus_pair_sample_size == null
+    ? null
+    : Number(row.consensus_pair_sample_size);
+  const derivedFromSnapshotAt = row.consensus_derived_from_snapshot_at;
+  const createdAt = row.consensus_created_at;
+  const expectedInputs = allowedInputs.get(status);
+  const expectedReasons = allowedReasons.get(status);
+  const forecastId = Number(row.consensus_forecast_id);
+  if (
+    !Number.isSafeInteger(forecastId) ||
+    forecastId <= 0 ||
+    forecastId !== Number(row.forecast_id) ||
+    schemaVersion !== 1 ||
+    row.consensus_algorithm_version !== FORECAST_CONSENSUS_ALGORITHM_VERSION ||
+    !expectedInputs ||
+    !expectedReasons ||
+    !expectedReasons.has(row.consensus_reason) ||
+    !Array.isArray(top3) ||
+    !Array.isArray(inputsUsed) ||
+    inputsUsed.length !== expectedInputs.length ||
+    inputsUsed.some((input, index) => input !== expectedInputs[index]) ||
+    (pairSampleSize !== null &&
+      (!Number.isSafeInteger(pairSampleSize) || pairSampleSize < 0)) ||
+    !Number.isFinite(Date.parse(derivedFromSnapshotAt)) ||
+    !Number.isFinite(Date.parse(createdAt)) ||
+    Date.parse(derivedFromSnapshotAt) > Date.parse(createdAt)
+  ) {
+    return null;
+  }
+  if (
+    top3.some(
+      (number) => !Number.isInteger(number) || number < 0 || number > 36,
+    ) ||
+    new Set(top3).size !== top3.length ||
+    (status === "unavailable" ? top3.length !== 0 : top3.length !== 3) ||
+    (status === "model_fallback" &&
+      (top3.length !== modelTop3.length ||
+        top3.some((number, index) => number !== modelTop3[index]))) ||
+    (["combined", "pair_fallback"].includes(status) &&
+      (pairSampleSize === null || pairSampleSize <= 0))
+  ) {
+    return null;
+  }
+
+  return {
+    status,
+    top3,
+    algorithmVersion: row.consensus_algorithm_version,
+    pairSampleSize,
+    derivedFromSnapshotAt,
+    inputsUsed,
+    reason: row.consensus_reason,
+  };
+}
+
 function mapPrecloseForecast(row) {
   if (!row) return null;
   const rawRankedNumbers = deserializeJson(row.ranked_numbers_json);
   const rankedNumbers = Array.isArray(rawRankedNumbers)
     ? rawRankedNumbers.map(Number)
     : [];
+  const pairHistory = mapForecastPairHistory(row);
+  const consensus = mapForecastConsensus(row, rankedNumbers);
   return {
     id: Number(row.forecast_id ?? row.id),
     snapshotId: Number(row.snapshot_id),
@@ -425,7 +520,8 @@ function mapPrecloseForecast(row) {
     rankedNumbers,
     modelVersion: row.model_version,
     features: deserializeJson(row.features_json),
-    pairHistory: mapForecastPairHistory(row),
+    pairHistory,
+    consensus,
     settlement:
       row.actual_number === null || row.actual_number === undefined
         ? null
@@ -890,6 +986,7 @@ export class RouletteDatabase {
     this.#migrateContinuityReconciliationV9();
     this.#migratePrecloseForecastsV10();
     this.#migrateForecastPairSnapshotsV11();
+    this.#migrateForecastConsensusSnapshotsV12();
   }
 
   #migratePrecloseForecastsV10() {
@@ -995,6 +1092,86 @@ export class RouletteDatabase {
       );
 
       PRAGMA user_version = 11;
+      COMMIT;
+    `);
+  }
+
+  #migrateForecastConsensusSnapshotsV12() {
+    this.sqlite.exec(`
+      BEGIN IMMEDIATE;
+
+      CREATE TABLE IF NOT EXISTS forecast_consensus_snapshots (
+        forecast_id INTEGER PRIMARY KEY REFERENCES round_forecasts(id),
+        schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+        algorithm_version TEXT NOT NULL CHECK (
+          algorithm_version = 'consensus-borda-v1'
+        ),
+        status TEXT NOT NULL CHECK (
+          status IN ('combined', 'model_fallback', 'pair_fallback', 'unavailable')
+        ),
+        top3_json TEXT NOT NULL CHECK (json_valid(top3_json)),
+        inputs_used_json TEXT NOT NULL CHECK (json_valid(inputs_used_json)),
+        pair_sample_size INTEGER CHECK (
+          pair_sample_size IS NULL OR pair_sample_size >= 0
+        ),
+        derived_from_snapshot_at TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        CHECK (json_type(top3_json) = 'array'),
+        CHECK (json_type(inputs_used_json) = 'array'),
+        CHECK (
+          (status = 'unavailable' AND json_array_length(top3_json) = 0)
+          OR
+          (status <> 'unavailable' AND json_array_length(top3_json) = 3)
+        ),
+        CHECK (
+          status = 'unavailable'
+          OR (
+            json_type(top3_json, '$[0]') = 'integer'
+            AND json_type(top3_json, '$[1]') = 'integer'
+            AND json_type(top3_json, '$[2]') = 'integer'
+            AND json_extract(top3_json, '$[0]') BETWEEN 0 AND 36
+            AND json_extract(top3_json, '$[1]') BETWEEN 0 AND 36
+            AND json_extract(top3_json, '$[2]') BETWEEN 0 AND 36
+            AND json_extract(top3_json, '$[0]') <> json_extract(top3_json, '$[1]')
+            AND json_extract(top3_json, '$[0]') <> json_extract(top3_json, '$[2]')
+            AND json_extract(top3_json, '$[1]') <> json_extract(top3_json, '$[2]')
+          )
+        ),
+        CHECK (
+          (status = 'combined' AND inputs_used_json = '["model","pair"]')
+          OR
+          (status = 'model_fallback' AND inputs_used_json = '["model"]')
+          OR
+          (status = 'pair_fallback' AND inputs_used_json = '["pair"]')
+          OR
+          (status = 'unavailable' AND inputs_used_json = '[]')
+        ),
+        CHECK (
+          (status = 'combined' AND reason = 'frozen_model_and_pair')
+          OR
+          (status = 'model_fallback' AND reason IN (
+            'pair_not_ready',
+            'invalid_pair_ranking',
+            'empty_pair_ranking',
+            'pair_snapshot_model_mismatch'
+          ))
+          OR
+          (status = 'pair_fallback' AND reason = 'model_unavailable')
+          OR
+          (status = 'unavailable' AND reason IN (
+            'incomplete_model_ranking',
+            'invalid_model_ranking'
+          ))
+        ),
+        CHECK (
+          status NOT IN ('combined', 'pair_fallback')
+          OR (pair_sample_size IS NOT NULL AND pair_sample_size > 0)
+        ),
+        CHECK (derived_from_snapshot_at <= created_at)
+      );
+
+      PRAGMA user_version = 12;
       COMMIT;
     `);
   }
@@ -3432,6 +3609,28 @@ export class RouletteDatabase {
       );
   }
 
+  #insertForecastConsensusSnapshot(forecastId, snapshot, createdAt) {
+    this.sqlite
+      .prepare(`
+        INSERT INTO forecast_consensus_snapshots (
+          forecast_id, schema_version, algorithm_version, status,
+          top3_json, inputs_used_json, pair_sample_size,
+          derived_from_snapshot_at, reason, created_at
+        ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        forecastId,
+        snapshot.algorithmVersion,
+        snapshot.status,
+        JSON.stringify(snapshot.top3),
+        JSON.stringify(snapshot.inputsUsed),
+        snapshot.pairSampleSize,
+        snapshot.derivedFromSnapshotAt,
+        snapshot.reason,
+        createdAt,
+      );
+  }
+
   recordPrecloseForecast(attempt) {
     this.#assertOpen();
     if (!attempt || typeof attempt !== "object" || Array.isArray(attempt)) {
@@ -3594,6 +3793,14 @@ export class RouletteDatabase {
           "forecast must be durably stored at least five seconds before betting closes",
         );
       }
+      const consensusSnapshot = combineFrozenTop3({
+        modelTop3: rankedNumbers,
+        pairTop3: pairSnapshot.pairTop3.map((item) => item.number),
+        pairStatus: pairSnapshot.status,
+        pairModelTop3: pairSnapshot.modelTop3,
+        pairSampleSize: pairSnapshot.sampleSize,
+        derivedFromSnapshotAt: persistedAt,
+      });
       const insertion = this.sqlite
         .prepare(`
           INSERT INTO forecast_snapshots (
@@ -3646,9 +3853,11 @@ export class RouletteDatabase {
           JSON.stringify(rankedNumbers),
           persistedAt,
         );
-      this.#insertForecastPairSnapshot(
-        Number(forecastInsertion.lastInsertRowid),
-        pairSnapshot,
+      const forecastId = Number(forecastInsertion.lastInsertRowid);
+      this.#insertForecastPairSnapshot(forecastId, pairSnapshot, persistedAt);
+      this.#insertForecastConsensusSnapshot(
+        forecastId,
+        consensusSnapshot,
         persistedAt,
       );
       const commitCheckedAt = asTimestamp(
@@ -3832,13 +4041,26 @@ export class RouletteDatabase {
           pair_snapshots.overlap_numbers_json AS pair_overlap_numbers_json,
           pair_snapshots.overlap_count AS pair_overlap_count,
           pair_snapshots.same_top1 AS pair_same_top1,
-          pair_snapshots.exact_order AS pair_exact_order
+          pair_snapshots.exact_order AS pair_exact_order,
+          consensus_snapshots.forecast_id AS consensus_forecast_id,
+          consensus_snapshots.schema_version AS consensus_schema_version,
+          consensus_snapshots.algorithm_version AS consensus_algorithm_version,
+          consensus_snapshots.status AS consensus_status,
+          consensus_snapshots.top3_json AS consensus_top3_json,
+          consensus_snapshots.inputs_used_json AS consensus_inputs_used_json,
+          consensus_snapshots.pair_sample_size AS consensus_pair_sample_size,
+          consensus_snapshots.derived_from_snapshot_at
+            AS consensus_derived_from_snapshot_at,
+          consensus_snapshots.reason AS consensus_reason,
+          consensus_snapshots.created_at AS consensus_created_at
         FROM round_forecasts AS forecasts
         JOIN forecast_snapshots AS snapshots ON snapshots.id = forecasts.snapshot_id
         LEFT JOIN forecast_settlements AS settlements
           ON settlements.forecast_id = forecasts.id
         LEFT JOIN forecast_pair_snapshots AS pair_snapshots
           ON pair_snapshots.forecast_id = forecasts.id
+        LEFT JOIN forecast_consensus_snapshots AS consensus_snapshots
+          ON consensus_snapshots.forecast_id = forecasts.id
         WHERE snapshots.source = ? AND snapshots.instrument = ?
         ORDER BY snapshots.locked_at DESC, forecasts.id DESC
         LIMIT 1
