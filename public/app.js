@@ -60,6 +60,12 @@ import { buildFollowerStats } from "./pair-followers.js?v=1";
     followerHorizon: document.getElementById("follower-horizon"),
     followerHorizonList: document.getElementById("follower-horizon-list"),
     followerHorizonStatus: document.getElementById("follower-horizon-status"),
+    followerDynamicNext: document.getElementById("follower-dynamic-next"),
+    followerDynamicNextStatus: document.getElementById("follower-dynamic-next-status"),
+    followerDynamicNextHits: document.getElementById("follower-dynamic-next-hits"),
+    followerDynamicNextMisses: document.getElementById("follower-dynamic-next-misses"),
+    followerDynamicNextRate: document.getElementById("follower-dynamic-next-rate"),
+    followerDynamicNextSample: document.getElementById("follower-dynamic-next-sample"),
     followerDescription: document.getElementById("follower-description"),
     followerNote: document.getElementById("follower-note"),
     followerToggle: document.getElementById("follower-toggle"),
@@ -2271,7 +2277,57 @@ import { buildFollowerStats } from "./pair-followers.js?v=1";
     return group;
   }
 
+  function renderFollowerDynamicNext() {
+    const setValues = ({ hits = "—", misses = "—", rate = "—", sample = "—" } = {}) => {
+      setTextIfChanged(elements.followerDynamicNextHits, hits);
+      setTextIfChanged(elements.followerDynamicNextMisses, misses);
+      setTextIfChanged(elements.followerDynamicNextRate, rate);
+      setTextIfChanged(elements.followerDynamicNextSample, sample);
+    };
+
+    if (!store.pairsLoaded) {
+      const failed = store.pairsError;
+      elements.followerDynamicNext.dataset.state = failed ? "error" : "loading";
+      elements.followerDynamicNext.setAttribute("aria-busy", String(!failed));
+      setTextIfChanged(elements.followerDynamicNextStatus, failed ? "Ошибка загрузки" : "Считаем…");
+      setValues();
+      return;
+    }
+
+    const curve = normalizedFollowerAllPoints();
+    const nextRound = curve?.points.find((point) => point.horizon === 1) ?? null;
+    if (!nextRound) {
+      elements.followerDynamicNext.dataset.state = "error";
+      elements.followerDynamicNext.setAttribute("aria-busy", "false");
+      setTextIfChanged(elements.followerDynamicNextStatus, "Нет расчёта");
+      setValues();
+      return;
+    }
+
+    const hits = nextRound.hitCount;
+    const sample = nextRound.eligibleCount;
+    const misses = sample - hits;
+    const stale = store.pairsError;
+    elements.followerDynamicNext.dataset.state = stale
+      ? "stale"
+      : sample > 0 ? "ready" : "empty";
+    elements.followerDynamicNext.setAttribute("aria-busy", "false");
+    setTextIfChanged(
+      elements.followerDynamicNextStatus,
+      sample > 0
+        ? `${sample} ${pluralForm(sample, "проверка", "проверки", "проверок")}${stale ? " · не обновлено" : ""}`
+        : "Ждём полную выборку"
+    );
+    setValues({
+      hits: riskAmountFormatter.format(hits),
+      misses: riskAmountFormatter.format(misses),
+      rate: sample > 0 ? historicalPercentFormatter.format(nextRound.rate) : "—",
+      sample: riskAmountFormatter.format(sample)
+    });
+  }
+
   function renderFollowerHitCurve() {
+    renderFollowerDynamicNext();
     if (!store.pairsLoaded) {
       const failed = store.pairsError;
       elements.followerHorizon.dataset.state = failed ? "error" : "loading";

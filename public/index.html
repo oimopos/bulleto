@@ -7,8 +7,8 @@
     <meta name="color-scheme" content="dark">
     <meta name="description" content="Онлайн-монитор результатов рулетки и циклов исключения чисел от 0 до 36">
     <title>Круг 37 — монитор результатов</title>
-    <link rel="stylesheet" href="/styles.css?v=18">
-    <script type="module" src="/app.js?v=18"></script>
+    <link rel="stylesheet" href="/styles.css?v=19">
+    <script type="module" src="/app.js?v=19"></script>
   </head>
   <body>
     <a class="skip-link" href="#main-content">Перейти к содержимому</a>
@@ -297,6 +297,22 @@
             </div>
             <span class="follower-horizon__status" id="follower-horizon-status" role="status" aria-live="polite" aria-atomic="true">Считаем…</span>
           </div>
+          <section class="follower-dynamic-next" id="follower-dynamic-next" data-state="loading" aria-labelledby="follower-dynamic-next-title" aria-describedby="follower-dynamic-next-note" aria-busy="true">
+            <div class="follower-dynamic-next__header">
+              <div>
+                <p class="eyebrow">Динамическая пятёрка · только следующий раунд</p>
+                <h4 id="follower-dynamic-next-title">Исходы проверки следующего раунда</h4>
+              </div>
+              <span class="follower-dynamic-next__status" id="follower-dynamic-next-status" role="status" aria-live="polite" aria-atomic="true">Считаем…</span>
+            </div>
+            <dl class="follower-dynamic-next__metrics" aria-label="Исходы динамической пятёрки на следующем раунде">
+              <div class="is-hit"><dt>Попадания</dt><dd id="follower-dynamic-next-hits">—</dd></div>
+              <div class="is-miss"><dt>Промахи</dt><dd id="follower-dynamic-next-misses">—</dd></div>
+              <div><dt>Доля попаданий</dt><dd id="follower-dynamic-next-rate">—</dd></div>
+              <div><dt>Размер выборки · N</dt><dd id="follower-dynamic-next-sample">—</dd></div>
+            </dl>
+            <p class="follower-dynamic-next__note" id="follower-dynamic-next-note">Для каждой подходящей исторической точки пятёрка заново рассчитывалась только по уже известным данным и проверялась лишь на следующем сохранённом результате. N — та же строгая выборка с полными 20 будущими раундами внутри непрерывного участка. Точки без полного 20‑раундового окна и края разрывов не входят. Попадание или промах — исход проверки, не деньги и не текущая серия с зафиксированной пятёркой.</p>
+          </section>
           <dl class="follower-horizon__grid" id="follower-horizon-list">
             <div class="follower-horizon__empty">
               <dt class="sr-only">Состояние расчёта</dt>
