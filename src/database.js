@@ -19,24 +19,28 @@ const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 500;
 const DEFAULT_VIRTUAL_STARTING_BALANCE = 87_700;
 const FOLLOWER_TOP5_HORIZONS = Object.freeze([1, 2, 3, 5, 10, 20]);
+const FOLLOWER_TOP5_ALL_HORIZONS = Object.freeze(
+  Array.from({ length: 20 }, (_, index) => index + 1),
+);
 const FOLLOWER_TOP5_COUNT = 5;
 const FOLLOWER_TOP5_MINIMUM_OBSERVED = 5;
+const FOLLOWER_TOP5_LIVE_ALGORITHM_VERSION = "follower-top5-live-v1";
 
 function emptyFollowerHitBucket() {
   return {
     eligibleCount: 0,
-    hitCounts: FOLLOWER_TOP5_HORIZONS.map(() => 0),
+    hitCounts: FOLLOWER_TOP5_ALL_HORIZONS.map(() => 0),
   };
 }
 
-function followerHitPoints(bucket) {
-  return FOLLOWER_TOP5_HORIZONS.map((horizon, index) => ({
+function followerHitPoints(bucket, horizons = FOLLOWER_TOP5_HORIZONS) {
+  return horizons.map((horizon) => ({
     horizon,
-    hitCount: bucket.hitCounts[index],
+    hitCount: bucket.hitCounts[horizon - 1],
     eligibleCount: bucket.eligibleCount,
     rate:
       bucket.eligibleCount > 0
-        ? bucket.hitCounts[index] / bucket.eligibleCount
+        ? bucket.hitCounts[horizon - 1] / bucket.eligibleCount
         : null,
   }));
 }
@@ -126,7 +130,7 @@ export function buildFollowerTop5HitCurve(rows) {
 
     overall.eligibleCount += 1;
     bySourceBuckets[number].eligibleCount += 1;
-    FOLLOWER_TOP5_HORIZONS.forEach((horizon, horizonIndex) => {
+    FOLLOWER_TOP5_ALL_HORIZONS.forEach((horizon, horizonIndex) => {
       if (firstHitOffset !== null && firstHitOffset <= horizon) {
         overall.hitCounts[horizonIndex] += 1;
         bySourceBuckets[number].hitCounts[horizonIndex] += 1;
@@ -150,6 +154,7 @@ export function buildFollowerTop5HitCurve(rows) {
     overall: {
       eligibleCount: overall.eligibleCount,
       points: followerHitPoints(overall),
+      allPoints: followerHitPoints(overall, FOLLOWER_TOP5_ALL_HORIZONS),
     },
     bySource: bySourceBuckets.map((bucket, sourceNumber) => ({
       sourceNumber,
@@ -796,6 +801,7 @@ export class RouletteDatabase {
       this.sqlite.exec("PRAGMA busy_timeout = 5000");
       this.sqlite.exec("PRAGMA journal_mode = WAL");
       this.#migrate();
+      this.#initializeFollowerTop5Trackers();
     } catch (error) {
       this.sqlite.close();
       this.closed = true;
@@ -1128,6 +1134,7 @@ export class RouletteDatabase {
     this.#migratePrecloseForecastsV10();
     this.#migrateForecastPairSnapshotsV11();
     this.#migrateForecastConsensusSnapshotsV12();
+    this.#migrateFollowerTop5TrackerV13();
   }
 
   #migratePrecloseForecastsV10() {
@@ -1313,6 +1320,104 @@ export class RouletteDatabase {
       );
 
       PRAGMA user_version = 12;
+      COMMIT;
+    `);
+  }
+
+  #migrateFollowerTop5TrackerV13() {
+    this.sqlite.exec(`
+      BEGIN IMMEDIATE;
+
+      CREATE TABLE IF NOT EXISTS follower_top5_sessions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source TEXT NOT NULL,
+        instrument TEXT NOT NULL,
+        continuity_epoch INTEGER NOT NULL CHECK (continuity_epoch >= 0),
+        status TEXT NOT NULL CHECK (
+          status IN ('active', 'completed', 'invalid_gap')
+        ),
+        end_reason TEXT CHECK (
+          end_reason IS NULL OR end_reason IN ('hit', 'integrity_gap')
+        ),
+        anchor_result_id INTEGER NOT NULL UNIQUE REFERENCES round_results(id),
+        anchor_number INTEGER NOT NULL CHECK (anchor_number BETWEEN 0 AND 36),
+        top_numbers_json TEXT NOT NULL CHECK (
+          json_valid(top_numbers_json)
+          AND json_type(top_numbers_json) = 'array'
+          AND json_array_length(top_numbers_json) = 5
+        ),
+        algorithm_version TEXT NOT NULL,
+        history_max_result_id INTEGER NOT NULL REFERENCES round_results(id),
+        sample_size INTEGER NOT NULL CHECK (sample_size >= 5),
+        observed_follower_count INTEGER NOT NULL CHECK (
+          observed_follower_count BETWEEN 5 AND 37
+        ),
+        attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+        miss_count INTEGER NOT NULL DEFAULT 0 CHECK (miss_count >= 0),
+        last_attempt_result_id INTEGER REFERENCES round_results(id),
+        completed_result_id INTEGER REFERENCES round_results(id),
+        locked_at TEXT NOT NULL,
+        last_event_at TEXT NOT NULL,
+        completed_at TEXT,
+        created_at TEXT NOT NULL,
+        CHECK (history_max_result_id = anchor_result_id),
+        CHECK (miss_count <= attempt_count),
+        CHECK (
+          (
+            status = 'active'
+            AND end_reason IS NULL
+            AND completed_result_id IS NULL
+            AND completed_at IS NULL
+            AND miss_count = attempt_count
+          )
+          OR
+          (
+            status = 'completed'
+            AND end_reason = 'hit'
+            AND completed_result_id IS NOT NULL
+            AND completed_at IS NOT NULL
+            AND attempt_count = miss_count + 1
+          )
+          OR
+          (
+            status = 'invalid_gap'
+            AND end_reason = 'integrity_gap'
+            AND completed_result_id IS NULL
+            AND completed_at IS NOT NULL
+            AND miss_count = attempt_count
+          )
+        )
+      );
+
+      CREATE UNIQUE INDEX IF NOT EXISTS follower_top5_one_active_stream_idx
+        ON follower_top5_sessions(source, instrument)
+        WHERE status = 'active';
+
+      CREATE INDEX IF NOT EXISTS follower_top5_session_history_idx
+        ON follower_top5_sessions(source, instrument, id DESC);
+
+      CREATE TABLE IF NOT EXISTS follower_top5_attempts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id INTEGER NOT NULL
+          REFERENCES follower_top5_sessions(id) ON DELETE CASCADE,
+        round_result_id INTEGER NOT NULL UNIQUE REFERENCES round_results(id),
+        attempt_number INTEGER NOT NULL CHECK (attempt_number > 0),
+        result_number INTEGER NOT NULL CHECK (result_number BETWEEN 0 AND 36),
+        outcome TEXT NOT NULL CHECK (outcome IN ('miss', 'hit')),
+        hit_rank INTEGER CHECK (hit_rank IS NULL OR hit_rank BETWEEN 1 AND 5),
+        occurred_at TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        CHECK (
+          (outcome = 'miss' AND hit_rank IS NULL)
+          OR (outcome = 'hit' AND hit_rank IS NOT NULL)
+        ),
+        UNIQUE(session_id, attempt_number)
+      );
+
+      CREATE INDEX IF NOT EXISTS follower_top5_attempts_session_idx
+        ON follower_top5_attempts(session_id, attempt_number);
+
+      PRAGMA user_version = 13;
       COMMIT;
     `);
   }
@@ -2483,6 +2588,367 @@ export class RouletteDatabase {
       .run(detectedAt, detectedAt, source, instrument);
   }
 
+  #liveFollowerTop5SessionRow(source, instrument) {
+    return this.sqlite
+      .prepare(`
+        SELECT
+          sessions.*,
+          COALESCE(last_attempt.settled_at, anchor.settled_at)
+            AS boundary_settled_at,
+          COALESCE(last_attempt.id, anchor.id) AS boundary_result_id
+        FROM follower_top5_sessions AS sessions
+        JOIN round_results AS anchor ON anchor.id = sessions.anchor_result_id
+        LEFT JOIN round_results AS last_attempt
+          ON last_attempt.id = sessions.last_attempt_result_id
+        WHERE sessions.source = ?
+          AND sessions.instrument = ?
+          AND sessions.status = 'active'
+        ORDER BY sessions.id DESC
+        LIMIT 1
+      `)
+      .get(source, instrument);
+  }
+
+  #followerTop5SnapshotAtResult(resultRow) {
+    const rows = this.sqlite
+      .prepare(`
+        WITH ordered AS (
+          SELECT
+            result_number AS source_number,
+            LEAD(result_number, 1) OVER stream_order AS follower_number,
+            LEAD(settled_at, 1) OVER stream_order AS follower_settled_at
+          FROM round_results
+          WHERE source = ?
+            AND instrument = ?
+            AND (
+              settled_at < ?
+              OR (settled_at = ? AND id <= ?)
+            )
+          WINDOW stream_order AS (
+            PARTITION BY continuity_epoch
+            ORDER BY settled_at, id
+          )
+        )
+        SELECT
+          follower_number,
+          COUNT(*) AS occurrence_count,
+          MAX(follower_settled_at) AS last_occurred_at
+        FROM ordered
+        WHERE source_number = ? AND follower_number IS NOT NULL
+        GROUP BY follower_number
+      `)
+      .all(
+        resultRow.source,
+        resultRow.instrument,
+        resultRow.settled_at,
+        resultRow.settled_at,
+        Number(resultRow.id),
+        Number(resultRow.result_number),
+      );
+    if (rows.length < FOLLOWER_TOP5_MINIMUM_OBSERVED) return null;
+
+    const counts = ROULETTE_NUMBERS.map(() => 0);
+    const lastOccurredAt = ROULETTE_NUMBERS.map(() => null);
+    let sampleSize = 0;
+    for (const row of rows) {
+      const number = Number(row.follower_number);
+      const count = Number(row.occurrence_count);
+      counts[number] = count;
+      lastOccurredAt[number] = row.last_occurred_at;
+      sampleSize += count;
+    }
+    const topNumbers = rankFollowerNumbers(counts, lastOccurredAt);
+    return {
+      topNumbers,
+      sampleSize,
+      observedFollowerCount: rows.length,
+    };
+  }
+
+  #armFollowerTop5SessionAtResult(resultRow, now, preparedSnapshot = null) {
+    if (!resultRow || this.#liveFollowerTop5SessionRow(
+      resultRow.source,
+      resultRow.instrument,
+    )) {
+      return null;
+    }
+    if (!this.#isChronologicalTail(resultRow)) return null;
+
+    const epochRow = this.sqlite
+      .prepare(`
+        SELECT continuity_epoch
+        FROM stream_state
+        WHERE source = ? AND instrument = ?
+      `)
+      .get(resultRow.source, resultRow.instrument);
+    if (
+      epochRow
+      && Number(epochRow.continuity_epoch) !== Number(resultRow.continuity_epoch)
+    ) {
+      return null;
+    }
+
+    const snapshot = preparedSnapshot ?? this.#followerTop5SnapshotAtResult(resultRow);
+    if (!snapshot) return null;
+    const insertion = this.sqlite
+      .prepare(`
+        INSERT OR IGNORE INTO follower_top5_sessions (
+          source,
+          instrument,
+          continuity_epoch,
+          status,
+          end_reason,
+          anchor_result_id,
+          anchor_number,
+          top_numbers_json,
+          algorithm_version,
+          history_max_result_id,
+          sample_size,
+          observed_follower_count,
+          attempt_count,
+          miss_count,
+          locked_at,
+          last_event_at,
+          created_at
+        ) VALUES (?, ?, ?, 'active', NULL, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?)
+      `)
+      .run(
+        resultRow.source,
+        resultRow.instrument,
+        Number(resultRow.continuity_epoch),
+        Number(resultRow.id),
+        Number(resultRow.result_number),
+        serializeJson(snapshot.topNumbers, "follower top-5"),
+        FOLLOWER_TOP5_LIVE_ALGORITHM_VERSION,
+        Number(resultRow.id),
+        snapshot.sampleSize,
+        snapshot.observedFollowerCount,
+        now,
+        resultRow.settled_at,
+        now,
+      );
+    if (Number(insertion.changes) === 0) return null;
+    return this.sqlite
+      .prepare("SELECT * FROM follower_top5_sessions WHERE id = ?")
+      .get(Number(insertion.lastInsertRowid));
+  }
+
+  #settleFollowerTop5Session(sessionRow, resultRow, now) {
+    if (
+      !sessionRow
+      || Number(sessionRow.continuity_epoch) !== Number(resultRow.continuity_epoch)
+      || Number(sessionRow.anchor_result_id) === Number(resultRow.id)
+    ) {
+      return null;
+    }
+    const boundarySettledAt = sessionRow.boundary_settled_at;
+    const boundaryResultId = Number(sessionRow.boundary_result_id);
+    if (
+      resultRow.settled_at < boundarySettledAt
+      || (
+        resultRow.settled_at === boundarySettledAt
+        && Number(resultRow.id) <= boundaryResultId
+      )
+    ) {
+      return null;
+    }
+    const topNumbers = deserializeJson(sessionRow.top_numbers_json);
+    if (
+      !Array.isArray(topNumbers)
+      || topNumbers.length !== FOLLOWER_TOP5_COUNT
+      || new Set(topNumbers).size !== FOLLOWER_TOP5_COUNT
+      || topNumbers.some((number) => !ROULETTE_NUMBERS.includes(Number(number)))
+    ) {
+      throw new Error("stored follower top-5 session is invalid");
+    }
+    const resultNumber = Number(resultRow.result_number);
+    const hitIndex = topNumbers.map(Number).indexOf(resultNumber);
+    const hit = hitIndex >= 0;
+    const attemptNumber = Number(sessionRow.attempt_count) + 1;
+    this.sqlite
+      .prepare(`
+        INSERT INTO follower_top5_attempts (
+          session_id,
+          round_result_id,
+          attempt_number,
+          result_number,
+          outcome,
+          hit_rank,
+          occurred_at,
+          created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        Number(sessionRow.id),
+        Number(resultRow.id),
+        attemptNumber,
+        resultNumber,
+        hit ? "hit" : "miss",
+        hit ? hitIndex + 1 : null,
+        resultRow.settled_at,
+        now,
+      );
+
+    if (hit) {
+      this.sqlite
+        .prepare(`
+          UPDATE follower_top5_sessions
+          SET
+            status = 'completed',
+            end_reason = 'hit',
+            attempt_count = ?,
+            last_attempt_result_id = ?,
+            completed_result_id = ?,
+            last_event_at = ?,
+            completed_at = ?
+          WHERE id = ? AND status = 'active'
+        `)
+        .run(
+          attemptNumber,
+          Number(resultRow.id),
+          Number(resultRow.id),
+          resultRow.settled_at,
+          resultRow.settled_at,
+          Number(sessionRow.id),
+        );
+    } else {
+      this.sqlite
+        .prepare(`
+          UPDATE follower_top5_sessions
+          SET
+            attempt_count = ?,
+            miss_count = miss_count + 1,
+            last_attempt_result_id = ?,
+            last_event_at = ?
+          WHERE id = ? AND status = 'active'
+        `)
+        .run(
+          attemptNumber,
+          Number(resultRow.id),
+          resultRow.settled_at,
+          Number(sessionRow.id),
+        );
+    }
+    return { hit, attemptNumber, hitRank: hit ? hitIndex + 1 : null };
+  }
+
+  #invalidateFollowerTop5SessionForGap(source, instrument, detectedAt) {
+    this.sqlite
+      .prepare(`
+        UPDATE follower_top5_sessions
+        SET
+          status = 'invalid_gap',
+          end_reason = 'integrity_gap',
+          last_event_at = ?,
+          completed_at = ?
+        WHERE source = ? AND instrument = ? AND status = 'active'
+      `)
+      .run(detectedAt, detectedAt, source, instrument);
+  }
+
+  #processFollowerTop5TrackerBatch(resultRows, now) {
+    const byStream = new Map();
+    for (const row of resultRows) {
+      const key = `${row.source}\u0000${row.instrument}`;
+      const group = byStream.get(key) ?? [];
+      group.push(row);
+      byStream.set(key, group);
+    }
+
+    for (const rows of byStream.values()) {
+      const first = rows[0];
+      let live = this.#liveFollowerTop5SessionRow(
+        first.source,
+        first.instrument,
+      );
+      if (live) {
+        for (const row of rows) {
+          if (Number(live.continuity_epoch) !== Number(row.continuity_epoch)) {
+            this.#invalidateFollowerTop5SessionForGap(
+              row.source,
+              row.instrument,
+              row.settled_at,
+            );
+            live = null;
+            break;
+          }
+          const settlement = this.#settleFollowerTop5Session(live, row, now);
+          if (settlement?.hit) {
+            live = null;
+            break;
+          }
+          live = this.#liveFollowerTop5SessionRow(row.source, row.instrument);
+        }
+      }
+
+      if (!this.#liveFollowerTop5SessionRow(first.source, first.instrument)) {
+        this.#armFollowerTop5SessionAtResult(rows.at(-1), now);
+      }
+    }
+  }
+
+  #initializeFollowerTop5Trackers() {
+    this.#transaction(() => {
+      // Continuity reconciliation can merge a proven false shutdown gap before
+      // this v13 initialization runs. Keep persisted sessions attached to the
+      // epoch of their immutable anchor instead of cancelling a healthy live
+      // session on the first result after restart.
+      this.sqlite
+        .prepare(`
+          UPDATE follower_top5_sessions
+          SET continuity_epoch = (
+            SELECT anchors.continuity_epoch
+            FROM round_results AS anchors
+            WHERE anchors.id = follower_top5_sessions.anchor_result_id
+          )
+          WHERE continuity_epoch <> (
+            SELECT anchors.continuity_epoch
+            FROM round_results AS anchors
+            WHERE anchors.id = follower_top5_sessions.anchor_result_id
+          )
+        `)
+        .run();
+
+      const tails = this.sqlite
+        .prepare(`
+          SELECT rr.*
+          FROM round_results AS rr
+          JOIN stream_state AS state
+            ON state.source = rr.source
+            AND state.instrument = rr.instrument
+            AND state.continuity_epoch = rr.continuity_epoch
+          WHERE rr.id = (
+            SELECT candidate.id
+            FROM round_results AS candidate
+            WHERE candidate.source = rr.source
+              AND candidate.instrument = rr.instrument
+            ORDER BY candidate.settled_at DESC, candidate.id DESC
+            LIMIT 1
+          )
+            AND NOT EXISTS (
+              SELECT 1
+              FROM follower_top5_sessions AS live
+              WHERE live.source = rr.source
+                AND live.instrument = rr.instrument
+                AND live.status = 'active'
+            )
+            AND NOT EXISTS (
+              SELECT 1
+              FROM follower_top5_sessions AS anchored
+              WHERE anchored.anchor_result_id = rr.id
+            )
+        `)
+        .all();
+      let now = null;
+      for (const tail of tails) {
+        const snapshot = this.#followerTop5SnapshotAtResult(tail);
+        if (!snapshot) continue;
+        now ??= asTimestamp(this.clock(), undefined, "clock");
+        this.#armFollowerTop5SessionAtResult(tail, now, snapshot);
+      }
+    });
+  }
+
   #remainingNumbers(cycleId) {
     return this.sqlite
       .prepare(`
@@ -2809,6 +3275,11 @@ export class RouletteDatabase {
       incident.instrument,
       incident.detectedAt,
     );
+    this.#invalidateFollowerTop5SessionForGap(
+      incident.source,
+      incident.instrument,
+      incident.detectedAt,
+    );
     const continuityEpoch = this.#advanceContinuityEpoch(
       incident.source,
       incident.instrument,
@@ -2895,6 +3366,7 @@ export class RouletteDatabase {
         const gapOutcome = gapOutcomes[0] ?? null;
         let duplicateCount = 0;
         const insertedResults = [];
+        const insertedResultRows = [];
         const completedCycleIds = [];
         const continuityEpochs = new Map();
         const insertResult = this.sqlite.prepare(`
@@ -3085,8 +3557,11 @@ export class RouletteDatabase {
             `)
             .get(resultId);
           this.#processVirtualBettorResult(storedRow, now);
+          insertedResultRows.push(storedRow);
           insertedResults.push(mapRoundResult(storedRow));
         }
+
+        this.#processFollowerTop5TrackerBatch(insertedResultRows, now);
 
         return {
           received: events.length,
@@ -3289,6 +3764,194 @@ export class RouletteDatabase {
         roundsSinceLast: row ? Number(row.rounds_since_last) : null,
       };
     });
+  }
+
+  getFollowerTop5TrackerState(source = "buleto", instrument = "default") {
+    this.#assertOpen();
+    const safeSource = asNonEmptyText(source, undefined, "source");
+    const safeInstrument = asNonEmptyText(instrument, undefined, "instrument");
+    const liveRow = this.sqlite
+      .prepare(`
+        SELECT
+          sessions.*,
+          anchor.result_number AS anchor_result_number,
+          anchor.settled_at AS anchor_settled_at,
+          anchor.external_round_id AS anchor_external_round_id
+        FROM follower_top5_sessions AS sessions
+        JOIN round_results AS anchor ON anchor.id = sessions.anchor_result_id
+        WHERE sessions.source = ?
+          AND sessions.instrument = ?
+          AND sessions.status = 'active'
+        ORDER BY sessions.id DESC
+        LIMIT 1
+      `)
+      .get(safeSource, safeInstrument);
+    const lastCompletedRow = this.sqlite
+      .prepare(`
+        SELECT
+          sessions.*,
+          anchor.result_number AS anchor_result_number,
+          anchor.settled_at AS anchor_settled_at,
+          result.result_number AS hit_number,
+          result.settled_at AS hit_settled_at
+        FROM follower_top5_sessions AS sessions
+        JOIN round_results AS anchor ON anchor.id = sessions.anchor_result_id
+        JOIN round_results AS result ON result.id = sessions.completed_result_id
+        WHERE sessions.source = ?
+          AND sessions.instrument = ?
+          AND sessions.status = 'completed'
+          AND sessions.end_reason = 'hit'
+        ORDER BY sessions.id DESC
+        LIMIT 1
+      `)
+      .get(safeSource, safeInstrument);
+    const lastAttemptRow = this.sqlite
+      .prepare(`
+        SELECT
+          attempts.*,
+          sessions.top_numbers_json,
+          sessions.anchor_number
+        FROM follower_top5_attempts AS attempts
+        JOIN follower_top5_sessions AS sessions ON sessions.id = attempts.session_id
+        WHERE sessions.source = ? AND sessions.instrument = ?
+        ORDER BY attempts.id DESC
+        LIMIT 1
+      `)
+      .get(safeSource, safeInstrument);
+    const lifetime = this.sqlite
+      .prepare(`
+        SELECT
+          COUNT(DISTINCT sessions.id) AS total_sessions,
+          COUNT(DISTINCT CASE WHEN sessions.status = 'completed' THEN sessions.id END)
+            AS completed_sessions,
+          COUNT(DISTINCT CASE WHEN sessions.status = 'invalid_gap' THEN sessions.id END)
+            AS invalidated_sessions,
+          COUNT(attempts.id) AS tracked_rounds,
+          COALESCE(SUM(CASE WHEN attempts.outcome = 'hit' THEN 1 ELSE 0 END), 0)
+            AS hits,
+          COALESCE(SUM(CASE WHEN attempts.outcome = 'miss' THEN 1 ELSE 0 END), 0)
+            AS misses
+        FROM follower_top5_sessions AS sessions
+        LEFT JOIN follower_top5_attempts AS attempts ON attempts.session_id = sessions.id
+        WHERE sessions.source = ? AND sessions.instrument = ?
+      `)
+      .get(safeSource, safeInstrument);
+    const epochShape = this.sqlite
+      .prepare(`
+        SELECT
+          state.continuity_epoch AS current_epoch,
+          (
+            SELECT continuity_epoch
+            FROM round_results
+            WHERE source = state.source AND instrument = state.instrument
+            ORDER BY settled_at DESC, id DESC
+            LIMIT 1
+          ) AS latest_result_epoch
+        FROM stream_state AS state
+        WHERE state.source = ? AND state.instrument = ?
+      `)
+      .get(safeSource, safeInstrument);
+
+    const attemptRows = liveRow
+      ? this.sqlite
+        .prepare(`
+          SELECT *
+          FROM follower_top5_attempts
+          WHERE session_id = ?
+          ORDER BY attempt_number DESC
+          LIMIT 101
+        `)
+        .all(Number(liveRow.id))
+      : [];
+    const visibleAttemptRows = attemptRows.slice(0, 100).reverse();
+    const mapAttempt = (row) => row
+      ? {
+          attemptNumber: Number(row.attempt_number),
+          resultId: Number(row.round_result_id),
+          resultNumber: Number(row.result_number),
+          outcome: row.outcome,
+          hitRank: row.hit_rank == null ? null : Number(row.hit_rank),
+          settledAt: row.occurred_at,
+        }
+      : null;
+    const fixedNumbers = liveRow
+      ? deserializeJson(liveRow.top_numbers_json)
+      : null;
+    const currentSession = liveRow
+      ? {
+          id: Number(liveRow.id),
+          continuityEpoch: Number(liveRow.continuity_epoch),
+          sourceNumber: Number(liveRow.anchor_number),
+          fixedNumbers: Array.isArray(fixedNumbers) ? fixedNumbers.map(Number) : [],
+          anchor: {
+            resultId: Number(liveRow.anchor_result_id),
+            number: Number(liveRow.anchor_result_number),
+            externalRoundId: liveRow.anchor_external_round_id ?? null,
+            settledAt: liveRow.anchor_settled_at,
+          },
+          lockedAt: liveRow.locked_at,
+          sampleSize: Number(liveRow.sample_size),
+          observedFollowerCount: Number(liveRow.observed_follower_count),
+          attemptCount: Number(liveRow.attempt_count),
+          missCount: Number(liveRow.miss_count),
+          nextAttemptNumber: Number(liveRow.attempt_count) + 1,
+          attempts: visibleAttemptRows.map(mapAttempt),
+          attemptsTruncated: attemptRows.length > visibleAttemptRows.length,
+        }
+      : null;
+    const completedTopNumbers = lastCompletedRow
+      ? deserializeJson(lastCompletedRow.top_numbers_json)
+      : null;
+    const gapWaiting =
+      epochShape
+      && epochShape.latest_result_epoch != null
+      && Number(epochShape.current_epoch) !== Number(epochShape.latest_result_epoch);
+
+    return {
+      schemaVersion: 1,
+      algorithmVersion: FOLLOWER_TOP5_LIVE_ALGORITHM_VERSION,
+      mode: "simulation",
+      executionEnabled: false,
+      trackingMode: "persisted-batch-aware",
+      topCount: FOLLOWER_TOP5_COUNT,
+      minimumObservedFollowerCount: FOLLOWER_TOP5_MINIMUM_OBSERVED,
+      status: currentSession
+        ? currentSession.attemptCount > 0 ? "active" : "armed"
+        : gapWaiting ? "gap" : "waiting_training",
+      currentSession,
+      lastCompletedSession: lastCompletedRow
+        ? {
+            id: Number(lastCompletedRow.id),
+            sourceNumber: Number(lastCompletedRow.anchor_number),
+            fixedNumbers: Array.isArray(completedTopNumbers)
+              ? completedTopNumbers.map(Number)
+              : [],
+            attemptCount: Number(lastCompletedRow.attempt_count),
+            missCount: Number(lastCompletedRow.miss_count),
+            hitNumber: Number(lastCompletedRow.hit_number),
+            hitRank: deserializeJson(lastCompletedRow.top_numbers_json)
+              .map(Number)
+              .indexOf(Number(lastCompletedRow.hit_number)) + 1,
+            completedAt: lastCompletedRow.hit_settled_at,
+          }
+        : null,
+      lastAttempt: lastAttemptRow
+        ? {
+            ...mapAttempt(lastAttemptRow),
+            sessionId: Number(lastAttemptRow.session_id),
+            sourceNumber: Number(lastAttemptRow.anchor_number),
+            fixedNumbers: deserializeJson(lastAttemptRow.top_numbers_json).map(Number),
+          }
+        : null,
+      lifetime: {
+        totalSessions: Number(lifetime.total_sessions),
+        completedSessions: Number(lifetime.completed_sessions),
+        invalidatedSessions: Number(lifetime.invalidated_sessions),
+        trackedRounds: Number(lifetime.tracked_rounds),
+        hits: Number(lifetime.hits),
+        misses: Number(lifetime.misses),
+      },
+    };
   }
 
   initializeVirtualBettor(source = "buleto", instrument = "default") {

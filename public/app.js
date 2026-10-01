@@ -43,6 +43,17 @@ import { buildFollowerStats } from "./pair-followers.js?v=1";
     precloseHitHistoryStatus: document.getElementById("preclose-hit-history-status"),
     followerPanel: document.getElementById("follower-panel"),
     followerTitle: document.getElementById("follower-title"),
+    followerLive: document.getElementById("follower-live-tracker"),
+    followerLiveStatus: document.getElementById("follower-live-status"),
+    followerLiveSource: document.getElementById("follower-live-source"),
+    followerLiveFixedList: document.getElementById("follower-live-fixed-list"),
+    followerLiveLockMeta: document.getElementById("follower-live-lock-meta"),
+    followerLiveCurrentAttempt: document.getElementById("follower-live-current-attempt"),
+    followerLiveAttemptSummary: document.getElementById("follower-live-attempt-summary"),
+    followerLiveHistoryRate: document.getElementById("follower-live-history-rate"),
+    followerLiveHistoryDetail: document.getElementById("follower-live-history-detail"),
+    followerLiveAttemptList: document.getElementById("follower-live-attempt-list"),
+    followerLiveLastHit: document.getElementById("follower-live-last-hit"),
     followerSource: document.getElementById("follower-source"),
     followerCount: document.getElementById("follower-count"),
     followerList: document.getElementById("follower-list"),
@@ -1169,6 +1180,7 @@ import { buildFollowerStats } from "./pair-followers.js?v=1";
     if (store.hasCompletedInitialRender) {
       renderFollowers(store.state?.latestResult || store.results[0] || null);
     }
+    renderFollowerTop5Tracker(store.state?.followerTop5Tracker || null);
     renderFollowerHitCurve();
     renderForecastHitHistory();
     renderVirtualBettor(store.state?.virtualBettor || null);
@@ -1181,6 +1193,7 @@ import { buildFollowerStats } from "./pair-followers.js?v=1";
     renderLatestResult(latestResult);
     renderPrecloseForecast();
     renderForecastHitHistory();
+    renderFollowerTop5Tracker(store.state?.followerTop5Tracker || null);
     renderFollowers(latestResult);
     renderOverdueNumbers();
     renderActiveCycle(store.state?.activeCycle || null);
@@ -1809,6 +1822,445 @@ import { buildFollowerStats } from "./pair-followers.js?v=1";
       return null;
     }
     return { eligibleCount, points: normalized };
+  }
+
+  function normalizedFollowerAllPoints() {
+    const summary = normalizedFollowerHitCurve();
+    const points = store.followerHitCurve?.overall?.allPoints;
+    if (!summary || !Array.isArray(points) || points.length !== 20) return null;
+
+    const normalized = [];
+    let previousHitCount = -1;
+    for (let index = 0; index < points.length; index += 1) {
+      const point = points[index];
+      const horizon = asOptionalNonNegativeInteger(point?.horizon);
+      const hitCount = asOptionalNonNegativeInteger(point?.hitCount);
+      const eligibleCount = asOptionalNonNegativeInteger(point?.eligibleCount);
+      const expectedHorizon = index + 1;
+      if (
+        horizon !== expectedHorizon
+        || hitCount === null
+        || eligibleCount !== summary.eligibleCount
+        || hitCount > eligibleCount
+        || hitCount < previousHitCount
+      ) {
+        return null;
+      }
+
+      let rate = null;
+      if (eligibleCount === 0) {
+        if (hitCount !== 0 || point?.rate !== null) return null;
+      } else {
+        rate = asOptionalFiniteNumber(point?.rate);
+        const expectedRate = hitCount / eligibleCount;
+        if (
+          rate === null
+          || rate < 0
+          || rate > 1
+          || Math.abs(rate - expectedRate) > 1e-12
+        ) {
+          return null;
+        }
+      }
+
+      normalized.push({ horizon, hitCount, eligibleCount, rate });
+      previousHitCount = hitCount;
+    }
+
+    const sparsePoints = new Map(summary.points.map((point) => [point.horizon, point]));
+    if (FOLLOWER_HIT_HORIZONS.some((horizon) => {
+      const sparse = sparsePoints.get(horizon);
+      const complete = normalized[horizon - 1];
+      return sparse.hitCount !== complete.hitCount
+        || sparse.eligibleCount !== complete.eligibleCount;
+    })) {
+      return null;
+    }
+
+    return { eligibleCount: summary.eligibleCount, points: normalized };
+  }
+
+  function normalizedFollowerFixedNumbers(value) {
+    if (!Array.isArray(value) || value.length !== 5) return null;
+    const numbers = value.map(asRouletteNumber);
+    if (numbers.some((number) => number === null) || new Set(numbers).size !== 5) return null;
+    return numbers;
+  }
+
+  function normalizedFollowerLiveSession(value, status) {
+    if (!value || typeof value !== "object") return null;
+    const id = asOptionalNonNegativeInteger(value.id);
+    const continuityEpoch = asOptionalNonNegativeInteger(value.continuityEpoch);
+    const sourceNumber = asRouletteNumber(value.sourceNumber);
+    const fixedNumbers = normalizedFollowerFixedNumbers(value.fixedNumbers);
+    const anchorResultId = asOptionalNonNegativeInteger(value.anchor?.resultId);
+    const anchorNumber = asRouletteNumber(value.anchor?.number);
+    const sampleSize = asOptionalNonNegativeInteger(value.sampleSize);
+    const observedFollowerCount = asOptionalNonNegativeInteger(value.observedFollowerCount);
+    const attemptCount = asOptionalNonNegativeInteger(value.attemptCount);
+    const missCount = asOptionalNonNegativeInteger(value.missCount);
+    const nextAttemptNumber = asOptionalNonNegativeInteger(value.nextAttemptNumber);
+    const attempts = Array.isArray(value.attempts) ? value.attempts : null;
+
+    if (
+      id === null || id < 1
+      || continuityEpoch === null
+      || sourceNumber === null
+      || fixedNumbers === null
+      || anchorResultId === null || anchorResultId < 1
+      || anchorNumber !== sourceNumber
+      || !parseDate(value.anchor?.settledAt)
+      || !parseDate(value.lockedAt)
+      || sampleSize === null
+      || observedFollowerCount === null
+      || observedFollowerCount < 5
+      || observedFollowerCount > sampleSize
+      || attemptCount === null
+      || missCount !== attemptCount
+      || nextAttemptNumber !== attemptCount + 1
+      || attempts === null
+      || typeof value.attemptsTruncated !== "boolean"
+      || value.attemptsTruncated !== (attemptCount > 100)
+      || attempts.length !== Math.min(attemptCount, 100)
+      || (status === "armed" && attemptCount !== 0)
+      || (status === "active" && attemptCount < 1)
+    ) {
+      return null;
+    }
+
+    const firstVisibleAttempt = attemptCount - attempts.length + 1;
+    const seenResultIds = new Set();
+    const normalizedAttempts = [];
+    for (let index = 0; index < attempts.length; index += 1) {
+      const attempt = attempts[index];
+      const attemptNumber = asOptionalNonNegativeInteger(attempt?.attemptNumber);
+      const resultId = asOptionalNonNegativeInteger(attempt?.resultId);
+      const resultNumber = asRouletteNumber(attempt?.resultNumber);
+      if (
+        attemptNumber !== firstVisibleAttempt + index
+        || resultId === null || resultId < 1
+        || seenResultIds.has(resultId)
+        || resultNumber === null
+        || fixedNumbers.includes(resultNumber)
+        || attempt?.outcome !== "miss"
+        || attempt?.hitRank !== null
+        || !parseDate(attempt?.settledAt)
+      ) {
+        return null;
+      }
+      seenResultIds.add(resultId);
+      normalizedAttempts.push({
+        attemptNumber,
+        resultId,
+        resultNumber,
+        settledAt: attempt.settledAt
+      });
+    }
+
+    return {
+      id,
+      continuityEpoch,
+      sourceNumber,
+      fixedNumbers,
+      anchor: {
+        resultId: anchorResultId,
+        number: anchorNumber,
+        settledAt: value.anchor.settledAt
+      },
+      lockedAt: value.lockedAt,
+      sampleSize,
+      observedFollowerCount,
+      attemptCount,
+      missCount,
+      nextAttemptNumber,
+      attempts: normalizedAttempts,
+      attemptsTruncated: value.attemptsTruncated
+    };
+  }
+
+  function normalizedFollowerLastHit(value) {
+    if (value === null) return null;
+    if (!value || typeof value !== "object") return false;
+    const id = asOptionalNonNegativeInteger(value.id);
+    const sourceNumber = asRouletteNumber(value.sourceNumber);
+    const fixedNumbers = normalizedFollowerFixedNumbers(value.fixedNumbers);
+    const attemptCount = asOptionalNonNegativeInteger(value.attemptCount);
+    const missCount = asOptionalNonNegativeInteger(value.missCount);
+    const hitNumber = asRouletteNumber(value.hitNumber);
+    const hitRank = asOptionalNonNegativeInteger(value.hitRank);
+    if (
+      id === null || id < 1
+      || sourceNumber === null
+      || fixedNumbers === null
+      || attemptCount === null || attemptCount < 1
+      || missCount !== attemptCount - 1
+      || hitNumber === null
+      || hitRank === null || hitRank < 1 || hitRank > 5
+      || fixedNumbers[hitRank - 1] !== hitNumber
+      || !parseDate(value.completedAt)
+    ) {
+      return false;
+    }
+    return {
+      id,
+      sourceNumber,
+      fixedNumbers,
+      attemptCount,
+      missCount,
+      hitNumber,
+      hitRank,
+      completedAt: value.completedAt
+    };
+  }
+
+  function normalizedFollowerTop5Tracker(value) {
+    const statuses = new Set(["armed", "active", "gap", "waiting_training"]);
+    if (
+      !value || typeof value !== "object"
+      || value.schemaVersion !== 1
+      || value.algorithmVersion !== "follower-top5-live-v1"
+      || value.mode !== "simulation"
+      || value.executionEnabled !== false
+      || value.trackingMode !== "persisted-batch-aware"
+      || value.topCount !== 5
+      || value.minimumObservedFollowerCount !== 5
+      || !statuses.has(value.status)
+    ) {
+      return null;
+    }
+
+    const hasCurrentSession = value.status === "armed" || value.status === "active";
+    if (
+      (hasCurrentSession && (!value.currentSession || typeof value.currentSession !== "object"))
+      || (!hasCurrentSession && value.currentSession !== null)
+    ) {
+      return null;
+    }
+    const currentSession = hasCurrentSession
+      ? normalizedFollowerLiveSession(value.currentSession, value.status)
+      : null;
+    const lastCompletedSession = normalizedFollowerLastHit(value.lastCompletedSession);
+    if ((hasCurrentSession && !currentSession) || lastCompletedSession === false) return null;
+
+    return {
+      status: value.status,
+      currentSession,
+      lastCompletedSession
+    };
+  }
+
+  function renderFollowerLiveFixedNumbers(numbers) {
+    const fragment = document.createDocumentFragment();
+    if (!numbers) {
+      for (let index = 0; index < 5; index += 1) {
+        fragment.appendChild(createElement("li", "follower-live__placeholder", "—"));
+      }
+      elements.followerLiveFixedList.setAttribute("aria-label", "Зафиксированная пятёрка пока недоступна");
+      elements.followerLiveFixedList.replaceChildren(fragment);
+      return;
+    }
+
+    numbers.forEach((number, index) => {
+      const item = createElement("li", "follower-live__fixed-item");
+      const rank = createElement("span", "follower-live__rank", `№${index + 1}`);
+      const ball = createElement("span", `history-number ${rouletteColorClass(number)}`, number);
+      ball.setAttribute("aria-hidden", "true");
+      item.setAttribute("aria-label", `Место ${index + 1}: число ${number}, ${rouletteColorLabel(number)}`);
+      item.append(rank, ball);
+      fragment.appendChild(item);
+    });
+    elements.followerLiveFixedList.setAttribute("aria-label", "Зафиксированные пять чисел по местам");
+    elements.followerLiveFixedList.replaceChildren(fragment);
+  }
+
+  function renderFollowerLiveAttempts(session) {
+    const fragment = document.createDocumentFragment();
+    elements.followerLiveAttemptList.setAttribute("aria-busy", "false");
+    if (!session || session.attemptCount === 0) {
+      fragment.appendChild(createElement(
+        "li",
+        "follower-live__attempt-empty",
+        session ? "Пока нет завершённых попыток." : "Нет активной серии."
+      ));
+      elements.followerLiveAttemptList.replaceChildren(fragment);
+      return;
+    }
+
+    if (session.attemptsTruncated) {
+      const hiddenCount = session.attemptCount - session.attempts.length;
+      fragment.appendChild(createElement(
+        "li",
+        "follower-live__attempt-truncated",
+        `Ранее ещё ${hiddenCount} ${pluralForm(hiddenCount, "промах", "промаха", "промахов")}`
+      ));
+    }
+
+    session.attempts.forEach((attempt) => {
+      const item = createElement("li", "follower-live__attempt-item");
+      const label = createElement("span", "follower-live__attempt-number", `№${attempt.attemptNumber}`);
+      const ball = createElement(
+        "span",
+        `follower-live__attempt-ball ${rouletteColorClass(attempt.resultNumber)}`,
+        attempt.resultNumber
+      );
+      ball.setAttribute("aria-hidden", "true");
+      const outcome = createElement("span", "follower-live__attempt-outcome", "промах");
+      const time = createElement("time", "follower-live__attempt-time", formatDateTime(attempt.settledAt));
+      time.dateTime = parseDate(attempt.settledAt).toISOString();
+      item.setAttribute(
+        "aria-label",
+        `Попытка ${attempt.attemptNumber}: выпало ${attempt.resultNumber}, ${rouletteColorLabel(attempt.resultNumber)}, промах, ${formatDateTime(attempt.settledAt, { alwaysShowDate: true })}`
+      );
+      item.append(label, ball, outcome, time);
+      fragment.appendChild(item);
+    });
+    elements.followerLiveAttemptList.replaceChildren(fragment);
+  }
+
+  function renderFollowerLiveHistory(nextAttemptNumber) {
+    if (nextAttemptNumber === null) {
+      setTextIfChanged(elements.followerLiveHistoryRate, "—");
+      setTextIfChanged(elements.followerLiveHistoryDetail, "Появится после фиксации пятёрки");
+      return;
+    }
+    if (!store.pairsLoaded) {
+      setTextIfChanged(elements.followerLiveHistoryRate, "—");
+      setTextIfChanged(
+        elements.followerLiveHistoryDetail,
+        store.pairsError ? "Исторический расчёт недоступен" : "Загружаем общую историю…"
+      );
+      return;
+    }
+
+    const curve = normalizedFollowerAllPoints();
+    if (!curve) {
+      setTextIfChanged(elements.followerLiveHistoryRate, "—");
+      setTextIfChanged(elements.followerLiveHistoryDetail, "Сервер не вернул полный ряд 1–20");
+      return;
+    }
+
+    const referenceAttempt = Math.min(nextAttemptNumber, 20);
+    const point = curve.points[referenceAttempt - 1];
+    const staleSuffix = store.pairsError ? " · не обновлено" : "";
+    if (point.eligibleCount === 0) {
+      setTextIfChanged(elements.followerLiveHistoryRate, "—");
+      setTextIfChanged(
+        elements.followerLiveHistoryDetail,
+        `К попытке ${referenceAttempt}: пока нет полных 20-раундовых окон${staleSuffix}`
+      );
+      return;
+    }
+
+    setTextIfChanged(
+      elements.followerLiveHistoryRate,
+      nextAttemptNumber > 20
+        ? `${historicalPercentFormatter.format(point.rate)} · ≤20`
+        : historicalPercentFormatter.format(point.rate)
+    );
+    setTextIfChanged(
+      elements.followerLiveHistoryDetail,
+      nextAttemptNumber > 20
+        ? `К попытке 20: ${point.hitCount} из ${point.eligibleCount}; текущая №${nextAttemptNumber}, дальше без экстраполяции${staleSuffix}`
+        : `К попытке ${nextAttemptNumber}: ${point.hitCount} из ${point.eligibleCount} в общей сохранённой истории${staleSuffix}`
+    );
+  }
+
+  function renderFollowerLiveLastHit(lastHit) {
+    elements.followerLiveLastHit.hidden = !lastHit;
+    if (!lastHit) {
+      setTextIfChanged(elements.followerLiveLastHit, "");
+      return;
+    }
+    setTextIfChanged(
+      elements.followerLiveLastHit,
+      `Последнее попадание: число ${lastHit.hitNumber} (место №${lastHit.hitRank}) на попытке ${lastHit.attemptCount}. Серия закрыта ${formatDateTime(lastHit.completedAt, { alwaysShowDate: true })}, счёт сброшен.`
+    );
+  }
+
+  function renderFollowerLiveUnavailable(state, status, message, busy = false) {
+    elements.followerLive.dataset.state = state;
+    elements.followerLive.setAttribute("aria-busy", String(busy));
+    setTextIfChanged(elements.followerLiveStatus, status);
+    setTextIfChanged(elements.followerLiveSource, "—");
+    setTextIfChanged(elements.followerLiveCurrentAttempt, "—");
+    setTextIfChanged(elements.followerLiveAttemptSummary, "Нет активной серии");
+    setTextIfChanged(elements.followerLiveLockMeta, message);
+    renderFollowerLiveFixedNumbers(null);
+    renderFollowerLiveAttempts(null);
+    renderFollowerLiveHistory(null);
+    renderFollowerLiveLastHit(null);
+  }
+
+  function renderFollowerTop5Tracker(value) {
+    if (!value) {
+      if (!store.stateLoaded && !store.stateError) {
+        renderFollowerLiveUnavailable("loading", "Загрузка…", "Получаем состояние live‑тестирования.", true);
+      } else if (store.stateError) {
+        renderFollowerLiveUnavailable("error", "Ошибка загрузки", "Не удалось получить состояние live‑тестирования. Повторим автоматически.");
+      } else {
+        renderFollowerLiveUnavailable("error", "Нет данных", "Сервер не передал состояние live‑тестирования.");
+      }
+      return;
+    }
+
+    const tracker = normalizedFollowerTop5Tracker(value);
+    if (!tracker) {
+      renderFollowerLiveUnavailable(
+        "error",
+        "Данные отклонены",
+        "Сервер вернул неподтверждённый режим или повреждённое состояние. Live‑значения скрыты."
+      );
+      return;
+    }
+
+    const stale = store.stateError;
+    const staleSuffix = stale ? " · не обновлено" : "";
+    elements.followerLive.dataset.state = stale ? "stale" : tracker.status;
+    elements.followerLive.setAttribute("aria-busy", "false");
+    renderFollowerLiveLastHit(tracker.lastCompletedSession);
+
+    if (!tracker.currentSession) {
+      setTextIfChanged(elements.followerLiveSource, "—");
+      setTextIfChanged(elements.followerLiveCurrentAttempt, "—");
+      setTextIfChanged(elements.followerLiveAttemptSummary, "Нет активной серии");
+      renderFollowerLiveFixedNumbers(null);
+      renderFollowerLiveAttempts(null);
+      renderFollowerLiveHistory(null);
+      if (tracker.status === "gap") {
+        setTextIfChanged(elements.followerLiveStatus, `Пауза после разрыва${staleSuffix}`);
+        setTextIfChanged(
+          elements.followerLiveLockMeta,
+          "Разрыв непрерывности сбросил текущую серию. Новая пятёрка появится после подтверждённого раунда и достаточной истории."
+        );
+      } else {
+        setTextIfChanged(elements.followerLiveStatus, `Ждём обучения${staleSuffix}`);
+        setTextIfChanged(
+          elements.followerLiveLockMeta,
+          "Для новой фиксации нужны не менее 5 разных сохранённых продолжений исходного числа."
+        );
+      }
+      return;
+    }
+
+    const session = tracker.currentSession;
+    setTextIfChanged(elements.followerLiveStatus, tracker.status === "armed"
+      ? `Пятёрка зафиксирована${staleSuffix}`
+      : `Попытка №${session.nextAttemptNumber}${staleSuffix}`);
+    setTextIfChanged(elements.followerLiveSource, session.sourceNumber);
+    setTextIfChanged(elements.followerLiveCurrentAttempt, `№${session.nextAttemptNumber}`);
+    setTextIfChanged(
+      elements.followerLiveAttemptSummary,
+      session.attemptCount === 0
+        ? "Ждём первый следующий сохранённый результат"
+        : `${session.missCount} ${pluralForm(session.missCount, "сохранённый промах", "сохранённых промаха", "сохранённых промахов")}; попадание закроет серию`
+    );
+    setTextIfChanged(
+      elements.followerLiveLockMeta,
+      `Зафиксировано ${formatDateTime(session.lockedAt, { alwaysShowDate: true })} · ${session.sampleSize} ${pluralForm(session.sampleSize, "переход", "перехода", "переходов")} в выборке, ${session.observedFollowerCount} разных продолжений.`
+    );
+    renderFollowerLiveFixedNumbers(session.fixedNumbers);
+    renderFollowerLiveAttempts(session);
+    renderFollowerLiveHistory(session.nextAttemptNumber);
   }
 
   function followerHitEmpty(message) {

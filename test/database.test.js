@@ -112,6 +112,8 @@ test("schema contains all persistence tables", () => {
       "cycle_events",
       "cycle_numbers",
       "cycles",
+      "follower_top5_attempts",
+      "follower_top5_sessions",
       "forecast_consensus_snapshots",
       "forecast_pair_snapshots",
       "forecast_settlements",
@@ -125,7 +127,7 @@ test("schema contains all persistence tables", () => {
       "virtual_bet_sessions",
       "virtual_bets",
     ]);
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 12);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 13);
     assert.deepEqual(
       database.sqlite
         .prepare("PRAGMA table_info(forecast_pair_snapshots)")
@@ -173,6 +175,56 @@ test("schema contains all persistence tables", () => {
     );
   } finally {
     database.close();
+  }
+});
+
+test("version 13 creates one live follower tracker at the current tail", () => {
+  const directory = mkdtempSync(join(tmpdir(), "roulette-v13-follower-"));
+  const path = join(directory, "tracker.sqlite");
+  const training = [9, 1, 9, 2, 9, 3, 9, 4, 9, 5, 9];
+  let clockCalls = 0;
+  const clock = () => {
+    clockCalls += 1;
+    return new Date(BASE_TIME + 60_000);
+  };
+  let database = createDatabase({ path, clock });
+  try {
+    database.ingestBatch(
+      training.map((number, index) => event(number, `v13-follower-${index}`, index)),
+    );
+    database.sqlite.exec(`
+      DROP TABLE follower_top5_attempts;
+      DROP TABLE follower_top5_sessions;
+      PRAGMA user_version = 12;
+    `);
+    database.close();
+
+    database = createDatabase({ path, clock });
+    const migrated = database.getFollowerTop5TrackerState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 13);
+    assert.equal(migrated.status, "armed");
+    assert.equal(migrated.currentSession.sourceNumber, 9);
+    assert.deepEqual(migrated.currentSession.fixedNumbers, [5, 4, 3, 2, 1]);
+    assert.equal(migrated.lifetime.totalSessions, 1);
+    assert.equal(clockCalls, 1);
+
+    const sessionId = migrated.currentSession.id;
+    database.close();
+    database = createDatabase({ path, clock });
+    assert.equal(
+      database.getFollowerTop5TrackerState(
+        "buleto",
+        "PRIMECOIN(XPM)/RUB",
+      ).currentSession.id,
+      sessionId,
+    );
+    assert.equal(clockCalls, 1, "an existing session must not consume the clock");
+  } finally {
+    database.close();
+    rmSync(directory, { recursive: true, force: true });
   }
 });
 
@@ -824,7 +876,7 @@ test("versions 11 and 12 do not backfill derived snapshots for version 10 foreca
       path,
       clock: () => new Date(BASE_TIME + 52_000),
     });
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 12);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 13);
     assert.equal(
       Number(
         database.sqlite
@@ -903,7 +955,7 @@ test("version 12 does not backfill consensus for legacy version 11 forecasts", (
       path,
       clock: () => new Date(BASE_TIME + 52_000),
     });
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 12);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 13);
     assert.equal(
       database.sqlite
         .prepare("SELECT COUNT(*) AS count FROM forecast_consensus_snapshots")
@@ -1227,7 +1279,7 @@ test("version 5 history is backfilled into continuity epochs before migration co
 
   const database = createDatabase({ path });
   try {
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 12);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 13);
     assert.deepEqual(
       database.sqlite
         .prepare("SELECT continuity_epoch FROM round_results ORDER BY settled_at, id")
@@ -1287,7 +1339,7 @@ test("version 9 reconciles a proven contiguous shutdown boundary without deletin
 
     database = createDatabase({ path, gapThresholdSeconds: 135 });
     const state = database.getDashboardState();
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 12);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 13);
     assert.equal(state.totals.results, 5, "raw results are never recreated or deleted");
     assert.equal(state.totals.cycles, 1);
     assert.equal(state.totals.invalidCycles, 0);
@@ -1782,7 +1834,10 @@ test("top-5 hit curve uses one complete cohort and accumulates fixed-list hits",
     assert.equal(curve.cohort, "anchors-with-complete-20-round-window");
     assert.equal(curve.historyResultCount, training.length + evaluation.length);
     assert.equal(curve.continuitySegmentCount, 2);
-    assert.deepEqual(curve.overall, {
+    assert.deepEqual({
+      eligibleCount: curve.overall.eligibleCount,
+      points: curve.overall.points,
+    }, {
       eligibleCount: 4,
       points: [
         { horizon: 1, hitCount: 1, eligibleCount: 4, rate: 0.25 },
@@ -1793,6 +1848,15 @@ test("top-5 hit curve uses one complete cohort and accumulates fixed-list hits",
         { horizon: 20, hitCount: 3, eligibleCount: 4, rate: 0.75 },
       ],
     });
+    assert.equal(curve.overall.allPoints.length, 20);
+    assert.equal(
+      curve.overall.allPoints.every((point) => point.eligibleCount === 4),
+      true,
+    );
+    assert.deepEqual(
+      curve.overall.allPoints.map((point) => point.hitCount),
+      [1, 1, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3],
+    );
     assert.equal(sourceNine.eligibleCount, 4);
     assert.deepEqual(
       sourceNine.points.map(({ horizon, hitCount, eligibleCount, rate }) => ({
@@ -1912,6 +1976,392 @@ test("top-5 hit curve never creates a transition across a known gap", () => {
     assert.equal(sourceNine.points[0].rate, 1);
   } finally {
     database.close();
+  }
+});
+
+test("fixed top-5 paper tracker records misses, closes on hit, and respects batch barriers", () => {
+  const database = createDatabase({ path: ":memory:" });
+  const training = [9, 1, 9, 2, 9, 3, 9, 4, 9, 5, 9];
+  try {
+    database.ingestBatch(
+      training.map((number, index) => event(number, `paper-train-${index}`, index)),
+    );
+    const armed = database.getFollowerTop5TrackerState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    assert.deepEqual(
+      {
+        schemaVersion: armed.schemaVersion,
+        algorithmVersion: armed.algorithmVersion,
+        mode: armed.mode,
+        executionEnabled: armed.executionEnabled,
+        trackingMode: armed.trackingMode,
+        topCount: armed.topCount,
+        minimumObservedFollowerCount: armed.minimumObservedFollowerCount,
+      },
+      {
+        schemaVersion: 1,
+        algorithmVersion: "follower-top5-live-v1",
+        mode: "simulation",
+        executionEnabled: false,
+        trackingMode: "persisted-batch-aware",
+        topCount: 5,
+        minimumObservedFollowerCount: 5,
+      },
+    );
+    assert.equal(armed.status, "armed");
+    assert.equal(armed.currentSession.sourceNumber, 9);
+    assert.deepEqual(armed.currentSession.fixedNumbers, [5, 4, 3, 2, 1]);
+    assert.equal(armed.currentSession.attemptCount, 0);
+
+    database.ingestBatch(
+      [8, 3, 7, 9].map((number, index) =>
+        event(number, `paper-batch-${index}`, training.length + index),
+      ),
+    );
+    const reset = database.getFollowerTop5TrackerState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    assert.equal(reset.status, "armed");
+    assert.equal(reset.currentSession.sourceNumber, 9);
+    assert.equal(reset.currentSession.attemptCount, 0);
+    assert.deepEqual(reset.currentSession.fixedNumbers, [8, 5, 4, 3, 2]);
+    assert.deepEqual(
+      database.sqlite
+        .prepare(`
+          SELECT attempt_number, result_number, outcome, hit_rank
+          FROM follower_top5_attempts
+          ORDER BY id
+        `)
+        .all()
+        .map((row) => ({
+          attemptNumber: Number(row.attempt_number),
+          resultNumber: Number(row.result_number),
+          outcome: row.outcome,
+          hitRank: row.hit_rank == null ? null : Number(row.hit_rank),
+        })),
+      [
+        { attemptNumber: 1, resultNumber: 8, outcome: "miss", hitRank: null },
+        { attemptNumber: 2, resultNumber: 3, outcome: "hit", hitRank: 3 },
+      ],
+    );
+    assert.equal(reset.lastCompletedSession.attemptCount, 2);
+    assert.equal(reset.lastCompletedSession.hitNumber, 3);
+    assert.equal(reset.lifetime.trackedRounds, 2);
+    assert.equal(reset.lifetime.hits, 1);
+    assert.equal(reset.lifetime.misses, 1);
+
+    database.ingestBatch([
+      event(6, "paper-live-miss", training.length + 4),
+    ]);
+    const missed = database.getFollowerTop5TrackerState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    assert.equal(missed.status, "active");
+    assert.equal(missed.currentSession.attemptCount, 1);
+    assert.equal(missed.currentSession.missCount, 1);
+    assert.equal(missed.currentSession.nextAttemptNumber, 2);
+    assert.deepEqual(missed.currentSession.fixedNumbers, [8, 5, 4, 3, 2]);
+    assert.deepEqual(missed.currentSession.attempts, [
+      {
+        attemptNumber: 1,
+        resultId: missed.currentSession.attempts[0].resultId,
+        resultNumber: 6,
+        outcome: "miss",
+        hitRank: null,
+        settledAt: new Date(
+          BASE_TIME + (training.length + 4) * 1_000,
+        ).toISOString(),
+      },
+    ]);
+
+    database.ingestBatch([
+      event(5, "paper-live-hit", training.length + 5),
+    ]);
+    const hit = database.getFollowerTop5TrackerState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    assert.equal(hit.currentSession, null);
+    assert.equal(hit.status, "waiting_training");
+    assert.equal(hit.lastCompletedSession.hitNumber, 5);
+    assert.equal(hit.lastCompletedSession.attemptCount, 2);
+    assert.equal(hit.lifetime.trackedRounds, 4);
+    assert.equal(hit.lifetime.hits, 2);
+    assert.equal(hit.lifetime.misses, 2);
+  } finally {
+    database.close();
+  }
+});
+
+test("fixed top-5 paper tracker invalidates a run at a gap without grading catch-up rows", () => {
+  const database = createDatabase({ path: ":memory:" });
+  const training = [9, 1, 9, 2, 9, 3, 9, 4, 9, 5, 9];
+  try {
+    database.ingestBatch(
+      training.map((number, index) => event(number, `paper-gap-train-${index}`, index)),
+    );
+    const miss = event(8, "paper-gap-miss", training.length);
+    database.ingestBatch([miss]);
+    database.ingestBatch([miss]);
+
+    database.ingestBatchAfterGap(
+      {
+        source: "buleto",
+        instrument: "PRIMECOIN(XPM)/RUB",
+        incidentKey: "paper-tracker-gap",
+        detectedAt: new Date(BASE_TIME + (training.length + 1) * 1_000).toISOString(),
+        message: "known missing result",
+      },
+      [1, 9].map((number, index) =>
+        event(number, `paper-gap-catchup-${index}`, training.length + index + 2),
+      ),
+    );
+
+    const state = database.getFollowerTop5TrackerState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    assert.equal(state.status, "armed");
+    assert.equal(state.currentSession.sourceNumber, 9);
+    assert.equal(state.currentSession.attemptCount, 0);
+    assert.equal(state.lifetime.trackedRounds, 1);
+    assert.equal(state.lifetime.hits, 0);
+    assert.equal(state.lifetime.misses, 1);
+    assert.equal(state.lifetime.invalidatedSessions, 1);
+    assert.equal(
+      database.sqlite
+        .prepare("SELECT COUNT(*) AS count FROM follower_top5_attempts")
+        .get().count,
+      1,
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test("fixed top-5 paper tracker ignores retrograde inserts before its chronological boundary", () => {
+  const database = createDatabase({ path: ":memory:" });
+  const training = [9, 1, 9, 2, 9, 3, 9, 4, 9, 5, 9];
+  try {
+    database.ingestBatch(
+      training.map((number, index) => event(number, `paper-order-${index}`, index)),
+    );
+    const armed = database.getFollowerTop5TrackerState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    const sessionId = armed.currentSession.id;
+
+    database.ingestBatch([
+      event(8, "paper-order-before-anchor", training.length - 1.5),
+    ]);
+    let state = database.getFollowerTop5TrackerState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    assert.equal(state.currentSession.id, sessionId);
+    assert.equal(state.currentSession.attemptCount, 0);
+    assert.equal(state.lastAttempt, null);
+
+    database.ingestBatch([
+      event(8, "paper-order-forward", training.length + 1),
+    ]);
+    state = database.getFollowerTop5TrackerState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    assert.equal(state.currentSession.attemptCount, 1);
+    const firstAttemptId = state.lastAttempt.resultId;
+
+    database.ingestBatch([
+      event(7, "paper-order-before-attempt", training.length + 0.5),
+    ]);
+    state = database.getFollowerTop5TrackerState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    assert.equal(state.currentSession.id, sessionId);
+    assert.equal(state.currentSession.attemptCount, 1);
+    assert.equal(state.lastAttempt.resultId, firstAttemptId);
+    assert.equal(
+      database.sqlite
+        .prepare("SELECT COUNT(*) AS count FROM follower_top5_attempts")
+        .get().count,
+      1,
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test("fixed top-5 paper tracker preserves its frozen list across restart", () => {
+  const directory = mkdtempSync(join(tmpdir(), "roulette-follower-paper-"));
+  const path = join(directory, "tracker.sqlite");
+  const training = [9, 1, 9, 2, 9, 3, 9, 4, 9, 5, 9];
+  let database = createDatabase({ path });
+  try {
+    database.ingestBatch(
+      training.map((number, index) => event(number, `paper-reopen-${index}`, index)),
+    );
+    database.ingestBatch([
+      event(8, "paper-reopen-miss", training.length),
+    ]);
+    const before = database.getFollowerTop5TrackerState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    database.close();
+
+    database = createDatabase({ path });
+    const after = database.getFollowerTop5TrackerState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    assert.equal(after.currentSession.id, before.currentSession.id);
+    assert.deepEqual(
+      after.currentSession.fixedNumbers,
+      before.currentSession.fixedNumbers,
+    );
+    assert.equal(after.currentSession.attemptCount, 1);
+    assert.equal(after.lifetime.trackedRounds, 1);
+  } finally {
+    database.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("fixed top-5 paper tracker keeps a tail gap cancelled across restart", () => {
+  const directory = mkdtempSync(join(tmpdir(), "roulette-follower-tail-gap-"));
+  const path = join(directory, "tracker.sqlite");
+  const training = [9, 1, 9, 2, 9, 3, 9, 4, 9, 5, 9];
+  let database = createDatabase({ path });
+  try {
+    database.ingestBatch(
+      training.map((number, index) => event(number, `paper-tail-gap-${index}`, index)),
+    );
+    database.markGap({
+      source: "buleto",
+      instrument: "PRIMECOIN(XPM)/RUB",
+      incidentKey: "paper-tail-gap",
+      detectedAt: new Date(BASE_TIME + training.length * 1_000).toISOString(),
+      message: "known missing result",
+    });
+    let state = database.getFollowerTop5TrackerState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    assert.equal(state.status, "gap");
+    assert.equal(state.currentSession, null);
+    assert.equal(state.lifetime.invalidatedSessions, 1);
+
+    database.close();
+    database = createDatabase({ path });
+    state = database.getFollowerTop5TrackerState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    assert.equal(state.status, "gap");
+    assert.equal(state.currentSession, null);
+    assert.equal(state.lifetime.invalidatedSessions, 1);
+
+    database.ingestBatch(
+      [1, 9].map((number, index) =>
+        event(number, `paper-tail-gap-next-${index}`, training.length + index + 1),
+      ),
+    );
+    state = database.getFollowerTop5TrackerState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    assert.equal(state.status, "armed");
+    assert.equal(state.currentSession.sourceNumber, 9);
+    assert.equal(state.currentSession.attemptCount, 0);
+  } finally {
+    database.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("fixed top-5 paper tracker follows a reconciled anchor epoch across restart", () => {
+  const directory = mkdtempSync(join(tmpdir(), "roulette-follower-reconcile-"));
+  const path = join(directory, "tracker.sqlite");
+  const training = [9, 1, 9, 2, 9, 3, 9, 4, 9, 5, 9];
+  let database = createDatabase({ path, gapThresholdSeconds: 135 });
+  try {
+    database.ingestBatch(
+      training.map((number, index) =>
+        event(number, `paper-reconcile-left-${index}`, index, {
+          externalRoundId: String(6_000 + index),
+        }),
+      ),
+    );
+    database.ingestBatchAfterGap(
+      {
+        source: "buleto",
+        instrument: "PRIMECOIN(XPM)/RUB",
+        reason: "shutdown-with-unconfirmed-round-result",
+        incidentKey: "paper-reconcile-gap",
+        detectedAt: new Date(
+          BASE_TIME + training.length * 1_000 + 100,
+        ).toISOString(),
+        message: "planned restart before snapshot confirmation",
+      },
+      [8, 9].map((number, index) =>
+        event(
+          number,
+          `paper-reconcile-right-${index}`,
+          training.length + index,
+          { externalRoundId: String(6_000 + training.length + index) },
+        ),
+      ),
+    );
+    const before = database.getFollowerTop5TrackerState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    assert.equal(before.status, "armed");
+    assert.equal(before.currentSession.continuityEpoch, 1);
+    const sessionId = before.currentSession.id;
+
+    database.sqlite.exec("PRAGMA user_version = 8");
+    database.close();
+    database = createDatabase({ path, gapThresholdSeconds: 135 });
+
+    const reconciled = database.getFollowerTop5TrackerState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    assert.equal(reconciled.status, "armed");
+    assert.equal(reconciled.currentSession.id, sessionId);
+    assert.equal(reconciled.currentSession.continuityEpoch, 0);
+    assert.equal(
+      Number(
+        database.sqlite
+          .prepare("SELECT continuity_epoch FROM stream_state")
+          .get().continuity_epoch,
+      ),
+      0,
+    );
+
+    database.ingestBatch([
+      event(6, "paper-reconcile-next", training.length + 2, {
+        externalRoundId: String(6_000 + training.length + 2),
+      }),
+    ]);
+    const continued = database.getFollowerTop5TrackerState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    assert.equal(continued.currentSession.id, sessionId);
+    assert.equal(continued.currentSession.attemptCount, 1);
+    assert.equal(continued.currentSession.missCount, 1);
+  } finally {
+    database.close();
+    rmSync(directory, { recursive: true, force: true });
   }
 });
 
@@ -2881,7 +3331,7 @@ test("v7 paper history initializes v8 bankroll with all known net results exactl
       "buleto",
       "PRIMECOIN(XPM)/RUB",
     );
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 12);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 13);
     assert.equal(state.testBank.initialBalance, 87_700);
     assert.equal(state.testBank.currentBalance, 87_910);
     assert.equal(state.testBank.netResult, 210);

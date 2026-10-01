@@ -7,8 +7,8 @@
     <meta name="color-scheme" content="dark">
     <meta name="description" content="Онлайн-монитор результатов рулетки и циклов исключения чисел от 0 до 36">
     <title>Круг 37 — монитор результатов</title>
-    <link rel="stylesheet" href="/styles.css?v=17">
-    <script type="module" src="/app.js?v=17"></script>
+    <link rel="stylesheet" href="/styles.css?v=18">
+    <script type="module" src="/app.js?v=18"></script>
   </head>
   <body>
     <a class="skip-link" href="#main-content">Перейти к содержимому</a>
@@ -184,12 +184,65 @@
       <details class="panel follower-panel disclosure disclosure--panel" id="follower-panel" data-state="loading" aria-labelledby="follower-title" aria-describedby="follower-description follower-note">
         <summary class="panel__topline follower-panel__header disclosure__summary">
           <span class="disclosure__copy">
-            <span class="eyebrow">Переходы по всей истории</span>
+            <span class="eyebrow">Переходы по всей истории · Live Top‑5</span>
             <span class="disclosure__title" id="follower-title" role="heading" aria-level="2">Что выпадало следующим</span>
           </span>
           <span class="count-badge" id="follower-count">Загрузка…</span>
           <span class="disclosure__chevron" aria-hidden="true"></span>
         </summary>
+        <section class="follower-live" id="follower-live-tracker" data-state="loading" aria-labelledby="follower-live-title" aria-describedby="follower-live-chance-note follower-live-selector-note" aria-busy="true">
+          <div class="follower-live__header">
+            <div>
+              <p class="eyebrow">Live · виртуальное наблюдение</p>
+              <h3 id="follower-live-title">Зафиксированный Top‑5</h3>
+            </div>
+            <span class="follower-live__status" id="follower-live-status" role="status" aria-live="polite" aria-atomic="true">Загрузка…</span>
+          </div>
+
+          <div class="follower-live__overview">
+            <section class="follower-live__selection" aria-labelledby="follower-live-selection-title">
+              <div class="follower-live__selection-heading">
+                <span id="follower-live-selection-title">Пятёрка не меняется до попадания</span>
+                <span>После числа <strong id="follower-live-source">—</strong></span>
+              </div>
+              <ol class="follower-live__fixed-list" id="follower-live-fixed-list" aria-label="Зафиксированные пять чисел">
+                <li class="follower-live__placeholder">—</li>
+                <li class="follower-live__placeholder">—</li>
+                <li class="follower-live__placeholder">—</li>
+                <li class="follower-live__placeholder">—</li>
+                <li class="follower-live__placeholder">—</li>
+              </ol>
+              <p class="follower-live__lock-meta" id="follower-live-lock-meta">Ожидаем состояние live‑тестирования.</p>
+            </section>
+
+            <div class="follower-live__metrics">
+              <section class="follower-live__metric" aria-labelledby="follower-live-current-label">
+                <span id="follower-live-current-label">Текущая попытка</span>
+                <strong id="follower-live-current-attempt">—</strong>
+                <small id="follower-live-attempt-summary">Нет активной серии</small>
+              </section>
+              <section class="follower-live__metric" aria-labelledby="follower-live-history-label">
+                <span id="follower-live-history-label">Исторически к этой попытке</span>
+                <strong id="follower-live-history-rate">—</strong>
+                <small id="follower-live-history-detail">Ждём расчёт</small>
+              </section>
+            </div>
+          </div>
+
+          <section class="follower-live__attempts" aria-labelledby="follower-live-attempts-title">
+            <div class="follower-live__attempts-heading">
+              <h4 id="follower-live-attempts-title">Промахи текущей серии</h4>
+              <span>Зафиксированная пятёрка сохраняется</span>
+            </div>
+            <ol class="follower-live__attempt-list" id="follower-live-attempt-list" tabindex="0" aria-label="Сохранённые промахи текущей серии">
+              <li class="follower-live__attempt-empty">Пока нет завершённых попыток.</li>
+            </ol>
+          </section>
+
+          <p class="follower-live__last-hit" id="follower-live-last-hit" role="status" aria-live="polite" aria-atomic="true" hidden></p>
+          <p class="follower-live__chance" id="follower-live-chance-note"><strong>Следующий независимый раунд: 5 из 37 (≈13,5%).</strong> Прошлые промахи не повышают этот шанс. Накопительный исторический процент выше отвечает на другой вопрос: было ли хотя бы одно попадание к указанной попытке. Это журнал без реальных ставок; механика сайта этой моделью не подтверждается.</p>
+          <p class="follower-live__selector-note" id="follower-live-selector-note">Live‑пятёрка фиксируется сервером автоматически. Выбор «После числа» ниже меняет только исторический список.</p>
+        </section>
         <div class="follower-panel__intro">
           <p class="follower-description" id="follower-description">Показываем, какие числа шли сразу после выбранного результата внутри сохранённых непрерывных участков.</p>
           <label class="follower-source-label" for="follower-source">
