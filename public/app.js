@@ -9,6 +9,7 @@ import { buildFollowerStats } from "./pair-followers.js?v=1";
   const REFRESH_INTERVAL_MS = 45_000;
   const AGE_UPDATE_INTERVAL_MS = 30_000;
   const FOLLOWER_COLLAPSED_LIMIT = 5;
+  const FOLLOWER_HIT_HORIZONS = [1, 2, 3, 5, 10, 20];
 
   const elements = {
     main: document.querySelector("main"),
@@ -45,6 +46,9 @@ import { buildFollowerStats } from "./pair-followers.js?v=1";
     followerSource: document.getElementById("follower-source"),
     followerCount: document.getElementById("follower-count"),
     followerList: document.getElementById("follower-list"),
+    followerHorizon: document.getElementById("follower-horizon"),
+    followerHorizonList: document.getElementById("follower-horizon-list"),
+    followerHorizonStatus: document.getElementById("follower-horizon-status"),
     followerDescription: document.getElementById("follower-description"),
     followerNote: document.getElementById("follower-note"),
     followerToggle: document.getElementById("follower-toggle"),
@@ -140,6 +144,7 @@ import { buildFollowerStats } from "./pair-followers.js?v=1";
     triplesHasMore: false,
     triplesVisibleCount: 8,
     pairs: [],
+    followerHitCurve: null,
     pairsLoaded: false,
     pairsError: false,
     forecastHits: [],
@@ -1100,6 +1105,7 @@ import { buildFollowerStats } from "./pair-followers.js?v=1";
     }
     if (requests[4].status === "fulfilled") {
       store.pairs = extractItems(requests[4].value);
+      store.followerHitCurve = requests[4].value?.top5HitByHorizon ?? null;
       store.pairsLoaded = true;
       store.pairsError = false;
       successfulRequests += 1;
@@ -1163,6 +1169,7 @@ import { buildFollowerStats } from "./pair-followers.js?v=1";
     if (store.hasCompletedInitialRender) {
       renderFollowers(store.state?.latestResult || store.results[0] || null);
     }
+    renderFollowerHitCurve();
     renderForecastHitHistory();
     renderVirtualBettor(store.state?.virtualBettor || null);
   }
@@ -1743,7 +1750,147 @@ import { buildFollowerStats } from "./pair-followers.js?v=1";
     maximumFractionDigits: 1
   });
 
+  function normalizedFollowerHitCurve() {
+    const curve = store.followerHitCurve;
+    if (
+      curve?.schemaVersion !== 1
+      || curve?.algorithmVersion !== "follower-top5-walk-forward-v1"
+      || curve?.topCount !== 5
+      || curve?.minimumObservedFollowerCount !== 5
+      || curve?.evaluationMode !== "saved-sequence-retrospective"
+      || curve?.maximumHorizonRounds !== 20
+      || curve?.cohort !== "anchors-with-complete-20-round-window"
+      || !Array.isArray(curve?.horizons)
+      || curve.horizons.length !== FOLLOWER_HIT_HORIZONS.length
+      || curve.horizons.some((horizon, index) => horizon !== FOLLOWER_HIT_HORIZONS[index])
+    ) {
+      return null;
+    }
+    const points = Array.isArray(curve?.overall?.points)
+      ? curve.overall.points
+      : [];
+    const byHorizon = new Map();
+    let invalidPoint = points.length !== FOLLOWER_HIT_HORIZONS.length;
+
+    points.forEach((point) => {
+      const horizon = asOptionalNonNegativeInteger(point?.horizon);
+      const hitCount = asOptionalNonNegativeInteger(point?.hitCount);
+      const eligibleCount = asOptionalNonNegativeInteger(point?.eligibleCount);
+      if (
+        !FOLLOWER_HIT_HORIZONS.includes(horizon)
+        || hitCount === null
+        || eligibleCount === null
+        || hitCount > eligibleCount
+      ) {
+        invalidPoint = true;
+        return;
+      }
+      if (byHorizon.has(horizon)) {
+        invalidPoint = true;
+        return;
+      }
+      byHorizon.set(horizon, { horizon, hitCount, eligibleCount });
+    });
+
+    if (
+      invalidPoint
+      || FOLLOWER_HIT_HORIZONS.some((horizon) => !byHorizon.has(horizon))
+    ) {
+      return null;
+    }
+    const normalized = FOLLOWER_HIT_HORIZONS.map((horizon) => byHorizon.get(horizon));
+    const eligibleCount = normalized[0].eligibleCount;
+    if (
+      asOptionalNonNegativeInteger(curve?.overall?.eligibleCount) !== eligibleCount
+      || normalized.some((point) => point.eligibleCount !== eligibleCount)
+      || normalized.some((point, index) =>
+        index > 0 && point.hitCount < normalized[index - 1].hitCount)
+    ) {
+      return null;
+    }
+    return { eligibleCount, points: normalized };
+  }
+
+  function followerHitEmpty(message) {
+    const group = createElement("div", "follower-horizon__empty");
+    const term = createElement("dt", "sr-only", "Состояние расчёта");
+    const description = createElement("dd", "", message);
+    group.append(term, description);
+    return group;
+  }
+
+  function renderFollowerHitCurve() {
+    if (!store.pairsLoaded) {
+      const failed = store.pairsError;
+      elements.followerHorizon.dataset.state = failed ? "error" : "loading";
+      elements.followerHorizon.setAttribute("aria-busy", String(!failed));
+      elements.followerHorizonStatus.textContent = failed ? "Ошибка загрузки" : "Считаем…";
+      elements.followerHorizonList.replaceChildren(followerHitEmpty(
+        failed
+          ? "Не удалось загрузить проверку Top‑5. Повторим автоматически."
+          : "Загружаем накопительную статистику…"
+      ));
+      return;
+    }
+
+    const curve = normalizedFollowerHitCurve();
+    if (!curve) {
+      elements.followerHorizon.dataset.state = "error";
+      elements.followerHorizon.setAttribute("aria-busy", "false");
+      elements.followerHorizonStatus.textContent = "Нет расчёта";
+      elements.followerHorizonList.replaceChildren(followerHitEmpty(
+        "Сервер пока не вернул накопительную проверку Top‑5."
+      ));
+      return;
+    }
+
+    const fragment = document.createDocumentFragment();
+    curve.points.forEach(({ horizon, hitCount, eligibleCount }) => {
+      const point = createElement("div", "follower-horizon__point");
+      const rounds = createElement(
+        "dt",
+        "follower-horizon__rounds",
+        `≤ ${horizon} ${pluralForm(horizon, "раунд", "раунда", "раундов")}`
+      );
+      const rate = createElement(
+        "dd",
+        "follower-horizon__rate",
+        eligibleCount > 0
+          ? historicalPercentFormatter.format(hitCount / eligibleCount)
+          : "—"
+      );
+      const count = createElement(
+        "span",
+        "follower-horizon__count",
+        eligibleCount > 0 ? `${hitCount} из ${eligibleCount}` : "нет полной выборки"
+      );
+      const randomBaseline = 1 - ((37 - 5) / 37) ** horizon;
+      const baseline = createElement(
+        "span",
+        "follower-horizon__baseline",
+        `случайная база ${historicalPercentFormatter.format(randomBaseline)}`
+      );
+      rate.append(count, baseline);
+      point.append(rounds, rate);
+      point.setAttribute(
+        "aria-label",
+        eligibleCount > 0
+          ? `Не позднее ${horizon} ${pluralForm(horizon, "раунда", "раундов", "раундов")}: ${hitCount} попаданий из ${eligibleCount}, ${historicalPercentFormatter.format(hitCount / eligibleCount)}; случайная база ${historicalPercentFormatter.format(randomBaseline)}`
+          : `Не позднее ${horizon} ${pluralForm(horizon, "раунда", "раундов", "раундов")}: пока нет полной выборки; случайная база ${historicalPercentFormatter.format(randomBaseline)}`
+      );
+      fragment.appendChild(point);
+    });
+
+    elements.followerHorizon.dataset.state = store.pairsError ? "stale" : "ready";
+    elements.followerHorizon.setAttribute("aria-busy", "false");
+    elements.followerHorizonStatus.textContent = curve.eligibleCount > 0
+      ? `${curve.eligibleCount} ${pluralForm(curve.eligibleCount, "проверка", "проверки", "проверок")} · все числа${store.pairsError ? " · не обновлено" : ""}`
+      : "Ждём полную выборку";
+    elements.followerHorizonList.replaceChildren(fragment);
+  }
+
   function renderFollowers(latestResult) {
+    renderFollowerHitCurve();
     const latestNumber = asRouletteNumber(latestResult?.number);
     if (!store.followerSourceLocked && latestNumber !== null) {
       if (store.followerSourceNumber !== latestNumber) {

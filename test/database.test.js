@@ -1746,6 +1746,175 @@ test("an integrity gap prevents pair statistics from joining continuity epochs",
   }
 });
 
+test("top-5 hit curve uses one complete cohort and accumulates fixed-list hits", () => {
+  const database = createDatabase({ path: ":memory:" });
+  const training = [9, 1, 9, 1, 9, 2, 9, 2, 9, 3, 9, 3, 9, 4, 9, 4, 9, 5, 9, 5];
+  const evaluation = [
+    9, 1, ...Array.from({ length: 19 }, () => 30),
+    9, 6, 30, 2, ...Array.from({ length: 17 }, () => 30),
+    9, 7, ...Array.from({ length: 8 }, () => 30), 3, ...Array.from({ length: 10 }, () => 30),
+    9, 8, ...Array.from({ length: 19 }, () => 30),
+  ];
+  try {
+    database.ingestBatch(
+      training.map((number, index) => event(number, `curve-train-${index}`, index)),
+    );
+    database.ingestBatchAfterGap(
+      {
+        source: "buleto",
+        instrument: "PRIMECOIN(XPM)/RUB",
+        incidentKey: "curve-gap",
+        detectedAt: new Date(BASE_TIME + training.length * 1_000).toISOString(),
+        message: "known missing result",
+      },
+      evaluation.map((number, index) =>
+        event(number, `curve-eval-${index}`, training.length + index + 1),
+      ),
+    );
+
+    const curve = database.getFollowerTop5HitCurve(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    const sourceNine = curve.bySource.find((item) => item.sourceNumber === 9);
+
+    assert.equal(curve.algorithmVersion, "follower-top5-walk-forward-v1");
+    assert.equal(curve.cohort, "anchors-with-complete-20-round-window");
+    assert.equal(curve.historyResultCount, training.length + evaluation.length);
+    assert.equal(curve.continuitySegmentCount, 2);
+    assert.deepEqual(curve.overall, {
+      eligibleCount: 4,
+      points: [
+        { horizon: 1, hitCount: 1, eligibleCount: 4, rate: 0.25 },
+        { horizon: 2, hitCount: 1, eligibleCount: 4, rate: 0.25 },
+        { horizon: 3, hitCount: 2, eligibleCount: 4, rate: 0.5 },
+        { horizon: 5, hitCount: 2, eligibleCount: 4, rate: 0.5 },
+        { horizon: 10, hitCount: 3, eligibleCount: 4, rate: 0.75 },
+        { horizon: 20, hitCount: 3, eligibleCount: 4, rate: 0.75 },
+      ],
+    });
+    assert.equal(sourceNine.eligibleCount, 4);
+    assert.deepEqual(
+      sourceNine.points.map(({ horizon, hitCount, eligibleCount, rate }) => ({
+        horizon,
+        hitCount,
+        eligibleCount,
+        rate,
+      })),
+      [
+        { horizon: 1, hitCount: 1, eligibleCount: 4, rate: 0.25 },
+        { horizon: 2, hitCount: 1, eligibleCount: 4, rate: 0.25 },
+        { horizon: 3, hitCount: 2, eligibleCount: 4, rate: 0.5 },
+        { horizon: 5, hitCount: 2, eligibleCount: 4, rate: 0.5 },
+        { horizon: 10, hitCount: 3, eligibleCount: 4, rate: 0.75 },
+        { horizon: 20, hitCount: 3, eligibleCount: 4, rate: 0.75 },
+      ],
+    );
+
+    database.ingestBatch([
+      event(
+        0,
+        "curve-cache-invalidation",
+        training.length + evaluation.length + 1,
+      ),
+    ]);
+    assert.equal(
+      database.getFollowerTop5HitCurve(
+        "buleto",
+        "PRIMECOIN(XPM)/RUB",
+      ).historyResultCount,
+      training.length + evaluation.length + 1,
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test("top-5 hit curve neither learns from future epochs nor changes a frozen prediction", () => {
+  const database = createDatabase({ path: ":memory:" });
+  const training = [9, 1, 9, 2, 9, 3, 9, 4, 9, 5];
+  const evaluation = [9, 6, ...Array.from({ length: 19 }, () => 30)];
+  const later = [9, 6, 9, 6, 9, 6, 9, 6, 9, 6, 9, 6];
+  try {
+    database.ingestBatch(
+      training.map((number, index) => event(number, `no-look-train-${index}`, index)),
+    );
+    database.ingestBatchAfterGap(
+      {
+        source: "buleto",
+        instrument: "PRIMECOIN(XPM)/RUB",
+        incidentKey: "no-look-gap-1",
+        detectedAt: new Date(BASE_TIME + training.length * 1_000).toISOString(),
+        message: "known missing result",
+      },
+      evaluation.map((number, index) =>
+        event(number, `no-look-eval-${index}`, training.length + index + 1),
+      ),
+    );
+    database.ingestBatchAfterGap(
+      {
+        source: "buleto",
+        instrument: "PRIMECOIN(XPM)/RUB",
+        incidentKey: "no-look-gap-2",
+        detectedAt: new Date(
+          BASE_TIME + (training.length + evaluation.length + 1) * 1_000,
+        ).toISOString(),
+        message: "known missing result",
+      },
+      later.map((number, index) =>
+        event(
+          number,
+          `no-look-later-${index}`,
+          training.length + evaluation.length + index + 2,
+        ),
+      ),
+    );
+
+    const sourceNine = database
+      .getFollowerTop5HitCurve("buleto", "PRIMECOIN(XPM)/RUB")
+      .bySource.find((item) => item.sourceNumber === 9);
+
+    assert.equal(sourceNine.eligibleCount, 1);
+    assert.equal(sourceNine.points.every((point) => point.hitCount === 0), true);
+    assert.equal(sourceNine.points.every((point) => point.rate === 0), true);
+  } finally {
+    database.close();
+  }
+});
+
+test("top-5 hit curve never creates a transition across a known gap", () => {
+  const database = createDatabase({ path: ":memory:" });
+  const training = [9, 1, 9, 2, 9, 3, 9, 4, 9, 5, 9];
+  const evaluation = [6, 30, 9, 1, ...Array.from({ length: 19 }, () => 30)];
+  try {
+    database.ingestBatch(
+      training.map((number, index) => event(number, `curve-boundary-${index}`, index)),
+    );
+    database.ingestBatchAfterGap(
+      {
+        source: "buleto",
+        instrument: "PRIMECOIN(XPM)/RUB",
+        incidentKey: "curve-boundary-gap",
+        detectedAt: new Date(BASE_TIME + training.length * 1_000).toISOString(),
+        message: "known missing result",
+      },
+      evaluation.map((number, index) =>
+        event(number, `curve-boundary-eval-${index}`, training.length + index + 1),
+      ),
+    );
+
+    const sourceNine = database
+      .getFollowerTop5HitCurve("buleto", "PRIMECOIN(XPM)/RUB")
+      .bySource.find((item) => item.sourceNumber === 9);
+
+    assert.equal(sourceNine.eligibleCount, 1);
+    assert.equal(sourceNine.points[0].hitCount, 1);
+    assert.equal(sourceNine.points[0].rate, 1);
+  } finally {
+    database.close();
+  }
+});
+
 test("repeated triples preserve order and count overlapping appearances", () => {
   const database = createDatabase({ path: ":memory:" });
   try {

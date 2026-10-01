@@ -7,8 +7,8 @@
     <meta name="color-scheme" content="dark">
     <meta name="description" content="Онлайн-монитор результатов рулетки и циклов исключения чисел от 0 до 36">
     <title>Круг 37 — монитор результатов</title>
-    <link rel="stylesheet" href="/styles.css?v=16">
-    <script type="module" src="/app.js?v=16"></script>
+    <link rel="stylesheet" href="/styles.css?v=17">
+    <script type="module" src="/app.js?v=17"></script>
   </head>
   <body>
     <a class="skip-link" href="#main-content">Перейти к содержимому</a>
@@ -236,12 +236,28 @@
             </select>
           </label>
         </div>
+        <section class="follower-horizon" id="follower-horizon" data-state="loading" aria-labelledby="follower-horizon-title" aria-describedby="follower-horizon-note" aria-busy="true">
+          <div class="follower-horizon__header">
+            <div>
+              <p class="eyebrow">Прошлая сохранённая последовательность</p>
+              <h3 id="follower-horizon-title">Общая проверка Top‑5 по всем числам</h3>
+            </div>
+            <span class="follower-horizon__status" id="follower-horizon-status" role="status" aria-live="polite" aria-atomic="true">Считаем…</span>
+          </div>
+          <dl class="follower-horizon__grid" id="follower-horizon-list">
+            <div class="follower-horizon__empty">
+              <dt class="sr-only">Состояние расчёта</dt>
+              <dd>Загружаем накопительную статистику…</dd>
+            </div>
+          </dl>
+          <p class="follower-horizon__note" id="follower-horizon-note">Ретроспективная реконструкция, а не журнал реально показанных прогнозов: на каждом прошлом раунде Top‑5 фиксируется только по предшествующей сохранённой последовательности. Учитываются случаи с 5 уже наблюдавшимися продолжениями и полными 20 следующими раундами внутри непрерывного участка. «Случайная база» — вероятность попадания любой заранее выбранной пятёрки.</p>
+        </section>
         <ol class="follower-list" id="follower-list" aria-label="Числа, выпадавшие следующими в сохранённой истории" aria-busy="true">
           <li class="empty-state">Считаем исторические переходы…</li>
         </ol>
         <div class="follower-footer">
           <button class="follower-toggle" id="follower-toggle" type="button" aria-controls="follower-list" aria-expanded="false" hidden>Показать все</button>
-          <p id="follower-note">Историческая частота, а не прогноз. Для независимого результата шанс каждого числа остаётся 1 из 37 (≈2,7%).</p>
+          <p id="follower-note">Историческая статистика, а не обещание результата. Проценты в блоке «Общая проверка Top‑5» накопительные: значение для 5 раундов включает попадания на раундах 1–5.</p>
         </div>
       </details>
 

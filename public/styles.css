@@ -938,6 +938,116 @@ h2 {
   outline-offset: 3px;
 }
 
+.follower-horizon {
+  margin-top: 18px;
+  padding: 16px;
+  border: 1px solid var(--border-soft);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.016);
+}
+
+.follower-horizon__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.follower-horizon__header .eyebrow {
+  margin: 0 0 4px;
+}
+
+.follower-horizon__header h3 {
+  margin: 0;
+  font-size: 15px;
+  line-height: 1.3;
+}
+
+.follower-horizon__status {
+  color: var(--muted);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.4;
+  text-align: right;
+}
+
+.follower-horizon__grid {
+  display: grid;
+  margin: 14px 0 0;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.follower-horizon__point {
+  min-width: 0;
+  margin: 0;
+  padding: 11px 9px;
+  border: 1px solid var(--border-soft);
+  border-radius: 11px;
+  background: rgba(0, 0, 0, 0.12);
+  text-align: center;
+}
+
+.follower-horizon__rounds {
+  margin: 0 0 5px;
+  color: var(--muted-strong);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.follower-horizon__rate {
+  margin: 0;
+  color: var(--gold-bright);
+  font-size: clamp(18px, 2vw, 25px);
+  font-variant-numeric: tabular-nums;
+  font-weight: 800;
+  line-height: 1.1;
+}
+
+.follower-horizon__count {
+  display: block;
+  margin-top: 5px;
+  color: var(--muted);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.3;
+}
+
+.follower-horizon__baseline {
+  display: block;
+  margin-top: 3px;
+  color: #71797e;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 500;
+  line-height: 1.3;
+}
+
+.follower-horizon__empty {
+  padding: 16px;
+  grid-column: 1 / -1;
+  color: var(--muted);
+  font-size: 11px;
+  text-align: center;
+}
+
+.follower-horizon__empty dd {
+  margin: 0;
+}
+
+.follower-horizon__note {
+  margin: 11px 0 0;
+  color: #71797e;
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.follower-horizon[data-state="error"] .follower-horizon__status,
+.follower-horizon[data-state="stale"] .follower-horizon__status {
+  color: var(--danger);
+}
+
 .follower-list {
   display: grid;
   margin: 20px 0 0;
@@ -2951,6 +3061,10 @@ tbody tr:first-child {
     width: 100%;
   }
 
+  .follower-horizon__grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
   .follower-footer {
     align-items: flex-start;
     flex-direction: column;
@@ -3080,6 +3194,19 @@ tbody tr:first-child {
 }
 
 @media (max-width: 430px) {
+  .follower-horizon {
+    padding: 13px;
+  }
+
+  .follower-horizon__header {
+    flex-direction: column;
+    gap: 7px;
+  }
+
+  .follower-horizon__status {
+    text-align: left;
+  }
+
   .preclose-panel__header,
   .preclose-comparison__header {
     align-items: flex-start;

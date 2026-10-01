@@ -328,6 +328,7 @@ const server = createServer((request, response) => {
       const source = 'buleto';
       const instrument = config.instrument;
       const items = db.getPairStats(source, instrument);
+      const top5HitByHorizon = db.getFollowerTop5HitCurve(source, instrument);
       const totalResults = db
         .getNumberStats(source, instrument)
         .reduce((total, item) => total + item.occurrenceCount, 0);
@@ -345,6 +346,7 @@ const server = createServer((request, response) => {
         distinctPairCount: items.length,
         continuitySegmentCount: totalResults - totalPairOccurrences,
         hasMore: false,
+        top5HitByHorizon,
         items,
       });
       return;

@@ -18,6 +18,146 @@ import {
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 500;
 const DEFAULT_VIRTUAL_STARTING_BALANCE = 87_700;
+const FOLLOWER_TOP5_HORIZONS = Object.freeze([1, 2, 3, 5, 10, 20]);
+const FOLLOWER_TOP5_COUNT = 5;
+const FOLLOWER_TOP5_MINIMUM_OBSERVED = 5;
+
+function emptyFollowerHitBucket() {
+  return {
+    eligibleCount: 0,
+    hitCounts: FOLLOWER_TOP5_HORIZONS.map(() => 0),
+  };
+}
+
+function followerHitPoints(bucket) {
+  return FOLLOWER_TOP5_HORIZONS.map((horizon, index) => ({
+    horizon,
+    hitCount: bucket.hitCounts[index],
+    eligibleCount: bucket.eligibleCount,
+    rate:
+      bucket.eligibleCount > 0
+        ? bucket.hitCounts[index] / bucket.eligibleCount
+        : null,
+  }));
+}
+
+function rankFollowerNumbers(counts, lastOccurredAt) {
+  return [...ROULETTE_NUMBERS]
+    .sort((left, right) => {
+      if (counts[right] !== counts[left]) {
+        return counts[right] - counts[left];
+      }
+      const rightLast = lastOccurredAt[right] ?? "";
+      const leftLast = lastOccurredAt[left] ?? "";
+      if (rightLast !== leftLast) {
+        return rightLast.localeCompare(leftLast);
+      }
+      return left - right;
+    })
+    .slice(0, FOLLOWER_TOP5_COUNT);
+}
+
+/**
+ * Retrospective expanding walk-forward over the saved event sequence.
+ * The incoming transition is known at an anchor; its outgoing transition is not.
+ * A shared complete-20-round cohort keeps every displayed rate comparable.
+ */
+export function buildFollowerTop5HitCurve(rows) {
+  const maximumHorizon = FOLLOWER_TOP5_HORIZONS.at(-1);
+  const counts = ROULETTE_NUMBERS.map(() =>
+    ROULETTE_NUMBERS.map(() => 0),
+  );
+  const lastOccurredAt = ROULETTE_NUMBERS.map(() =>
+    ROULETTE_NUMBERS.map(() => null),
+  );
+  const observedFollowerCounts = ROULETTE_NUMBERS.map(() => 0);
+  const overall = emptyFollowerHitBucket();
+  const bySourceBuckets = ROULETTE_NUMBERS.map(() => emptyFollowerHitBucket());
+  let continuitySegmentCount = 0;
+  let excludedInsufficientTrainingCount = 0;
+  let excludedIncompleteWindowCount = 0;
+
+  rows.forEach((row, index) => {
+    const number = Number(row.result_number);
+    const epoch = Number(row.continuity_epoch);
+    const previous = rows[index - 1];
+
+    if (!previous || Number(previous.continuity_epoch) !== epoch) {
+      continuitySegmentCount += 1;
+    } else {
+      const previousNumber = Number(previous.result_number);
+      if (counts[previousNumber][number] === 0) {
+        observedFollowerCounts[previousNumber] += 1;
+      }
+      counts[previousNumber][number] += 1;
+      lastOccurredAt[previousNumber][number] = row.settled_at;
+    }
+
+    if (observedFollowerCounts[number] < FOLLOWER_TOP5_MINIMUM_OBSERVED) {
+      excludedInsufficientTrainingCount += 1;
+      return;
+    }
+
+    let hasCompleteWindow = index + maximumHorizon < rows.length;
+    if (hasCompleteWindow) {
+      for (let offset = 1; offset <= maximumHorizon; offset += 1) {
+        if (Number(rows[index + offset].continuity_epoch) !== epoch) {
+          hasCompleteWindow = false;
+          break;
+        }
+      }
+    }
+    if (!hasCompleteWindow) {
+      excludedIncompleteWindowCount += 1;
+      return;
+    }
+
+    const top5 = new Set(rankFollowerNumbers(
+      counts[number],
+      lastOccurredAt[number],
+    ));
+    let firstHitOffset = null;
+    for (let offset = 1; offset <= maximumHorizon; offset += 1) {
+      if (top5.has(Number(rows[index + offset].result_number))) {
+        firstHitOffset = offset;
+        break;
+      }
+    }
+
+    overall.eligibleCount += 1;
+    bySourceBuckets[number].eligibleCount += 1;
+    FOLLOWER_TOP5_HORIZONS.forEach((horizon, horizonIndex) => {
+      if (firstHitOffset !== null && firstHitOffset <= horizon) {
+        overall.hitCounts[horizonIndex] += 1;
+        bySourceBuckets[number].hitCounts[horizonIndex] += 1;
+      }
+    });
+  });
+
+  return {
+    schemaVersion: 1,
+    algorithmVersion: "follower-top5-walk-forward-v1",
+    topCount: FOLLOWER_TOP5_COUNT,
+    minimumObservedFollowerCount: FOLLOWER_TOP5_MINIMUM_OBSERVED,
+    evaluationMode: "saved-sequence-retrospective",
+    horizons: [...FOLLOWER_TOP5_HORIZONS],
+    maximumHorizonRounds: maximumHorizon,
+    cohort: "anchors-with-complete-20-round-window",
+    historyResultCount: rows.length,
+    continuitySegmentCount,
+    excludedInsufficientTrainingCount,
+    excludedIncompleteWindowCount,
+    overall: {
+      eligibleCount: overall.eligibleCount,
+      points: followerHitPoints(overall),
+    },
+    bySource: bySourceBuckets.map((bucket, sourceNumber) => ({
+      sourceNumber,
+      eligibleCount: bucket.eligibleCount,
+      points: followerHitPoints(bucket),
+    })),
+  };
+}
 
 function asNonEmptyText(value, fallback, label) {
   const candidate = value ?? fallback;
@@ -647,6 +787,7 @@ export class RouletteDatabase {
     this.virtualStartingBalance = normalizedVirtualStartingBalance(
       virtualStartingBalance,
     );
+    this.followerTop5HitCurveCache = new Map();
     this.closed = false;
     this.sqlite = new DatabaseSync(path);
 
@@ -3411,6 +3552,50 @@ export class RouletteDatabase {
         firstOccurredAt: row.first_occurred_at,
         lastOccurredAt: row.last_occurred_at,
       }));
+  }
+
+  getFollowerTop5HitCurve(source = "buleto", instrument = "default") {
+    this.#assertOpen();
+    const safeSource = asNonEmptyText(source, undefined, "source");
+    const safeInstrument = asNonEmptyText(instrument, undefined, "instrument");
+    const revision = this.sqlite
+      .prepare(`
+        SELECT
+          COUNT(*) AS result_count,
+          MAX(id) AS maximum_result_id,
+          MAX(continuity_epoch) AS maximum_continuity_epoch,
+          SUM(continuity_epoch) AS continuity_epoch_checksum
+        FROM round_results
+        WHERE source = ? AND instrument = ?
+      `)
+      .get(safeSource, safeInstrument);
+    const cacheKey = `${safeSource}\u0000${safeInstrument}`;
+    const signature = [
+      Number(revision.result_count),
+      revision.maximum_result_id == null ? null : Number(revision.maximum_result_id),
+      revision.maximum_continuity_epoch == null
+        ? null
+        : Number(revision.maximum_continuity_epoch),
+      revision.continuity_epoch_checksum == null
+        ? null
+        : Number(revision.continuity_epoch_checksum),
+    ].join(":");
+    const cached = this.followerTop5HitCurveCache.get(cacheKey);
+    if (cached?.signature === signature) {
+      return cached.value;
+    }
+    const rows = this.sqlite
+      .prepare(`
+        SELECT id, result_number, settled_at, continuity_epoch
+        FROM round_results
+        WHERE source = ? AND instrument = ?
+        ORDER BY settled_at, id
+      `)
+      .all(safeSource, safeInstrument);
+
+    const value = buildFollowerTop5HitCurve(rows);
+    this.followerTop5HitCurveCache.set(cacheKey, { signature, value });
+    return value;
   }
 
   #buildForecastPairSnapshot({
