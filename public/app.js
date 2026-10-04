@@ -1,5 +1,6 @@
 import { BET_RISK_MODEL, calculateBetRisk } from "./risk-calculator.js?v=2";
 import { buildFollowerStats } from "./pair-followers.js?v=1";
+import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
 
 (() => {
   "use strict";
@@ -2807,7 +2808,13 @@ import { buildFollowerStats } from "./pair-followers.js?v=1";
   function renderCycleSequence(
     list,
     events,
-    { emptyMessage = "Выпадений пока нет.", compareEvents = null } = {}
+    {
+      emptyMessage = "Выпадений пока нет.",
+      compareEvents = null,
+      stageMarker = null,
+      markerRole = null,
+      markerStale = false
+    } = {}
   ) {
     if (!events.length) {
       cycleSequenceEmpty(list, emptyMessage);
@@ -2828,6 +2835,17 @@ import { buildFollowerStats } from "./pair-followers.js?v=1";
           ? "повтор"
           : "признак первого появления неизвестен";
       const item = createElement("li", `cycle-sequence-event ${noveltyClass}`);
+      const isCurrentMarker = markerRole === "current"
+        && stageMarker?.position === event.position;
+      const isReferenceMarker = markerRole === "reference"
+        && stageMarker?.referenceAvailable === true
+        && stageMarker.position === event.position;
+      const isStageMarker = isCurrentMarker || isReferenceMarker;
+      const markerLabel = isCurrentMarker
+        ? "последний ход текущего круга и ориентир сравнения"
+        : isReferenceMarker
+          ? "та же позиция исторического аналога"
+          : null;
       const position = createElement(
         "span",
         "cycle-sequence-event__position",
@@ -2839,16 +2857,17 @@ import { buildFollowerStats } from "./pair-followers.js?v=1";
         event.number
       );
       const novelty = createElement("span", "cycle-sequence-event__kind", noveltyVisible);
-      const comparedEvent = Array.isArray(compareEvents)
+      const hasComparison = Array.isArray(compareEvents);
+      const comparedEvent = hasComparison
         ? compareEvents[event.position - 1] ?? null
         : null;
       const isPositionMatch = comparedEvent !== null && comparedEvent.number === event.number;
-      const comparison = comparedEvent === null
+      const comparison = !hasComparison
         ? null
         : createElement(
             "span",
-            `cycle-sequence-event__comparison ${isPositionMatch ? "is-match" : "is-mismatch"}`,
-            isPositionMatch ? "✓" : "≠"
+            `cycle-sequence-event__comparison ${comparedEvent === null ? "is-pending" : isPositionMatch ? "is-match" : "is-mismatch"}`,
+            comparedEvent === null ? "·" : isPositionMatch ? "✓" : "≠"
           );
       const badges = createElement("span", "cycle-sequence-event__badges");
       position.setAttribute("aria-hidden", "true");
@@ -2856,11 +2875,24 @@ import { buildFollowerStats } from "./pair-followers.js?v=1";
       novelty.setAttribute("aria-hidden", "true");
       if (comparison) {
         comparison.setAttribute("aria-hidden", "true");
-        item.classList.add(isPositionMatch ? "is-position-match" : "is-position-mismatch");
+        if (comparedEvent !== null) {
+          item.classList.add(isPositionMatch ? "is-position-match" : "is-position-mismatch");
+        }
+      }
+      if (isStageMarker) {
+        item.classList.add(
+          "is-stage-marker",
+          `is-marker-${rouletteColor(stageMarker.number)}`,
+          isCurrentMarker ? "is-marker-current" : "is-marker-reference"
+        );
+        if (stageMarker.active && !markerStale) item.classList.add("is-marker-live");
+        if (isCurrentMarker && stageMarker.active && !markerStale) {
+          item.setAttribute("aria-current", "step");
+        }
       }
       item.setAttribute(
         "aria-label",
-        `Ход ${event.position}: число ${event.number}, ${rouletteColorLabel(event.number)}, ${noveltyLabel}${comparedEvent === null ? "" : isPositionMatch ? "; совпало с текущим кругом на этой позиции" : `; отличается от числа ${comparedEvent.number} текущего круга на этой позиции`}`
+        `Ход ${event.position}: число ${event.number}, ${rouletteColorLabel(event.number)}, ${noveltyLabel}${markerLabel ? `; ${markerLabel}` : ""}${!hasComparison ? "" : comparedEvent === null ? "; текущий круг ещё не дошёл до этой позиции" : isPositionMatch ? "; совпало с текущим кругом на этой позиции" : `; отличается от числа ${comparedEvent.number} текущего круга на этой позиции`}`
       );
       if (event.settledAt) {
         item.title = `${formatDateTime(event.settledAt, { alwaysShowDate: true })} · ${noveltyLabel}`;
@@ -2896,7 +2928,40 @@ import { buildFollowerStats } from "./pair-followers.js?v=1";
     return parts.join(" · ");
   }
 
-  function renderCycleComparisonCurrent(target) {
+  function cycleMarkerColorLabel(number) {
+    const labels = {
+      red: "красным",
+      green: "зелёным",
+      black: "светлым контуром для чёрного числа"
+    };
+    return labels[rouletteColor(number)];
+  }
+
+  function cycleMarkerStatus(marker, { stale = false, completed = false } = {}) {
+    if (!marker) return null;
+    const comparePrefix = stale
+      ? "На предыдущем снимке сравнивался"
+      : completed
+        ? "Для завершённого круга сравнивается итоговый"
+        : "Сейчас сравниваем";
+    const singlePrefix = stale
+      ? "На предыдущем снимке был отмечен"
+      : completed
+        ? "Для завершённого круга отмечен итоговый"
+        : "Сейчас отмечен";
+    const color = cycleMarkerColorLabel(marker.number);
+
+    if (!marker.referenceAvailable) {
+      if (marker.referenceLength > 0) {
+        return `${singlePrefix} ход №${marker.position}. Исторический аналог завершился на ходе №${marker.referenceLength}, поэтому такой позиции в нём нет.`;
+      }
+      return `${singlePrefix} ход №${marker.position}; последняя ячейка текущего круга подсвечена ${color}.`;
+    }
+
+    return `${comparePrefix} ход №${marker.position}: текущее число ${marker.number} ↔ в аналоге ${marker.referenceNumber}. Обе позиции подсвечены ${color}.`;
+  }
+
+  function renderCycleComparisonCurrent(target, stageMarker = null, { stale = false } = {}) {
     if (!target) {
       elements.cycleComparisonCurrentTitle.textContent = "Текущий круг";
       elements.cycleComparisonCurrentMeta.textContent = "Полный круг пока недоступен.";
@@ -2922,7 +2987,10 @@ import { buildFollowerStats } from "./pair-followers.js?v=1";
     }
     elements.cycleComparisonCurrentMeta.textContent = cycleComparisonMeta(target);
     renderCycleSequence(elements.cycleComparisonCurrentSequence, target.events, {
-      emptyMessage: "В этом круге пока нет сохранённых выпадений."
+      emptyMessage: "В этом круге пока нет сохранённых выпадений.",
+      stageMarker,
+      markerRole: "current",
+      markerStale: stale
     });
   }
 
@@ -2996,7 +3064,7 @@ import { buildFollowerStats } from "./pair-followers.js?v=1";
     replaceCycleComparisonMetrics(items);
   }
 
-  function renderReadyCycleComparison(comparison) {
+  function renderReadyCycleComparison(comparison, stageMarker, { stale = false } = {}) {
     const analogue = comparison.analogue;
     const cycle = analogue.cycle || {};
     const analogueId = cycle.id;
@@ -3016,7 +3084,10 @@ import { buildFollowerStats } from "./pair-followers.js?v=1";
     elements.cycleComparisonAnalogueMeta.textContent = meta.join(" · ");
     elements.cycleComparisonAnchorMeta.textContent = `Только эти ${comparison.anchorDrawCount} ходов участвовали в выборе аналога`;
     renderCycleSequence(elements.cycleComparisonAnalogueSequence, anchorEvents, {
-      compareEvents: comparison.target.events
+      compareEvents: comparison.target.events,
+      stageMarker,
+      markerRole: "reference",
+      markerStale: stale
     });
     replaceCycleComparisonMetrics(cycleComparisonMetricItems(comparison));
 
@@ -3026,13 +3097,20 @@ import { buildFollowerStats } from "./pair-followers.js?v=1";
       : "Архивный круг завершился в точке фиксации";
     renderCycleSequence(elements.cycleComparisonContinuationSequence, continuationEvents, {
       emptyMessage: "После точки фиксации в архивном круге больше не было ходов.",
-      compareEvents: comparison.target.events
+      compareEvents: comparison.target.events,
+      stageMarker,
+      markerRole: "reference",
+      markerStale: stale
     });
 
     const targetId = comparison.target.cycle?.id;
     const targetLabel = targetId === null || targetId === undefined ? "целевого круга" : `цикла №${compactId(targetId)}`;
     const analogueLabel = analogueId === null || analogueId === undefined ? "архивный аналог" : `цикл №${compactId(analogueId)}`;
-    return `${analogueLabel} зафиксирован по первым ${comparison.anchorDrawCount} ходам ${targetLabel} и не меняется до завершения круга.`;
+    const markerStatus = cycleMarkerStatus(stageMarker, {
+      stale,
+      completed: comparison.target.mode === "latest_completed"
+    });
+    return `${markerStatus ? `${markerStatus} ` : ""}${analogueLabel} зафиксирован по первым ${comparison.anchorDrawCount} ходам ${targetLabel} и не меняется до завершения круга.`;
   }
 
   function renderCycleComparison(value) {
@@ -3067,14 +3145,25 @@ import { buildFollowerStats } from "./pair-followers.js?v=1";
       return;
     }
 
-    renderCycleComparisonCurrent(comparison.target);
+    const stageMarker = comparison.target?.historyComplete
+      ? buildCycleStageMarker(
+          comparison.target,
+          comparison.status === "ready" ? comparison.analogue : null
+        )
+      : null;
+    const markerStale = store.cycleComparisonError;
+    const markerStatus = cycleMarkerStatus(stageMarker, {
+      stale: markerStale,
+      completed: comparison.target?.mode === "latest_completed"
+    });
+    renderCycleComparisonCurrent(comparison.target, stageMarker, { stale: markerStale });
     const candidates = cycleComparisonCandidateCount(comparison.candidateStats);
     let state = comparison.status;
     let badge = "Нет данных";
     let status = "Полные последовательности пока недоступны.";
 
     if (comparison.status === "ready") {
-      status = renderReadyCycleComparison(comparison);
+      status = renderReadyCycleComparison(comparison, stageMarker, { stale: markerStale });
       badge = comparison.analogue.cycle?.id === null || comparison.analogue.cycle?.id === undefined
         ? "Аналог зафиксирован"
         : `Аналог №${compactId(comparison.analogue.cycle.id)}`;
@@ -3088,13 +3177,13 @@ import { buildFollowerStats } from "./pair-followers.js?v=1";
         ...(candidates === null ? [] : [["Доступно кругов", String(candidates)]])
       ]);
       badge = `${collected} / ${comparison.anchorDrawCount}`;
-      status = message;
+      status = `${markerStatus ? `${markerStatus} ` : ""}${message}`;
       state = "collecting";
     } else if (comparison.status === "integrity_gap") {
       const message = "В истории целевого круга обнаружен разрыв. Аналог не выбирается по неполной последовательности.";
       resetCycleComparisonAnalogue(message, { candidates });
       badge = "Разрыв истории";
-      status = message;
+      status = `${markerStatus ? `${markerStatus} ` : ""}${message}`;
       state = "gap";
     } else {
       const message = comparison.reason === "target-history-incomplete"
@@ -3104,7 +3193,7 @@ import { buildFollowerStats } from "./pair-followers.js?v=1";
           : "Круг для сравнения ещё не сформирован. Ждём первое сохранённое выпадение.";
       resetCycleComparisonAnalogue(message, { candidates });
       badge = "Нет аналога";
-      status = message;
+      status = `${markerStatus ? `${markerStatus} ` : ""}${message}`;
       state = "unavailable";
     }
 

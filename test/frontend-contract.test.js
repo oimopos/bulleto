@@ -129,6 +129,17 @@ test("cycle analogue uses the fixed 20-draw contract and renders the entire arch
   assert.match(app, /compareEvents: comparison\.target\.events/);
   assert.match(app, /is-position-match/);
   assert.match(app, /is-position-mismatch/);
+  assert.match(app, /buildCycleStageMarker/);
+  assert.match(app, /stageMarker\.position === event\.position/);
+  assert.match(app, /markerRole: "current"/);
+  assert.match(app, /markerRole: "reference"/);
+  assert.match(app, /aria-current/);
+  assert.match(app, /Сейчас сравниваем/);
+  assert.match(app, /Исторический аналог завершился на ходе/);
+  assert.match(styles, /\.cycle-sequence-event\.is-stage-marker/);
+  assert.match(styles, /\.cycle-sequence-event\.is-marker-red/);
+  assert.match(styles, /\.cycle-sequence-event\.is-marker-black/);
+  assert.match(styles, /\.cycle-sequence-event\.is-marker-green/);
   assert.match(app, /не меняется до завершения круга/);
   assert.match(app, /function renderCycleComparison\(value\)/);
   assert.match(app, /setCycleComparisonState\("loading"/);
@@ -150,8 +161,8 @@ test("cycle comparison language is descriptive, responsive, and cache-busted", (
   assert.match(block, /не прогноз/);
   assert.match(block, /не предсказывает следующее число/);
   assert.doesNotMatch(block, /должн/iu);
-  assert.match(html, /href="\/styles\.css\?v=20"/);
-  assert.match(html, /src="\/app\.js\?v=20"/);
+  assert.match(html, /href="\/styles\.css\?v=21"/);
+  assert.match(html, /src="\/app\.js\?v=21"/);
   assert.match(styles, /\.cycle-sequence-list\s*\{[\s\S]*?repeat\(auto-fill, minmax\(50px, 1fr\)\)/);
   assert.match(
     styles,
