@@ -74,3 +74,91 @@ test("dynamic top-5 next-round summary uses the validated full-20 cohort", () =>
     /@media \(max-width: 680px\)[\s\S]*?\.follower-dynamic-next__metrics\s*\{\s*grid-template-columns: repeat\(2, minmax\(0, 1fr\)\)/,
   );
 });
+
+test("full-cycle comparison block exposes every renderer target and stays above forecasts", () => {
+  const rendererIds = [
+    "cycle-comparison-panel",
+    "cycle-comparison-badge",
+    "cycle-comparison-status",
+    "cycle-comparison-current-title",
+    "cycle-comparison-current-meta",
+    "cycle-comparison-current-sequence",
+    "cycle-comparison-analogue-card",
+    "cycle-comparison-analogue-title",
+    "cycle-comparison-analogue-meta",
+    "cycle-comparison-metrics",
+    "cycle-comparison-anchor-meta",
+    "cycle-comparison-analogue-sequence",
+    "cycle-comparison-continuation",
+    "cycle-comparison-continuation-meta",
+    "cycle-comparison-continuation-sequence",
+  ];
+  const semanticIds = [
+    "cycle-comparison-title",
+    "cycle-comparison-anchor-title",
+    "cycle-comparison-continuation-title",
+    "cycle-comparison-note",
+  ];
+
+  for (const id of [...rendererIds, ...semanticIds]) {
+    assert.match(html, new RegExp(`\\bid="${id}"`));
+  }
+  for (const id of rendererIds) {
+    assert.match(app, new RegExp(`getElementById\\("${id}"\\)`));
+  }
+
+  assert.match(
+    html,
+    /<section class="overview-grid"[\s\S]*?<section class="panel cycle-comparison-panel"[\s\S]*?<section class="panel preclose-panel"/,
+  );
+  assert.match(html, /id="cycle-comparison-status" role="status" aria-live="polite" aria-atomic="true"/);
+  assert.match(html, /id="cycle-comparison-panel"[\s\S]*?aria-busy="true"/);
+  assert.match(html, /id="cycle-comparison-current-sequence"[\s\S]*?aria-busy="true"/);
+});
+
+test("cycle analogue uses the fixed 20-draw contract and renders the entire archive tail", () => {
+  assert.match(app, /const CYCLE_COMPARISON_ANCHOR_DRAWS = 20/);
+  assert.match(app, /const CYCLE_COMPARISON_ALGORITHM_VERSION = "cycle-analogue-prefix-v1"/);
+  assert.match(app, /fetchJson\("\/api\/cycle-comparison"\)/);
+  assert.match(app, /value\.schemaVersion !== 1/);
+  assert.match(app, /value\.algorithmVersion !== CYCLE_COMPARISON_ALGORITHM_VERSION/);
+  assert.match(app, /value\.interpretation !== "descriptive-not-predictive"/);
+  assert.match(app, /\["ready", "collecting_anchor", "unavailable", "integrity_gap"\]/);
+  assert.match(app, /analogue\.events\.slice\(0, comparison\.anchorDrawCount\)/);
+  assert.match(app, /analogue\.events\.slice\(comparison\.anchorDrawCount\)/);
+  assert.match(app, /compareEvents: comparison\.target\.events/);
+  assert.match(app, /is-position-match/);
+  assert.match(app, /is-position-mismatch/);
+  assert.match(app, /не меняется до завершения круга/);
+  assert.match(app, /function renderCycleComparison\(value\)/);
+  assert.match(app, /setCycleComparisonState\("loading"/);
+  assert.match(app, /setCycleComparisonState\(\s*"error"/);
+  assert.match(app, /setCycleComparisonState\(\s*"stale"/);
+  assert.match(app, /state = "collecting"/);
+  assert.ok(
+    [...app.matchAll(/renderCycleComparison\(store\.cycleComparison\)/g)].length >= 2,
+    "comparison must render on normal and failed refresh paths",
+  );
+});
+
+test("cycle comparison language is descriptive, responsive, and cache-busted", () => {
+  const blockStart = html.indexOf('id="cycle-comparison-panel"');
+  const blockEnd = html.indexOf('id="preclose-panel"');
+  const block = html.slice(blockStart, blockEnd);
+
+  assert.ok(blockStart >= 0 && blockEnd > blockStart);
+  assert.match(block, /не прогноз/);
+  assert.match(block, /не предсказывает следующее число/);
+  assert.doesNotMatch(block, /должн/iu);
+  assert.match(html, /href="\/styles\.css\?v=20"/);
+  assert.match(html, /src="\/app\.js\?v=20"/);
+  assert.match(styles, /\.cycle-sequence-list\s*\{[\s\S]*?repeat\(auto-fill, minmax\(50px, 1fr\)\)/);
+  assert.match(
+    styles,
+    /@media \(max-width: 680px\)[\s\S]*?\.cycle-sequence-list\s*\{\s*grid-template-columns: repeat\(5, minmax\(42px, 1fr\)\)/,
+  );
+  assert.match(
+    styles,
+    /@media \(max-width: 430px\)[\s\S]*?\.cycle-sequence-list\s*\{\s*grid-template-columns: repeat\(4, minmax\(40px, 1fr\)\)/,
+  );
+});

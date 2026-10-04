@@ -378,6 +378,26 @@ const server = createServer((request, response) => {
       return;
     }
 
+    if (pathname === '/api/cycle-comparison') {
+      const comparison = db.getCycleAnalogue('buleto', config.instrument);
+      sendJson(response, 200, {
+        ...comparison,
+        target: comparison.target
+          ? {
+              ...comparison.target,
+              cycle: cycleForApi(comparison.target.cycle),
+            }
+          : null,
+        analogue: comparison.analogue
+          ? {
+              ...comparison.analogue,
+              cycle: cycleForApi(comparison.analogue.cycle),
+            }
+          : null,
+      });
+      return;
+    }
+
     if (pathname === '/api/sequences') {
       const limit = clampLimit(url.searchParams.get('limit'), 50, 100);
       const matches = db.getRepeatedTriples('buleto', config.instrument, limit + 1);

@@ -10,6 +10,8 @@ import { buildFollowerStats } from "./pair-followers.js?v=1";
   const AGE_UPDATE_INTERVAL_MS = 30_000;
   const FOLLOWER_COLLAPSED_LIMIT = 5;
   const FOLLOWER_HIT_HORIZONS = [1, 2, 3, 5, 10, 20];
+  const CYCLE_COMPARISON_ANCHOR_DRAWS = 20;
+  const CYCLE_COMPARISON_ALGORITHM_VERSION = "cycle-analogue-prefix-v1";
 
   const elements = {
     main: document.querySelector("main"),
@@ -78,6 +80,21 @@ import { buildFollowerStats } from "./pair-followers.js?v=1";
     drawCount: document.getElementById("draw-count"),
     repeatCount: document.getElementById("repeat-count"),
     cycleStart: document.getElementById("cycle-start"),
+    cycleComparisonPanel: document.getElementById("cycle-comparison-panel"),
+    cycleComparisonBadge: document.getElementById("cycle-comparison-badge"),
+    cycleComparisonStatus: document.getElementById("cycle-comparison-status"),
+    cycleComparisonCurrentTitle: document.getElementById("cycle-comparison-current-title"),
+    cycleComparisonCurrentMeta: document.getElementById("cycle-comparison-current-meta"),
+    cycleComparisonCurrentSequence: document.getElementById("cycle-comparison-current-sequence"),
+    cycleComparisonAnalogueCard: document.getElementById("cycle-comparison-analogue-card"),
+    cycleComparisonAnalogueTitle: document.getElementById("cycle-comparison-analogue-title"),
+    cycleComparisonAnalogueMeta: document.getElementById("cycle-comparison-analogue-meta"),
+    cycleComparisonMetrics: document.getElementById("cycle-comparison-metrics"),
+    cycleComparisonAnchorMeta: document.getElementById("cycle-comparison-anchor-meta"),
+    cycleComparisonAnalogueSequence: document.getElementById("cycle-comparison-analogue-sequence"),
+    cycleComparisonContinuation: document.getElementById("cycle-comparison-continuation"),
+    cycleComparisonContinuationMeta: document.getElementById("cycle-comparison-continuation-meta"),
+    cycleComparisonContinuationSequence: document.getElementById("cycle-comparison-continuation-sequence"),
     numberGrid: document.getElementById("number-grid"),
     boardNote: document.getElementById("board-note"),
     overdueList: document.getElementById("overdue-list"),
@@ -153,6 +170,9 @@ import { buildFollowerStats } from "./pair-followers.js?v=1";
     state: null,
     results: [],
     cycles: [],
+    cycleComparison: null,
+    cycleComparisonLoaded: false,
+    cycleComparisonError: false,
     stateLoaded: false,
     stateError: false,
     triples: [],
@@ -1089,7 +1109,8 @@ import { buildFollowerStats } from "./pair-followers.js?v=1";
       fetchJson("/api/cycles?limit=10"),
       fetchJson("/api/sequences?limit=50"),
       fetchJson("/api/pairs"),
-      fetchJson("/api/forecasts/hits?limit=20")
+      fetchJson("/api/forecasts/hits?limit=20"),
+      fetchJson("/api/cycle-comparison")
     ]);
 
     let successfulRequests = 0;
@@ -1137,6 +1158,14 @@ import { buildFollowerStats } from "./pair-followers.js?v=1";
       successfulRequests += 1;
     } else {
       store.forecastHitsError = true;
+    }
+    if (requests[6].status === "fulfilled") {
+      store.cycleComparison = requests[6].value;
+      store.cycleComparisonLoaded = true;
+      store.cycleComparisonError = false;
+      successfulRequests += 1;
+    } else {
+      store.cycleComparisonError = true;
     }
 
     if (successfulRequests > 0) {
@@ -1190,6 +1219,7 @@ import { buildFollowerStats } from "./pair-followers.js?v=1";
     renderFollowerHitCurve();
     renderForecastHitHistory();
     renderVirtualBettor(store.state?.virtualBettor || null);
+    renderCycleComparison(store.cycleComparison);
   }
 
   function renderAll() {
@@ -1203,6 +1233,7 @@ import { buildFollowerStats } from "./pair-followers.js?v=1";
     renderFollowers(latestResult);
     renderOverdueNumbers();
     renderActiveCycle(store.state?.activeCycle || null);
+    renderCycleComparison(store.cycleComparison);
     renderTriples();
     renderResults(store.results, store.state?.stats);
     renderCycles(store.cycles, store.state?.stats);
@@ -2657,6 +2688,436 @@ import { buildFollowerStats } from "./pair-followers.js?v=1";
       );
       card.title = `Всего в базе: ${occurrenceCount} ${pluralForm(occurrenceCount, "выпадение", "выпадения", "выпадений")}`;
     });
+  }
+
+  function normalizedCycleComparisonEvents(value) {
+    if (!Array.isArray(value)) return null;
+
+    const events = [];
+    for (let index = 0; index < value.length; index += 1) {
+      const item = value[index];
+      const position = asOptionalNonNegativeInteger(item?.position);
+      const number = asRouletteNumber(item?.number);
+      if (position !== index + 1 || number === null) return null;
+
+      let wasNew = null;
+      if (item?.wasNew === true || item?.wasNew === 1) wasNew = true;
+      else if (item?.wasNew === false || item?.wasNew === 0) wasNew = false;
+
+      events.push({
+        ...item,
+        position,
+        number,
+        wasNew,
+        remainingAfter: asOptionalNonNegativeInteger(item?.remainingAfter)
+      });
+    }
+    return events;
+  }
+
+  function normalizedCycleComparisonTarget(value) {
+    if (!value || !["active", "latest_completed"].includes(value.mode) || !value.cycle) return null;
+    const events = normalizedCycleComparisonEvents(value.events);
+    if (!events) return null;
+    const declaredDraws = asOptionalNonNegativeInteger(value.cycle.totalDraws ?? value.cycle.eventCount);
+    return {
+      ...value,
+      events,
+      historyComplete: declaredDraws === null || declaredDraws === events.length,
+      declaredDraws
+    };
+  }
+
+  function normalizedCycleComparisonAnalogue(value) {
+    if (!value || !value.cycle) return null;
+    const events = normalizedCycleComparisonEvents(value.events);
+    if (!events) return null;
+    const declaredDraws = asOptionalNonNegativeInteger(value.cycle.totalDraws ?? value.cycle.eventCount);
+    return {
+      ...value,
+      events,
+      historyComplete: declaredDraws === null || declaredDraws === events.length,
+      declaredDraws,
+      metrics: value.metrics && typeof value.metrics === "object" ? value.metrics : {},
+      afterAnchor: value.afterAnchor && typeof value.afterAnchor === "object" ? value.afterAnchor : {}
+    };
+  }
+
+  function normalizedCycleComparison(value) {
+    if (
+      !value
+      || value.schemaVersion !== 1
+      || value.algorithmVersion !== CYCLE_COMPARISON_ALGORITHM_VERSION
+      || value.interpretation !== "descriptive-not-predictive"
+      || value.anchorDrawCount !== CYCLE_COMPARISON_ANCHOR_DRAWS
+      || !["ready", "collecting_anchor", "unavailable", "integrity_gap"].includes(value.status)
+    ) {
+      return null;
+    }
+
+    const target = value.target === null || value.target === undefined
+      ? null
+      : normalizedCycleComparisonTarget(value.target);
+    const analogue = value.analogue === null || value.analogue === undefined
+      ? null
+      : normalizedCycleComparisonAnalogue(value.analogue);
+
+    if ((value.target && !target) || (value.analogue && !analogue)) return null;
+    if (value.status === "ready") {
+      if (!target || !analogue) return null;
+      if (!target.historyComplete || !analogue.historyComplete) return null;
+      if (target.events.length < CYCLE_COMPARISON_ANCHOR_DRAWS) return null;
+      if (analogue.events.length < CYCLE_COMPARISON_ANCHOR_DRAWS) return null;
+    }
+    if (value.status === "collecting_anchor") {
+      if (!target || !target.historyComplete || analogue || target.events.length >= CYCLE_COMPARISON_ANCHOR_DRAWS) return null;
+    }
+    if (["unavailable", "integrity_gap"].includes(value.status) && analogue) return null;
+
+    return {
+      ...value,
+      target,
+      analogue,
+      candidateStats: value.candidateStats && typeof value.candidateStats === "object"
+        ? value.candidateStats
+        : {}
+    };
+  }
+
+  function cycleComparisonCandidateCount(stats) {
+    return asOptionalNonNegativeInteger(
+      stats?.eligibleCompleted
+      ?? stats?.evaluatedCompleted
+      ?? stats?.totalCompleted
+    );
+  }
+
+  function setCycleComparisonState(state, badge, status, { busy = false } = {}) {
+    elements.cycleComparisonPanel.dataset.state = state;
+    setTextIfChanged(elements.cycleComparisonBadge, badge);
+    setTextIfChanged(elements.cycleComparisonStatus, status);
+    elements.cycleComparisonPanel.setAttribute("aria-busy", String(busy));
+  }
+
+  function cycleSequenceEmpty(list, message, { busy = false } = {}) {
+    list.replaceChildren(createElement("li", "empty-state", message));
+    list.setAttribute("aria-busy", String(busy));
+  }
+
+  function renderCycleSequence(
+    list,
+    events,
+    { emptyMessage = "Выпадений пока нет.", compareEvents = null } = {}
+  ) {
+    if (!events.length) {
+      cycleSequenceEmpty(list, emptyMessage);
+      return;
+    }
+
+    const fragment = document.createDocumentFragment();
+    events.forEach((event) => {
+      const noveltyClass = event.wasNew === true
+        ? "is-new"
+        : event.wasNew === false
+          ? "is-repeat"
+          : "is-unknown";
+      const noveltyVisible = event.wasNew === true ? "Н" : event.wasNew === false ? "П" : "—";
+      const noveltyLabel = event.wasNew === true
+        ? "первое появление в круге"
+        : event.wasNew === false
+          ? "повтор"
+          : "признак первого появления неизвестен";
+      const item = createElement("li", `cycle-sequence-event ${noveltyClass}`);
+      const position = createElement(
+        "span",
+        "cycle-sequence-event__position",
+        String(event.position).padStart(3, "0")
+      );
+      const number = createElement(
+        "span",
+        `cycle-sequence-event__number ${rouletteColorClass(event.number)}`,
+        event.number
+      );
+      const novelty = createElement("span", "cycle-sequence-event__kind", noveltyVisible);
+      const comparedEvent = Array.isArray(compareEvents)
+        ? compareEvents[event.position - 1] ?? null
+        : null;
+      const isPositionMatch = comparedEvent !== null && comparedEvent.number === event.number;
+      const comparison = comparedEvent === null
+        ? null
+        : createElement(
+            "span",
+            `cycle-sequence-event__comparison ${isPositionMatch ? "is-match" : "is-mismatch"}`,
+            isPositionMatch ? "✓" : "≠"
+          );
+      const badges = createElement("span", "cycle-sequence-event__badges");
+      position.setAttribute("aria-hidden", "true");
+      number.setAttribute("aria-hidden", "true");
+      novelty.setAttribute("aria-hidden", "true");
+      if (comparison) {
+        comparison.setAttribute("aria-hidden", "true");
+        item.classList.add(isPositionMatch ? "is-position-match" : "is-position-mismatch");
+      }
+      item.setAttribute(
+        "aria-label",
+        `Ход ${event.position}: число ${event.number}, ${rouletteColorLabel(event.number)}, ${noveltyLabel}${comparedEvent === null ? "" : isPositionMatch ? "; совпало с текущим кругом на этой позиции" : `; отличается от числа ${comparedEvent.number} текущего круга на этой позиции`}`
+      );
+      if (event.settledAt) {
+        item.title = `${formatDateTime(event.settledAt, { alwaysShowDate: true })} · ${noveltyLabel}`;
+      }
+      badges.append(novelty);
+      if (comparison) badges.append(comparison);
+      item.append(position, number, badges);
+      fragment.appendChild(item);
+    });
+
+    list.replaceChildren(fragment);
+    list.setAttribute("aria-busy", "false");
+  }
+
+  function cycleComparisonMeta(target) {
+    const cycle = target.cycle || {};
+    const draws = target.events.length;
+    const uniqueFallback = new Set(target.events.map((event) => event.number)).size;
+    const uniqueCount = Math.min(36, asNonNegativeInteger(cycle.uniqueCount, uniqueFallback));
+    const repeats = Math.max(0, draws - uniqueCount);
+    const modeLabel = target.mode === "latest_completed"
+      ? "Последний завершённый цикл"
+      : "Текущий цикл";
+    const id = cycle.id === null || cycle.id === undefined ? "" : ` №${compactId(cycle.id)}`;
+    const parts = [
+      `${modeLabel}${id}`,
+      `${draws} ${pluralForm(draws, "ход", "хода", "ходов")}`,
+      `${uniqueCount} ${pluralForm(uniqueCount, "уникальное число", "уникальных числа", "уникальных чисел")}`,
+      `${repeats} ${pluralForm(repeats, "повтор", "повтора", "повторов")}`
+    ];
+    const survivor = asRouletteNumber(cycle.survivorNumber);
+    if (survivor !== null) parts.push(`осталось ${survivor}`);
+    return parts.join(" · ");
+  }
+
+  function renderCycleComparisonCurrent(target) {
+    if (!target) {
+      elements.cycleComparisonCurrentTitle.textContent = "Текущий круг";
+      elements.cycleComparisonCurrentMeta.textContent = "Полный круг пока недоступен.";
+      cycleSequenceEmpty(elements.cycleComparisonCurrentSequence, "Ждём первое сохранённое выпадение.");
+      return;
+    }
+
+    const cycleId = target.cycle?.id;
+    const modeLabel = target.mode === "latest_completed" ? "Последний завершённый круг" : "Текущий круг";
+    elements.cycleComparisonCurrentTitle.textContent = cycleId === null || cycleId === undefined
+      ? modeLabel
+      : `${modeLabel} №${compactId(cycleId)}`;
+    if (!target.historyComplete) {
+      const declared = target.declaredDraws;
+      elements.cycleComparisonCurrentMeta.textContent = declared === null
+        ? "Сервер передал неполную историю круга. Последовательность скрыта."
+        : `Сохранено ${target.events.length} из ${declared} ходов. Неполная последовательность скрыта.`;
+      cycleSequenceEmpty(
+        elements.cycleComparisonCurrentSequence,
+        "Полный порядок выпадений недоступен: в истории круга не хватает событий."
+      );
+      return;
+    }
+    elements.cycleComparisonCurrentMeta.textContent = cycleComparisonMeta(target);
+    renderCycleSequence(elements.cycleComparisonCurrentSequence, target.events, {
+      emptyMessage: "В этом круге пока нет сохранённых выпадений."
+    });
+  }
+
+  function replaceCycleComparisonMetrics(items) {
+    const fragment = document.createDocumentFragment();
+    items.forEach(([term, description]) => {
+      const item = document.createElement("div");
+      item.append(createElement("dt", null, term), createElement("dd", null, description));
+      fragment.appendChild(item);
+    });
+    elements.cycleComparisonMetrics.replaceChildren(fragment);
+  }
+
+  function finiteCycleMetric(value) {
+    const number = Number(value);
+    return Number.isFinite(number) && number >= 0 ? number : null;
+  }
+
+  function cycleComparisonMetricItems(comparison) {
+    const metrics = comparison.analogue.metrics;
+    const afterAnchor = comparison.analogue.afterAnchor;
+    const anchor = comparison.anchorDrawCount;
+    const pairDenominator = Math.max(0, anchor - 1);
+    const candidates = cycleComparisonCandidateCount(comparison.candidateStats);
+    const items = [["Точка фиксации", `${anchor} ходов`]];
+
+    if (candidates !== null) items.push(["Проверено кругов", String(candidates)]);
+
+    const lcsLength = asOptionalNonNegativeInteger(metrics.lcsLength);
+    if (lcsLength !== null) items.push(["Общий порядок", `${lcsLength} из ${anchor}`]);
+
+    const positionalMatches = asOptionalNonNegativeInteger(metrics.positionalMatches);
+    if (positionalMatches !== null) items.push(["Та же позиция", `${positionalMatches} из ${anchor}`]);
+
+    const alignedPairMatches = asOptionalNonNegativeInteger(metrics.alignedPairMatches);
+    if (alignedPairMatches !== null) items.push(["Соседние пары", `${alignedPairMatches} из ${pairDenominator}`]);
+
+    const noveltyMatches = asOptionalNonNegativeInteger(metrics.noveltyMatches);
+    if (noveltyMatches !== null) items.push(["Новое / повтор", `${noveltyMatches} из ${anchor}`]);
+
+    const seenIntersection = asOptionalNonNegativeInteger(metrics.seenIntersection);
+    if (seenIntersection !== null) items.push(["Общие числа", `${seenIntersection} к точке фиксации`]);
+
+    const uniqueCurveError = finiteCycleMetric(metrics.uniqueCurveError);
+    if (uniqueCurveError !== null) {
+      items.push(["Расхождение этапа", new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 2 }).format(uniqueCurveError)]);
+    }
+
+    const comparedDraws = asOptionalNonNegativeInteger(afterAnchor.comparedDraws);
+    const exactMatches = asOptionalNonNegativeInteger(afterAnchor.exactMatches);
+    if (comparedDraws !== null && exactMatches !== null) {
+      items.push([
+        "После фиксации",
+        comparedDraws > 0 ? `${exactMatches} из ${comparedDraws} совпали по позиции` : "ещё не проверено"
+      ]);
+    }
+
+    return items;
+  }
+
+  function resetCycleComparisonAnalogue(message, { candidates = null, busy = false } = {}) {
+    elements.cycleComparisonAnalogueCard.dataset.state = busy ? "loading" : "empty";
+    elements.cycleComparisonAnalogueTitle.textContent = "Зафиксированный исторический аналог";
+    elements.cycleComparisonAnalogueMeta.textContent = message;
+    elements.cycleComparisonAnchorMeta.textContent = `Фиксация после ${CYCLE_COMPARISON_ANCHOR_DRAWS}-го хода`;
+    cycleSequenceEmpty(elements.cycleComparisonAnalogueSequence, message, { busy });
+    elements.cycleComparisonContinuation.hidden = true;
+    cycleSequenceEmpty(elements.cycleComparisonContinuationSequence, "Исторического продолжения пока нет.", { busy });
+    const items = [["Статус", busy ? "Загрузка…" : "Аналог не зафиксирован"]];
+    if (candidates !== null) items.push(["Доступно кругов", String(candidates)]);
+    replaceCycleComparisonMetrics(items);
+  }
+
+  function renderReadyCycleComparison(comparison) {
+    const analogue = comparison.analogue;
+    const cycle = analogue.cycle || {};
+    const analogueId = cycle.id;
+    const anchorEvents = analogue.events.slice(0, comparison.anchorDrawCount);
+    const continuationEvents = analogue.events.slice(comparison.anchorDrawCount);
+    const survivor = asRouletteNumber(cycle.survivorNumber);
+    const idLabel = analogueId === null || analogueId === undefined ? "" : ` №${compactId(analogueId)}`;
+    const meta = [
+      `Цикл${idLabel}`,
+      `${analogue.events.length} ${pluralForm(analogue.events.length, "ход", "хода", "ходов")}`,
+      formatCyclePeriod(cycle.startedAt, cycle.completedAt)
+    ];
+    if (survivor !== null) meta.push(`не выпало ${survivor}`);
+
+    elements.cycleComparisonAnalogueCard.dataset.state = "ready";
+    elements.cycleComparisonAnalogueTitle.textContent = `Зафиксированный исторический аналог${idLabel}`;
+    elements.cycleComparisonAnalogueMeta.textContent = meta.join(" · ");
+    elements.cycleComparisonAnchorMeta.textContent = `Только эти ${comparison.anchorDrawCount} ходов участвовали в выборе аналога`;
+    renderCycleSequence(elements.cycleComparisonAnalogueSequence, anchorEvents, {
+      compareEvents: comparison.target.events
+    });
+    replaceCycleComparisonMetrics(cycleComparisonMetricItems(comparison));
+
+    elements.cycleComparisonContinuation.hidden = continuationEvents.length === 0;
+    elements.cycleComparisonContinuationMeta.textContent = continuationEvents.length
+      ? `${continuationEvents.length} ${pluralForm(continuationEvents.length, "исторический ход", "исторических хода", "исторических ходов")} после фиксации · полный архивный хвост`
+      : "Архивный круг завершился в точке фиксации";
+    renderCycleSequence(elements.cycleComparisonContinuationSequence, continuationEvents, {
+      emptyMessage: "После точки фиксации в архивном круге больше не было ходов.",
+      compareEvents: comparison.target.events
+    });
+
+    const targetId = comparison.target.cycle?.id;
+    const targetLabel = targetId === null || targetId === undefined ? "целевого круга" : `цикла №${compactId(targetId)}`;
+    const analogueLabel = analogueId === null || analogueId === undefined ? "архивный аналог" : `цикл №${compactId(analogueId)}`;
+    return `${analogueLabel} зафиксирован по первым ${comparison.anchorDrawCount} ходам ${targetLabel} и не меняется до завершения круга.`;
+  }
+
+  function renderCycleComparison(value) {
+    if (!store.cycleComparisonLoaded && !store.cycleComparisonError) {
+      renderCycleComparisonCurrent(null);
+      resetCycleComparisonAnalogue("Загружаем исторические круги…", { busy: true });
+      elements.cycleComparisonCurrentSequence.setAttribute("aria-busy", "true");
+      setCycleComparisonState("loading", "Загрузка…", "Загружаем полные последовательности кругов.", { busy: true });
+      return;
+    }
+
+    if (!value) {
+      renderCycleComparisonCurrent(null);
+      resetCycleComparisonAnalogue("Не удалось загрузить исторический аналог.");
+      setCycleComparisonState(
+        "error",
+        "Ошибка загрузки",
+        "Не удалось получить полные последовательности. Повторим попытку автоматически."
+      );
+      return;
+    }
+
+    const comparison = normalizedCycleComparison(value);
+    if (!comparison) {
+      renderCycleComparisonCurrent(null);
+      resetCycleComparisonAnalogue("Ответ сервера не прошёл проверку целостности.");
+      setCycleComparisonState(
+        "error",
+        "Неполные данные",
+        "Полный круг скрыт: формат или порядок событий в ответе сервера некорректен."
+      );
+      return;
+    }
+
+    renderCycleComparisonCurrent(comparison.target);
+    const candidates = cycleComparisonCandidateCount(comparison.candidateStats);
+    let state = comparison.status;
+    let badge = "Нет данных";
+    let status = "Полные последовательности пока недоступны.";
+
+    if (comparison.status === "ready") {
+      status = renderReadyCycleComparison(comparison);
+      badge = comparison.analogue.cycle?.id === null || comparison.analogue.cycle?.id === undefined
+        ? "Аналог зафиксирован"
+        : `Аналог №${compactId(comparison.analogue.cycle.id)}`;
+    } else if (comparison.status === "collecting_anchor") {
+      const collected = comparison.target?.events.length || 0;
+      const remaining = Math.max(0, comparison.anchorDrawCount - collected);
+      const message = `Собрано ${collected} из ${comparison.anchorDrawCount} ходов. Аналог будет зафиксирован один раз после ещё ${remaining} ${pluralForm(remaining, "ход", "хода", "ходов")}.`;
+      resetCycleComparisonAnalogue(message, { candidates });
+      replaceCycleComparisonMetrics([
+        ["Собрано", `${collected} из ${comparison.anchorDrawCount}`],
+        ...(candidates === null ? [] : [["Доступно кругов", String(candidates)]])
+      ]);
+      badge = `${collected} / ${comparison.anchorDrawCount}`;
+      status = message;
+      state = "collecting";
+    } else if (comparison.status === "integrity_gap") {
+      const message = "В истории целевого круга обнаружен разрыв. Аналог не выбирается по неполной последовательности.";
+      resetCycleComparisonAnalogue(message, { candidates });
+      badge = "Разрыв истории";
+      status = message;
+      state = "gap";
+    } else {
+      const message = comparison.reason === "target-history-incomplete"
+        ? "Полный текущий круг недоступен: в сохранённой истории не хватает событий. Аналог не строится по неполному ряду."
+        : comparison.target
+          ? "Полный текущий круг показан, но подходящего завершённого архивного круга для фиксации аналога пока нет."
+          : "Круг для сравнения ещё не сформирован. Ждём первое сохранённое выпадение.";
+      resetCycleComparisonAnalogue(message, { candidates });
+      badge = "Нет аналога";
+      status = message;
+      state = "unavailable";
+    }
+
+    if (store.cycleComparisonError) {
+      setCycleComparisonState(
+        "stale",
+        "Не обновлено",
+        `Не удалось обновить блок. Показан предыдущий снимок. ${status}`
+      );
+      return;
+    }
+
+    setCycleComparisonState(state, badge, status);
   }
 
   function renderActiveCycle(cycle) {

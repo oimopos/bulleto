@@ -14,6 +14,11 @@ import {
   FORECAST_CONSENSUS_ALGORITHM_VERSION,
   combineFrozenTop3,
 } from "./forecast-consensus.js";
+import {
+  CYCLE_ANALOGUE_ALGORITHM_VERSION,
+  CYCLE_ANALOGUE_ANCHOR_DRAW_COUNT,
+  selectCycleAnalogue,
+} from "./cycle-analogue.js";
 
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 500;
@@ -2961,6 +2966,33 @@ export class RouletteDatabase {
       .map((row) => Number(row.number));
   }
 
+  #cycleEventSequence(cycleId) {
+    return this.sqlite
+      .prepare(`
+        SELECT
+          ce.id AS event_id,
+          ce.round_result_id,
+          ce.result_number,
+          ce.eliminated,
+          ce.remaining_count,
+          ce.occurred_at
+        FROM cycle_events AS ce
+        WHERE ce.cycle_id = ?
+        ORDER BY ce.occurred_at, ce.round_result_id, ce.id
+      `)
+      .all(cycleId)
+      .map((row, index) => ({
+        position: index + 1,
+        id: Number(row.round_result_id),
+        resultId: Number(row.round_result_id),
+        eventId: Number(row.event_id),
+        number: Number(row.result_number),
+        settledAt: row.occurred_at,
+        wasNew: Boolean(row.eliminated),
+        remainingAfter: Number(row.remaining_count),
+      }));
+  }
+
   #hydrateCycle(row) {
     if (!row) {
       return null;
@@ -5032,6 +5064,223 @@ export class RouletteDatabase {
       `)
       .all(safeLimit)
       .map(mapRoundResult);
+  }
+
+  getCycleAnalogue(source = "buleto", instrument = "default") {
+    this.#assertOpen();
+    const safeSource = asNonEmptyText(source, undefined, "source");
+    const safeInstrument = asNonEmptyText(instrument, undefined, "instrument");
+    const generatedAt = asTimestamp(this.clock(), undefined, "clock");
+    const responseBase = {
+      schemaVersion: 1,
+      algorithmVersion: CYCLE_ANALOGUE_ALGORITHM_VERSION,
+      interpretation: "descriptive-not-predictive",
+      generatedAt,
+      anchorDrawCount: CYCLE_ANALOGUE_ANCHOR_DRAW_COUNT,
+      anchorResultId: null,
+      target: null,
+      analogue: null,
+      candidateStats: { eligibleCompleted: null },
+    };
+
+    const activeRow = this.sqlite
+      .prepare(`
+        SELECT *
+        FROM cycles
+        WHERE source = ? AND instrument = ? AND status = 'active'
+        ORDER BY last_event_at DESC, id DESC
+        LIMIT 1
+      `)
+      .get(safeSource, safeInstrument);
+    const latestRow =
+      activeRow ??
+      this.sqlite
+        .prepare(`
+          SELECT *
+          FROM cycles
+          WHERE source = ? AND instrument = ?
+          ORDER BY last_event_at DESC, id DESC
+          LIMIT 1
+        `)
+        .get(safeSource, safeInstrument);
+
+    if (!latestRow) {
+      return {
+        ...responseBase,
+        status: "unavailable",
+        reason: "no-cycle",
+      };
+    }
+    if (latestRow.status === "invalid_gap") {
+      return {
+        ...responseBase,
+        status: "integrity_gap",
+        reason: "current-cycle-integrity-gap",
+      };
+    }
+
+    const targetCycle = this.#hydrateCycle(latestRow);
+    const targetEvents = this.#cycleEventSequence(targetCycle.id);
+    const target = {
+      mode: targetCycle.status === "active" ? "active" : "latest_completed",
+      cycle: targetCycle,
+      events: targetEvents,
+    };
+    if (targetEvents.length !== targetCycle.eventCount) {
+      return {
+        ...responseBase,
+        status: "unavailable",
+        reason: "target-history-incomplete",
+      };
+    }
+
+    const initialSelection = selectCycleAnalogue(targetEvents, []);
+    if (initialSelection.status === "collecting_anchor") {
+      return {
+        ...responseBase,
+        status: "collecting_anchor",
+        target,
+        reason: "awaiting-anchor",
+      };
+    }
+
+    const prefixRows = this.sqlite
+      .prepare(`
+        WITH valid_candidates AS (
+          SELECT c.id, c.completed_at
+          FROM cycles AS c
+          JOIN cycle_events AS ce ON ce.cycle_id = c.id
+          JOIN round_results AS rr ON rr.id = ce.round_result_id
+          WHERE c.source = ?
+            AND c.instrument = ?
+            AND c.status = 'completed'
+            AND c.id < ?
+            AND c.completed_at < ?
+            AND c.event_count >= ?
+            AND c.eliminated_count = 36
+            AND NOT EXISTS (
+              SELECT 1
+              FROM incidents AS incident
+              WHERE incident.cycle_id = c.id
+                AND NOT EXISTS (
+                  SELECT 1
+                  FROM incident_resolutions AS resolution
+                  WHERE resolution.incident_id = incident.id
+                )
+            )
+            AND (
+              SELECT COUNT(*)
+              FROM cycle_numbers AS cn
+              WHERE cn.cycle_id = c.id
+            ) = 37
+            AND (
+              SELECT COUNT(*)
+              FROM cycle_numbers AS cn
+              WHERE cn.cycle_id = c.id AND cn.eliminated_at IS NOT NULL
+            ) = 36
+          GROUP BY c.id, c.completed_at, c.event_count, c.survivor_number
+          HAVING COUNT(*) = c.event_count
+            AND SUM(CASE WHEN rr.cycle_id = c.id THEN 0 ELSE 1 END) = 0
+            AND COUNT(DISTINCT rr.continuity_epoch) = 1
+            AND COUNT(DISTINCT ce.result_number) = 36
+            AND SUM(CASE WHEN ce.result_number = c.survivor_number THEN 1 ELSE 0 END) = 0
+        ), ordered_prefixes AS (
+          SELECT
+            candidates.id AS cycle_id,
+            candidates.completed_at,
+            ce.id AS event_id,
+            ce.round_result_id,
+            ce.result_number,
+            ce.eliminated,
+            ce.remaining_count,
+            ce.occurred_at,
+            ROW_NUMBER() OVER (
+              PARTITION BY ce.cycle_id
+              ORDER BY ce.occurred_at, ce.round_result_id, ce.id
+            ) AS prefix_position
+          FROM valid_candidates AS candidates
+          JOIN cycle_events AS ce ON ce.cycle_id = candidates.id
+        )
+        SELECT *
+        FROM ordered_prefixes
+        WHERE prefix_position <= ?
+        ORDER BY cycle_id, prefix_position
+      `)
+      .all(
+        safeSource,
+        safeInstrument,
+        targetCycle.id,
+        targetCycle.startedAt,
+        CYCLE_ANALOGUE_ANCHOR_DRAW_COUNT,
+        CYCLE_ANALOGUE_ANCHOR_DRAW_COUNT,
+      );
+
+    const candidateMap = new Map();
+    for (const row of prefixRows) {
+      const cycleId = Number(row.cycle_id);
+      let candidate = candidateMap.get(cycleId);
+      if (!candidate) {
+        candidate = {
+          id: cycleId,
+          completedAt: row.completed_at,
+          events: [],
+        };
+        candidateMap.set(cycleId, candidate);
+      }
+      candidate.events.push({
+        position: Number(row.prefix_position),
+        id: Number(row.round_result_id),
+        resultId: Number(row.round_result_id),
+        eventId: Number(row.event_id),
+        number: Number(row.result_number),
+        settledAt: row.occurred_at,
+        wasNew: Boolean(row.eliminated),
+        remainingAfter: Number(row.remaining_count),
+      });
+    }
+
+    const candidates = [...candidateMap.values()];
+    const selection = selectCycleAnalogue(targetEvents, candidates);
+    const candidateStats = { eligibleCompleted: candidates.length };
+    if (selection.status !== "ready") {
+      return {
+        ...responseBase,
+        status: "unavailable",
+        anchorResultId: selection.anchorResultId,
+        target,
+        candidateStats,
+        reason: "no-eligible-completed-history",
+      };
+    }
+
+    const analogueCycle = this.#cycleById(selection.winner.id);
+    const analogueEvents = this.#cycleEventSequence(selection.winner.id);
+    const targetAfterAnchor = targetEvents.slice(CYCLE_ANALOGUE_ANCHOR_DRAW_COUNT);
+    const analogueAfterAnchor = analogueEvents.slice(CYCLE_ANALOGUE_ANCHOR_DRAW_COUNT);
+    const comparedDraws = Math.min(targetAfterAnchor.length, analogueAfterAnchor.length);
+    let exactMatches = 0;
+    for (let index = 0; index < comparedDraws; index += 1) {
+      if (targetAfterAnchor[index].number === analogueAfterAnchor[index].number) {
+        exactMatches += 1;
+      }
+    }
+
+    return {
+      ...responseBase,
+      status: "ready",
+      anchorResultId: selection.anchorResultId,
+      target,
+      analogue: {
+        cycle: analogueCycle,
+        events: analogueEvents,
+        metrics: selection.metrics,
+        afterAnchor: {
+          comparedDraws,
+          exactMatches,
+        },
+      },
+      candidateStats,
+    };
   }
 
   getCompletedCycles(limit = DEFAULT_LIMIT) {

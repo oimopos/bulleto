@@ -7,8 +7,8 @@
     <meta name="color-scheme" content="dark">
     <meta name="description" content="Онлайн-монитор результатов рулетки и циклов исключения чисел от 0 до 36">
     <title>Круг 37 — монитор результатов</title>
-    <link rel="stylesheet" href="/styles.css?v=19">
-    <script type="module" src="/app.js?v=19"></script>
+    <link rel="stylesheet" href="/styles.css?v=20">
+    <script type="module" src="/app.js?v=20"></script>
   </head>
   <body>
     <a class="skip-link" href="#main-content">Перейти к содержимому</a>
@@ -121,6 +121,72 @@
             </div>
           </div>
         </article>
+      </section>
+
+      <section class="panel cycle-comparison-panel" id="cycle-comparison-panel" data-state="loading" aria-labelledby="cycle-comparison-title" aria-describedby="cycle-comparison-status cycle-comparison-note" aria-busy="true">
+        <div class="panel__topline cycle-comparison-panel__header">
+          <div>
+            <p class="eyebrow">Полная последовательность · только наблюдение</p>
+            <h2 id="cycle-comparison-title">Текущий круг и исторический аналог</h2>
+          </div>
+          <span class="count-badge" id="cycle-comparison-badge">Загрузка…</span>
+        </div>
+
+        <p class="cycle-comparison-status" id="cycle-comparison-status" role="status" aria-live="polite" aria-atomic="true">Загружаем полные последовательности кругов.</p>
+
+        <section class="cycle-sequence-card" aria-labelledby="cycle-comparison-current-title">
+          <div class="cycle-sequence-card__header">
+            <div>
+              <h3 id="cycle-comparison-current-title">Текущий круг</h3>
+              <p id="cycle-comparison-current-meta">Ожидаем данные текущего круга.</p>
+            </div>
+            <div class="cycle-sequence-legend" aria-label="Обозначения последовательности">
+              <span><i class="cycle-sequence-legend__mark is-new" aria-hidden="true">Н</i> Первое появление</span>
+              <span><i class="cycle-sequence-legend__mark is-repeat" aria-hidden="true">П</i> Повтор</span>
+            </div>
+          </div>
+          <ol class="cycle-sequence-list" id="cycle-comparison-current-sequence" aria-label="Все выпадения текущего круга по порядку" aria-describedby="cycle-comparison-current-meta" aria-busy="true">
+            <li class="empty-state">Загружаем текущий круг…</li>
+          </ol>
+        </section>
+
+        <section class="cycle-sequence-card cycle-sequence-card--analogue" id="cycle-comparison-analogue-card" aria-labelledby="cycle-comparison-analogue-title">
+          <div class="cycle-sequence-card__header">
+            <div>
+              <h3 id="cycle-comparison-analogue-title">Зафиксированный исторический аналог</h3>
+              <p id="cycle-comparison-analogue-meta">Аналог фиксируется один раз по первым 20 ходам.</p>
+            </div>
+            <div class="cycle-sequence-legend" aria-label="Сравнение с текущим кругом по одинаковым позициям">
+              <span><i class="cycle-sequence-legend__mark is-match" aria-hidden="true">✓</i> Совпало</span>
+              <span><i class="cycle-sequence-legend__mark is-mismatch" aria-hidden="true">≠</i> Отличается</span>
+              <span><i class="cycle-sequence-legend__mark is-pending" aria-hidden="true">·</i> Ход ещё не наступил</span>
+            </div>
+          </div>
+
+          <dl class="cycle-comparison-metrics" id="cycle-comparison-metrics" aria-label="Показатели описательного сходства">
+            <div><dt>Статус</dt><dd>Загрузка…</dd></div>
+          </dl>
+
+          <div class="cycle-sequence-segment">
+            <div class="cycle-sequence-segment__heading">
+              <h4 id="cycle-comparison-anchor-title">Ходы 1–20, по которым выбран аналог</h4>
+              <span id="cycle-comparison-anchor-meta">Фиксированная точка сравнения</span>
+            </div>
+            <ol class="cycle-sequence-list cycle-sequence-list--anchor" id="cycle-comparison-analogue-sequence" aria-label="Первые двадцать выпадений исторического аналога" aria-describedby="cycle-comparison-anchor-meta" aria-busy="true">
+              <li class="empty-state">Загружаем исторический аналог…</li>
+            </ol>
+          </div>
+
+          <section class="cycle-sequence-segment cycle-sequence-segment--continuation" id="cycle-comparison-continuation" aria-labelledby="cycle-comparison-continuation-title" hidden>
+            <div class="cycle-sequence-segment__heading">
+              <h4 id="cycle-comparison-continuation-title">Как продолжился тот архивный круг · не прогноз</h4>
+              <span id="cycle-comparison-continuation-meta">Исторические ходы после точки фиксации</span>
+            </div>
+            <ol class="cycle-sequence-list cycle-sequence-list--continuation" id="cycle-comparison-continuation-sequence" aria-label="Историческое продолжение зафиксированного аналога, не прогноз" aria-describedby="cycle-comparison-continuation-meta" aria-busy="true"></ol>
+          </section>
+        </section>
+
+        <p class="cycle-comparison-note" id="cycle-comparison-note">Историческое сходство описывает прошлые последовательности и не предсказывает следующее число. Продолжение архивного круга — не прогноз и не совет для ставки.</p>
       </section>
 
       <section class="panel preclose-panel" id="preclose-panel" data-state="waiting" aria-labelledby="preclose-title" aria-describedby="preclose-note">
