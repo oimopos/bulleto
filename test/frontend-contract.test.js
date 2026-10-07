@@ -77,8 +77,8 @@ test("warm next-round forecast exposes a strict 5-percent walk-forward contract"
   );
   assert.match(html, /id="follower-dynamic-next-title"[^>]*>[^<]*≥5%/);
   assert.match(html, /id="follower-dynamic-next-note"[^>]*>[\s\S]*?5%/);
-  assert.match(html, /styles\.css\?v=23/);
-  assert.match(html, /app\.js\?v=23/);
+  assert.match(html, /styles\.css\?v=24/);
+  assert.match(html, /app\.js\?v=24/);
   assert.match(styles, /\.follower-dynamic-next\s*\{/);
   assert.match(styles, /\.follower-warm-current\s*\{/);
   assert.match(styles, /\.follower-warm-picks\s*\{/);
@@ -118,11 +118,15 @@ test("warm top-1 archival account is simulated, strict, and compact", () => {
   assert.match(app, /model\?\.maxStake !== 2_500/);
   assert.match(app, /model\?\.grossPayoutMultiplier !== 36/);
   assert.match(app, /value\.executionEnabled !== false/);
+  assert.match(app, /initialBalance !== 10_000/);
   assert.match(app, /betCount \+ skippedAfterExhaustionCount !== signalCount/);
   assert.match(app, /totalGrossPayout - totalStaked !== netResult/);
   assert.match(app, /function renderFollowerWarmHistoricalAccount\(account,/);
   assert.match(app, /"Для счёта"/);
   assert.match(html, /Архивная симуляция · только кандидат №1/);
+  assert.match(html, /старт 10 000/);
+  assert.match(html, /Счёт начинается с 10 000 условных единиц/);
+  assert.doesNotMatch(html, /Счёт начинается с 1 000 условных единиц/);
   assert.match(html, /Стартовая ставка 10, шаг 10, максимум 2 500, валовая выплата ×36/);
   assert.match(styles, /\.follower-warm-account\s*\{/);
   assert.match(styles, /\.follower-warm-account__metrics\s*\{/);
@@ -223,8 +227,8 @@ test("cycle comparison language is descriptive, responsive, and cache-busted", (
   assert.match(block, /не прогноз/);
   assert.match(block, /не предсказывает следующее число/);
   assert.doesNotMatch(block, /должн/iu);
-  assert.match(html, /href="\/styles\.css\?v=23"/);
-  assert.match(html, /src="\/app\.js\?v=23"/);
+  assert.match(html, /href="\/styles\.css\?v=24"/);
+  assert.match(html, /src="\/app\.js\?v=24"/);
   assert.match(styles, /\.cycle-sequence-list\s*\{[\s\S]*?repeat\(auto-fill, minmax\(50px, 1fr\)\)/);
   assert.match(
     styles,

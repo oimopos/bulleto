@@ -2000,7 +2000,7 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
       && nextStake !== null
       && finalBalance >= nextStake;
     if (
-      initialBalance !== 1_000
+      initialBalance !== 10_000
       || finalBalance === null
       || netResult === null
       || finalBalance !== initialBalance + netResult

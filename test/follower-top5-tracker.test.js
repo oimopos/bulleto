@@ -80,6 +80,32 @@ function compactWarmCandidates(candidates) {
   }));
 }
 
+function assertWarmAccountInvariants(account) {
+  assert.equal(account.hitCount + account.missCount, account.betCount);
+  assert.equal(
+    account.betCount + account.skippedAfterExhaustionCount,
+    account.signalCount,
+  );
+  assert.equal(
+    account.initialBalance - account.totalStaked + account.totalGrossPayout,
+    account.finalBalance,
+  );
+  assert.equal(account.finalBalance - account.initialBalance, account.netResult);
+  assert.equal(
+    account.shortfall,
+    Math.max(0, account.nextStake - account.finalBalance),
+  );
+  assert.equal(
+    account.canAffordNext,
+    account.status !== "exhausted" && account.finalBalance >= account.nextStake,
+  );
+  assert.ok(account.peakBalance >= account.initialBalance);
+  assert.ok(account.peakBalance >= account.finalBalance);
+  assert.ok(account.minimumBalance <= account.initialBalance);
+  assert.ok(account.minimumBalance <= account.finalBalance);
+  assert.ok(account.maximumDrawdown >= account.peakBalance - account.finalBalance);
+}
+
 test("fixed top-5 tracker schema and empty state expose a stable simulation contract", () => {
   const database = createDatabase({ path: ":memory:" });
   try {
@@ -539,7 +565,7 @@ test("warm historical account stakes only rank one even when rank two hits", () 
         grossPayoutMultiplier: 36,
         payoutIncludesStake: true,
       },
-      initialBalance: 1_000,
+      initialBalance: 10_000,
     },
   );
   assert.equal(warm.hitCount, 2, "both outcomes are inside the wider warm top-five");
@@ -566,10 +592,10 @@ test("warm historical account stakes only rank one even when rank two hits", () 
       missCount: 1,
       totalStaked: 20,
       totalGrossPayout: 360,
-      finalBalance: 1_340,
+      finalBalance: 10_340,
       netResult: 340,
       nextStake: 10,
-      minimumBalance: 990,
+      minimumBalance: 9_990,
       ladder: { missCount: 0, totalStaked: 0 },
     },
   );
@@ -588,9 +614,10 @@ test("warm historical account stakes only rank one even when rank two hits", () 
       stake: 10,
       outcome: "hit",
       grossPayout: 360,
-      balanceAfter: 1_340,
+      balanceAfter: 10_340,
     },
   );
+  assertWarmAccountInvariants(account);
 });
 
 test("warm historical account resets an elevated ladder after a hit", () => {
@@ -644,12 +671,12 @@ test("warm historical account resets an elevated ladder after a hit", () => {
       missCount: 37,
       totalStaked: 390,
       totalGrossPayout: 720,
-      finalBalance: 1_330,
+      finalBalance: 10_330,
       netResult: 330,
       nextStake: 10,
       maximumStake: 20,
-      peakBalance: 1_340,
-      minimumBalance: 640,
+      peakBalance: 10_340,
+      minimumBalance: 9_640,
       maximumDrawdown: 360,
       ladder: { missCount: 1, totalStaked: 10 },
     },
@@ -657,6 +684,7 @@ test("warm historical account resets an elevated ladder after a hit", () => {
   assert.equal(account.latestOutcome.stake, 10);
   assert.equal(account.latestOutcome.outcome, "miss");
   assert.equal(account.latestOutcome.resultNumber, 2);
+  assertWarmAccountInvariants(account);
 });
 
 test("warm historical account pauses without charging on a no-signal anchor", () => {
@@ -688,7 +716,7 @@ test("warm historical account pauses without charging on a no-signal anchor", ()
       hitCount: 0,
       missCount: 16,
       totalStaked: 160,
-      finalBalance: 840,
+      finalBalance: 9_840,
       nextStake: 10,
       ladder: { missCount: 16, totalStaked: 160 },
       currentAction: {
@@ -700,6 +728,7 @@ test("warm historical account pauses without charging on a no-signal anchor", ()
       },
     },
   );
+  assertWarmAccountInvariants(account);
 });
 
 test("warm historical account resets its ladder at a gap without restoring balance", () => {
@@ -745,7 +774,7 @@ test("warm historical account resets its ladder at a gap without restoring balan
       betCount: 37,
       missCount: 37,
       totalStaked: 370,
-      finalBalance: 630,
+      finalBalance: 9_630,
       nextStake: 10,
       maximumStake: 10,
       continuityGapCount: 1,
@@ -754,7 +783,8 @@ test("warm historical account resets its ladder at a gap without restoring balan
     },
   );
   assert.equal(account.latestOutcome.stake, 10);
-  assert.equal(account.latestOutcome.balanceAfter, 630);
+  assert.equal(account.latestOutcome.balanceAfter, 9_630);
+  assertWarmAccountInvariants(account);
 });
 
 test("warm historical account selects every target walk-forward without lookahead", () => {
@@ -789,17 +819,18 @@ test("warm historical account selects every target walk-forward without lookahea
       missCount: 1,
       totalStaked: 20,
       totalGrossPayout: 360,
-      finalBalance: 1_340,
-      minimumBalance: 990,
+      finalBalance: 10_340,
+      minimumBalance: 9_990,
       ladder: { missCount: 0, totalStaked: 0 },
     },
   );
   assert.equal(account.latestOutcome.targetNumber, 6);
   assert.equal(account.latestOutcome.resultNumber, 6);
   assert.equal(account.latestOutcome.outcome, "hit");
+  assertWarmAccountInvariants(account);
 });
 
-test("warm historical account exhausts after 63 misses and skips every later signal", () => {
+test("warm historical account exhausts after 140 misses and skips every later signal", () => {
   const losingNumbers = ROULETTE_NUMBERS_FOR_TEST.filter(
     (number) => number !== 1 && number !== 9,
   );
@@ -810,13 +841,13 @@ test("warm historical account exhausts after 63 misses and skips every later sig
     4,
     5,
   ];
-  const sixtyFourMisses = Array.from(
-    { length: 64 },
+  const oneHundredFortyOneMisses = Array.from(
+    { length: 141 },
     (_, index) => losingNumbers[index % losingNumbers.length],
   );
   const rows = curveRows([[
     ...followerTransitionNumbers(9, trainingFollowers, { tail: false }),
-    ...followerTransitionNumbers(9, sixtyFourMisses, { tail: false }),
+    ...followerTransitionNumbers(9, oneHundredFortyOneMisses, { tail: false }),
     9,
   ]]);
   const account = buildFollowerTop5HitCurve(rows)
@@ -846,38 +877,39 @@ test("warm historical account exhausts after 63 misses and skips every later sig
     },
     {
       status: "exhausted",
-      initialBalance: 1_000,
-      finalBalance: 10,
-      netResult: -990,
-      nextStake: 30,
+      initialBalance: 10_000,
+      finalBalance: 130,
+      netResult: -9_870,
+      nextStake: 290,
       canAffordNext: false,
-      shortfall: 20,
-      signalCount: 64,
-      betCount: 63,
+      shortfall: 160,
+      signalCount: 141,
+      betCount: 140,
       hitCount: 0,
-      missCount: 63,
-      totalStaked: 990,
+      missCount: 140,
+      totalStaked: 9_870,
       totalGrossPayout: 0,
       skippedAfterExhaustionCount: 1,
-      peakBalance: 1_000,
-      minimumBalance: 10,
-      maximumDrawdown: 990,
-      maximumStake: 30,
-      ladder: { missCount: 63, totalStaked: 990 },
+      peakBalance: 10_000,
+      minimumBalance: 130,
+      maximumDrawdown: 9_870,
+      maximumStake: 280,
+      ladder: { missCount: 140, totalStaked: 9_870 },
     },
   );
   assert.equal(account.exhaustedAt, account.lastBetAt);
   assert.equal(account.latestOutcome.outcome, "miss");
-  assert.equal(account.latestOutcome.stake, 30);
-  assert.equal(account.latestOutcome.balanceAfter, 10);
-  assert.equal(account.latestOutcome.resultNumber, sixtyFourMisses[62]);
+  assert.equal(account.latestOutcome.stake, 280);
+  assert.equal(account.latestOutcome.balanceAfter, 130);
+  assert.equal(account.latestOutcome.resultNumber, oneHundredFortyOneMisses[139]);
   assert.deepEqual(account.currentAction, {
     action: "wait",
     reason: "bankroll_exhausted",
     targetNumber: 1,
-    stake: 30,
+    stake: 290,
     anchorResultId: rows.at(-1).id,
   });
+  assertWarmAccountInvariants(account);
 });
 
 test("a hit inside a catch-up batch closes once and re-arms only at the batch tail", () => {
