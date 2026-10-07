@@ -2790,6 +2790,7 @@ test("virtual bettor arms at 200 misses and starts betting only on the next tail
     assert.equal(state.longestCandidate.roundsSinceLast, 199);
     assert.equal(state.longestCandidate.eligible, false);
     assert.equal(state.activeSession, null);
+    assert.equal(state.latestOutcome, null);
 
     database.ingestBatch(history.slice(-1));
     state = database.getVirtualBettorState(
@@ -2819,6 +2820,7 @@ test("virtual bettor arms at 200 misses and starts betting only on the next tail
     assert.equal(state.activeSession.nextStake, 10);
     assert.equal(state.activeSession.selectedAt, "2026-09-21T00:03:20.000Z");
     assert.equal(state.activeSession.startedAt, null);
+    assert.equal(state.latestOutcome, null);
     assert.deepEqual(state.testBank, {
       mode: "simulation",
       status: "running",
@@ -2854,6 +2856,39 @@ test("virtual bettor arms at 200 misses and starts betting only on the next tail
     assert.equal(state.activeSession.startedAt, "2026-09-21T00:03:21.000Z");
     assert.equal(state.testBank.currentBalance, 87_690);
     assert.equal(state.testBank.netResult, -10);
+    assert.deepEqual(
+      {
+        roundId: state.latestOutcome.roundId,
+        sessionId: state.latestOutcome.sessionId,
+        attemptNumber: state.latestOutcome.attemptNumber,
+        targetNumber: state.latestOutcome.targetNumber,
+        resultNumber: state.latestOutcome.resultNumber,
+        outcome: state.latestOutcome.outcome,
+        stake: state.latestOutcome.stake,
+        grossPayout: state.latestOutcome.grossPayout,
+        totalStakedAfter: state.latestOutcome.totalStakedAfter,
+        sessionNetAfter: state.latestOutcome.sessionNetAfter,
+        nextStake: state.latestOutcome.nextStake,
+        recoveryPossible: state.latestOutcome.recoveryPossible,
+        occurredAt: state.latestOutcome.occurredAt,
+      },
+      {
+        roundId: null,
+        sessionId: state.activeSession.id,
+        attemptNumber: 1,
+        targetNumber: 1,
+        resultNumber: 3,
+        outcome: "miss",
+        stake: 10,
+        grossPayout: 0,
+        totalStakedAfter: 10,
+        sessionNetAfter: -10,
+        nextStake: 10,
+        recoveryPossible: true,
+        occurredAt: "2026-09-21T00:03:21.000Z",
+      },
+    );
+    const firstOutcomeId = state.latestOutcome.betId;
 
     database.ingestBatch([event(3, "virtual-first-miss", 202)]);
     database.ingestBatch([event(4, "virtual-late-history", 50)]);
@@ -2863,6 +2898,7 @@ test("virtual bettor arms at 200 misses and starts betting only on the next tail
     );
     assert.equal(state.activeSession.attemptCount, 1);
     assert.equal(state.lifetime.totalBets, 1);
+    assert.equal(state.latestOutcome.betId, firstOutcomeId);
 
     database.ingestBatch([event(1, "virtual-hit", 202)]);
     state = database.getVirtualBettorState(
@@ -2878,6 +2914,20 @@ test("virtual bettor arms at 200 misses and starts betting only on the next tail
     assert.equal(state.recentSessions[0].grossPayout, 360);
     assert.equal(state.recentSessions[0].netResult, 340);
     assert.equal(state.recentSessions[0].endReason, "hit");
+    assert.equal(state.latestOutcome.betId, firstOutcomeId + 1);
+    assert.equal(state.latestOutcome.resultId, state.recentSessions[0].completedResultId);
+    assert.equal(state.latestOutcome.sessionId, state.recentSessions[0].id);
+    assert.equal(state.latestOutcome.attemptNumber, 2);
+    assert.equal(state.latestOutcome.targetNumber, 1);
+    assert.equal(state.latestOutcome.resultNumber, 1);
+    assert.equal(state.latestOutcome.outcome, "hit");
+    assert.equal(state.latestOutcome.stake, 10);
+    assert.equal(state.latestOutcome.grossPayout, 360);
+    assert.equal(state.latestOutcome.totalStakedAfter, 20);
+    assert.equal(state.latestOutcome.sessionNetAfter, 340);
+    assert.equal(state.latestOutcome.nextStake, null);
+    assert.equal(state.latestOutcome.recoveryPossible, true);
+    assert.equal(state.latestOutcome.occurredAt, "2026-09-21T00:03:22.000Z");
     assert.equal(state.testBank.currentBalance, 88_040);
     assert.equal(state.testBank.netResult, 340);
     assert.deepEqual(state.lifetime, {

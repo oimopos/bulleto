@@ -10,9 +10,9 @@ import { createServer } from 'node:http';
 import { dirname, extname, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { BuletoCollector } from './collector.js';
-import { virtualBettingForApi } from './betting-window.js';
 import { createDatabase } from './database.js';
 import { ResultPipeline } from './result-pipeline.js';
+import { virtualBettorSnapshotForApi } from './virtual-bettor-api.js';
 
 const ROOT_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const PUBLIC_DIR = resolve(ROOT_DIR, 'public');
@@ -241,23 +241,13 @@ function dashboardState() {
 
 function virtualBettorForApi() {
   const state = db.getVirtualBettorState('buleto', config.instrument);
-  const candidate = state.longestCandidate;
   const now = new Date();
-  return {
-    mode: state.mode,
-    executionEnabled: state.executionEnabled,
-    status: state.status,
-    currentBalance: state.testBank.currentBalance,
-    longestSeries: candidate
-      ? {
-          number: candidate.number,
-          progress: candidate.roundsSinceLast,
-          target: state.triggerThreshold,
-        }
-      : null,
-    serverTime: now.toISOString(),
-    betting: virtualBettingForApi(collector.getStatus(), state.status, now),
-  };
+  return virtualBettorSnapshotForApi({
+    state,
+    latestResult: db.getLatestResult('buleto', config.instrument),
+    collectorState: collector.getStatus(),
+    now,
+  });
 }
 
 function clampLimit(rawValue, fallback, max) {

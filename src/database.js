@@ -768,6 +768,28 @@ function mapVirtualBetSession(row) {
   };
 }
 
+function mapVirtualBetOutcome(row) {
+  if (!row) return null;
+  return {
+    betId: Number(row.bet_id),
+    resultId: Number(row.round_result_id),
+    roundId: row.external_round_id ?? null,
+    sessionId: Number(row.session_id),
+    attemptNumber: Number(row.attempt_number),
+    targetNumber: Number(row.target_number),
+    resultNumber: Number(row.result_number),
+    outcome: row.outcome,
+    stake: Number(row.stake),
+    grossPayout: Number(row.gross_payout),
+    totalStakedAfter: Number(row.total_staked_after),
+    sessionNetAfter: Number(row.net_after),
+    nextStake:
+      row.next_stake_after == null ? null : Number(row.next_stake_after),
+    recoveryPossible: Boolean(row.recovery_possible),
+    occurredAt: row.occurred_at,
+  };
+}
+
 function emitLog(logger, level, payload, message) {
   try {
     logger?.[level]?.(payload, message);
@@ -4065,6 +4087,32 @@ export class RouletteDatabase {
         LIMIT 10
       `)
       .all(safeSource, safeInstrument);
+    const latestOutcomeRow = this.sqlite
+      .prepare(`
+        SELECT
+          bets.id AS bet_id,
+          bets.round_result_id,
+          bets.session_id,
+          bets.attempt_number,
+          bets.stake,
+          bets.result_number,
+          bets.outcome,
+          bets.gross_payout,
+          bets.total_staked_after,
+          bets.net_after,
+          bets.next_stake_after,
+          bets.recovery_possible,
+          bets.occurred_at,
+          sessions.target_number,
+          results.external_round_id
+        FROM virtual_bets AS bets
+        JOIN virtual_bet_sessions AS sessions ON sessions.id = bets.session_id
+        JOIN round_results AS results ON results.id = bets.round_result_id
+        WHERE sessions.source = ? AND sessions.instrument = ?
+        ORDER BY bets.id DESC
+        LIMIT 1
+      `)
+      .get(safeSource, safeInstrument);
     const lifetime = this.sqlite
       .prepare(`
         SELECT
@@ -4136,6 +4184,7 @@ export class RouletteDatabase {
         continuityEpoch,
       ),
       activeSession: mapVirtualBetSession(liveRow),
+      latestOutcome: mapVirtualBetOutcome(latestOutcomeRow),
       recentSessions: recentRows.map(mapVirtualBetSession),
       lifetime: {
         totalSessions: Number(lifetime.total_sessions),

@@ -220,24 +220,48 @@ npm.cmd run backup -- ./data/buleto.sqlite ./seed/buleto.sqlite
 - `GET /api/forecasts/hits?limit=20` — последние проверенные прогнозы, в которых фактическое число вошло в неизменно сохранённый ценовой top‑3.
 - `GET /api/cycles?limit=10` — завершённые циклы.
 - `GET /api/sequences?limit=50` — повторяющиеся последовательности из трёх результатов.
-- `GET /api/virtual-bettor` — компактное состояние симуляции: остаток виртуального банка, самая длинная текущая серия и live-время окна ставок.
+- `GET /api/virtual-bettor` — состояние симуляции для polling: последний результат, баланс и профит, активная цель, команда `WAIT`/`BET`, итог последней ставки и live-время окна.
 - `GET /api/virtual-bettor/sessions?limit=20` — история виртуальных сессий; реальные ставки всегда отключены.
 - `GET /api/events` — Server-Sent Events для мгновенного обновления панели.
 - `GET /api/live` — liveness-проверка процесса для Docker/Render.
 - `GET /api/health` — состояние процесса, базы и внешнего сборщика.
 
-Пример ответа `GET /api/virtual-bettor`:
+Сокращённый пример ответа `GET /api/virtual-bettor`:
 
 ```json
 {
   "mode": "simulation",
   "executionEnabled": false,
-  "status": "waiting",
-  "currentBalance": 87700,
+  "status": "armed",
+  "currentBalance": 97220,
+  "profit": 9520,
+  "bank": {
+    "status": "running",
+    "initialBalance": 87700,
+    "currentBalance": 97220,
+    "profit": 9520,
+    "nextStake": 10,
+    "canAffordNext": true
+  },
+  "latestResult": {
+    "id": 14445,
+    "roundId": "4102100",
+    "number": 35,
+    "settledAt": "2026-10-07T17:43:29.000Z"
+  },
   "longestSeries": {
     "number": 17,
-    "progress": 143,
+    "progress": 200,
     "target": 200
+  },
+  "activeSession": {
+    "id": 51,
+    "targetNumber": 17,
+    "triggerProgress": 200,
+    "nextAttemptNumber": 1,
+    "nextStake": 10,
+    "projectedBalanceIfHit": 97570,
+    "projectedProfitIfHit": 9870
   },
   "serverTime": "2026-10-07T17:43:57.822Z",
   "betting": {
@@ -246,8 +270,29 @@ npm.cmd run backup -- ./data/buleto.sqlite ./seed/buleto.sqlite
     "opensAt": "2026-10-07T17:43:40.000Z",
     "closesAt": "2026-10-07T17:44:20.000Z",
     "secondsUntilClose": 23,
-    "strategyReady": false,
-    "canBetNow": false
+    "strategyReady": true,
+    "canBetNow": true
+  },
+  "signal": {
+    "action": "BET",
+    "actionable": true,
+    "reason": "ready",
+    "actionId": "bet:51:4102101",
+    "targetNumber": 17,
+    "stake": 10,
+    "attemptNumber": 1,
+    "validUntil": "2026-10-07T17:44:20.000Z"
+  },
+  "latestOutcome": {
+    "eventId": "virtual-bet:1578",
+    "targetNumber": 35,
+    "resultNumber": 35,
+    "outcome": "HIT",
+    "stake": 10,
+    "grossPayout": 360,
+    "sessionNetAfter": 220,
+    "occurredAt": "2026-10-07T17:43:29.000Z",
+    "isLatestResult": true
   }
 }
 ```
@@ -257,10 +302,20 @@ npm.cmd run backup -- ./data/buleto.sqlite ./seed/buleto.sqlite
 Buleto: от `opensAt` включительно до `closesAt` исключительно. Поле
 `strategyReady` становится `true` при статусе симуляции `armed` или `active`, а
 `canBetNow` — только когда одновременно открыто окно и готова виртуальная
-стратегия. Это информационный сигнал симуляции: `executionEnabled` остаётся
-`false`, проект сам ставок не отправляет. `secondsUntilClose` округляется вверх;
-точной границей всегда служит `closesAt`. Если live-время раунда недоступно,
-невалидно или коллектор сообщает ошибку, `betting` будет `null`.
+стратегия. `signal.action` равен `BET` только при сохранённой активной сессии,
+доступном банке и открытом live-окне; цель и сумма находятся в `targetNumber` и
+`stake`. Повторно выполнять одну команду нельзя: `actionId` остаётся одинаковым
+в пределах раунда. Результат реальной симуляционной ставки передаётся отдельно в
+`latestOutcome`: `HIT` означает попадание, `MISS` — промах. Клиент должен
+обрабатывать его один раз на новый `eventId`; простое совпадение
+`latestResult.number` с кандидатом не считается ставкой. На результате, который
+довёл серию до 200, сессия только вооружается, а первая ставка относится к
+следующему результату.
+
+Это информационный сигнал симуляции: `executionEnabled` остаётся `false`, проект
+сам ставок не отправляет. `secondsUntilClose` округляется вверх; точной границей
+всегда служит `closesAt`. Если live-время раунда недоступно, невалидно или
+коллектор сообщает ошибку, `betting` будет `null`, а `signal.action` — `WAIT`.
 
 ## Ограничения
 

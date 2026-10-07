@@ -164,18 +164,68 @@ test(
       const payload = await response.json();
       assert.equal(typeof payload.serverTime, "string");
       assert.equal(new Date(payload.serverTime).toISOString(), payload.serverTime);
+      assert.equal(typeof payload.bank.startedAt, "string");
+      assert.equal(
+        new Date(payload.bank.startedAt).toISOString(),
+        payload.bank.startedAt,
+      );
       assert.deepEqual(payload, {
         mode: "simulation",
         executionEnabled: false,
         status: "waiting",
         currentBalance: STARTING_BALANCE,
+        profit: 0,
+        bank: {
+          status: "running",
+          initialBalance: STARTING_BALANCE,
+          currentBalance: STARTING_BALANCE,
+          profit: 0,
+          nextStake: 10,
+          canAffordNext: true,
+          shortfall: 0,
+          startedAt: payload.bank.startedAt,
+          exhaustedAt: null,
+          dataComplete: true,
+        },
+        latestResult: {
+          id: 3,
+          roundId: null,
+          number: 1,
+          settledAt: "2026-10-07T00:00:02.000Z",
+        },
         longestSeries: {
           number: 0,
           progress: 3,
           target: 200,
         },
+        activeSession: null,
+        lifetime: {
+          totalSessions: 0,
+          completedSessions: 0,
+          invalidatedSessions: 0,
+          totalBets: 0,
+          winningBets: 0,
+          losingBets: 0,
+          totalStaked: 0,
+          grossPayout: 0,
+          netResult: 0,
+          profit: 0,
+        },
         serverTime: payload.serverTime,
         betting: null,
+        signal: {
+          action: "WAIT",
+          actionable: false,
+          reason: "below_threshold",
+          actionId: null,
+          sessionId: null,
+          roundId: null,
+          targetNumber: null,
+          stake: null,
+          attemptNumber: null,
+          validUntil: null,
+        },
+        latestOutcome: null,
       });
     } finally {
       await stopChild(child);
