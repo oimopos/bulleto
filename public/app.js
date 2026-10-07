@@ -1943,19 +1943,23 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
     if (
       !value || typeof value !== "object"
       || value.schemaVersion !== 1
-      || value.algorithmVersion !== "follower-warm-top1-ladder-v1"
+      || value.algorithmVersion !== "follower-warm-top5-ladder-v2"
       || value.mode !== "saved-sequence-retrospective"
       || value.executionEnabled !== false
-      || strategy?.rank !== 1
-      || strategy?.threshold !== FOLLOWER_WARM_THRESHOLD
-      || strategy?.noSignalPolicy !== "pause"
+      || strategy?.selectionMode !== "dynamic-top5"
+      || strategy?.selectionCount !== 5
+      || strategy?.threshold !== null
+      || strategy?.minimumObservedFollowerCount !== 5
+      || strategy?.eligibleAnchorPolicy !== "every-known-next"
       || strategy?.gapPolicy !== "reset-ladder-keep-balance"
       || strategy?.exhaustionPolicy !== "permanent-stop"
-      || model?.modelVersion !== "1.0.0"
-      || model?.initialStake !== 10
-      || model?.stakeStep !== 10
-      || model?.maxStake !== 2_500
+      || model?.modelVersion !== "2.0.0"
+      || model?.initialStakePerNumber !== 10
+      || model?.stakeStepPerNumber !== 10
+      || model?.maxStakePerNumber !== 2_500
+      || model?.numbersPerRound !== 5
       || model?.grossPayoutMultiplier !== 36
+      || model?.netHitMultiplier !== 31
       || model?.payoutIncludesStake !== true
       || !["waiting", "running", "exhausted"].includes(value.status)
       || typeof value.dataComplete !== "boolean"
@@ -1964,22 +1968,33 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
     }
 
     const safeInteger = (raw) => Number.isSafeInteger(raw) ? raw : null;
-    const positiveStake = (raw) => {
+    const positiveStakePerNumber = (raw) => {
       const amount = safeInteger(raw);
       return amount !== null
-        && amount >= model.initialStake
-        && amount <= model.maxStake
-        && amount % model.stakeStep === 0
+        && amount >= model.initialStakePerNumber
+        && amount <= model.maxStakePerNumber
+        && amount % model.stakeStepPerNumber === 0
         ? amount
         : null;
     };
+    const normalizedTargetNumbers = (raw) => {
+      if (!Array.isArray(raw) || raw.length !== model.numbersPerRound) return null;
+      const numbers = raw.map((number) => asRouletteNumber(number));
+      return numbers.every((number) => number !== null)
+        && new Set(numbers).size === model.numbersPerRound
+        ? numbers
+        : null;
+    };
+    const sameNumbers = (left, right) =>
+      left.length === right.length
+      && left.every((number, index) => number === right[index]);
     const initialBalance = asOptionalNonNegativeInteger(value.initialBalance);
     const finalBalance = asOptionalNonNegativeInteger(value.finalBalance);
     const netResult = safeInteger(value.netResult);
-    const nextStake = positiveStake(value.nextStake);
+    const nextStakePerNumber = positiveStakePerNumber(value.nextStakePerNumber);
+    const nextRoundCost = asOptionalNonNegativeInteger(value.nextRoundCost);
     const shortfall = asOptionalNonNegativeInteger(value.shortfall);
-    const signalCount = asOptionalNonNegativeInteger(value.signalCount);
-    const noSignalCount = asOptionalNonNegativeInteger(value.noSignalCount);
+    const eligibleAnchorCount = asOptionalNonNegativeInteger(value.eligibleAnchorCount);
     const betCount = asOptionalNonNegativeInteger(value.betCount);
     const hitCount = asOptionalNonNegativeInteger(value.hitCount);
     const missCount = asOptionalNonNegativeInteger(value.missCount);
@@ -1991,26 +2006,31 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
     const peakBalance = asOptionalNonNegativeInteger(value.peakBalance);
     const minimumBalance = asOptionalNonNegativeInteger(value.minimumBalance);
     const maximumDrawdown = asOptionalNonNegativeInteger(value.maximumDrawdown);
-    const maximumStake = asOptionalNonNegativeInteger(value.maximumStake);
+    const maxStakePerNumber = asOptionalNonNegativeInteger(value.maxStakePerNumber);
+    const maxRoundCost = asOptionalNonNegativeInteger(value.maxRoundCost);
     const continuityGapCount = asOptionalNonNegativeInteger(value.continuityGapCount);
     const ladderMissCount = asOptionalNonNegativeInteger(value.ladder?.missCount);
-    const ladderTotalStaked = asOptionalNonNegativeInteger(value.ladder?.totalStaked);
-    const expectedCanAffordNext = value.status !== "exhausted"
+    const ladderTotalLoss = asOptionalNonNegativeInteger(value.ladder?.totalLoss);
+    const expectedNextRoundCost = nextStakePerNumber === null
+      ? null
+      : model.numbersPerRound * nextStakePerNumber;
+    const expectedCanAffordNextRound = value.status !== "exhausted"
       && finalBalance !== null
-      && nextStake !== null
-      && finalBalance >= nextStake;
+      && expectedNextRoundCost !== null
+      && finalBalance >= expectedNextRoundCost;
     if (
       initialBalance !== 10_000
       || finalBalance === null
       || netResult === null
       || finalBalance !== initialBalance + netResult
-      || nextStake === null
+      || nextStakePerNumber === null
+      || nextRoundCost !== expectedNextRoundCost
       || shortfall === null
-      || typeof value.canAffordNext !== "boolean"
-      || value.canAffordNext !== expectedCanAffordNext
-      || shortfall !== Math.max(0, nextStake - finalBalance)
-      || signalCount === null
-      || noSignalCount === null
+      || typeof value.canAffordNextRound !== "boolean"
+      || value.canAffordNextRound !== expectedCanAffordNextRound
+      || (value.status !== "exhausted" && !value.canAffordNextRound)
+      || shortfall !== Math.max(0, nextRoundCost - finalBalance)
+      || eligibleAnchorCount === null
       || betCount === null
       || hitCount === null
       || missCount === null
@@ -2019,7 +2039,7 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
       || totalGrossPayout === null
       || totalGrossPayout - totalStaked !== netResult
       || skippedAfterExhaustionCount === null
-      || betCount + skippedAfterExhaustionCount !== signalCount
+      || betCount + skippedAfterExhaustionCount !== eligibleAnchorCount
       || peakBalance === null
       || peakBalance < initialBalance
       || peakBalance < finalBalance
@@ -2028,30 +2048,39 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
       || minimumBalance > finalBalance
       || maximumDrawdown === null
       || maximumDrawdown > peakBalance
-      || maximumStake === null
-      || maximumStake > model.maxStake
-      || (maximumStake > 0 && (
-        maximumStake < model.initialStake
-        || maximumStake % model.stakeStep !== 0
+      || maxStakePerNumber === null
+      || maxStakePerNumber > model.maxStakePerNumber
+      || (maxStakePerNumber > 0 && (
+        maxStakePerNumber < model.initialStakePerNumber
+        || maxStakePerNumber % model.stakeStepPerNumber !== 0
       ))
+      || maxRoundCost === null
+      || maxRoundCost !== model.numbersPerRound * maxStakePerNumber
+      || totalStaked % (model.numbersPerRound * model.stakeStepPerNumber) !== 0
       || continuityGapCount === null
       || value.dataComplete !== (continuityGapCount === 0)
       || ladderMissCount === null
-      || ladderTotalStaked === null
-      || (ladderMissCount === 0) !== (ladderTotalStaked === 0)
+      || ladderTotalLoss === null
+      || ladderMissCount > missCount
+      || ladderTotalLoss > totalStaked
+      || ladderTotalLoss % (model.numbersPerRound * model.stakeStepPerNumber) !== 0
+      || (ladderMissCount === 0) !== (ladderTotalLoss === 0)
     ) {
       return null;
     }
 
     const expectedRecoverySteps = Math.max(
       1,
-      Math.ceil(ladderTotalStaked / ((model.grossPayoutMultiplier - 1) * model.stakeStep))
+      Math.ceil(ladderTotalLoss / (model.netHitMultiplier * model.stakeStepPerNumber))
     );
-    const expectedNextStake = Math.min(
-      model.maxStake,
-      Math.max(model.initialStake, expectedRecoverySteps * model.stakeStep)
+    const expectedNextStakePerNumber = Math.min(
+      model.maxStakePerNumber,
+      Math.max(
+        model.initialStakePerNumber,
+        expectedRecoverySteps * model.stakeStepPerNumber
+      )
     );
-    if (nextStake !== expectedNextStake) return null;
+    if (nextStakePerNumber !== expectedNextStakePerNumber) return null;
 
     let hitRate = null;
     if (betCount === 0) {
@@ -2062,7 +2091,8 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
         || totalGrossPayout !== 0
         || netResult !== 0
         || finalBalance !== initialBalance
-        || maximumStake !== 0
+        || maxStakePerNumber !== 0
+        || maxRoundCost !== 0
         || maximumDrawdown !== 0
         || peakBalance !== initialBalance
         || minimumBalance !== initialBalance
@@ -2083,7 +2113,7 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
         || !lastBetAt
         || firstBetAt.getTime() > lastBetAt.getTime()
         || value.status === "waiting"
-        || maximumStake < model.initialStake
+        || maxStakePerNumber < model.initialStakePerNumber
       ) {
         return null;
       }
@@ -2093,7 +2123,7 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
     if (
       (value.status === "exhausted" && !exhaustedAt)
       || (value.status !== "exhausted" && value.exhaustedAt !== null)
-      || (value.status === "exhausted" && (value.canAffordNext || shortfall <= 0))
+      || (value.status === "exhausted" && (value.canAffordNextRound || shortfall <= 0))
     ) {
       return null;
     }
@@ -2103,31 +2133,45 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
       const outcome = value.latestOutcome;
       const anchorResultId = asOptionalNonNegativeInteger(outcome?.anchorResultId);
       const resultId = asOptionalNonNegativeInteger(outcome?.resultId);
-      const targetNumber = asRouletteNumber(outcome?.targetNumber);
+      const sourceNumber = asRouletteNumber(outcome?.sourceNumber);
+      const targetNumbers = normalizedTargetNumbers(outcome?.targetNumbers);
+      const selectionCount = asOptionalNonNegativeInteger(outcome?.selectionCount);
       const resultNumber = asRouletteNumber(outcome?.resultNumber);
-      const historicalShare = asOptionalFiniteNumber(outcome?.historicalShare);
-      const sampleSize = asOptionalNonNegativeInteger(outcome?.sampleSize);
-      const stake = positiveStake(outcome?.stake);
+      const hitRank = outcome?.hitRank === null
+        ? null
+        : asOptionalNonNegativeInteger(outcome?.hitRank);
+      const stakePerNumber = positiveStakePerNumber(outcome?.stakePerNumber);
+      const totalStake = asOptionalNonNegativeInteger(outcome?.totalStake);
       const grossPayout = asOptionalNonNegativeInteger(outcome?.grossPayout);
       const balanceAfter = asOptionalNonNegativeInteger(outcome?.balanceAfter);
-      const outcomeNextStake = positiveStake(outcome?.nextStake);
+      const outcomeNextStakePerNumber = positiveStakePerNumber(
+        outcome?.nextStakePerNumber
+      );
+      const outcomeNextRoundCost = asOptionalNonNegativeInteger(outcome?.nextRoundCost);
       const occurredAt = parseDate(outcome?.occurredAt);
+      const expectedHitIndex = targetNumbers?.indexOf(resultNumber) ?? -1;
+      const expectedOutcome = expectedHitIndex >= 0 ? "hit" : "miss";
       if (
         anchorResultId === null || anchorResultId < 1
         || resultId === null || resultId < 1
-        || targetNumber === null
+        || sourceNumber === null
+        || targetNumbers === null
+        || selectionCount !== model.numbersPerRound
         || resultNumber === null
-        || historicalShare === null
-        || historicalShare < FOLLOWER_WARM_THRESHOLD
-        || historicalShare > 1
-        || sampleSize === null || sampleSize < 1
-        || stake === null
+        || stakePerNumber === null
+        || totalStake !== model.numbersPerRound * stakePerNumber
         || !["hit", "miss"].includes(outcome?.outcome)
-        || (outcome.outcome === "hit") !== (targetNumber === resultNumber)
+        || outcome.outcome !== expectedOutcome
+        || hitRank !== (expectedHitIndex >= 0 ? expectedHitIndex + 1 : null)
         || grossPayout === null
-        || grossPayout !== (outcome.outcome === "hit" ? stake * model.grossPayoutMultiplier : 0)
+        || grossPayout !== (
+          outcome.outcome === "hit"
+            ? stakePerNumber * model.grossPayoutMultiplier
+            : 0
+        )
         || balanceAfter !== finalBalance
-        || outcomeNextStake === null
+        || outcomeNextStakePerNumber === null
+        || outcomeNextRoundCost !== model.numbersPerRound * outcomeNextStakePerNumber
         || !occurredAt
         || outcome.occurredAt !== value.lastBetAt
       ) {
@@ -2136,15 +2180,18 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
       latestOutcome = {
         anchorResultId,
         resultId,
-        targetNumber,
+        sourceNumber,
+        targetNumbers,
+        selectionCount,
         resultNumber,
-        historicalShare,
-        sampleSize,
-        stake,
+        hitRank,
+        stakePerNumber,
+        totalStake,
         outcome: outcome.outcome,
         grossPayout,
         balanceAfter,
-        nextStake: outcomeNextStake,
+        nextStakePerNumber: outcomeNextStakePerNumber,
+        nextRoundCost: outcomeNextRoundCost,
         occurredAt: outcome.occurredAt
       };
     } else if (betCount > 0) {
@@ -2155,48 +2202,65 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
     const actionAnchorResultId = action?.anchorResultId === null
       ? null
       : asOptionalNonNegativeInteger(action?.anchorResultId);
-    const actionTargetNumber = action?.targetNumber === null
+    const actionTargetNumbers = Array.isArray(action?.targetNumbers)
+      && action.targetNumbers.length === 0
+      ? []
+      : normalizedTargetNumbers(action?.targetNumbers);
+    const actionSelectionCount = asOptionalNonNegativeInteger(action?.selectionCount);
+    const actionStakePerNumber = action?.stakePerNumber === null
       ? null
-      : asRouletteNumber(action?.targetNumber);
-    const actionStake = action?.stake === null ? null : positiveStake(action?.stake);
+      : positiveStakePerNumber(action?.stakePerNumber);
+    const actionTotalStake = action?.totalStake === null
+      ? null
+      : asOptionalNonNegativeInteger(action?.totalStake);
     const validReasons = [
-      "ready",
+      "eligible",
       "bankroll_exhausted",
       "empty",
       "gap",
-      "waiting_training",
-      "no_signal"
+      "waiting_training"
     ];
     if (
       !action || typeof action !== "object"
       || !["would_bet", "wait"].includes(action.action)
       || !validReasons.includes(action.reason)
       || (action.anchorResultId !== null && (actionAnchorResultId === null || actionAnchorResultId < 1))
-      || (action.targetNumber !== null && actionTargetNumber === null)
-      || (action.stake !== null && actionStake === null)
+      || actionTargetNumbers === null
+      || actionSelectionCount !== actionTargetNumbers.length
+      || (action.stakePerNumber !== null && actionStakePerNumber === null)
+      || (action.totalStake !== null && actionTotalStake === null)
     ) {
       return null;
     }
 
-    const currentReady = currentSignal?.status === "ready";
-    const currentPick = currentReady ? currentSignal.picks[0] : null;
+    const currentEligible = ["ready", "no_signal"].includes(currentSignal?.status);
+    const currentTargets = currentEligible
+      ? currentSignal.candidates.map(({ number }) => number)
+      : [];
+    if (
+      (currentEligible && currentTargets.length !== model.numbersPerRound)
+      || !sameNumbers(actionTargetNumbers, currentTargets)
+    ) {
+      return null;
+    }
+    const hasCurrentTicket = currentTargets.length === model.numbersPerRound;
     if (value.status === "exhausted") {
       if (
         action.action !== "wait"
         || action.reason !== "bankroll_exhausted"
         || actionAnchorResultId !== currentSignal?.anchorResultId
-        || actionTargetNumber !== (currentPick?.number ?? null)
-        || actionStake !== (currentPick ? nextStake : null)
+        || actionStakePerNumber !== (hasCurrentTicket ? nextStakePerNumber : null)
+        || actionTotalStake !== (hasCurrentTicket ? nextRoundCost : null)
       ) {
         return null;
       }
-    } else if (currentReady) {
+    } else if (hasCurrentTicket) {
       if (
         action.action !== "would_bet"
-        || action.reason !== "ready"
+        || action.reason !== "eligible"
         || actionAnchorResultId !== currentSignal.anchorResultId
-        || actionTargetNumber !== currentPick.number
-        || actionStake !== nextStake
+        || actionStakePerNumber !== nextStakePerNumber
+        || actionTotalStake !== nextRoundCost
       ) {
         return null;
       }
@@ -2204,8 +2268,9 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
       action.action !== "wait"
       || action.reason !== currentSignal?.status
       || actionAnchorResultId !== currentSignal?.anchorResultId
-      || actionTargetNumber !== null
-      || actionStake !== null
+      || actionSelectionCount !== 0
+      || actionStakePerNumber !== null
+      || actionTotalStake !== null
     ) {
       return null;
     }
@@ -2215,11 +2280,11 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
       initialBalance,
       finalBalance,
       netResult,
-      nextStake,
-      canAffordNext: value.canAffordNext,
+      nextStakePerNumber,
+      nextRoundCost,
+      canAffordNextRound: value.canAffordNextRound,
       shortfall,
-      signalCount,
-      noSignalCount,
+      eligibleAnchorCount,
       betCount,
       hitCount,
       missCount,
@@ -2230,7 +2295,8 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
       peakBalance,
       minimumBalance,
       maximumDrawdown,
-      maximumStake,
+      maxStakePerNumber,
+      maxRoundCost,
       continuityGapCount,
       dataComplete: value.dataComplete,
       firstBetAt: value.firstBetAt,
@@ -2238,14 +2304,16 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
       exhaustedAt: value.exhaustedAt,
       ladder: {
         missCount: ladderMissCount,
-        totalStaked: ladderTotalStaked
+        totalLoss: ladderTotalLoss
       },
       latestOutcome,
       currentAction: {
         action: action.action,
         reason: action.reason,
-        targetNumber: actionTargetNumber,
-        stake: actionStake,
+        targetNumbers: actionTargetNumbers,
+        selectionCount: actionSelectionCount,
+        stakePerNumber: actionStakePerNumber,
+        totalStake: actionTotalStake,
         anchorResultId: actionAnchorResultId
       }
     };
@@ -2451,6 +2519,7 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
       anchoredAt: current.anchoredAt,
       sampleSize,
       observedFollowerCount,
+      candidates: normalizedCandidates,
       picks
     };
     const historicalAccount = normalizedFollowerWarmHistoricalAccount(
@@ -2458,8 +2527,7 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
       currentSignal
     );
     const consistentHistoricalAccount = historicalAccount
-      && historicalAccount.signalCount === signalCount
-      && historicalAccount.noSignalCount === noSignalCount
+      && historicalAccount.eligibleAnchorCount === eligibleCount
       ? historicalAccount
       : null;
     return {
@@ -2890,9 +2958,8 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
         "Текущий сигнал пока недоступен"
       );
     } else if (signal.status === "ready") {
-      signal.picks.forEach((pick, index) => {
+      signal.picks.forEach((pick) => {
         const item = createElement("li", "follower-warm-pick");
-        if (index === 0) item.classList.add("is-account-pick");
         const transition = createElement("span", "follower-warm-pick__transition");
         const source = createElement(
           "span",
@@ -2917,12 +2984,9 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
           "follower-warm-pick__count",
           `${pick.occurrenceCount} из ${signal.sampleSize}`
         );
-        if (index === 0) {
-          count.append(" · ", createElement("span", "follower-warm-pick__account", "Для счёта"));
-        }
         item.setAttribute(
           "aria-label",
-          `После числа ${signal.sourceNumber} тёплый кандидат ${pick.number}: ${pick.occurrenceCount} из ${signal.sampleSize}, историческая доля ${historicalPercentFormatter.format(pick.share)}${index === 0 ? "; выбран для исторического счёта" : ""}`
+          `После числа ${signal.sourceNumber} тёплый кандидат ${pick.number}: ${pick.occurrenceCount} из ${signal.sampleSize}, историческая доля ${historicalPercentFormatter.format(pick.share)}`
         );
         item.append(transition, share, count);
         fragment.appendChild(item);
@@ -2967,7 +3031,7 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
       setTextIfChanged(elements.followerWarmAccountBets, "—");
       setTextIfChanged(elements.followerWarmAccountRecord, "— попаданий · — промахов");
       setTextIfChanged(elements.followerWarmAccountDrawdown, "—");
-      setTextIfChanged(elements.followerWarmAccountRisk, "макс. ставка —");
+      setTextIfChanged(elements.followerWarmAccountRisk, "макс. билет — · по —");
       elements.followerWarmAccountResultCard.classList.remove("is-positive", "is-loss");
     };
 
@@ -2995,7 +3059,7 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
     const statusLabels = {
       waiting: "Пока без ставок",
       running: "Рассчитан",
-      exhausted: "Стоп · не хватает на шаг"
+      exhausted: "Стоп · не хватает на билет"
     };
     elements.followerWarmAccount.dataset.state = state;
     elements.followerWarmAccount.setAttribute("aria-busy", "false");
@@ -3028,43 +3092,41 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
     );
     setTextIfChanged(
       elements.followerWarmAccountRisk,
-      `макс. ставка ${formatRiskAmount(account.maximumStake)}`
+      `макс. билет ${formatRiskAmount(account.maxRoundCost)} · по ${formatRiskAmount(account.maxStakePerNumber)}`
     );
 
     const action = account.currentAction;
     let actionText;
     if (action.action === "would_bet") {
-      actionText = `На текущем срезе: условный шаг ${formatRiskAmount(action.stake)} на число ${action.targetNumber}.`;
+      actionText = `На текущем срезе: по ${formatRiskAmount(action.stakePerNumber)} на каждое из чисел ${action.targetNumbers.join(", ")} · полный билет ${formatRiskAmount(action.totalStake)}.`;
     } else if (action.reason === "bankroll_exhausted") {
       const stoppedAt = account.exhaustedAt
         ? ` ${formatDateTime(account.exhaustedAt, { alwaysShowDate: true })}`
         : "";
-      const skippedCurrent = action.targetNumber === null
+      const skippedCurrent = action.targetNumbers.length === 0
         ? ""
-        : ` Текущий кандидат №1 — ${action.targetNumber}, но новые ставки уже не считаются.`;
-      actionText = `Лестница остановлена${stoppedAt}: следующая ступень ${formatRiskAmount(account.nextStake)}, на счёте ${formatRiskAmount(account.finalBalance)}, не хватает ${formatRiskAmount(account.shortfall)}.${skippedCurrent}`;
-    } else if (action.reason === "no_signal") {
-      actionText = `Текущий раунд пропущен без списания; следующая ступень ${formatRiskAmount(account.nextStake)} сохранена.`;
+        : ` Текущая пятёрка — ${action.targetNumbers.join(", ")}, но новый билет уже не считается.`;
+      actionText = `Лестница остановлена${stoppedAt}: следующий билет по ${formatRiskAmount(account.nextStakePerNumber)} на число стоит ${formatRiskAmount(account.nextRoundCost)}, на счёте ${formatRiskAmount(account.finalBalance)}, не хватает ${formatRiskAmount(account.shortfall)}.${skippedCurrent}`;
     } else if (action.reason === "gap") {
-      actionText = `Сейчас пауза после разрыва; лестница начинается заново со ступени ${formatRiskAmount(account.nextStake)}, счёт сохранён.`;
+      actionText = `Сейчас пауза после разрыва; лестница начинается заново с ${formatRiskAmount(account.nextStakePerNumber)} на число и билета ${formatRiskAmount(account.nextRoundCost)}, счёт сохранён.`;
     } else if (action.reason === "waiting_training") {
-      actionText = `Текущий раунд ждёт достаточную историю; следующая ступень ${formatRiskAmount(account.nextStake)} сохранена.`;
+      actionText = `Текущий раунд ждёт пять разных исторических продолжений; следующая ступень — по ${formatRiskAmount(account.nextStakePerNumber)} на число, билет ${formatRiskAmount(account.nextRoundCost)}.`;
     } else {
-      actionText = `Текущего сигнала пока нет; следующая ступень ${formatRiskAmount(account.nextStake)} сохранена.`;
+      actionText = `Текущей пятёрки пока нет; следующая ступень — по ${formatRiskAmount(account.nextStakePerNumber)} на число, билет ${formatRiskAmount(account.nextRoundCost)}.`;
     }
 
     const gapText = account.continuityGapCount > 0
       ? ` Разрывов: ${formatRiskAmount(account.continuityGapCount)} — в каждом счёт сохранялся, а лестница сбрасывалась.`
       : " Разрывов в рассчитанном участке нет.";
     const stoppedText = account.skippedAfterExhaustionCount > 0
-      ? ` После остановки пропущено ${formatRiskAmount(account.skippedAfterExhaustionCount)} ${pluralForm(account.skippedAfterExhaustionCount, "сигнал", "сигнала", "сигналов")}.`
+      ? ` После остановки пропущено ${formatRiskAmount(account.skippedAfterExhaustionCount)} ${pluralForm(account.skippedAfterExhaustionCount, "билет", "билета", "билетов")}.`
       : "";
     const ladderText = account.ladder.missCount > 0
-      ? ` В текущей лестнице ${formatRiskAmount(account.ladder.missCount)} ${pluralForm(account.ladder.missCount, "промах", "промаха", "промахов")} и ${formatRiskAmount(account.ladder.totalStaked)} поставлено.`
+      ? ` В общей лестнице ${formatRiskAmount(account.ladder.missCount)} ${pluralForm(account.ladder.missCount, "промах", "промаха", "промахов")} и ${formatRiskAmount(account.ladder.totalLoss)} накопленного расхода.`
       : " Текущая лестница без накопленного убытка.";
     setTextIfChanged(
       elements.followerWarmAccountAudit,
-      `Top‑1 сигналов ${formatRiskAmount(account.signalCount)} · без сигнала ${formatRiskAmount(account.noSignalCount)} · всего поставлено ${formatRiskAmount(account.totalStaked)} · валовые выплаты ${formatRiskAmount(account.totalGrossPayout)}. ${actionText}${ladderText}${gapText}${stoppedText}`
+      `Доступных точек ${formatRiskAmount(account.eligibleAnchorCount)} · разыграно билетов ${formatRiskAmount(account.betCount)} · всего поставлено ${formatRiskAmount(account.totalStaked)} · валовые выплаты ${formatRiskAmount(account.totalGrossPayout)}. ${actionText}${ladderText}${gapText}${stoppedText}`
     );
   }
 

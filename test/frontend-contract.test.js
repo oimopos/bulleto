@@ -77,8 +77,8 @@ test("warm next-round forecast exposes a strict 5-percent walk-forward contract"
   );
   assert.match(html, /id="follower-dynamic-next-title"[^>]*>[^<]*≥5%/);
   assert.match(html, /id="follower-dynamic-next-note"[^>]*>[\s\S]*?5%/);
-  assert.match(html, /styles\.css\?v=24/);
-  assert.match(html, /app\.js\?v=24/);
+  assert.match(html, /styles\.css\?v=25/);
+  assert.match(html, /app\.js\?v=25/);
   assert.match(styles, /\.follower-dynamic-next\s*\{/);
   assert.match(styles, /\.follower-warm-current\s*\{/);
   assert.match(styles, /\.follower-warm-picks\s*\{/);
@@ -89,7 +89,7 @@ test("warm next-round forecast exposes a strict 5-percent walk-forward contract"
   );
 });
 
-test("warm top-1 archival account is simulated, strict, and compact", () => {
+test("raw dynamic top-5 archival account uses one strict shared ticket ladder", () => {
   for (const id of [
     "follower-warm-account",
     "follower-warm-account-status",
@@ -107,30 +107,45 @@ test("warm top-1 archival account is simulated, strict, and compact", () => {
   }
 
   assert.match(app, /function normalizedFollowerWarmHistoricalAccount\(value, currentSignal\)/);
-  assert.match(app, /follower-warm-top1-ladder-v1/);
-  assert.match(app, /strategy\?\.rank !== 1/);
-  assert.match(app, /strategy\?\.threshold !== FOLLOWER_WARM_THRESHOLD/);
-  assert.match(app, /noSignalPolicy !== "pause"/);
+  assert.match(app, /follower-warm-top5-ladder-v2/);
+  assert.match(app, /strategy\?\.selectionMode !== "dynamic-top5"/);
+  assert.match(app, /strategy\?\.selectionCount !== 5/);
+  assert.match(app, /strategy\?\.threshold !== null/);
+  assert.match(app, /eligibleAnchorPolicy !== "every-known-next"/);
   assert.match(app, /gapPolicy !== "reset-ladder-keep-balance"/);
   assert.match(app, /exhaustionPolicy !== "permanent-stop"/);
-  assert.match(app, /model\?\.initialStake !== 10/);
-  assert.match(app, /model\?\.stakeStep !== 10/);
-  assert.match(app, /model\?\.maxStake !== 2_500/);
+  assert.match(app, /model\?\.modelVersion !== "2\.0\.0"/);
+  assert.match(app, /model\?\.initialStakePerNumber !== 10/);
+  assert.match(app, /model\?\.stakeStepPerNumber !== 10/);
+  assert.match(app, /model\?\.maxStakePerNumber !== 2_500/);
+  assert.match(app, /model\?\.numbersPerRound !== 5/);
   assert.match(app, /model\?\.grossPayoutMultiplier !== 36/);
+  assert.match(app, /model\?\.netHitMultiplier !== 31/);
   assert.match(app, /value\.executionEnabled !== false/);
   assert.match(app, /initialBalance !== 10_000/);
-  assert.match(app, /betCount \+ skippedAfterExhaustionCount !== signalCount/);
+  assert.match(app, /nextRoundCost !== expectedNextRoundCost/);
+  assert.match(app, /betCount \+ skippedAfterExhaustionCount !== eligibleAnchorCount/);
   assert.match(app, /totalGrossPayout - totalStaked !== netResult/);
+  assert.match(app, /ladderTotalLoss \/ \(model\.netHitMultiplier \* model\.stakeStepPerNumber\)/);
+  assert.match(app, /\["ready", "no_signal"\]\.includes\(currentSignal\?\.status\)/);
+  assert.match(app, /currentSignal\.candidates\.map\(\(\{ number \}\) => number\)/);
+  assert.match(app, /historicalAccount\.eligibleAnchorCount === eligibleCount/);
   assert.match(app, /function renderFollowerWarmHistoricalAccount\(account,/);
-  assert.match(app, /"Для счёта"/);
-  assert.match(html, /Архивная симуляция · только кандидат №1/);
+  assert.doesNotMatch(app, /"Для счёта"|выбран для исторического счёта|is-account-pick/);
+  assert.doesNotMatch(styles, /\.follower-warm-pick\.is-account-pick|\.follower-warm-pick__account/);
+  assert.match(html, /Архивная симуляция · динамический Top‑5/);
+  assert.match(html, /Исторический счёт общего билета/);
+  assert.match(html, /Билеты Top‑5/);
   assert.match(html, /старт 10 000/);
   assert.match(html, /Счёт начинается с 10 000 условных единиц/);
   assert.doesNotMatch(html, /Счёт начинается с 1 000 условных единиц/);
-  assert.match(html, /Стартовая ставка 10, шаг 10, максимум 2 500, валовая выплата ×36/);
+  assert.match(html, /на каждое из 5 чисел необрезанного динамического Top‑5/);
+  assert.match(html, /старт по 10 \(билет 50\), шаг по 10, максимум по 2 500 \(билет 12 500\)/);
+  assert.match(html, /×36 начисляется только на одно выигравшее число/);
+  assert.match(html, /коэффициент восстановления равен 31/);
+  assert.match(html, /Порог ≥5% относится только к тёплому прогнозу выше/);
   assert.match(styles, /\.follower-warm-account\s*\{/);
   assert.match(styles, /\.follower-warm-account__metrics\s*\{/);
-  assert.match(styles, /\.follower-warm-pick\.is-account-pick\s*\{/);
   assert.match(
     styles,
     /@media \(max-width: 680px\)[\s\S]*?\.follower-warm-account__metrics\s*\{\s*grid-template-columns: repeat\(2, minmax\(0, 1fr\)\)/,
@@ -227,8 +242,8 @@ test("cycle comparison language is descriptive, responsive, and cache-busted", (
   assert.match(block, /не прогноз/);
   assert.match(block, /не предсказывает следующее число/);
   assert.doesNotMatch(block, /должн/iu);
-  assert.match(html, /href="\/styles\.css\?v=24"/);
-  assert.match(html, /src="\/app\.js\?v=24"/);
+  assert.match(html, /href="\/styles\.css\?v=25"/);
+  assert.match(html, /src="\/app\.js\?v=25"/);
   assert.match(styles, /\.cycle-sequence-list\s*\{[\s\S]*?repeat\(auto-fill, minmax\(50px, 1fr\)\)/);
   assert.match(
     styles,

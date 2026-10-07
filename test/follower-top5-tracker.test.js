@@ -84,7 +84,7 @@ function assertWarmAccountInvariants(account) {
   assert.equal(account.hitCount + account.missCount, account.betCount);
   assert.equal(
     account.betCount + account.skippedAfterExhaustionCount,
-    account.signalCount,
+    account.eligibleAnchorCount,
   );
   assert.equal(
     account.initialBalance - account.totalStaked + account.totalGrossPayout,
@@ -92,18 +92,53 @@ function assertWarmAccountInvariants(account) {
   );
   assert.equal(account.finalBalance - account.initialBalance, account.netResult);
   assert.equal(
-    account.shortfall,
-    Math.max(0, account.nextStake - account.finalBalance),
+    account.nextRoundCost,
+    account.model.numbersPerRound * account.nextStakePerNumber,
   );
   assert.equal(
-    account.canAffordNext,
-    account.status !== "exhausted" && account.finalBalance >= account.nextStake,
+    account.shortfall,
+    Math.max(0, account.nextRoundCost - account.finalBalance),
+  );
+  assert.equal(
+    account.canAffordNextRound,
+    account.status !== "exhausted"
+      && account.finalBalance >= account.nextRoundCost,
+  );
+  assert.equal(
+    account.maxRoundCost,
+    account.model.numbersPerRound * account.maxStakePerNumber,
   );
   assert.ok(account.peakBalance >= account.initialBalance);
   assert.ok(account.peakBalance >= account.finalBalance);
   assert.ok(account.minimumBalance <= account.initialBalance);
   assert.ok(account.minimumBalance <= account.finalBalance);
   assert.ok(account.maximumDrawdown >= account.peakBalance - account.finalBalance);
+
+  if (account.latestOutcome) {
+    const outcome = account.latestOutcome;
+    assert.equal(outcome.selectionCount, account.model.numbersPerRound);
+    assert.equal(outcome.targetNumbers.length, account.model.numbersPerRound);
+    assert.equal(new Set(outcome.targetNumbers).size, account.model.numbersPerRound);
+    assert.equal(
+      outcome.totalStake,
+      account.model.numbersPerRound * outcome.stakePerNumber,
+    );
+    assert.equal(
+      outcome.grossPayout,
+      outcome.outcome === "hit"
+        ? account.model.grossPayoutMultiplier * outcome.stakePerNumber
+        : 0,
+    );
+    if (outcome.outcome === "hit") {
+      assert.equal(
+        outcome.targetNumbers[outcome.hitRank - 1],
+        outcome.resultNumber,
+      );
+    } else {
+      assert.equal(outcome.hitRank, null);
+      assert.equal(outcome.targetNumbers.includes(outcome.resultNumber), false);
+    }
+  }
 }
 
 test("fixed top-5 tracker schema and empty state expose a stable simulation contract", () => {
@@ -523,17 +558,15 @@ test("warm current signal switches to gap when stream state advances without a r
   }
 });
 
-test("warm historical account stakes only rank one even when rank two hits", () => {
+test("warm historical account pays one 36x payout when rank two of five hits", () => {
   const numbers = [
     ...followerTransitionNumbers(9, [1, 1, 2, 3, 4, 5], { tail: false }),
     9,
     5,
     9,
-    5,
-    9,
   ];
-  const warm = buildFollowerTop5HitCurve(curveRows([numbers])).warmNextRound;
-  const account = warm.historicalAccount;
+  const account = buildFollowerTop5HitCurve(curveRows([numbers]))
+    .warmNextRound.historicalAccount;
 
   assert.deepEqual(
     {
@@ -547,32 +580,35 @@ test("warm historical account stakes only rank one even when rank two hits", () 
     },
     {
       schemaVersion: 1,
-      algorithmVersion: "follower-warm-top1-ladder-v1",
+      algorithmVersion: "follower-warm-top5-ladder-v2",
       mode: "saved-sequence-retrospective",
       executionEnabled: false,
       strategy: {
-        rank: 1,
-        threshold: 0.05,
-        noSignalPolicy: "pause",
+        selectionMode: "dynamic-top5",
+        selectionCount: 5,
+        threshold: null,
+        minimumObservedFollowerCount: 5,
+        eligibleAnchorPolicy: "every-known-next",
         gapPolicy: "reset-ladder-keep-balance",
         exhaustionPolicy: "permanent-stop",
       },
       model: {
-        modelVersion: "1.0.0",
-        initialStake: 10,
-        stakeStep: 10,
-        maxStake: 2_500,
+        modelVersion: "2.0.0",
+        initialStakePerNumber: 10,
+        stakeStepPerNumber: 10,
+        maxStakePerNumber: 2_500,
+        numbersPerRound: 5,
         grossPayoutMultiplier: 36,
+        netHitMultiplier: 31,
         payoutIncludesStake: true,
       },
       initialBalance: 10_000,
     },
   );
-  assert.equal(warm.hitCount, 2, "both outcomes are inside the wider warm top-five");
   assert.deepEqual(
     {
       status: account.status,
-      signalCount: account.signalCount,
+      eligibleAnchorCount: account.eligibleAnchorCount,
       betCount: account.betCount,
       hitCount: account.hitCount,
       missCount: account.missCount,
@@ -580,50 +616,117 @@ test("warm historical account stakes only rank one even when rank two hits", () 
       totalGrossPayout: account.totalGrossPayout,
       finalBalance: account.finalBalance,
       netResult: account.netResult,
-      nextStake: account.nextStake,
+      nextStakePerNumber: account.nextStakePerNumber,
+      nextRoundCost: account.nextRoundCost,
+      peakBalance: account.peakBalance,
       minimumBalance: account.minimumBalance,
+      maximumDrawdown: account.maximumDrawdown,
       ladder: account.ladder,
     },
     {
       status: "running",
-      signalCount: 2,
-      betCount: 2,
+      eligibleAnchorCount: 1,
+      betCount: 1,
       hitCount: 1,
-      missCount: 1,
-      totalStaked: 20,
+      missCount: 0,
+      totalStaked: 50,
       totalGrossPayout: 360,
-      finalBalance: 10_340,
-      netResult: 340,
-      nextStake: 10,
-      minimumBalance: 9_990,
-      ladder: { missCount: 0, totalStaked: 0 },
+      finalBalance: 10_310,
+      netResult: 310,
+      nextStakePerNumber: 10,
+      nextRoundCost: 50,
+      peakBalance: 10_310,
+      minimumBalance: 10_000,
+      maximumDrawdown: 0,
+      ladder: { missCount: 0, totalLoss: 0 },
     },
   );
   assert.deepEqual(
     {
-      targetNumber: account.latestOutcome.targetNumber,
+      sourceNumber: account.latestOutcome.sourceNumber,
+      targetNumbers: account.latestOutcome.targetNumbers,
+      selectionCount: account.latestOutcome.selectionCount,
       resultNumber: account.latestOutcome.resultNumber,
-      stake: account.latestOutcome.stake,
+      hitRank: account.latestOutcome.hitRank,
+      stakePerNumber: account.latestOutcome.stakePerNumber,
+      totalStake: account.latestOutcome.totalStake,
       outcome: account.latestOutcome.outcome,
       grossPayout: account.latestOutcome.grossPayout,
       balanceAfter: account.latestOutcome.balanceAfter,
     },
     {
-      targetNumber: 5,
+      sourceNumber: 9,
+      targetNumbers: [1, 5, 4, 3, 2],
+      selectionCount: 5,
       resultNumber: 5,
-      stake: 10,
+      hitRank: 2,
+      stakePerNumber: 10,
+      totalStake: 50,
       outcome: "hit",
       grossPayout: 360,
-      balanceAfter: 10_340,
+      balanceAfter: 10_310,
     },
   );
   assertWarmAccountInvariants(account);
 });
 
-test("warm historical account resets an elevated ladder after a hit", () => {
-  const losingNumbers = ROULETTE_NUMBERS_FOR_TEST.filter(
-    (number) => number !== 1 && number !== 9,
+test("warm historical account freezes each raw top five before learning its outcome", () => {
+  const training = followerTransitionNumbers(9, [1, 2, 3, 4, 5], {
+    tail: false,
+  });
+  const prefixNumbers = [...training, 9, 6, 9];
+  const prefixAccount = buildFollowerTop5HitCurve(curveRows([prefixNumbers]))
+    .warmNextRound.historicalAccount;
+
+  assert.deepEqual(prefixAccount.latestOutcome.targetNumbers, [5, 4, 3, 2, 1]);
+  assert.equal(prefixAccount.latestOutcome.resultNumber, 6);
+  assert.equal(prefixAccount.latestOutcome.outcome, "miss");
+  assert.deepEqual(prefixAccount.currentAction, {
+    action: "would_bet",
+    reason: "eligible",
+    targetNumbers: [6, 5, 4, 3, 2],
+    selectionCount: 5,
+    stakePerNumber: 10,
+    totalStake: 50,
+    anchorResultId: prefixNumbers.length,
+  });
+
+  const account = buildFollowerTop5HitCurve(curveRows([
+    [...prefixNumbers, 6, 9],
+  ])).warmNextRound.historicalAccount;
+  assert.deepEqual(
+    {
+      eligibleAnchorCount: account.eligibleAnchorCount,
+      betCount: account.betCount,
+      hitCount: account.hitCount,
+      missCount: account.missCount,
+      totalStaked: account.totalStaked,
+      totalGrossPayout: account.totalGrossPayout,
+      finalBalance: account.finalBalance,
+      netResult: account.netResult,
+      ladder: account.ladder,
+    },
+    {
+      eligibleAnchorCount: 2,
+      betCount: 2,
+      hitCount: 1,
+      missCount: 1,
+      totalStaked: 100,
+      totalGrossPayout: 360,
+      finalBalance: 10_260,
+      netResult: 260,
+      ladder: { missCount: 0, totalLoss: 0 },
+    },
   );
+  assert.deepEqual(account.latestOutcome.targetNumbers, [6, 5, 4, 3, 2]);
+  assert.equal(account.latestOutcome.resultNumber, 6);
+  assert.equal(account.latestOutcome.hitRank, 1);
+  assert.equal(account.latestOutcome.outcome, "hit");
+  assertWarmAccountInvariants(prefixAccount);
+  assertWarmAccountInvariants(account);
+});
+
+test("warm historical account uses the shared 31x ladder and resets it on hit", () => {
   const trainingFollowers = [
     ...Array.from({ length: 40 }, () => 1),
     2,
@@ -631,17 +734,10 @@ test("warm historical account resets an elevated ladder after a hit", () => {
     4,
     5,
   ];
-  const firstThirtySixMisses = Array.from(
-    { length: 36 },
-    (_, index) => losingNumbers[index % losingNumbers.length],
-  );
+  const sevenMisses = [0, 6, 7, 8, 10, 11, 12];
   const numbers = [
     ...followerTransitionNumbers(9, trainingFollowers, { tail: false }),
-    ...followerTransitionNumbers(
-      9,
-      [...firstThirtySixMisses, 1, 2],
-      { tail: false },
-    ),
+    ...followerTransitionNumbers(9, [...sevenMisses, 1], { tail: false }),
     9,
   ];
   const account = buildFollowerTop5HitCurve(curveRows([numbers]))
@@ -649,7 +745,7 @@ test("warm historical account resets an elevated ladder after a hit", () => {
 
   assert.deepEqual(
     {
-      signalCount: account.signalCount,
+      eligibleAnchorCount: account.eligibleAnchorCount,
       betCount: account.betCount,
       hitCount: account.hitCount,
       missCount: account.missCount,
@@ -657,84 +753,108 @@ test("warm historical account resets an elevated ladder after a hit", () => {
       totalGrossPayout: account.totalGrossPayout,
       finalBalance: account.finalBalance,
       netResult: account.netResult,
-      nextStake: account.nextStake,
-      maximumStake: account.maximumStake,
+      nextStakePerNumber: account.nextStakePerNumber,
+      nextRoundCost: account.nextRoundCost,
+      maxStakePerNumber: account.maxStakePerNumber,
+      maxRoundCost: account.maxRoundCost,
       peakBalance: account.peakBalance,
       minimumBalance: account.minimumBalance,
       maximumDrawdown: account.maximumDrawdown,
       ladder: account.ladder,
     },
     {
-      signalCount: 38,
-      betCount: 38,
+      eligibleAnchorCount: 8,
+      betCount: 8,
       hitCount: 1,
-      missCount: 37,
-      totalStaked: 390,
+      missCount: 7,
+      totalStaked: 450,
       totalGrossPayout: 720,
-      finalBalance: 10_330,
-      netResult: 330,
-      nextStake: 10,
-      maximumStake: 20,
-      peakBalance: 10_340,
-      minimumBalance: 9_640,
-      maximumDrawdown: 360,
-      ladder: { missCount: 1, totalStaked: 10 },
+      finalBalance: 10_270,
+      netResult: 270,
+      nextStakePerNumber: 10,
+      nextRoundCost: 50,
+      maxStakePerNumber: 20,
+      maxRoundCost: 100,
+      peakBalance: 10_270,
+      minimumBalance: 9_650,
+      maximumDrawdown: 350,
+      ladder: { missCount: 0, totalLoss: 0 },
     },
   );
-  assert.equal(account.latestOutcome.stake, 10);
-  assert.equal(account.latestOutcome.outcome, "miss");
-  assert.equal(account.latestOutcome.resultNumber, 2);
+  assert.equal(account.latestOutcome.stakePerNumber, 20);
+  assert.equal(account.latestOutcome.totalStake, 100);
+  assert.equal(account.latestOutcome.outcome, "hit");
+  assert.equal(account.latestOutcome.grossPayout, 720);
+  assert.equal(account.latestOutcome.balanceAfter, 10_270);
+  assert.equal(31 * account.latestOutcome.stakePerNumber - 350, 270);
   assertWarmAccountInvariants(account);
 });
 
-test("warm historical account pauses without charging on a no-signal anchor", () => {
+test("warm historical account bets the raw top five even when warm picks are empty", () => {
   const uniqueFollowers = Array.from(
     { length: 22 },
     (_, index) => index < 9 ? index : index + 1,
   );
-  const account = buildFollowerTop5HitCurve(curveRows([
+  const warm = buildFollowerTop5HitCurve(curveRows([
     followerTransitionNumbers(9, uniqueFollowers),
-  ])).warmNextRound.historicalAccount;
+  ])).warmNextRound;
+  const account = warm.historicalAccount;
 
+  assert.equal(warm.currentSignal.status, "no_signal");
+  assert.deepEqual(warm.currentSignal.picks, []);
+  assert.equal(warm.currentSignal.candidates.length, 5);
   assert.deepEqual(
     {
-      signalCount: account.signalCount,
-      noSignalCount: account.noSignalCount,
+      status: account.status,
+      eligibleAnchorCount: account.eligibleAnchorCount,
       betCount: account.betCount,
       hitCount: account.hitCount,
       missCount: account.missCount,
       totalStaked: account.totalStaked,
+      totalGrossPayout: account.totalGrossPayout,
       finalBalance: account.finalBalance,
-      nextStake: account.nextStake,
+      netResult: account.netResult,
+      nextStakePerNumber: account.nextStakePerNumber,
+      nextRoundCost: account.nextRoundCost,
+      maxStakePerNumber: account.maxStakePerNumber,
+      maxRoundCost: account.maxRoundCost,
       ladder: account.ladder,
       currentAction: account.currentAction,
     },
     {
-      signalCount: 16,
-      noSignalCount: 1,
-      betCount: 16,
+      status: "running",
+      eligibleAnchorCount: 17,
+      betCount: 17,
       hitCount: 0,
-      missCount: 16,
-      totalStaked: 160,
-      finalBalance: 9_840,
-      nextStake: 10,
-      ladder: { missCount: 16, totalStaked: 160 },
+      missCount: 17,
+      totalStaked: 2_250,
+      totalGrossPayout: 0,
+      finalBalance: 7_750,
+      netResult: -2_250,
+      nextStakePerNumber: 80,
+      nextRoundCost: 400,
+      maxStakePerNumber: 70,
+      maxRoundCost: 350,
+      ladder: { missCount: 17, totalLoss: 2_250 },
       currentAction: {
-        action: "wait",
-        reason: "no_signal",
-        targetNumber: null,
-        stake: null,
+        action: "would_bet",
+        reason: "eligible",
+        targetNumbers: [22, 21, 20, 19, 18],
+        selectionCount: 5,
+        stakePerNumber: 80,
+        totalStake: 400,
         anchorResultId: 45,
       },
     },
   );
+  assert.deepEqual(account.latestOutcome.targetNumbers, [21, 20, 19, 18, 17]);
+  assert.equal(account.latestOutcome.resultNumber, 22);
+  assert.equal(account.latestOutcome.stakePerNumber, 70);
+  assert.equal(account.latestOutcome.totalStake, 350);
   assertWarmAccountInvariants(account);
 });
 
-test("warm historical account resets its ladder at a gap without restoring balance", () => {
-  const losingNumbers = ROULETTE_NUMBERS_FOR_TEST.filter(
-    (number) => number !== 1 && number !== 9,
-  );
+test("warm historical account resets its shared ladder at a gap without restoring cash", () => {
   const trainingFollowers = [
     ...Array.from({ length: 40 }, () => 1),
     2,
@@ -742,112 +862,74 @@ test("warm historical account resets its ladder at a gap without restoring balan
     4,
     5,
   ];
-  const missesBeforeGap = Array.from(
-    { length: 36 },
-    (_, index) => losingNumbers[index % losingNumbers.length],
-  );
+  const sevenMisses = [0, 6, 7, 8, 10, 11, 12];
   const account = buildFollowerTop5HitCurve(curveRows([
     [
       ...followerTransitionNumbers(9, trainingFollowers, { tail: false }),
-      ...followerTransitionNumbers(9, missesBeforeGap, { tail: false }),
+      ...followerTransitionNumbers(9, sevenMisses, { tail: false }),
     ],
-    [9, 2, 9],
+    [9, 13, 9],
   ])).warmNextRound.historicalAccount;
 
   assert.deepEqual(
     {
       status: account.status,
-      signalCount: account.signalCount,
+      eligibleAnchorCount: account.eligibleAnchorCount,
       betCount: account.betCount,
+      hitCount: account.hitCount,
       missCount: account.missCount,
       totalStaked: account.totalStaked,
       finalBalance: account.finalBalance,
-      nextStake: account.nextStake,
-      maximumStake: account.maximumStake,
+      nextStakePerNumber: account.nextStakePerNumber,
+      nextRoundCost: account.nextRoundCost,
+      maxStakePerNumber: account.maxStakePerNumber,
+      maxRoundCost: account.maxRoundCost,
       continuityGapCount: account.continuityGapCount,
       dataComplete: account.dataComplete,
       ladder: account.ladder,
     },
     {
       status: "running",
-      signalCount: 37,
-      betCount: 37,
-      missCount: 37,
-      totalStaked: 370,
-      finalBalance: 9_630,
-      nextStake: 10,
-      maximumStake: 10,
+      eligibleAnchorCount: 8,
+      betCount: 8,
+      hitCount: 0,
+      missCount: 8,
+      totalStaked: 400,
+      finalBalance: 9_600,
+      nextStakePerNumber: 10,
+      nextRoundCost: 50,
+      maxStakePerNumber: 10,
+      maxRoundCost: 50,
       continuityGapCount: 1,
       dataComplete: false,
-      ladder: { missCount: 1, totalStaked: 10 },
+      ladder: { missCount: 1, totalLoss: 50 },
     },
   );
-  assert.equal(account.latestOutcome.stake, 10);
-  assert.equal(account.latestOutcome.balanceAfter, 9_630);
+  assert.equal(account.latestOutcome.stakePerNumber, 10);
+  assert.equal(account.latestOutcome.totalStake, 50);
+  assert.equal(account.latestOutcome.balanceAfter, 9_600);
+  assert.equal(account.latestOutcome.resultNumber, 13);
   assertWarmAccountInvariants(account);
 });
 
-test("warm historical account selects every target walk-forward without lookahead", () => {
-  const numbers = [
-    ...followerTransitionNumbers(9, [1, 1, 2, 3, 4, 6], { tail: false }),
-    9,
-    6,
-    9,
-    6,
-    9,
-  ];
-  const warm = buildFollowerTop5HitCurve(curveRows([numbers])).warmNextRound;
-  const account = warm.historicalAccount;
-
-  assert.equal(warm.hitCount, 2);
-  assert.deepEqual(
-    {
-      signalCount: account.signalCount,
-      betCount: account.betCount,
-      hitCount: account.hitCount,
-      missCount: account.missCount,
-      totalStaked: account.totalStaked,
-      totalGrossPayout: account.totalGrossPayout,
-      finalBalance: account.finalBalance,
-      minimumBalance: account.minimumBalance,
-      ladder: account.ladder,
-    },
-    {
-      signalCount: 2,
-      betCount: 2,
-      hitCount: 1,
-      missCount: 1,
-      totalStaked: 20,
-      totalGrossPayout: 360,
-      finalBalance: 10_340,
-      minimumBalance: 9_990,
-      ladder: { missCount: 0, totalStaked: 0 },
-    },
-  );
-  assert.equal(account.latestOutcome.targetNumber, 6);
-  assert.equal(account.latestOutcome.resultNumber, 6);
-  assert.equal(account.latestOutcome.outcome, "hit");
-  assertWarmAccountInvariants(account);
-});
-
-test("warm historical account exhausts after 140 misses and skips every later signal", () => {
-  const losingNumbers = ROULETTE_NUMBERS_FOR_TEST.filter(
-    (number) => number !== 1 && number !== 9,
-  );
+test("warm historical account exhausts on total ticket cost and permanently skips a later hit", () => {
   const trainingFollowers = [
     ...Array.from({ length: 100 }, () => 1),
-    2,
-    3,
-    4,
+    ...Array.from({ length: 50 }, () => 2),
+    ...Array.from({ length: 25 }, () => 3),
+    ...Array.from({ length: 10 }, () => 4),
     5,
   ];
-  const oneHundredFortyOneMisses = Array.from(
-    { length: 141 },
-    (_, index) => losingNumbers[index % losingNumbers.length],
-  );
+  const firstTwentySixMisses = ROULETTE_NUMBERS_FOR_TEST.filter(
+    (number) => ![1, 2, 3, 4, 5, 9].includes(number),
+  ).slice(0, 26);
   const rows = curveRows([[
     ...followerTransitionNumbers(9, trainingFollowers, { tail: false }),
-    ...followerTransitionNumbers(9, oneHundredFortyOneMisses, { tail: false }),
+    ...followerTransitionNumbers(
+      9,
+      [...firstTwentySixMisses, 1],
+      { tail: false },
+    ),
     9,
   ]]);
   const account = buildFollowerTop5HitCurve(rows)
@@ -859,10 +941,11 @@ test("warm historical account exhausts after 140 misses and skips every later si
       initialBalance: account.initialBalance,
       finalBalance: account.finalBalance,
       netResult: account.netResult,
-      nextStake: account.nextStake,
-      canAffordNext: account.canAffordNext,
+      nextStakePerNumber: account.nextStakePerNumber,
+      nextRoundCost: account.nextRoundCost,
+      canAffordNextRound: account.canAffordNextRound,
       shortfall: account.shortfall,
-      signalCount: account.signalCount,
+      eligibleAnchorCount: account.eligibleAnchorCount,
       betCount: account.betCount,
       hitCount: account.hitCount,
       missCount: account.missCount,
@@ -872,41 +955,56 @@ test("warm historical account exhausts after 140 misses and skips every later si
       peakBalance: account.peakBalance,
       minimumBalance: account.minimumBalance,
       maximumDrawdown: account.maximumDrawdown,
-      maximumStake: account.maximumStake,
+      maxStakePerNumber: account.maxStakePerNumber,
+      maxRoundCost: account.maxRoundCost,
       ladder: account.ladder,
     },
     {
       status: "exhausted",
       initialBalance: 10_000,
-      finalBalance: 130,
-      netResult: -9_870,
-      nextStake: 290,
-      canAffordNext: false,
-      shortfall: 160,
-      signalCount: 141,
-      betCount: 140,
+      finalBalance: 1_000,
+      netResult: -9_000,
+      nextStakePerNumber: 300,
+      nextRoundCost: 1_500,
+      canAffordNextRound: false,
+      shortfall: 500,
+      eligibleAnchorCount: 27,
+      betCount: 26,
       hitCount: 0,
-      missCount: 140,
-      totalStaked: 9_870,
+      missCount: 26,
+      totalStaked: 9_000,
       totalGrossPayout: 0,
       skippedAfterExhaustionCount: 1,
       peakBalance: 10_000,
-      minimumBalance: 130,
-      maximumDrawdown: 9_870,
-      maximumStake: 280,
-      ladder: { missCount: 140, totalStaked: 9_870 },
+      minimumBalance: 1_000,
+      maximumDrawdown: 9_000,
+      maxStakePerNumber: 250,
+      maxRoundCost: 1_250,
+      ladder: { missCount: 26, totalLoss: 9_000 },
     },
+  );
+  assert.equal(
+    account.finalBalance >= account.nextStakePerNumber,
+    true,
+    "one number is affordable but the complete five-number ticket is not",
   );
   assert.equal(account.exhaustedAt, account.lastBetAt);
   assert.equal(account.latestOutcome.outcome, "miss");
-  assert.equal(account.latestOutcome.stake, 280);
-  assert.equal(account.latestOutcome.balanceAfter, 130);
-  assert.equal(account.latestOutcome.resultNumber, oneHundredFortyOneMisses[139]);
+  assert.equal(account.latestOutcome.stakePerNumber, 250);
+  assert.equal(account.latestOutcome.totalStake, 1_250);
+  assert.equal(account.latestOutcome.balanceAfter, 1_000);
+  assert.equal(account.latestOutcome.resultNumber, firstTwentySixMisses.at(-1));
+  assert.ok(
+    account.latestOutcome.resultId < rows.at(-2).id,
+    "the later dominant-number hit is skipped after permanent exhaustion",
+  );
   assert.deepEqual(account.currentAction, {
     action: "wait",
     reason: "bankroll_exhausted",
-    targetNumber: 1,
-    stake: 290,
+    targetNumbers: [1, 2, 3, 4, firstTwentySixMisses.at(-1)],
+    selectionCount: 5,
+    stakePerNumber: 300,
+    totalStake: 1_500,
     anchorResultId: rows.at(-1).id,
   });
   assertWarmAccountInvariants(account);

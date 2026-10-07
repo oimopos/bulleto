@@ -1782,13 +1782,6 @@ h2 {
   background: rgba(43, 196, 141, 0.045);
 }
 
-.follower-warm-pick.is-account-pick {
-  border-color: rgba(228, 189, 115, 0.34);
-  background:
-    linear-gradient(135deg, rgba(228, 189, 115, 0.075), transparent 62%),
-    rgba(43, 196, 141, 0.035);
-}
-
 .follower-warm-pick__transition {
   display: flex;
   min-width: 0;
@@ -1827,12 +1820,6 @@ h2 {
   font-size: 8px;
   font-variant-numeric: tabular-nums;
   line-height: 1.35;
-}
-
-.follower-warm-pick__account {
-  color: var(--gold-bright);
-  font-weight: 750;
-  letter-spacing: 0.025em;
 }
 
 .follower-warm-picks__empty {

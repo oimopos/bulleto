@@ -33,8 +33,12 @@ const FOLLOWER_TOP5_LIVE_ALGORITHM_VERSION = "follower-top5-live-v1";
 const FOLLOWER_WARM_THRESHOLD_PERCENT = 5;
 const FOLLOWER_WARM_ALGORITHM_VERSION = "follower-warm-top5-next-v1";
 const FOLLOWER_WARM_ACCOUNT_STARTING_BALANCE = 10_000;
+const FOLLOWER_WARM_ACCOUNT_SELECTION_COUNT = FOLLOWER_TOP5_COUNT;
+const FOLLOWER_WARM_ACCOUNT_NET_HIT_MULTIPLIER =
+  VIRTUAL_BET_MODEL.grossPayoutMultiplier - FOLLOWER_WARM_ACCOUNT_SELECTION_COUNT;
 const FOLLOWER_WARM_ACCOUNT_ALGORITHM_VERSION =
-  "follower-warm-top1-ladder-v1";
+  "follower-warm-top5-ladder-v2";
+const FOLLOWER_WARM_ACCOUNT_MODEL_VERSION = "2.0.0";
 
 function emptyFollowerHitBucket() {
   return {
@@ -91,13 +95,28 @@ function followerRankedCandidates(counts, lastOccurredAt) {
   }));
 }
 
+function calculateFollowerWarmAccountStake(priorSessionLoss) {
+  const lossCoveredPerStep =
+    FOLLOWER_WARM_ACCOUNT_NET_HIT_MULTIPLIER * VIRTUAL_BET_MODEL.stakeStep;
+  const requiredSteps = Math.max(
+    1,
+    Math.ceil(priorSessionLoss / lossCoveredPerStep),
+  );
+  return Math.min(
+    VIRTUAL_BET_MODEL.maxStake,
+    Math.max(
+      VIRTUAL_BET_MODEL.initialStake,
+      VIRTUAL_BET_MODEL.stakeStep * requiredSteps,
+    ),
+  );
+}
+
 function createFollowerWarmHistoricalAccount() {
   return {
     status: "waiting",
     currentBalance: FOLLOWER_WARM_ACCOUNT_STARTING_BALANCE,
-    nextStake: calculateNextVirtualStake(0),
-    signalCount: 0,
-    noSignalCount: 0,
+    nextStakePerNumber: calculateFollowerWarmAccountStake(0),
+    eligibleAnchorCount: 0,
     betCount: 0,
     hitCount: 0,
     missCount: 0,
@@ -107,13 +126,14 @@ function createFollowerWarmHistoricalAccount() {
     peakBalance: FOLLOWER_WARM_ACCOUNT_STARTING_BALANCE,
     minimumBalance: FOLLOWER_WARM_ACCOUNT_STARTING_BALANCE,
     maximumDrawdown: 0,
-    maximumStake: 0,
+    maxStakePerNumber: 0,
+    maxRoundCost: 0,
     continuityGapCount: 0,
     firstBetAt: null,
     lastBetAt: null,
     exhaustedAt: null,
     ladderMissCount: 0,
-    ladderTotalStaked: 0,
+    ladderTotalLoss: 0,
     latestOutcome: null,
   };
 }
@@ -122,44 +142,42 @@ function resetFollowerWarmLadderAtGap(account) {
   account.continuityGapCount += 1;
   if (account.status === "exhausted") return;
   account.ladderMissCount = 0;
-  account.ladderTotalStaked = 0;
-  account.nextStake = calculateNextVirtualStake(0);
+  account.ladderTotalLoss = 0;
+  account.nextStakePerNumber = calculateFollowerWarmAccountStake(0);
 }
 
-function recordFollowerWarmNoSignal(account) {
-  account.noSignalCount += 1;
-}
-
-function settleFollowerWarmHistoricalSignal(account, {
+function settleFollowerWarmHistoricalAnchor(account, {
   anchor,
   next,
-  targetNumber,
-  occurrenceCount,
-  sampleSize,
+  sourceNumber,
+  targetNumbers,
 }) {
-  account.signalCount += 1;
+  account.eligibleAnchorCount += 1;
   if (account.status === "exhausted") {
     account.skippedAfterExhaustionCount += 1;
     return;
   }
 
-  const stake = calculateNextVirtualStake(account.ladderTotalStaked);
-  account.nextStake = stake;
-  if (stake > account.currentBalance) {
+  const stakePerNumber = calculateFollowerWarmAccountStake(
+    account.ladderTotalLoss,
+  );
+  const totalStake = FOLLOWER_WARM_ACCOUNT_SELECTION_COUNT * stakePerNumber;
+  account.nextStakePerNumber = stakePerNumber;
+  if (totalStake > account.currentBalance) {
     account.status = "exhausted";
     account.exhaustedAt = anchor.settled_at;
     account.skippedAfterExhaustionCount += 1;
     return;
   }
 
-  const settlement = settleVirtualBet({
-    targetNumber,
-    resultNumber: Number(next.result_number),
-    stake,
-    priorTotalStaked: account.ladderTotalStaked,
-  });
+  const resultNumber = Number(next.result_number);
+  const hitIndex = targetNumbers.indexOf(resultNumber);
+  const outcome = hitIndex >= 0 ? "hit" : "miss";
+  const grossPayout = outcome === "hit"
+    ? stakePerNumber * VIRTUAL_BET_MODEL.grossPayoutMultiplier
+    : 0;
   const balanceAfter =
-    account.currentBalance - stake + settlement.grossPayout;
+    account.currentBalance - totalStake + grossPayout;
   if (!Number.isSafeInteger(balanceAfter) || balanceAfter < 0) {
     throw new RangeError("warm historical account balance is invalid");
   }
@@ -167,9 +185,13 @@ function settleFollowerWarmHistoricalSignal(account, {
   account.status = "running";
   account.currentBalance = balanceAfter;
   account.betCount += 1;
-  account.totalStaked += stake;
-  account.totalGrossPayout += settlement.grossPayout;
-  account.maximumStake = Math.max(account.maximumStake, stake);
+  account.totalStaked += totalStake;
+  account.totalGrossPayout += grossPayout;
+  account.maxStakePerNumber = Math.max(
+    account.maxStakePerNumber,
+    stakePerNumber,
+  );
+  account.maxRoundCost = Math.max(account.maxRoundCost, totalStake);
   account.firstBetAt ??= next.settled_at;
   account.lastBetAt = next.settled_at;
   account.peakBalance = Math.max(account.peakBalance, balanceAfter);
@@ -179,17 +201,22 @@ function settleFollowerWarmHistoricalSignal(account, {
     account.peakBalance - balanceAfter,
   );
 
-  if (settlement.outcome === "hit") {
+  if (outcome === "hit") {
     account.hitCount += 1;
     account.ladderMissCount = 0;
-    account.ladderTotalStaked = 0;
-    account.nextStake = calculateNextVirtualStake(0);
+    account.ladderTotalLoss = 0;
+    account.nextStakePerNumber = calculateFollowerWarmAccountStake(0);
   } else {
     account.missCount += 1;
     account.ladderMissCount += 1;
-    account.ladderTotalStaked = settlement.totalStaked;
-    account.nextStake = settlement.nextStake;
-    if (account.nextStake > balanceAfter) {
+    account.ladderTotalLoss += totalStake;
+    account.nextStakePerNumber = calculateFollowerWarmAccountStake(
+      account.ladderTotalLoss,
+    );
+    if (
+      FOLLOWER_WARM_ACCOUNT_SELECTION_COUNT * account.nextStakePerNumber
+      > balanceAfter
+    ) {
       account.status = "exhausted";
       account.exhaustedAt = next.settled_at;
     }
@@ -198,72 +225,96 @@ function settleFollowerWarmHistoricalSignal(account, {
   account.latestOutcome = {
     anchorResultId: Number(anchor.id),
     resultId: Number(next.id),
-    targetNumber,
-    resultNumber: Number(next.result_number),
-    historicalShare: occurrenceCount / sampleSize,
-    sampleSize,
-    stake,
-    outcome: settlement.outcome,
-    grossPayout: settlement.grossPayout,
+    sourceNumber,
+    targetNumbers: [...targetNumbers],
+    selectionCount: targetNumbers.length,
+    resultNumber,
+    hitRank: hitIndex >= 0 ? hitIndex + 1 : null,
+    stakePerNumber,
+    totalStake,
+    outcome,
+    grossPayout,
     balanceAfter,
-    nextStake: account.nextStake,
+    nextStakePerNumber: account.nextStakePerNumber,
+    nextRoundCost:
+      FOLLOWER_WARM_ACCOUNT_SELECTION_COUNT * account.nextStakePerNumber,
     occurredAt: next.settled_at,
   };
 }
 
 function followerWarmCurrentAction(account, currentSignal) {
-  const candidate = currentSignal.status === "ready"
-    ? currentSignal.picks[0] ?? null
+  const targetNumbers = ["ready", "no_signal"].includes(currentSignal.status)
+    ? currentSignal.candidates
+      .slice(0, FOLLOWER_WARM_ACCOUNT_SELECTION_COUNT)
+      .map((candidate) => candidate.number)
+    : [];
+  const hasSelection =
+    targetNumbers.length === FOLLOWER_WARM_ACCOUNT_SELECTION_COUNT;
+  const stakePerNumber = hasSelection ? account.nextStakePerNumber : null;
+  const totalStake = hasSelection
+    ? FOLLOWER_WARM_ACCOUNT_SELECTION_COUNT * account.nextStakePerNumber
     : null;
   if (account.status === "exhausted") {
     return {
       action: "wait",
       reason: "bankroll_exhausted",
-      targetNumber: candidate?.number ?? null,
-      stake: candidate ? account.nextStake : null,
+      targetNumbers,
+      selectionCount: targetNumbers.length,
+      stakePerNumber,
+      totalStake,
       anchorResultId: currentSignal.anchorResultId,
     };
   }
-  if (!candidate) {
+  if (!hasSelection) {
     return {
       action: "wait",
       reason: currentSignal.status,
-      targetNumber: null,
-      stake: null,
+      targetNumbers: [],
+      selectionCount: 0,
+      stakePerNumber: null,
+      totalStake: null,
       anchorResultId: currentSignal.anchorResultId,
     };
   }
   return {
     action: "would_bet",
-    reason: "ready",
-    targetNumber: candidate.number,
-    stake: account.nextStake,
+    reason: "eligible",
+    targetNumbers,
+    selectionCount: targetNumbers.length,
+    stakePerNumber,
+    totalStake,
     anchorResultId: currentSignal.anchorResultId,
   };
 }
 
 function followerWarmHistoricalAccountForApi(account, currentSignal) {
-  const canAffordNext =
+  const nextRoundCost =
+    FOLLOWER_WARM_ACCOUNT_SELECTION_COUNT * account.nextStakePerNumber;
+  const canAffordNextRound =
     account.status !== "exhausted"
-    && account.currentBalance >= account.nextStake;
+    && account.currentBalance >= nextRoundCost;
   return {
     schemaVersion: 1,
     algorithmVersion: FOLLOWER_WARM_ACCOUNT_ALGORITHM_VERSION,
     mode: "saved-sequence-retrospective",
     executionEnabled: false,
     strategy: {
-      rank: 1,
-      threshold: FOLLOWER_WARM_THRESHOLD_PERCENT / 100,
-      noSignalPolicy: "pause",
+      selectionMode: "dynamic-top5",
+      selectionCount: FOLLOWER_WARM_ACCOUNT_SELECTION_COUNT,
+      threshold: null,
+      minimumObservedFollowerCount: FOLLOWER_TOP5_MINIMUM_OBSERVED,
+      eligibleAnchorPolicy: "every-known-next",
       gapPolicy: "reset-ladder-keep-balance",
       exhaustionPolicy: "permanent-stop",
     },
     model: {
-      modelVersion: VIRTUAL_BET_MODEL.modelVersion,
-      initialStake: VIRTUAL_BET_MODEL.initialStake,
-      stakeStep: VIRTUAL_BET_MODEL.stakeStep,
-      maxStake: VIRTUAL_BET_MODEL.maxStake,
+      modelVersion: FOLLOWER_WARM_ACCOUNT_MODEL_VERSION,
+      initialStakePerNumber: VIRTUAL_BET_MODEL.initialStake,
+      stakeStepPerNumber: VIRTUAL_BET_MODEL.stakeStep,
+      maxStakePerNumber: VIRTUAL_BET_MODEL.maxStake,
+      numbersPerRound: FOLLOWER_WARM_ACCOUNT_SELECTION_COUNT,
       grossPayoutMultiplier: VIRTUAL_BET_MODEL.grossPayoutMultiplier,
+      netHitMultiplier: FOLLOWER_WARM_ACCOUNT_NET_HIT_MULTIPLIER,
       payoutIncludesStake: VIRTUAL_BET_MODEL.payoutIncludesStake,
     },
     status: account.status,
@@ -271,11 +322,11 @@ function followerWarmHistoricalAccountForApi(account, currentSignal) {
     finalBalance: account.currentBalance,
     netResult:
       account.currentBalance - FOLLOWER_WARM_ACCOUNT_STARTING_BALANCE,
-    nextStake: account.nextStake,
-    canAffordNext,
-    shortfall: Math.max(0, account.nextStake - account.currentBalance),
-    signalCount: account.signalCount,
-    noSignalCount: account.noSignalCount,
+    nextStakePerNumber: account.nextStakePerNumber,
+    nextRoundCost,
+    canAffordNextRound,
+    shortfall: Math.max(0, nextRoundCost - account.currentBalance),
+    eligibleAnchorCount: account.eligibleAnchorCount,
     betCount: account.betCount,
     hitCount: account.hitCount,
     missCount: account.missCount,
@@ -287,7 +338,8 @@ function followerWarmHistoricalAccountForApi(account, currentSignal) {
     peakBalance: account.peakBalance,
     minimumBalance: account.minimumBalance,
     maximumDrawdown: account.maximumDrawdown,
-    maximumStake: account.maximumStake,
+    maxStakePerNumber: account.maxStakePerNumber,
+    maxRoundCost: account.maxRoundCost,
     continuityGapCount: account.continuityGapCount,
     dataComplete: account.continuityGapCount === 0,
     firstBetAt: account.firstBetAt,
@@ -295,7 +347,7 @@ function followerWarmHistoricalAccountForApi(account, currentSignal) {
     exhaustedAt: account.exhaustedAt,
     ladder: {
       missCount: account.ladderMissCount,
-      totalStaked: account.ladderTotalStaked,
+      totalLoss: account.ladderTotalLoss,
     },
     latestOutcome: account.latestOutcome,
     currentAction: followerWarmCurrentAction(account, currentSignal),
@@ -372,7 +424,9 @@ function currentFollowerWarmSignal(
  * Retrospective expanding walk-forward over the saved event sequence.
  * The incoming transition is known at an anchor; its outgoing transition is not.
  * The legacy horizon curve uses one complete-20-round cohort. The warm signal
- * has its own next-round cohort because it never evaluates later horizons.
+ * has its own next-round cohort because it never evaluates later horizons. Its
+ * historical account bets the raw frozen Top-5 at every eligible anchor, while
+ * the surrounding warm metrics keep applying the individual-share threshold.
  */
 export function buildFollowerTop5HitCurve(
   rows,
@@ -435,22 +489,18 @@ export function buildFollowerTop5HitCurve(
     const next = rows[index + 1];
     if (next && Number(next.continuity_epoch) === epoch) {
       warmNextRound.eligibleCount += 1;
+      settleFollowerWarmHistoricalAnchor(warmHistoricalAccount, {
+        anchor: row,
+        next,
+        sourceNumber: number,
+        targetNumbers: rankedTop5,
+      });
       if (warmNumbers.length > 0) {
         warmNextRound.signalCount += 1;
         warmNextRound.selectionCount += warmNumbers.length;
-        const topNumber = rankedTop5[0];
-        settleFollowerWarmHistoricalSignal(warmHistoricalAccount, {
-          anchor: row,
-          next,
-          targetNumber: topNumber,
-          occurrenceCount: counts[number][topNumber],
-          sampleSize,
-        });
         if (warmNumbers.includes(Number(next.result_number))) {
           warmNextRound.hitCount += 1;
         }
-      } else {
-        recordFollowerWarmNoSignal(warmHistoricalAccount);
       }
     } else {
       warmNextRound.excludedMissingNextRoundCount += 1;

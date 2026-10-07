@@ -7,8 +7,8 @@
     <meta name="color-scheme" content="dark">
     <meta name="description" content="Онлайн-монитор результатов рулетки и циклов исключения чисел от 0 до 36">
     <title>Круг 37 — монитор результатов</title>
-    <link rel="stylesheet" href="/styles.css?v=24">
-    <script type="module" src="/app.js?v=24"></script>
+    <link rel="stylesheet" href="/styles.css?v=25">
+    <script type="module" src="/app.js?v=25"></script>
   </head>
   <body>
     <a class="skip-link" href="#main-content">Перейти к содержимому</a>
@@ -390,12 +390,12 @@
             <section class="follower-warm-account" id="follower-warm-account" data-state="loading" aria-labelledby="follower-warm-account-title" aria-describedby="follower-warm-account-audit follower-warm-account-note" aria-busy="true">
               <div class="follower-warm-account__header">
                 <div>
-                  <p class="eyebrow">Архивная симуляция · только кандидат №1</p>
-                  <h5 id="follower-warm-account-title">Исторический счёт</h5>
+                  <p class="eyebrow">Архивная симуляция · динамический Top‑5</p>
+                  <h5 id="follower-warm-account-title">Исторический счёт общего билета</h5>
                 </div>
                 <span class="follower-warm-account__status" id="follower-warm-account-status" role="status" aria-live="polite" aria-atomic="true">Считаем…</span>
               </div>
-              <dl class="follower-warm-account__metrics" aria-label="Исторический счёт стратегии по первому тёплому кандидату">
+              <dl class="follower-warm-account__metrics" aria-label="Исторический счёт общей лестницы по пяти числам динамического Top‑5">
                 <div>
                   <dt>Итоговый счёт</dt>
                   <dd id="follower-warm-account-balance">—</dd>
@@ -407,18 +407,18 @@
                   <small>условные единицы</small>
                 </div>
                 <div>
-                  <dt>Ставки</dt>
+                  <dt>Билеты Top‑5</dt>
                   <dd id="follower-warm-account-bets">—</dd>
                   <small id="follower-warm-account-record">— попаданий · — промахов</small>
                 </div>
                 <div>
                   <dt>Макс. просадка</dt>
                   <dd id="follower-warm-account-drawdown">—</dd>
-                  <small id="follower-warm-account-risk">макс. ставка —</small>
+                  <small id="follower-warm-account-risk">макс. билет — · по —</small>
                 </div>
               </dl>
               <p class="follower-warm-account__audit" id="follower-warm-account-audit">Загружаем движение счёта и состояние лестницы.</p>
-              <p class="follower-warm-account__note" id="follower-warm-account-note">Счёт начинается с 10 000 условных единиц и выбирает только кандидата №1 с долей ≥5%. Стартовая ставка 10, шаг 10, максимум 2 500, валовая выплата ×36. Раунд без сигнала сохраняет лестницу; разрыв истории сбрасывает лестницу, но не счёт. Это ретроспективный расчёт без реальных ставок.</p>
+              <p class="follower-warm-account__note" id="follower-warm-account-note">Счёт начинается с 10 000 условных единиц. В каждом доступном раунде общая лестница ставит одинаковую сумму на каждое из 5 чисел необрезанного динамического Top‑5: старт по 10 (билет 50), шаг по 10, максимум по 2 500 (билет 12 500). При попадании ×36 начисляется только на одно выигравшее число; остальные четыре ставки проигрывают, поэтому коэффициент восстановления равен 31. Разрыв истории сбрасывает лестницу, но не счёт. Порог ≥5% относится только к тёплому прогнозу выше. Это ретроспективный расчёт без реальных ставок.</p>
             </section>
             <p class="follower-dynamic-next__note" id="follower-dynamic-next-note">На каждой прошлой точке Top‑5 заново строился только по более ранним переходам; в сигнал входили лишь числа с точной долей не ниже 5%. Проверялся один следующий сохранённый результат в том же непрерывном участке. Точка без подходящих чисел считается пропуском, а не промахом. Это ретроспективная статистика без реальных ставок.</p>
           </section>
