@@ -161,7 +161,10 @@ test(
       assert.equal(response.status, 200, logs());
       assert.match(response.headers.get("content-type") ?? "", /^application\/json\b/);
       assert.equal(response.headers.get("cache-control"), "no-store");
-      assert.deepEqual(await response.json(), {
+      const payload = await response.json();
+      assert.equal(typeof payload.serverTime, "string");
+      assert.equal(new Date(payload.serverTime).toISOString(), payload.serverTime);
+      assert.deepEqual(payload, {
         mode: "simulation",
         executionEnabled: false,
         status: "waiting",
@@ -171,6 +174,8 @@ test(
           progress: 3,
           target: 200,
         },
+        serverTime: payload.serverTime,
+        betting: null,
       });
     } finally {
       await stopChild(child);

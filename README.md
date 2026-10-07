@@ -220,7 +220,7 @@ npm.cmd run backup -- ./data/buleto.sqlite ./seed/buleto.sqlite
 - `GET /api/forecasts/hits?limit=20` — последние проверенные прогнозы, в которых фактическое число вошло в неизменно сохранённый ценовой top‑3.
 - `GET /api/cycles?limit=10` — завершённые циклы.
 - `GET /api/sequences?limit=50` — повторяющиеся последовательности из трёх результатов.
-- `GET /api/virtual-bettor` — компактное состояние симуляции: остаток виртуального банка, число с самой длинной текущей серией без выпадения и её прогресс до порога.
+- `GET /api/virtual-bettor` — компактное состояние симуляции: остаток виртуального банка, самая длинная текущая серия и live-время окна ставок.
 - `GET /api/virtual-bettor/sessions?limit=20` — история виртуальных сессий; реальные ставки всегда отключены.
 - `GET /api/events` — Server-Sent Events для мгновенного обновления панели.
 - `GET /api/live` — liveness-проверка процесса для Docker/Render.
@@ -238,12 +238,29 @@ npm.cmd run backup -- ./data/buleto.sqlite ./seed/buleto.sqlite
     "number": 17,
     "progress": 143,
     "target": 200
+  },
+  "serverTime": "2026-10-07T17:43:57.822Z",
+  "betting": {
+    "roundId": 4102101,
+    "isOpen": true,
+    "opensAt": "2026-10-07T17:43:40.000Z",
+    "closesAt": "2026-10-07T17:44:20.000Z",
+    "secondsUntilClose": 23,
+    "strategyReady": false,
+    "canBetNow": false
   }
 }
 ```
 
 Если в текущем непрерывном участке ещё нет результатов, `longestSeries` будет
-`null`.
+`null`. Время передаётся в UTC. `betting.isOpen` описывает только live-окно
+Buleto: от `opensAt` включительно до `closesAt` исключительно. Поле
+`strategyReady` становится `true` при статусе симуляции `armed` или `active`, а
+`canBetNow` — только когда одновременно открыто окно и готова виртуальная
+стратегия. Это информационный сигнал симуляции: `executionEnabled` остаётся
+`false`, проект сам ставок не отправляет. `secondsUntilClose` округляется вверх;
+точной границей всегда служит `closesAt`. Если live-время раунда недоступно,
+невалидно или коллектор сообщает ошибку, `betting` будет `null`.
 
 ## Ограничения
 

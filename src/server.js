@@ -10,6 +10,7 @@ import { createServer } from 'node:http';
 import { dirname, extname, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { BuletoCollector } from './collector.js';
+import { virtualBettingForApi } from './betting-window.js';
 import { createDatabase } from './database.js';
 import { ResultPipeline } from './result-pipeline.js';
 
@@ -241,6 +242,7 @@ function dashboardState() {
 function virtualBettorForApi() {
   const state = db.getVirtualBettorState('buleto', config.instrument);
   const candidate = state.longestCandidate;
+  const now = new Date();
   return {
     mode: state.mode,
     executionEnabled: state.executionEnabled,
@@ -253,6 +255,8 @@ function virtualBettorForApi() {
           target: state.triggerThreshold,
         }
       : null,
+    serverTime: now.toISOString(),
+    betting: virtualBettingForApi(collector.getStatus(), state.status, now),
   };
 }
 
