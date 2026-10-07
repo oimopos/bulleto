@@ -7,8 +7,8 @@
     <meta name="color-scheme" content="dark">
     <meta name="description" content="Онлайн-монитор результатов рулетки и циклов исключения чисел от 0 до 36">
     <title>Круг 37 — монитор результатов</title>
-    <link rel="stylesheet" href="/styles.css?v=21">
-    <script type="module" src="/app.js?v=21"></script>
+    <link rel="stylesheet" href="/styles.css?v=23">
+    <script type="module" src="/app.js?v=23"></script>
   </head>
   <body>
     <a class="skip-link" href="#main-content">Перейти к содержимому</a>
@@ -366,18 +366,61 @@
           <section class="follower-dynamic-next" id="follower-dynamic-next" data-state="loading" aria-labelledby="follower-dynamic-next-title" aria-describedby="follower-dynamic-next-note" aria-busy="true">
             <div class="follower-dynamic-next__header">
               <div>
-                <p class="eyebrow">Динамическая пятёрка · только следующий раунд</p>
-                <h4 id="follower-dynamic-next-title">Исходы проверки следующего раунда</h4>
+                <p class="eyebrow">Только следующий раунд</p>
+                <h4 id="follower-dynamic-next-title">Тёплый прогноз · доля ≥5%</h4>
               </div>
               <span class="follower-dynamic-next__status" id="follower-dynamic-next-status" role="status" aria-live="polite" aria-atomic="true">Считаем…</span>
             </div>
-            <dl class="follower-dynamic-next__metrics" aria-label="Исходы динамической пятёрки на следующем раунде">
+            <section class="follower-warm-current" aria-labelledby="follower-warm-current-title">
+              <div class="follower-warm-current__heading">
+                <span id="follower-warm-current-title">Текущий сигнал после числа <strong id="follower-dynamic-next-source">—</strong></span>
+                <span id="follower-dynamic-next-current-meta">Ожидаем расчёт по полной истории</span>
+              </div>
+              <ol class="follower-warm-picks" id="follower-dynamic-next-picks" aria-label="Текущие числа тёплого прогноза" aria-live="polite">
+                <li class="follower-warm-picks__empty">Загружаем кандидатов…</li>
+              </ol>
+            </section>
+            <dl class="follower-dynamic-next__metrics" aria-label="Walk-forward проверка тёплого прогноза на следующем раунде">
               <div class="is-hit"><dt>Попадания</dt><dd id="follower-dynamic-next-hits">—</dd></div>
               <div class="is-miss"><dt>Промахи</dt><dd id="follower-dynamic-next-misses">—</dd></div>
-              <div><dt>Доля попаданий</dt><dd id="follower-dynamic-next-rate">—</dd></div>
-              <div><dt>Размер выборки · N</dt><dd id="follower-dynamic-next-sample">—</dd></div>
+              <div><dt>Точность набора</dt><dd id="follower-dynamic-next-rate">—</dd></div>
+              <div><dt>Проверки с сигналом</dt><dd id="follower-dynamic-next-sample">—</dd></div>
             </dl>
-            <p class="follower-dynamic-next__note" id="follower-dynamic-next-note">Для каждой подходящей исторической точки пятёрка заново рассчитывалась только по уже известным данным и проверялась лишь на следующем сохранённом результате. N — та же строгая выборка с полными 20 будущими раундами внутри непрерывного участка. Точки без полного 20‑раундового окна и края разрывов не входят. Попадание или промах — исход проверки, не деньги и не текущая серия с зафиксированной пятёркой.</p>
+            <p class="follower-warm-audit" id="follower-dynamic-next-audit">Покрытие и точность одной выбранной цифры появятся после загрузки.</p>
+            <section class="follower-warm-account" id="follower-warm-account" data-state="loading" aria-labelledby="follower-warm-account-title" aria-describedby="follower-warm-account-audit follower-warm-account-note" aria-busy="true">
+              <div class="follower-warm-account__header">
+                <div>
+                  <p class="eyebrow">Архивная симуляция · только кандидат №1</p>
+                  <h5 id="follower-warm-account-title">Исторический счёт</h5>
+                </div>
+                <span class="follower-warm-account__status" id="follower-warm-account-status" role="status" aria-live="polite" aria-atomic="true">Считаем…</span>
+              </div>
+              <dl class="follower-warm-account__metrics" aria-label="Исторический счёт стратегии по первому тёплому кандидату">
+                <div>
+                  <dt>Итоговый счёт</dt>
+                  <dd id="follower-warm-account-balance">—</dd>
+                  <small>старт 1 000</small>
+                </div>
+                <div id="follower-warm-account-result-card">
+                  <dt>Результат</dt>
+                  <dd id="follower-warm-account-result">—</dd>
+                  <small>условные единицы</small>
+                </div>
+                <div>
+                  <dt>Ставки</dt>
+                  <dd id="follower-warm-account-bets">—</dd>
+                  <small id="follower-warm-account-record">— попаданий · — промахов</small>
+                </div>
+                <div>
+                  <dt>Макс. просадка</dt>
+                  <dd id="follower-warm-account-drawdown">—</dd>
+                  <small id="follower-warm-account-risk">макс. ставка —</small>
+                </div>
+              </dl>
+              <p class="follower-warm-account__audit" id="follower-warm-account-audit">Загружаем движение счёта и состояние лестницы.</p>
+              <p class="follower-warm-account__note" id="follower-warm-account-note">Счёт начинается с 1 000 условных единиц и выбирает только кандидата №1 с долей ≥5%. Стартовая ставка 10, шаг 10, максимум 2 500, валовая выплата ×36. Раунд без сигнала сохраняет лестницу; разрыв истории сбрасывает лестницу, но не счёт. Это ретроспективный расчёт без реальных ставок.</p>
+            </section>
+            <p class="follower-dynamic-next__note" id="follower-dynamic-next-note">На каждой прошлой точке Top‑5 заново строился только по более ранним переходам; в сигнал входили лишь числа с точной долей не ниже 5%. Проверялся один следующий сохранённый результат в том же непрерывном участке. Точка без подходящих чисел считается пропуском, а не промахом. Это ретроспективная статистика без реальных ставок.</p>
           </section>
           <dl class="follower-horizon__grid" id="follower-horizon-list">
             <div class="follower-horizon__empty">

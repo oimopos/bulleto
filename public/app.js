@@ -11,6 +11,7 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
   const AGE_UPDATE_INTERVAL_MS = 30_000;
   const FOLLOWER_COLLAPSED_LIMIT = 5;
   const FOLLOWER_HIT_HORIZONS = [1, 2, 3, 5, 10, 20];
+  const FOLLOWER_WARM_THRESHOLD = 0.05;
   const CYCLE_COMPARISON_ANCHOR_DRAWS = 20;
   const CYCLE_COMPARISON_ALGORITHM_VERSION = "cycle-analogue-prefix-v1";
 
@@ -69,6 +70,20 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
     followerDynamicNextMisses: document.getElementById("follower-dynamic-next-misses"),
     followerDynamicNextRate: document.getElementById("follower-dynamic-next-rate"),
     followerDynamicNextSample: document.getElementById("follower-dynamic-next-sample"),
+    followerDynamicNextSource: document.getElementById("follower-dynamic-next-source"),
+    followerDynamicNextPicks: document.getElementById("follower-dynamic-next-picks"),
+    followerDynamicNextCurrentMeta: document.getElementById("follower-dynamic-next-current-meta"),
+    followerDynamicNextAudit: document.getElementById("follower-dynamic-next-audit"),
+    followerWarmAccount: document.getElementById("follower-warm-account"),
+    followerWarmAccountStatus: document.getElementById("follower-warm-account-status"),
+    followerWarmAccountBalance: document.getElementById("follower-warm-account-balance"),
+    followerWarmAccountResultCard: document.getElementById("follower-warm-account-result-card"),
+    followerWarmAccountResult: document.getElementById("follower-warm-account-result"),
+    followerWarmAccountBets: document.getElementById("follower-warm-account-bets"),
+    followerWarmAccountRecord: document.getElementById("follower-warm-account-record"),
+    followerWarmAccountDrawdown: document.getElementById("follower-warm-account-drawdown"),
+    followerWarmAccountRisk: document.getElementById("follower-warm-account-risk"),
+    followerWarmAccountAudit: document.getElementById("follower-warm-account-audit"),
     followerDescription: document.getElementById("follower-description"),
     followerNote: document.getElementById("follower-note"),
     followerToggle: document.getElementById("follower-toggle"),
@@ -1800,6 +1815,10 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
     minimumFractionDigits: 0,
     maximumFractionDigits: 1
   });
+  const followerAverageFormatter = new Intl.NumberFormat("ru-RU", {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 2
+  });
 
   function normalizedFollowerHitCurve() {
     const curve = store.followerHitCurve;
@@ -1916,6 +1935,549 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
     }
 
     return { eligibleCount: summary.eligibleCount, points: normalized };
+  }
+
+  function normalizedFollowerWarmHistoricalAccount(value, currentSignal) {
+    const strategy = value?.strategy;
+    const model = value?.model;
+    if (
+      !value || typeof value !== "object"
+      || value.schemaVersion !== 1
+      || value.algorithmVersion !== "follower-warm-top1-ladder-v1"
+      || value.mode !== "saved-sequence-retrospective"
+      || value.executionEnabled !== false
+      || strategy?.rank !== 1
+      || strategy?.threshold !== FOLLOWER_WARM_THRESHOLD
+      || strategy?.noSignalPolicy !== "pause"
+      || strategy?.gapPolicy !== "reset-ladder-keep-balance"
+      || strategy?.exhaustionPolicy !== "permanent-stop"
+      || model?.modelVersion !== "1.0.0"
+      || model?.initialStake !== 10
+      || model?.stakeStep !== 10
+      || model?.maxStake !== 2_500
+      || model?.grossPayoutMultiplier !== 36
+      || model?.payoutIncludesStake !== true
+      || !["waiting", "running", "exhausted"].includes(value.status)
+      || typeof value.dataComplete !== "boolean"
+    ) {
+      return null;
+    }
+
+    const safeInteger = (raw) => Number.isSafeInteger(raw) ? raw : null;
+    const positiveStake = (raw) => {
+      const amount = safeInteger(raw);
+      return amount !== null
+        && amount >= model.initialStake
+        && amount <= model.maxStake
+        && amount % model.stakeStep === 0
+        ? amount
+        : null;
+    };
+    const initialBalance = asOptionalNonNegativeInteger(value.initialBalance);
+    const finalBalance = asOptionalNonNegativeInteger(value.finalBalance);
+    const netResult = safeInteger(value.netResult);
+    const nextStake = positiveStake(value.nextStake);
+    const shortfall = asOptionalNonNegativeInteger(value.shortfall);
+    const signalCount = asOptionalNonNegativeInteger(value.signalCount);
+    const noSignalCount = asOptionalNonNegativeInteger(value.noSignalCount);
+    const betCount = asOptionalNonNegativeInteger(value.betCount);
+    const hitCount = asOptionalNonNegativeInteger(value.hitCount);
+    const missCount = asOptionalNonNegativeInteger(value.missCount);
+    const totalStaked = asOptionalNonNegativeInteger(value.totalStaked);
+    const totalGrossPayout = asOptionalNonNegativeInteger(value.totalGrossPayout);
+    const skippedAfterExhaustionCount = asOptionalNonNegativeInteger(
+      value.skippedAfterExhaustionCount
+    );
+    const peakBalance = asOptionalNonNegativeInteger(value.peakBalance);
+    const minimumBalance = asOptionalNonNegativeInteger(value.minimumBalance);
+    const maximumDrawdown = asOptionalNonNegativeInteger(value.maximumDrawdown);
+    const maximumStake = asOptionalNonNegativeInteger(value.maximumStake);
+    const continuityGapCount = asOptionalNonNegativeInteger(value.continuityGapCount);
+    const ladderMissCount = asOptionalNonNegativeInteger(value.ladder?.missCount);
+    const ladderTotalStaked = asOptionalNonNegativeInteger(value.ladder?.totalStaked);
+    const expectedCanAffordNext = value.status !== "exhausted"
+      && finalBalance !== null
+      && nextStake !== null
+      && finalBalance >= nextStake;
+    if (
+      initialBalance !== 1_000
+      || finalBalance === null
+      || netResult === null
+      || finalBalance !== initialBalance + netResult
+      || nextStake === null
+      || shortfall === null
+      || typeof value.canAffordNext !== "boolean"
+      || value.canAffordNext !== expectedCanAffordNext
+      || shortfall !== Math.max(0, nextStake - finalBalance)
+      || signalCount === null
+      || noSignalCount === null
+      || betCount === null
+      || hitCount === null
+      || missCount === null
+      || hitCount + missCount !== betCount
+      || totalStaked === null
+      || totalGrossPayout === null
+      || totalGrossPayout - totalStaked !== netResult
+      || skippedAfterExhaustionCount === null
+      || betCount + skippedAfterExhaustionCount !== signalCount
+      || peakBalance === null
+      || peakBalance < initialBalance
+      || peakBalance < finalBalance
+      || minimumBalance === null
+      || minimumBalance > initialBalance
+      || minimumBalance > finalBalance
+      || maximumDrawdown === null
+      || maximumDrawdown > peakBalance
+      || maximumStake === null
+      || maximumStake > model.maxStake
+      || (maximumStake > 0 && (
+        maximumStake < model.initialStake
+        || maximumStake % model.stakeStep !== 0
+      ))
+      || continuityGapCount === null
+      || value.dataComplete !== (continuityGapCount === 0)
+      || ladderMissCount === null
+      || ladderTotalStaked === null
+      || (ladderMissCount === 0) !== (ladderTotalStaked === 0)
+    ) {
+      return null;
+    }
+
+    const expectedRecoverySteps = Math.max(
+      1,
+      Math.ceil(ladderTotalStaked / ((model.grossPayoutMultiplier - 1) * model.stakeStep))
+    );
+    const expectedNextStake = Math.min(
+      model.maxStake,
+      Math.max(model.initialStake, expectedRecoverySteps * model.stakeStep)
+    );
+    if (nextStake !== expectedNextStake) return null;
+
+    let hitRate = null;
+    if (betCount === 0) {
+      if (
+        value.hitRate !== null
+        || value.status !== "waiting"
+        || totalStaked !== 0
+        || totalGrossPayout !== 0
+        || netResult !== 0
+        || finalBalance !== initialBalance
+        || maximumStake !== 0
+        || maximumDrawdown !== 0
+        || peakBalance !== initialBalance
+        || minimumBalance !== initialBalance
+        || value.firstBetAt !== null
+        || value.lastBetAt !== null
+        || value.latestOutcome !== null
+      ) {
+        return null;
+      }
+    } else {
+      hitRate = asOptionalFiniteNumber(value.hitRate);
+      const firstBetAt = parseDate(value.firstBetAt);
+      const lastBetAt = parseDate(value.lastBetAt);
+      if (
+        hitRate === null
+        || Math.abs(hitRate - hitCount / betCount) > 1e-12
+        || !firstBetAt
+        || !lastBetAt
+        || firstBetAt.getTime() > lastBetAt.getTime()
+        || value.status === "waiting"
+        || maximumStake < model.initialStake
+      ) {
+        return null;
+      }
+    }
+
+    const exhaustedAt = value.exhaustedAt === null ? null : parseDate(value.exhaustedAt);
+    if (
+      (value.status === "exhausted" && !exhaustedAt)
+      || (value.status !== "exhausted" && value.exhaustedAt !== null)
+      || (value.status === "exhausted" && (value.canAffordNext || shortfall <= 0))
+    ) {
+      return null;
+    }
+
+    let latestOutcome = null;
+    if (value.latestOutcome !== null) {
+      const outcome = value.latestOutcome;
+      const anchorResultId = asOptionalNonNegativeInteger(outcome?.anchorResultId);
+      const resultId = asOptionalNonNegativeInteger(outcome?.resultId);
+      const targetNumber = asRouletteNumber(outcome?.targetNumber);
+      const resultNumber = asRouletteNumber(outcome?.resultNumber);
+      const historicalShare = asOptionalFiniteNumber(outcome?.historicalShare);
+      const sampleSize = asOptionalNonNegativeInteger(outcome?.sampleSize);
+      const stake = positiveStake(outcome?.stake);
+      const grossPayout = asOptionalNonNegativeInteger(outcome?.grossPayout);
+      const balanceAfter = asOptionalNonNegativeInteger(outcome?.balanceAfter);
+      const outcomeNextStake = positiveStake(outcome?.nextStake);
+      const occurredAt = parseDate(outcome?.occurredAt);
+      if (
+        anchorResultId === null || anchorResultId < 1
+        || resultId === null || resultId < 1
+        || targetNumber === null
+        || resultNumber === null
+        || historicalShare === null
+        || historicalShare < FOLLOWER_WARM_THRESHOLD
+        || historicalShare > 1
+        || sampleSize === null || sampleSize < 1
+        || stake === null
+        || !["hit", "miss"].includes(outcome?.outcome)
+        || (outcome.outcome === "hit") !== (targetNumber === resultNumber)
+        || grossPayout === null
+        || grossPayout !== (outcome.outcome === "hit" ? stake * model.grossPayoutMultiplier : 0)
+        || balanceAfter !== finalBalance
+        || outcomeNextStake === null
+        || !occurredAt
+        || outcome.occurredAt !== value.lastBetAt
+      ) {
+        return null;
+      }
+      latestOutcome = {
+        anchorResultId,
+        resultId,
+        targetNumber,
+        resultNumber,
+        historicalShare,
+        sampleSize,
+        stake,
+        outcome: outcome.outcome,
+        grossPayout,
+        balanceAfter,
+        nextStake: outcomeNextStake,
+        occurredAt: outcome.occurredAt
+      };
+    } else if (betCount > 0) {
+      return null;
+    }
+
+    const action = value.currentAction;
+    const actionAnchorResultId = action?.anchorResultId === null
+      ? null
+      : asOptionalNonNegativeInteger(action?.anchorResultId);
+    const actionTargetNumber = action?.targetNumber === null
+      ? null
+      : asRouletteNumber(action?.targetNumber);
+    const actionStake = action?.stake === null ? null : positiveStake(action?.stake);
+    const validReasons = [
+      "ready",
+      "bankroll_exhausted",
+      "empty",
+      "gap",
+      "waiting_training",
+      "no_signal"
+    ];
+    if (
+      !action || typeof action !== "object"
+      || !["would_bet", "wait"].includes(action.action)
+      || !validReasons.includes(action.reason)
+      || (action.anchorResultId !== null && (actionAnchorResultId === null || actionAnchorResultId < 1))
+      || (action.targetNumber !== null && actionTargetNumber === null)
+      || (action.stake !== null && actionStake === null)
+    ) {
+      return null;
+    }
+
+    const currentReady = currentSignal?.status === "ready";
+    const currentPick = currentReady ? currentSignal.picks[0] : null;
+    if (value.status === "exhausted") {
+      if (
+        action.action !== "wait"
+        || action.reason !== "bankroll_exhausted"
+        || actionAnchorResultId !== currentSignal?.anchorResultId
+        || actionTargetNumber !== (currentPick?.number ?? null)
+        || actionStake !== (currentPick ? nextStake : null)
+      ) {
+        return null;
+      }
+    } else if (currentReady) {
+      if (
+        action.action !== "would_bet"
+        || action.reason !== "ready"
+        || actionAnchorResultId !== currentSignal.anchorResultId
+        || actionTargetNumber !== currentPick.number
+        || actionStake !== nextStake
+      ) {
+        return null;
+      }
+    } else if (
+      action.action !== "wait"
+      || action.reason !== currentSignal?.status
+      || actionAnchorResultId !== currentSignal?.anchorResultId
+      || actionTargetNumber !== null
+      || actionStake !== null
+    ) {
+      return null;
+    }
+
+    return {
+      status: value.status,
+      initialBalance,
+      finalBalance,
+      netResult,
+      nextStake,
+      canAffordNext: value.canAffordNext,
+      shortfall,
+      signalCount,
+      noSignalCount,
+      betCount,
+      hitCount,
+      missCount,
+      hitRate,
+      totalStaked,
+      totalGrossPayout,
+      skippedAfterExhaustionCount,
+      peakBalance,
+      minimumBalance,
+      maximumDrawdown,
+      maximumStake,
+      continuityGapCount,
+      dataComplete: value.dataComplete,
+      firstBetAt: value.firstBetAt,
+      lastBetAt: value.lastBetAt,
+      exhaustedAt: value.exhaustedAt,
+      ladder: {
+        missCount: ladderMissCount,
+        totalStaked: ladderTotalStaked
+      },
+      latestOutcome,
+      currentAction: {
+        action: action.action,
+        reason: action.reason,
+        targetNumber: actionTargetNumber,
+        stake: actionStake,
+        anchorResultId: actionAnchorResultId
+      }
+    };
+  }
+
+  function normalizedFollowerWarmNextRound() {
+    const value = store.followerHitCurve?.warmNextRound;
+    if (
+      !value || typeof value !== "object"
+      || value.schemaVersion !== 1
+      || value.algorithmVersion !== "follower-warm-top5-next-v1"
+      || value.threshold !== FOLLOWER_WARM_THRESHOLD
+      || value.comparison !== "individual-share-gte"
+      || value.candidatePool !== "dynamic-top5"
+      || value.topCount !== 5
+      || value.minimumObservedFollowerCount !== 5
+      || value.evaluationMode !== "saved-sequence-retrospective"
+      || value.cohort !== "anchors-with-known-next-round"
+    ) {
+      return null;
+    }
+
+    const eligibleCount = asOptionalNonNegativeInteger(value.eligibleCount);
+    const signalCount = asOptionalNonNegativeInteger(value.signalCount);
+    const noSignalCount = asOptionalNonNegativeInteger(value.noSignalCount);
+    const hitCount = asOptionalNonNegativeInteger(value.hitCount);
+    const missCount = asOptionalNonNegativeInteger(value.missCount);
+    const selectionCount = asOptionalNonNegativeInteger(value.selectionCount);
+    const excludedMissingNextRoundCount = asOptionalNonNegativeInteger(
+      value.excludedMissingNextRoundCount
+    );
+    if (
+      eligibleCount === null
+      || signalCount === null
+      || noSignalCount === null
+      || hitCount === null
+      || missCount === null
+      || selectionCount === null
+      || excludedMissingNextRoundCount === null
+      || signalCount + noSignalCount !== eligibleCount
+      || hitCount + missCount !== signalCount
+      || selectionCount < signalCount
+      || selectionCount > signalCount * 5
+      || hitCount > selectionCount
+    ) {
+      return null;
+    }
+
+    const ratio = (raw, numerator, denominator) => {
+      if (denominator === 0) return raw === null ? null : false;
+      const parsed = asOptionalFiniteNumber(raw);
+      const expected = numerator / denominator;
+      return parsed !== null
+        && parsed >= 0
+        && parsed <= 1
+        && Math.abs(parsed - expected) <= 1e-12
+        ? parsed
+        : false;
+    };
+    const hitRate = ratio(value.hitRate, hitCount, signalCount);
+    const ticketHitRate = ratio(value.ticketHitRate, hitCount, selectionCount);
+    const coverage = ratio(value.coverage, signalCount, eligibleCount);
+    const averageSelectionCount = signalCount === 0
+      ? value.averageSelectionCount === null ? null : false
+      : asOptionalFiniteNumber(value.averageSelectionCount);
+    const expectedAverage = signalCount > 0 ? selectionCount / signalCount : null;
+    if (
+      hitRate === false
+      || ticketHitRate === false
+      || coverage === false
+      || averageSelectionCount === false
+      || (
+        averageSelectionCount !== null
+        && (
+          averageSelectionCount < 1
+          || averageSelectionCount > 5
+          || Math.abs(averageSelectionCount - expectedAverage) > 1e-12
+        )
+      )
+    ) {
+      return null;
+    }
+    const randomBaselineRate = averageSelectionCount === null
+      ? value.randomBaselineRate === null ? null : false
+      : asOptionalFiniteNumber(value.randomBaselineRate);
+    if (
+      randomBaselineRate === false
+      || (
+        randomBaselineRate !== null
+        && Math.abs(randomBaselineRate - averageSelectionCount / 37) > 1e-12
+      )
+    ) {
+      return null;
+    }
+
+    const current = value.currentSignal;
+    const statuses = new Set(["ready", "no_signal", "waiting_training", "gap", "empty"]);
+    if (!current || typeof current !== "object" || !statuses.has(current.status)) {
+      return null;
+    }
+    const sourceNumber = asRouletteNumber(current.sourceNumber);
+    const anchorResultId = asOptionalNonNegativeInteger(current.anchorResultId);
+    const sampleSize = asOptionalNonNegativeInteger(current.sampleSize);
+    const observedFollowerCount = asOptionalNonNegativeInteger(
+      current.observedFollowerCount
+    );
+    if (
+      sampleSize === null
+      || observedFollowerCount === null
+      || observedFollowerCount > 37
+      || observedFollowerCount > sampleSize
+      || !Array.isArray(current.candidates)
+      || !Array.isArray(current.picks)
+    ) {
+      return null;
+    }
+
+    if (current.status === "empty") {
+      if (
+        current.sourceNumber !== null
+        || current.anchorResultId !== null
+        || current.anchoredAt !== null
+        || sampleSize !== 0
+        || observedFollowerCount !== 0
+        || current.candidates.length !== 0
+        || current.picks.length !== 0
+      ) {
+        return null;
+      }
+    } else if (
+      sourceNumber === null
+      || anchorResultId === null
+      || anchorResultId < 1
+      || !parseDate(current.anchoredAt)
+    ) {
+      return null;
+    }
+
+    const normalizedCandidates = [];
+    if (current.status === "ready" || current.status === "no_signal") {
+      if (observedFollowerCount < 5 || current.candidates.length !== 5) return null;
+      const seen = new Set();
+      for (let index = 0; index < current.candidates.length; index += 1) {
+        const candidate = current.candidates[index];
+        const rank = asOptionalNonNegativeInteger(candidate?.rank);
+        const number = asRouletteNumber(candidate?.number);
+        const occurrenceCount = asOptionalNonNegativeInteger(candidate?.occurrenceCount);
+        const share = asOptionalFiniteNumber(candidate?.share);
+        if (
+          rank !== index + 1
+          || number === null
+          || seen.has(number)
+          || occurrenceCount === null
+          || occurrenceCount < 1
+          || share === null
+          || Math.abs(share - occurrenceCount / sampleSize) > 1e-12
+          || !parseDate(candidate?.lastOccurredAt)
+        ) {
+          return null;
+        }
+        seen.add(number);
+        normalizedCandidates.push({
+          rank,
+          number,
+          occurrenceCount,
+          share,
+          lastOccurredAt: candidate.lastOccurredAt
+        });
+      }
+      const expectedPicks = normalizedCandidates.filter((candidate) =>
+        candidate.occurrenceCount * 100 >= sampleSize * 5
+      );
+      if (
+        current.picks.length !== expectedPicks.length
+        || current.picks.some((pick, index) =>
+          pick?.number !== expectedPicks[index].number
+          || pick?.rank !== expectedPicks[index].rank
+          || pick?.occurrenceCount !== expectedPicks[index].occurrenceCount
+          || pick?.share !== expectedPicks[index].share
+          || pick?.lastOccurredAt !== expectedPicks[index].lastOccurredAt
+        )
+        || (current.status === "ready" && expectedPicks.length === 0)
+        || (current.status === "no_signal" && expectedPicks.length !== 0)
+      ) {
+        return null;
+      }
+    } else if (current.candidates.length !== 0 || current.picks.length !== 0) {
+      return null;
+    }
+    if (current.status === "waiting_training" && observedFollowerCount >= 5) {
+      return null;
+    }
+
+    const picks = current.status === "ready"
+      ? normalizedCandidates.filter((candidate) =>
+          candidate.occurrenceCount * 100 >= sampleSize * 5
+        )
+      : [];
+    const currentSignal = {
+      status: current.status,
+      sourceNumber,
+      anchorResultId,
+      anchoredAt: current.anchoredAt,
+      sampleSize,
+      observedFollowerCount,
+      picks
+    };
+    const historicalAccount = normalizedFollowerWarmHistoricalAccount(
+      value.historicalAccount,
+      currentSignal
+    );
+    const consistentHistoricalAccount = historicalAccount
+      && historicalAccount.signalCount === signalCount
+      && historicalAccount.noSignalCount === noSignalCount
+      ? historicalAccount
+      : null;
+    return {
+      eligibleCount,
+      signalCount,
+      noSignalCount,
+      hitCount,
+      missCount,
+      selectionCount,
+      hitRate,
+      ticketHitRate,
+      coverage,
+      averageSelectionCount,
+      randomBaselineRate,
+      excludedMissingNextRoundCount,
+      currentSignal,
+      historicalAccount: consistentHistoricalAccount
+    };
   }
 
   function normalizedFollowerFixedNumbers(value) {
@@ -2309,6 +2871,203 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
     return group;
   }
 
+  function renderFollowerWarmCurrent(signal) {
+    const fragment = document.createDocumentFragment();
+    const appendEmpty = (message) => {
+      fragment.appendChild(createElement("li", "follower-warm-picks__empty", message));
+    };
+    setTextIfChanged(
+      elements.followerDynamicNextSource,
+      signal?.sourceNumber === null || signal?.sourceNumber === undefined
+        ? "—"
+        : signal.sourceNumber
+    );
+
+    if (!signal) {
+      appendEmpty("Ожидаем подтверждённый расчёт.");
+      setTextIfChanged(
+        elements.followerDynamicNextCurrentMeta,
+        "Текущий сигнал пока недоступен"
+      );
+    } else if (signal.status === "ready") {
+      signal.picks.forEach((pick, index) => {
+        const item = createElement("li", "follower-warm-pick");
+        if (index === 0) item.classList.add("is-account-pick");
+        const transition = createElement("span", "follower-warm-pick__transition");
+        const source = createElement(
+          "span",
+          `history-number follower-warm-pick__number ${rouletteColorClass(signal.sourceNumber)}`,
+          signal.sourceNumber
+        );
+        const arrow = createElement("span", "follower-warm-pick__arrow", "→");
+        const target = createElement(
+          "span",
+          `history-number follower-warm-pick__number ${rouletteColorClass(pick.number)}`,
+          pick.number
+        );
+        transition.setAttribute("aria-hidden", "true");
+        transition.append(source, arrow, target);
+        const share = createElement(
+          "strong",
+          "follower-warm-pick__share",
+          historicalPercentFormatter.format(pick.share)
+        );
+        const count = createElement(
+          "span",
+          "follower-warm-pick__count",
+          `${pick.occurrenceCount} из ${signal.sampleSize}`
+        );
+        if (index === 0) {
+          count.append(" · ", createElement("span", "follower-warm-pick__account", "Для счёта"));
+        }
+        item.setAttribute(
+          "aria-label",
+          `После числа ${signal.sourceNumber} тёплый кандидат ${pick.number}: ${pick.occurrenceCount} из ${signal.sampleSize}, историческая доля ${historicalPercentFormatter.format(pick.share)}${index === 0 ? "; выбран для исторического счёта" : ""}`
+        );
+        item.append(transition, share, count);
+        fragment.appendChild(item);
+      });
+      setTextIfChanged(
+        elements.followerDynamicNextCurrentMeta,
+        `${signal.sampleSize} ${pluralForm(signal.sampleSize, "переход", "перехода", "переходов")} · ${signal.observedFollowerCount} разных продолжений · зафиксировано ${formatDateTime(signal.anchoredAt, { alwaysShowDate: true })}`
+      );
+    } else if (signal.status === "no_signal") {
+      appendEmpty("Сигнала нет: ни одно число Top‑5 не достигло 5% — следующий раунд пропускается.");
+      setTextIfChanged(
+        elements.followerDynamicNextCurrentMeta,
+        `${signal.sampleSize} ${pluralForm(signal.sampleSize, "переход", "перехода", "переходов")} · все пять долей ниже порога`
+      );
+    } else if (signal.status === "waiting_training") {
+      appendEmpty("Ждём минимум пять разных исторических продолжений этого числа.");
+      setTextIfChanged(
+        elements.followerDynamicNextCurrentMeta,
+        `${signal.sampleSize} ${pluralForm(signal.sampleSize, "переход", "перехода", "переходов")} · ${signal.observedFollowerCount} из 5 нужных продолжений`
+      );
+    } else if (signal.status === "gap") {
+      appendEmpty("Сигнал приостановлен после обнаруженного разрыва последовательности.");
+      setTextIfChanged(
+        elements.followerDynamicNextCurrentMeta,
+        "Новый сигнал появится после подтверждённого результата"
+      );
+    } else {
+      appendEmpty("В сохранённой истории пока нет результата для расчёта.");
+      setTextIfChanged(elements.followerDynamicNextCurrentMeta, "Нет истории");
+    }
+    elements.followerDynamicNextPicks.replaceChildren(fragment);
+  }
+
+  function renderFollowerWarmHistoricalAccount(account, {
+    loading = false,
+    failed = false,
+    stale = false
+  } = {}) {
+    const resetValues = () => {
+      setTextIfChanged(elements.followerWarmAccountBalance, "—");
+      setTextIfChanged(elements.followerWarmAccountResult, "—");
+      setTextIfChanged(elements.followerWarmAccountBets, "—");
+      setTextIfChanged(elements.followerWarmAccountRecord, "— попаданий · — промахов");
+      setTextIfChanged(elements.followerWarmAccountDrawdown, "—");
+      setTextIfChanged(elements.followerWarmAccountRisk, "макс. ставка —");
+      elements.followerWarmAccountResultCard.classList.remove("is-positive", "is-loss");
+    };
+
+    if (!account) {
+      const state = loading ? "loading" : "error";
+      elements.followerWarmAccount.dataset.state = state;
+      elements.followerWarmAccount.setAttribute("aria-busy", String(loading));
+      setTextIfChanged(
+        elements.followerWarmAccountStatus,
+        loading ? "Считаем…" : failed ? "Ошибка загрузки" : "Данные отклонены"
+      );
+      setTextIfChanged(
+        elements.followerWarmAccountAudit,
+        loading
+          ? "Загружаем движение счёта и состояние лестницы."
+          : failed
+            ? "Исторический счёт временно недоступен; повторим загрузку автоматически."
+            : "Сервер не вернул подтверждённый контракт исторического счёта."
+      );
+      resetValues();
+      return;
+    }
+
+    const state = stale ? "stale" : account.status;
+    const statusLabels = {
+      waiting: "Пока без ставок",
+      running: "Рассчитан",
+      exhausted: "Стоп · не хватает на шаг"
+    };
+    elements.followerWarmAccount.dataset.state = state;
+    elements.followerWarmAccount.setAttribute("aria-busy", "false");
+    setTextIfChanged(
+      elements.followerWarmAccountStatus,
+      `${statusLabels[account.status]}${stale ? " · не обновлено" : ""}`
+    );
+    setTextIfChanged(
+      elements.followerWarmAccountBalance,
+      formatRiskAmount(account.finalBalance)
+    );
+    setTextIfChanged(
+      elements.followerWarmAccountResult,
+      formatSignedRiskAmount(account.netResult)
+    );
+    elements.followerWarmAccountResultCard.classList.remove("is-positive", "is-loss");
+    if (account.netResult > 0) {
+      elements.followerWarmAccountResultCard.classList.add("is-positive");
+    } else if (account.netResult < 0) {
+      elements.followerWarmAccountResultCard.classList.add("is-loss");
+    }
+    setTextIfChanged(elements.followerWarmAccountBets, formatRiskAmount(account.betCount));
+    setTextIfChanged(
+      elements.followerWarmAccountRecord,
+      `${formatRiskAmount(account.hitCount)} ${pluralForm(account.hitCount, "попадание", "попадания", "попаданий")} · ${formatRiskAmount(account.missCount)} ${pluralForm(account.missCount, "промах", "промаха", "промахов")}`
+    );
+    setTextIfChanged(
+      elements.followerWarmAccountDrawdown,
+      account.maximumDrawdown > 0 ? `−${formatRiskAmount(account.maximumDrawdown)}` : "0"
+    );
+    setTextIfChanged(
+      elements.followerWarmAccountRisk,
+      `макс. ставка ${formatRiskAmount(account.maximumStake)}`
+    );
+
+    const action = account.currentAction;
+    let actionText;
+    if (action.action === "would_bet") {
+      actionText = `На текущем срезе: условный шаг ${formatRiskAmount(action.stake)} на число ${action.targetNumber}.`;
+    } else if (action.reason === "bankroll_exhausted") {
+      const stoppedAt = account.exhaustedAt
+        ? ` ${formatDateTime(account.exhaustedAt, { alwaysShowDate: true })}`
+        : "";
+      const skippedCurrent = action.targetNumber === null
+        ? ""
+        : ` Текущий кандидат №1 — ${action.targetNumber}, но новые ставки уже не считаются.`;
+      actionText = `Лестница остановлена${stoppedAt}: следующая ступень ${formatRiskAmount(account.nextStake)}, на счёте ${formatRiskAmount(account.finalBalance)}, не хватает ${formatRiskAmount(account.shortfall)}.${skippedCurrent}`;
+    } else if (action.reason === "no_signal") {
+      actionText = `Текущий раунд пропущен без списания; следующая ступень ${formatRiskAmount(account.nextStake)} сохранена.`;
+    } else if (action.reason === "gap") {
+      actionText = `Сейчас пауза после разрыва; лестница начинается заново со ступени ${formatRiskAmount(account.nextStake)}, счёт сохранён.`;
+    } else if (action.reason === "waiting_training") {
+      actionText = `Текущий раунд ждёт достаточную историю; следующая ступень ${formatRiskAmount(account.nextStake)} сохранена.`;
+    } else {
+      actionText = `Текущего сигнала пока нет; следующая ступень ${formatRiskAmount(account.nextStake)} сохранена.`;
+    }
+
+    const gapText = account.continuityGapCount > 0
+      ? ` Разрывов: ${formatRiskAmount(account.continuityGapCount)} — в каждом счёт сохранялся, а лестница сбрасывалась.`
+      : " Разрывов в рассчитанном участке нет.";
+    const stoppedText = account.skippedAfterExhaustionCount > 0
+      ? ` После остановки пропущено ${formatRiskAmount(account.skippedAfterExhaustionCount)} ${pluralForm(account.skippedAfterExhaustionCount, "сигнал", "сигнала", "сигналов")}.`
+      : "";
+    const ladderText = account.ladder.missCount > 0
+      ? ` В текущей лестнице ${formatRiskAmount(account.ladder.missCount)} ${pluralForm(account.ladder.missCount, "промах", "промаха", "промахов")} и ${formatRiskAmount(account.ladder.totalStaked)} поставлено.`
+      : " Текущая лестница без накопленного убытка.";
+    setTextIfChanged(
+      elements.followerWarmAccountAudit,
+      `Top‑1 сигналов ${formatRiskAmount(account.signalCount)} · без сигнала ${formatRiskAmount(account.noSignalCount)} · всего поставлено ${formatRiskAmount(account.totalStaked)} · валовые выплаты ${formatRiskAmount(account.totalGrossPayout)}. ${actionText}${ladderText}${gapText}${stoppedText}`
+    );
+  }
+
   function renderFollowerDynamicNext() {
     const setValues = ({ hits = "—", misses = "—", rate = "—", sample = "—" } = {}) => {
       setTextIfChanged(elements.followerDynamicNextHits, hits);
@@ -2322,40 +3081,64 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
       elements.followerDynamicNext.dataset.state = failed ? "error" : "loading";
       elements.followerDynamicNext.setAttribute("aria-busy", String(!failed));
       setTextIfChanged(elements.followerDynamicNextStatus, failed ? "Ошибка загрузки" : "Считаем…");
+      renderFollowerWarmCurrent(null);
+      renderFollowerWarmHistoricalAccount(null, { loading: !failed, failed });
+      setTextIfChanged(
+        elements.followerDynamicNextAudit,
+        failed
+          ? "Walk-forward проверка временно недоступна."
+          : "Загружаем walk-forward проверку…"
+      );
       setValues();
       return;
     }
 
-    const curve = normalizedFollowerAllPoints();
-    const nextRound = curve?.points.find((point) => point.horizon === 1) ?? null;
-    if (!nextRound) {
+    const warm = normalizedFollowerWarmNextRound();
+    if (!warm) {
       elements.followerDynamicNext.dataset.state = "error";
       elements.followerDynamicNext.setAttribute("aria-busy", "false");
-      setTextIfChanged(elements.followerDynamicNextStatus, "Нет расчёта");
+      setTextIfChanged(elements.followerDynamicNextStatus, "Данные отклонены");
+      renderFollowerWarmCurrent(null);
+      renderFollowerWarmHistoricalAccount(null);
+      setTextIfChanged(
+        elements.followerDynamicNextAudit,
+        "Сервер не вернул подтверждённый контракт тёплого прогноза."
+      );
       setValues();
       return;
     }
 
-    const hits = nextRound.hitCount;
-    const sample = nextRound.eligibleCount;
-    const misses = sample - hits;
     const stale = store.pairsError;
-    elements.followerDynamicNext.dataset.state = stale
-      ? "stale"
-      : sample > 0 ? "ready" : "empty";
+    const signal = warm.currentSignal;
+    elements.followerDynamicNext.dataset.state = stale ? "stale" : signal.status;
     elements.followerDynamicNext.setAttribute("aria-busy", "false");
+    const statusLabels = {
+      ready: `${signal.picks.length} ${pluralForm(signal.picks.length, "кандидат", "кандидата", "кандидатов")} ≥5%`,
+      no_signal: "Сигнала нет · пропуск",
+      waiting_training: "Ждём обучение",
+      gap: "Пауза после разрыва",
+      empty: "Нет истории"
+    };
     setTextIfChanged(
       elements.followerDynamicNextStatus,
-      sample > 0
-        ? `${sample} ${pluralForm(sample, "проверка", "проверки", "проверок")}${stale ? " · не обновлено" : ""}`
-        : "Ждём полную выборку"
+      `${statusLabels[signal.status]}${stale ? " · не обновлено" : ""}`
     );
+    renderFollowerWarmCurrent(signal);
+    renderFollowerWarmHistoricalAccount(warm.historicalAccount, { stale });
     setValues({
-      hits: riskAmountFormatter.format(hits),
-      misses: riskAmountFormatter.format(misses),
-      rate: sample > 0 ? historicalPercentFormatter.format(nextRound.rate) : "—",
-      sample: riskAmountFormatter.format(sample)
+      hits: riskAmountFormatter.format(warm.hitCount),
+      misses: riskAmountFormatter.format(warm.missCount),
+      rate: warm.hitRate === null ? "—" : historicalPercentFormatter.format(warm.hitRate),
+      sample: riskAmountFormatter.format(warm.signalCount)
     });
+    setTextIfChanged(
+      elements.followerDynamicNextAudit,
+      warm.eligibleCount === 0
+        ? "Пока нет исторических точек с известным следующим результатом."
+        : warm.signalCount === 0
+          ? `Сигналов 0 из ${warm.eligibleCount}; все прошлые точки были пропущены по порогу 5%.`
+          : `Покрытие ${historicalPercentFormatter.format(warm.coverage)} (${warm.signalCount} из ${warm.eligibleCount}) · пропуски ${warm.noSignalCount} · в среднем ${followerAverageFormatter.format(warm.averageSelectionCount)} ${pluralForm(warm.averageSelectionCount, "число", "числа", "чисел")} в сигнале · точность одного выбранного числа ${historicalPercentFormatter.format(warm.ticketHitRate)} · случайная база для такого среднего набора ${historicalPercentFormatter.format(warm.randomBaselineRate)}.`
+    );
   }
 
   function renderFollowerHitCurve() {

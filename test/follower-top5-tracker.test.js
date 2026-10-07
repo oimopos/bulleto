@@ -13,6 +13,7 @@ const SOURCE = "buleto";
 const INSTRUMENT = "PRIMECOIN(XPM)/RUB";
 const BASE_TIME = Date.parse("2026-09-21T00:00:00.000Z");
 const TRAINING_NUMBERS = [9, 1, 9, 2, 9, 3, 9, 4, 9, 5, 9];
+const ROULETTE_NUMBERS_FOR_TEST = Array.from({ length: 37 }, (_, number) => number);
 
 function event(resultNumber, fingerprint, offsetSeconds = 0, extra = {}) {
   const settledAt = new Date(BASE_TIME + offsetSeconds * 1_000).toISOString();
@@ -47,6 +48,36 @@ function ingestTrackerTraining(database, prefix, {
 
 function trackerState(database) {
   return database.getFollowerTop5TrackerState(SOURCE, INSTRUMENT);
+}
+
+function followerTransitionNumbers(sourceNumber, followers, { tail = true } = {}) {
+  const numbers = followers.flatMap((follower) => [sourceNumber, follower]);
+  if (tail) numbers.push(sourceNumber);
+  return numbers;
+}
+
+function curveRows(segments) {
+  let id = 0;
+  return segments.flatMap((numbers, continuityEpoch) =>
+    numbers.map((resultNumber) => {
+      id += 1;
+      return {
+        id,
+        result_number: resultNumber,
+        settled_at: new Date(BASE_TIME + id * 1_000).toISOString(),
+        continuity_epoch: continuityEpoch,
+      };
+    }),
+  );
+}
+
+function compactWarmCandidates(candidates) {
+  return candidates.map(({ rank, number, occurrenceCount, share }) => ({
+    rank,
+    number,
+    occurrenceCount,
+    share,
+  }));
 }
 
 test("fixed top-5 tracker schema and empty state expose a stable simulation contract", () => {
@@ -179,6 +210,674 @@ test("walk-forward allPoints exposes every cumulative horizon from 1 through 20"
     curve.overall.allPoints.filter(({ horizon }) =>
       [1, 2, 3, 5, 10, 20].includes(horizon)),
   );
+});
+
+test("warm next-round signal includes an individual share exactly equal to five percent", () => {
+  const followers = [
+    ...Array.from({ length: 7 }, () => 1),
+    ...Array.from({ length: 5 }, () => 2),
+    ...Array.from({ length: 4 }, () => 3),
+    ...Array.from({ length: 3 }, () => 4),
+    5,
+  ];
+  const curve = buildFollowerTop5HitCurve(curveRows([
+    followerTransitionNumbers(9, followers),
+  ]));
+  const warm = curve.warmNextRound;
+
+  assert.deepEqual(
+    {
+      schemaVersion: warm.schemaVersion,
+      algorithmVersion: warm.algorithmVersion,
+      threshold: warm.threshold,
+      comparison: warm.comparison,
+      candidatePool: warm.candidatePool,
+      topCount: warm.topCount,
+      minimumObservedFollowerCount: warm.minimumObservedFollowerCount,
+      evaluationMode: warm.evaluationMode,
+      cohort: warm.cohort,
+    },
+    {
+      schemaVersion: 1,
+      algorithmVersion: "follower-warm-top5-next-v1",
+      threshold: 0.05,
+      comparison: "individual-share-gte",
+      candidatePool: "dynamic-top5",
+      topCount: 5,
+      minimumObservedFollowerCount: 5,
+      evaluationMode: "saved-sequence-retrospective",
+      cohort: "anchors-with-known-next-round",
+    },
+  );
+  assert.equal(warm.currentSignal.status, "ready");
+  assert.equal(warm.currentSignal.sourceNumber, 9);
+  assert.equal(warm.currentSignal.sampleSize, 20);
+  assert.equal(warm.currentSignal.observedFollowerCount, 5);
+  assert.deepEqual(
+    compactWarmCandidates(warm.currentSignal.picks),
+    [
+      { rank: 1, number: 1, occurrenceCount: 7, share: 0.35 },
+      { rank: 2, number: 2, occurrenceCount: 5, share: 0.25 },
+      { rank: 3, number: 3, occurrenceCount: 4, share: 0.2 },
+      { rank: 4, number: 4, occurrenceCount: 3, share: 0.15 },
+      { rank: 5, number: 5, occurrenceCount: 1, share: 0.05 },
+    ],
+  );
+  assert.equal(warm.eligibleCount, 0);
+  assert.equal(warm.excludedMissingNextRoundCount, 1);
+});
+
+test("warm next-round reports below-threshold top-five anchors as no signal, not misses", () => {
+  const uniqueFollowers = Array.from(
+    { length: 22 },
+    (_, index) => index < 9 ? index : index + 1,
+  );
+  const warm = buildFollowerTop5HitCurve(curveRows([
+    followerTransitionNumbers(9, uniqueFollowers),
+  ])).warmNextRound;
+
+  assert.deepEqual(
+    {
+      eligibleCount: warm.eligibleCount,
+      signalCount: warm.signalCount,
+      noSignalCount: warm.noSignalCount,
+      hitCount: warm.hitCount,
+      missCount: warm.missCount,
+      selectionCount: warm.selectionCount,
+      hitRate: warm.hitRate,
+      ticketHitRate: warm.ticketHitRate,
+      coverage: warm.coverage,
+      averageSelectionCount: warm.averageSelectionCount,
+      randomBaselineRate: warm.randomBaselineRate,
+      excludedMissingNextRoundCount: warm.excludedMissingNextRoundCount,
+    },
+    {
+      eligibleCount: 17,
+      signalCount: 16,
+      noSignalCount: 1,
+      hitCount: 0,
+      missCount: 16,
+      selectionCount: 80,
+      hitRate: 0,
+      ticketHitRate: 0,
+      coverage: 16 / 17,
+      averageSelectionCount: 5,
+      randomBaselineRate: 5 / 37,
+      excludedMissingNextRoundCount: 1,
+    },
+  );
+  assert.equal(warm.currentSignal.status, "no_signal");
+  assert.equal(warm.currentSignal.sampleSize, 22);
+  assert.equal(warm.currentSignal.observedFollowerCount, 22);
+  assert.deepEqual(warm.currentSignal.picks, []);
+  assert.deepEqual(
+    compactWarmCandidates(warm.currentSignal.candidates),
+    [22, 21, 20, 19, 18].map((number, index) => ({
+      rank: index + 1,
+      number,
+      occurrenceCount: 1,
+      share: 1 / 22,
+    })),
+  );
+  assert.equal(
+    warm.currentSignal.candidates.every(({ share }) => share < warm.threshold),
+    true,
+  );
+});
+
+test("warm next-round supports variable pick counts and uses the signal count as its hit denominator", () => {
+  const trainingFollowers = [
+    ...Array.from({ length: 8 }, () => 1),
+    ...Array.from({ length: 6 }, () => 2),
+    ...Array.from({ length: 4 }, () => 3),
+    4,
+    5,
+    6,
+  ];
+  const numbers = [
+    ...followerTransitionNumbers(9, trainingFollowers, { tail: false }),
+    9,
+    1,
+    9,
+  ];
+  const warm = buildFollowerTop5HitCurve(curveRows([numbers])).warmNextRound;
+
+  assert.deepEqual(
+    {
+      eligibleCount: warm.eligibleCount,
+      signalCount: warm.signalCount,
+      noSignalCount: warm.noSignalCount,
+      hitCount: warm.hitCount,
+      missCount: warm.missCount,
+      selectionCount: warm.selectionCount,
+      hitRate: warm.hitRate,
+      ticketHitRate: warm.ticketHitRate,
+      coverage: warm.coverage,
+      averageSelectionCount: warm.averageSelectionCount,
+      randomBaselineRate: warm.randomBaselineRate,
+    },
+    {
+      eligibleCount: 2,
+      signalCount: 2,
+      noSignalCount: 0,
+      hitCount: 1,
+      missCount: 1,
+      selectionCount: 8,
+      hitRate: 1 / 2,
+      ticketHitRate: 1 / 8,
+      coverage: 1,
+      averageSelectionCount: 4,
+      randomBaselineRate: 4 / 37,
+    },
+  );
+  assert.equal(warm.currentSignal.status, "ready");
+  assert.equal(warm.currentSignal.sampleSize, 22);
+  assert.equal(warm.currentSignal.observedFollowerCount, 6);
+  assert.deepEqual(
+    compactWarmCandidates(warm.currentSignal.picks),
+    [
+      { rank: 1, number: 1, occurrenceCount: 9, share: 9 / 22 },
+      { rank: 2, number: 2, occurrenceCount: 6, share: 6 / 22 },
+      { rank: 3, number: 3, occurrenceCount: 4, share: 4 / 22 },
+    ],
+  );
+  assert.deepEqual(
+    compactWarmCandidates(warm.currentSignal.candidates.slice(3)),
+    [
+      { rank: 4, number: 6, occurrenceCount: 1, share: 1 / 22 },
+      { rank: 5, number: 5, occurrenceCount: 1, share: 1 / 22 },
+    ],
+  );
+});
+
+test("warm next-round is walk-forward and does not promote an earlier result from later pairs", () => {
+  const trainingFollowers = [
+    ...Array.from({ length: 8 }, () => 1),
+    ...Array.from({ length: 6 }, () => 2),
+    ...Array.from({ length: 4 }, () => 3),
+    4,
+    5,
+    6,
+  ];
+  const warm = buildFollowerTop5HitCurve(curveRows([
+    [
+      ...followerTransitionNumbers(9, trainingFollowers, { tail: false }),
+      9,
+      6,
+    ],
+    [9, 6, 9, 6],
+  ])).warmNextRound;
+
+  assert.deepEqual(
+    {
+      eligibleCount: warm.eligibleCount,
+      signalCount: warm.signalCount,
+      hitCount: warm.hitCount,
+      missCount: warm.missCount,
+      selectionCount: warm.selectionCount,
+    },
+    {
+      eligibleCount: 4,
+      signalCount: 4,
+      hitCount: 2,
+      missCount: 2,
+      selectionCount: 16,
+    },
+  );
+});
+
+test("warm next-round never treats the first result after a gap as the prior anchor outcome", () => {
+  const followers = [
+    ...Array.from({ length: 7 }, () => 1),
+    ...Array.from({ length: 5 }, () => 2),
+    ...Array.from({ length: 4 }, () => 3),
+    ...Array.from({ length: 3 }, () => 4),
+    5,
+  ];
+  const warm = buildFollowerTop5HitCurve(curveRows([
+    followerTransitionNumbers(9, followers),
+    [1],
+  ])).warmNextRound;
+
+  assert.equal(warm.eligibleCount, 0);
+  assert.equal(warm.signalCount, 0);
+  assert.equal(warm.hitCount, 0);
+  assert.equal(warm.missCount, 0);
+  assert.equal(warm.excludedMissingNextRoundCount, 1);
+});
+
+test("warm current signal switches to gap when stream state advances without a result", () => {
+  const database = createDatabase({ path: ":memory:" });
+  try {
+    ingestTrackerTraining(database, "warm-current-gap");
+    const before = database.getFollowerTop5HitCurve(SOURCE, INSTRUMENT);
+    assert.equal(before.warmNextRound.currentSignal.status, "ready");
+    assert.equal(
+      before.warmNextRound.historicalAccount.continuityGapCount,
+      0,
+    );
+    assert.deepEqual(
+      before.warmNextRound.currentSignal.picks.map(({ number }) => number),
+      [5, 4, 3, 2, 1],
+    );
+
+    database.ingestBatchAfterGap(
+      {
+        source: SOURCE,
+        instrument: INSTRUMENT,
+        incidentKey: "warm-current-gap-boundary",
+        detectedAt: new Date(BASE_TIME + 20_000).toISOString(),
+        message: "known missing result",
+      },
+      [],
+    );
+    const after = database.getFollowerTop5HitCurve(SOURCE, INSTRUMENT);
+
+    assert.equal(after.warmNextRound.currentSignal.status, "gap");
+    assert.equal(
+      after.warmNextRound.currentSignal.anchorResultId,
+      before.warmNextRound.currentSignal.anchorResultId,
+    );
+    assert.equal(after.warmNextRound.currentSignal.sourceNumber, 9);
+    assert.equal(after.warmNextRound.currentSignal.sampleSize, 5);
+    assert.equal(after.warmNextRound.currentSignal.observedFollowerCount, 5);
+    assert.deepEqual(after.warmNextRound.currentSignal.candidates, []);
+    assert.deepEqual(after.warmNextRound.currentSignal.picks, []);
+    assert.equal(
+      after.warmNextRound.historicalAccount.continuityGapCount,
+      1,
+    );
+    assert.equal(after.warmNextRound.historicalAccount.dataComplete, false);
+    assert.equal(
+      after.warmNextRound.historicalAccount.currentAction.reason,
+      "gap",
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test("warm historical account stakes only rank one even when rank two hits", () => {
+  const numbers = [
+    ...followerTransitionNumbers(9, [1, 1, 2, 3, 4, 5], { tail: false }),
+    9,
+    5,
+    9,
+    5,
+    9,
+  ];
+  const warm = buildFollowerTop5HitCurve(curveRows([numbers])).warmNextRound;
+  const account = warm.historicalAccount;
+
+  assert.deepEqual(
+    {
+      schemaVersion: account.schemaVersion,
+      algorithmVersion: account.algorithmVersion,
+      mode: account.mode,
+      executionEnabled: account.executionEnabled,
+      strategy: account.strategy,
+      model: account.model,
+      initialBalance: account.initialBalance,
+    },
+    {
+      schemaVersion: 1,
+      algorithmVersion: "follower-warm-top1-ladder-v1",
+      mode: "saved-sequence-retrospective",
+      executionEnabled: false,
+      strategy: {
+        rank: 1,
+        threshold: 0.05,
+        noSignalPolicy: "pause",
+        gapPolicy: "reset-ladder-keep-balance",
+        exhaustionPolicy: "permanent-stop",
+      },
+      model: {
+        modelVersion: "1.0.0",
+        initialStake: 10,
+        stakeStep: 10,
+        maxStake: 2_500,
+        grossPayoutMultiplier: 36,
+        payoutIncludesStake: true,
+      },
+      initialBalance: 1_000,
+    },
+  );
+  assert.equal(warm.hitCount, 2, "both outcomes are inside the wider warm top-five");
+  assert.deepEqual(
+    {
+      status: account.status,
+      signalCount: account.signalCount,
+      betCount: account.betCount,
+      hitCount: account.hitCount,
+      missCount: account.missCount,
+      totalStaked: account.totalStaked,
+      totalGrossPayout: account.totalGrossPayout,
+      finalBalance: account.finalBalance,
+      netResult: account.netResult,
+      nextStake: account.nextStake,
+      minimumBalance: account.minimumBalance,
+      ladder: account.ladder,
+    },
+    {
+      status: "running",
+      signalCount: 2,
+      betCount: 2,
+      hitCount: 1,
+      missCount: 1,
+      totalStaked: 20,
+      totalGrossPayout: 360,
+      finalBalance: 1_340,
+      netResult: 340,
+      nextStake: 10,
+      minimumBalance: 990,
+      ladder: { missCount: 0, totalStaked: 0 },
+    },
+  );
+  assert.deepEqual(
+    {
+      targetNumber: account.latestOutcome.targetNumber,
+      resultNumber: account.latestOutcome.resultNumber,
+      stake: account.latestOutcome.stake,
+      outcome: account.latestOutcome.outcome,
+      grossPayout: account.latestOutcome.grossPayout,
+      balanceAfter: account.latestOutcome.balanceAfter,
+    },
+    {
+      targetNumber: 5,
+      resultNumber: 5,
+      stake: 10,
+      outcome: "hit",
+      grossPayout: 360,
+      balanceAfter: 1_340,
+    },
+  );
+});
+
+test("warm historical account resets an elevated ladder after a hit", () => {
+  const losingNumbers = ROULETTE_NUMBERS_FOR_TEST.filter(
+    (number) => number !== 1 && number !== 9,
+  );
+  const trainingFollowers = [
+    ...Array.from({ length: 40 }, () => 1),
+    2,
+    3,
+    4,
+    5,
+  ];
+  const firstThirtySixMisses = Array.from(
+    { length: 36 },
+    (_, index) => losingNumbers[index % losingNumbers.length],
+  );
+  const numbers = [
+    ...followerTransitionNumbers(9, trainingFollowers, { tail: false }),
+    ...followerTransitionNumbers(
+      9,
+      [...firstThirtySixMisses, 1, 2],
+      { tail: false },
+    ),
+    9,
+  ];
+  const account = buildFollowerTop5HitCurve(curveRows([numbers]))
+    .warmNextRound.historicalAccount;
+
+  assert.deepEqual(
+    {
+      signalCount: account.signalCount,
+      betCount: account.betCount,
+      hitCount: account.hitCount,
+      missCount: account.missCount,
+      totalStaked: account.totalStaked,
+      totalGrossPayout: account.totalGrossPayout,
+      finalBalance: account.finalBalance,
+      netResult: account.netResult,
+      nextStake: account.nextStake,
+      maximumStake: account.maximumStake,
+      peakBalance: account.peakBalance,
+      minimumBalance: account.minimumBalance,
+      maximumDrawdown: account.maximumDrawdown,
+      ladder: account.ladder,
+    },
+    {
+      signalCount: 38,
+      betCount: 38,
+      hitCount: 1,
+      missCount: 37,
+      totalStaked: 390,
+      totalGrossPayout: 720,
+      finalBalance: 1_330,
+      netResult: 330,
+      nextStake: 10,
+      maximumStake: 20,
+      peakBalance: 1_340,
+      minimumBalance: 640,
+      maximumDrawdown: 360,
+      ladder: { missCount: 1, totalStaked: 10 },
+    },
+  );
+  assert.equal(account.latestOutcome.stake, 10);
+  assert.equal(account.latestOutcome.outcome, "miss");
+  assert.equal(account.latestOutcome.resultNumber, 2);
+});
+
+test("warm historical account pauses without charging on a no-signal anchor", () => {
+  const uniqueFollowers = Array.from(
+    { length: 22 },
+    (_, index) => index < 9 ? index : index + 1,
+  );
+  const account = buildFollowerTop5HitCurve(curveRows([
+    followerTransitionNumbers(9, uniqueFollowers),
+  ])).warmNextRound.historicalAccount;
+
+  assert.deepEqual(
+    {
+      signalCount: account.signalCount,
+      noSignalCount: account.noSignalCount,
+      betCount: account.betCount,
+      hitCount: account.hitCount,
+      missCount: account.missCount,
+      totalStaked: account.totalStaked,
+      finalBalance: account.finalBalance,
+      nextStake: account.nextStake,
+      ladder: account.ladder,
+      currentAction: account.currentAction,
+    },
+    {
+      signalCount: 16,
+      noSignalCount: 1,
+      betCount: 16,
+      hitCount: 0,
+      missCount: 16,
+      totalStaked: 160,
+      finalBalance: 840,
+      nextStake: 10,
+      ladder: { missCount: 16, totalStaked: 160 },
+      currentAction: {
+        action: "wait",
+        reason: "no_signal",
+        targetNumber: null,
+        stake: null,
+        anchorResultId: 45,
+      },
+    },
+  );
+});
+
+test("warm historical account resets its ladder at a gap without restoring balance", () => {
+  const losingNumbers = ROULETTE_NUMBERS_FOR_TEST.filter(
+    (number) => number !== 1 && number !== 9,
+  );
+  const trainingFollowers = [
+    ...Array.from({ length: 40 }, () => 1),
+    2,
+    3,
+    4,
+    5,
+  ];
+  const missesBeforeGap = Array.from(
+    { length: 36 },
+    (_, index) => losingNumbers[index % losingNumbers.length],
+  );
+  const account = buildFollowerTop5HitCurve(curveRows([
+    [
+      ...followerTransitionNumbers(9, trainingFollowers, { tail: false }),
+      ...followerTransitionNumbers(9, missesBeforeGap, { tail: false }),
+    ],
+    [9, 2, 9],
+  ])).warmNextRound.historicalAccount;
+
+  assert.deepEqual(
+    {
+      status: account.status,
+      signalCount: account.signalCount,
+      betCount: account.betCount,
+      missCount: account.missCount,
+      totalStaked: account.totalStaked,
+      finalBalance: account.finalBalance,
+      nextStake: account.nextStake,
+      maximumStake: account.maximumStake,
+      continuityGapCount: account.continuityGapCount,
+      dataComplete: account.dataComplete,
+      ladder: account.ladder,
+    },
+    {
+      status: "running",
+      signalCount: 37,
+      betCount: 37,
+      missCount: 37,
+      totalStaked: 370,
+      finalBalance: 630,
+      nextStake: 10,
+      maximumStake: 10,
+      continuityGapCount: 1,
+      dataComplete: false,
+      ladder: { missCount: 1, totalStaked: 10 },
+    },
+  );
+  assert.equal(account.latestOutcome.stake, 10);
+  assert.equal(account.latestOutcome.balanceAfter, 630);
+});
+
+test("warm historical account selects every target walk-forward without lookahead", () => {
+  const numbers = [
+    ...followerTransitionNumbers(9, [1, 1, 2, 3, 4, 6], { tail: false }),
+    9,
+    6,
+    9,
+    6,
+    9,
+  ];
+  const warm = buildFollowerTop5HitCurve(curveRows([numbers])).warmNextRound;
+  const account = warm.historicalAccount;
+
+  assert.equal(warm.hitCount, 2);
+  assert.deepEqual(
+    {
+      signalCount: account.signalCount,
+      betCount: account.betCount,
+      hitCount: account.hitCount,
+      missCount: account.missCount,
+      totalStaked: account.totalStaked,
+      totalGrossPayout: account.totalGrossPayout,
+      finalBalance: account.finalBalance,
+      minimumBalance: account.minimumBalance,
+      ladder: account.ladder,
+    },
+    {
+      signalCount: 2,
+      betCount: 2,
+      hitCount: 1,
+      missCount: 1,
+      totalStaked: 20,
+      totalGrossPayout: 360,
+      finalBalance: 1_340,
+      minimumBalance: 990,
+      ladder: { missCount: 0, totalStaked: 0 },
+    },
+  );
+  assert.equal(account.latestOutcome.targetNumber, 6);
+  assert.equal(account.latestOutcome.resultNumber, 6);
+  assert.equal(account.latestOutcome.outcome, "hit");
+});
+
+test("warm historical account exhausts after 63 misses and skips every later signal", () => {
+  const losingNumbers = ROULETTE_NUMBERS_FOR_TEST.filter(
+    (number) => number !== 1 && number !== 9,
+  );
+  const trainingFollowers = [
+    ...Array.from({ length: 100 }, () => 1),
+    2,
+    3,
+    4,
+    5,
+  ];
+  const sixtyFourMisses = Array.from(
+    { length: 64 },
+    (_, index) => losingNumbers[index % losingNumbers.length],
+  );
+  const rows = curveRows([[
+    ...followerTransitionNumbers(9, trainingFollowers, { tail: false }),
+    ...followerTransitionNumbers(9, sixtyFourMisses, { tail: false }),
+    9,
+  ]]);
+  const account = buildFollowerTop5HitCurve(rows)
+    .warmNextRound.historicalAccount;
+
+  assert.deepEqual(
+    {
+      status: account.status,
+      initialBalance: account.initialBalance,
+      finalBalance: account.finalBalance,
+      netResult: account.netResult,
+      nextStake: account.nextStake,
+      canAffordNext: account.canAffordNext,
+      shortfall: account.shortfall,
+      signalCount: account.signalCount,
+      betCount: account.betCount,
+      hitCount: account.hitCount,
+      missCount: account.missCount,
+      totalStaked: account.totalStaked,
+      totalGrossPayout: account.totalGrossPayout,
+      skippedAfterExhaustionCount: account.skippedAfterExhaustionCount,
+      peakBalance: account.peakBalance,
+      minimumBalance: account.minimumBalance,
+      maximumDrawdown: account.maximumDrawdown,
+      maximumStake: account.maximumStake,
+      ladder: account.ladder,
+    },
+    {
+      status: "exhausted",
+      initialBalance: 1_000,
+      finalBalance: 10,
+      netResult: -990,
+      nextStake: 30,
+      canAffordNext: false,
+      shortfall: 20,
+      signalCount: 64,
+      betCount: 63,
+      hitCount: 0,
+      missCount: 63,
+      totalStaked: 990,
+      totalGrossPayout: 0,
+      skippedAfterExhaustionCount: 1,
+      peakBalance: 1_000,
+      minimumBalance: 10,
+      maximumDrawdown: 990,
+      maximumStake: 30,
+      ladder: { missCount: 63, totalStaked: 990 },
+    },
+  );
+  assert.equal(account.exhaustedAt, account.lastBetAt);
+  assert.equal(account.latestOutcome.outcome, "miss");
+  assert.equal(account.latestOutcome.stake, 30);
+  assert.equal(account.latestOutcome.balanceAfter, 10);
+  assert.equal(account.latestOutcome.resultNumber, sixtyFourMisses[62]);
+  assert.deepEqual(account.currentAction, {
+    action: "wait",
+    reason: "bankroll_exhausted",
+    targetNumber: 1,
+    stake: 30,
+    anchorResultId: rows.at(-1).id,
+  });
 });
 
 test("a hit inside a catch-up batch closes once and re-arms only at the batch tail", () => {

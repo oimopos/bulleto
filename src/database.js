@@ -30,6 +30,11 @@ const FOLLOWER_TOP5_ALL_HORIZONS = Object.freeze(
 const FOLLOWER_TOP5_COUNT = 5;
 const FOLLOWER_TOP5_MINIMUM_OBSERVED = 5;
 const FOLLOWER_TOP5_LIVE_ALGORITHM_VERSION = "follower-top5-live-v1";
+const FOLLOWER_WARM_THRESHOLD_PERCENT = 5;
+const FOLLOWER_WARM_ALGORITHM_VERSION = "follower-warm-top5-next-v1";
+const FOLLOWER_WARM_ACCOUNT_STARTING_BALANCE = 1_000;
+const FOLLOWER_WARM_ACCOUNT_ALGORITHM_VERSION =
+  "follower-warm-top1-ladder-v1";
 
 function emptyFollowerHitBucket() {
   return {
@@ -66,12 +71,313 @@ function rankFollowerNumbers(counts, lastOccurredAt) {
     .slice(0, FOLLOWER_TOP5_COUNT);
 }
 
+function followerSampleSize(counts) {
+  return counts.reduce((total, count) => total + count, 0);
+}
+
+function meetsFollowerWarmThreshold(occurrenceCount, sampleSize) {
+  return sampleSize > 0
+    && occurrenceCount * 100 >= sampleSize * FOLLOWER_WARM_THRESHOLD_PERCENT;
+}
+
+function followerRankedCandidates(counts, lastOccurredAt) {
+  const sampleSize = followerSampleSize(counts);
+  return rankFollowerNumbers(counts, lastOccurredAt).map((number, index) => ({
+    rank: index + 1,
+    number,
+    occurrenceCount: counts[number],
+    share: sampleSize > 0 ? counts[number] / sampleSize : null,
+    lastOccurredAt: lastOccurredAt[number],
+  }));
+}
+
+function createFollowerWarmHistoricalAccount() {
+  return {
+    status: "waiting",
+    currentBalance: FOLLOWER_WARM_ACCOUNT_STARTING_BALANCE,
+    nextStake: calculateNextVirtualStake(0),
+    signalCount: 0,
+    noSignalCount: 0,
+    betCount: 0,
+    hitCount: 0,
+    missCount: 0,
+    totalStaked: 0,
+    totalGrossPayout: 0,
+    skippedAfterExhaustionCount: 0,
+    peakBalance: FOLLOWER_WARM_ACCOUNT_STARTING_BALANCE,
+    minimumBalance: FOLLOWER_WARM_ACCOUNT_STARTING_BALANCE,
+    maximumDrawdown: 0,
+    maximumStake: 0,
+    continuityGapCount: 0,
+    firstBetAt: null,
+    lastBetAt: null,
+    exhaustedAt: null,
+    ladderMissCount: 0,
+    ladderTotalStaked: 0,
+    latestOutcome: null,
+  };
+}
+
+function resetFollowerWarmLadderAtGap(account) {
+  account.continuityGapCount += 1;
+  if (account.status === "exhausted") return;
+  account.ladderMissCount = 0;
+  account.ladderTotalStaked = 0;
+  account.nextStake = calculateNextVirtualStake(0);
+}
+
+function recordFollowerWarmNoSignal(account) {
+  account.noSignalCount += 1;
+}
+
+function settleFollowerWarmHistoricalSignal(account, {
+  anchor,
+  next,
+  targetNumber,
+  occurrenceCount,
+  sampleSize,
+}) {
+  account.signalCount += 1;
+  if (account.status === "exhausted") {
+    account.skippedAfterExhaustionCount += 1;
+    return;
+  }
+
+  const stake = calculateNextVirtualStake(account.ladderTotalStaked);
+  account.nextStake = stake;
+  if (stake > account.currentBalance) {
+    account.status = "exhausted";
+    account.exhaustedAt = anchor.settled_at;
+    account.skippedAfterExhaustionCount += 1;
+    return;
+  }
+
+  const settlement = settleVirtualBet({
+    targetNumber,
+    resultNumber: Number(next.result_number),
+    stake,
+    priorTotalStaked: account.ladderTotalStaked,
+  });
+  const balanceAfter =
+    account.currentBalance - stake + settlement.grossPayout;
+  if (!Number.isSafeInteger(balanceAfter) || balanceAfter < 0) {
+    throw new RangeError("warm historical account balance is invalid");
+  }
+
+  account.status = "running";
+  account.currentBalance = balanceAfter;
+  account.betCount += 1;
+  account.totalStaked += stake;
+  account.totalGrossPayout += settlement.grossPayout;
+  account.maximumStake = Math.max(account.maximumStake, stake);
+  account.firstBetAt ??= next.settled_at;
+  account.lastBetAt = next.settled_at;
+  account.peakBalance = Math.max(account.peakBalance, balanceAfter);
+  account.minimumBalance = Math.min(account.minimumBalance, balanceAfter);
+  account.maximumDrawdown = Math.max(
+    account.maximumDrawdown,
+    account.peakBalance - balanceAfter,
+  );
+
+  if (settlement.outcome === "hit") {
+    account.hitCount += 1;
+    account.ladderMissCount = 0;
+    account.ladderTotalStaked = 0;
+    account.nextStake = calculateNextVirtualStake(0);
+  } else {
+    account.missCount += 1;
+    account.ladderMissCount += 1;
+    account.ladderTotalStaked = settlement.totalStaked;
+    account.nextStake = settlement.nextStake;
+    if (account.nextStake > balanceAfter) {
+      account.status = "exhausted";
+      account.exhaustedAt = next.settled_at;
+    }
+  }
+
+  account.latestOutcome = {
+    anchorResultId: Number(anchor.id),
+    resultId: Number(next.id),
+    targetNumber,
+    resultNumber: Number(next.result_number),
+    historicalShare: occurrenceCount / sampleSize,
+    sampleSize,
+    stake,
+    outcome: settlement.outcome,
+    grossPayout: settlement.grossPayout,
+    balanceAfter,
+    nextStake: account.nextStake,
+    occurredAt: next.settled_at,
+  };
+}
+
+function followerWarmCurrentAction(account, currentSignal) {
+  const candidate = currentSignal.status === "ready"
+    ? currentSignal.picks[0] ?? null
+    : null;
+  if (account.status === "exhausted") {
+    return {
+      action: "wait",
+      reason: "bankroll_exhausted",
+      targetNumber: candidate?.number ?? null,
+      stake: candidate ? account.nextStake : null,
+      anchorResultId: currentSignal.anchorResultId,
+    };
+  }
+  if (!candidate) {
+    return {
+      action: "wait",
+      reason: currentSignal.status,
+      targetNumber: null,
+      stake: null,
+      anchorResultId: currentSignal.anchorResultId,
+    };
+  }
+  return {
+    action: "would_bet",
+    reason: "ready",
+    targetNumber: candidate.number,
+    stake: account.nextStake,
+    anchorResultId: currentSignal.anchorResultId,
+  };
+}
+
+function followerWarmHistoricalAccountForApi(account, currentSignal) {
+  const canAffordNext =
+    account.status !== "exhausted"
+    && account.currentBalance >= account.nextStake;
+  return {
+    schemaVersion: 1,
+    algorithmVersion: FOLLOWER_WARM_ACCOUNT_ALGORITHM_VERSION,
+    mode: "saved-sequence-retrospective",
+    executionEnabled: false,
+    strategy: {
+      rank: 1,
+      threshold: FOLLOWER_WARM_THRESHOLD_PERCENT / 100,
+      noSignalPolicy: "pause",
+      gapPolicy: "reset-ladder-keep-balance",
+      exhaustionPolicy: "permanent-stop",
+    },
+    model: {
+      modelVersion: VIRTUAL_BET_MODEL.modelVersion,
+      initialStake: VIRTUAL_BET_MODEL.initialStake,
+      stakeStep: VIRTUAL_BET_MODEL.stakeStep,
+      maxStake: VIRTUAL_BET_MODEL.maxStake,
+      grossPayoutMultiplier: VIRTUAL_BET_MODEL.grossPayoutMultiplier,
+      payoutIncludesStake: VIRTUAL_BET_MODEL.payoutIncludesStake,
+    },
+    status: account.status,
+    initialBalance: FOLLOWER_WARM_ACCOUNT_STARTING_BALANCE,
+    finalBalance: account.currentBalance,
+    netResult:
+      account.currentBalance - FOLLOWER_WARM_ACCOUNT_STARTING_BALANCE,
+    nextStake: account.nextStake,
+    canAffordNext,
+    shortfall: Math.max(0, account.nextStake - account.currentBalance),
+    signalCount: account.signalCount,
+    noSignalCount: account.noSignalCount,
+    betCount: account.betCount,
+    hitCount: account.hitCount,
+    missCount: account.missCount,
+    hitRate:
+      account.betCount > 0 ? account.hitCount / account.betCount : null,
+    totalStaked: account.totalStaked,
+    totalGrossPayout: account.totalGrossPayout,
+    skippedAfterExhaustionCount: account.skippedAfterExhaustionCount,
+    peakBalance: account.peakBalance,
+    minimumBalance: account.minimumBalance,
+    maximumDrawdown: account.maximumDrawdown,
+    maximumStake: account.maximumStake,
+    continuityGapCount: account.continuityGapCount,
+    dataComplete: account.continuityGapCount === 0,
+    firstBetAt: account.firstBetAt,
+    lastBetAt: account.lastBetAt,
+    exhaustedAt: account.exhaustedAt,
+    ladder: {
+      missCount: account.ladderMissCount,
+      totalStaked: account.ladderTotalStaked,
+    },
+    latestOutcome: account.latestOutcome,
+    currentAction: followerWarmCurrentAction(account, currentSignal),
+  };
+}
+
+function currentFollowerWarmSignal(
+  rows,
+  counts,
+  lastOccurredAt,
+  observedFollowerCounts,
+  currentContinuityEpoch,
+) {
+  const anchor = rows.at(-1);
+  if (!anchor) {
+    return {
+      status: "empty",
+      sourceNumber: null,
+      anchorResultId: null,
+      anchoredAt: null,
+      sampleSize: 0,
+      observedFollowerCount: 0,
+      candidates: [],
+      picks: [],
+    };
+  }
+
+  const sourceNumber = Number(anchor.result_number);
+  const sampleSize = followerSampleSize(counts[sourceNumber]);
+  const observedFollowerCount = observedFollowerCounts[sourceNumber];
+  const base = {
+    sourceNumber,
+    anchorResultId: Number(anchor.id),
+    anchoredAt: anchor.settled_at,
+    sampleSize,
+    observedFollowerCount,
+  };
+  if (
+    currentContinuityEpoch !== null
+    && Number(anchor.continuity_epoch) !== currentContinuityEpoch
+  ) {
+    return {
+      status: "gap",
+      ...base,
+      candidates: [],
+      picks: [],
+    };
+  }
+  if (observedFollowerCount < FOLLOWER_TOP5_MINIMUM_OBSERVED) {
+    return {
+      status: "waiting_training",
+      ...base,
+      candidates: [],
+      picks: [],
+    };
+  }
+
+  const candidates = followerRankedCandidates(
+    counts[sourceNumber],
+    lastOccurredAt[sourceNumber],
+  );
+  const picks = candidates.filter((candidate) =>
+    meetsFollowerWarmThreshold(candidate.occurrenceCount, sampleSize),
+  );
+  return {
+    status: picks.length > 0 ? "ready" : "no_signal",
+    ...base,
+    candidates,
+    picks,
+  };
+}
+
 /**
  * Retrospective expanding walk-forward over the saved event sequence.
  * The incoming transition is known at an anchor; its outgoing transition is not.
- * A shared complete-20-round cohort keeps every displayed rate comparable.
+ * The legacy horizon curve uses one complete-20-round cohort. The warm signal
+ * has its own next-round cohort because it never evaluates later horizons.
  */
-export function buildFollowerTop5HitCurve(rows) {
+export function buildFollowerTop5HitCurve(
+  rows,
+  { currentContinuityEpoch = null } = {},
+) {
   const maximumHorizon = FOLLOWER_TOP5_HORIZONS.at(-1);
   const counts = ROULETTE_NUMBERS.map(() =>
     ROULETTE_NUMBERS.map(() => 0),
@@ -82,6 +388,14 @@ export function buildFollowerTop5HitCurve(rows) {
   const observedFollowerCounts = ROULETTE_NUMBERS.map(() => 0);
   const overall = emptyFollowerHitBucket();
   const bySourceBuckets = ROULETTE_NUMBERS.map(() => emptyFollowerHitBucket());
+  const warmNextRound = {
+    eligibleCount: 0,
+    signalCount: 0,
+    hitCount: 0,
+    selectionCount: 0,
+    excludedMissingNextRoundCount: 0,
+  };
+  const warmHistoricalAccount = createFollowerWarmHistoricalAccount();
   let continuitySegmentCount = 0;
   let excludedInsufficientTrainingCount = 0;
   let excludedIncompleteWindowCount = 0;
@@ -93,6 +407,9 @@ export function buildFollowerTop5HitCurve(rows) {
 
     if (!previous || Number(previous.continuity_epoch) !== epoch) {
       continuitySegmentCount += 1;
+      if (previous) {
+        resetFollowerWarmLadderAtGap(warmHistoricalAccount);
+      }
     } else {
       const previousNumber = Number(previous.result_number);
       if (counts[previousNumber][number] === 0) {
@@ -105,6 +422,38 @@ export function buildFollowerTop5HitCurve(rows) {
     if (observedFollowerCounts[number] < FOLLOWER_TOP5_MINIMUM_OBSERVED) {
       excludedInsufficientTrainingCount += 1;
       return;
+    }
+
+    const rankedTop5 = rankFollowerNumbers(
+      counts[number],
+      lastOccurredAt[number],
+    );
+    const sampleSize = followerSampleSize(counts[number]);
+    const warmNumbers = rankedTop5.filter((candidate) =>
+      meetsFollowerWarmThreshold(counts[number][candidate], sampleSize),
+    );
+    const next = rows[index + 1];
+    if (next && Number(next.continuity_epoch) === epoch) {
+      warmNextRound.eligibleCount += 1;
+      if (warmNumbers.length > 0) {
+        warmNextRound.signalCount += 1;
+        warmNextRound.selectionCount += warmNumbers.length;
+        const topNumber = rankedTop5[0];
+        settleFollowerWarmHistoricalSignal(warmHistoricalAccount, {
+          anchor: row,
+          next,
+          targetNumber: topNumber,
+          occurrenceCount: counts[number][topNumber],
+          sampleSize,
+        });
+        if (warmNumbers.includes(Number(next.result_number))) {
+          warmNextRound.hitCount += 1;
+        }
+      } else {
+        recordFollowerWarmNoSignal(warmHistoricalAccount);
+      }
+    } else {
+      warmNextRound.excludedMissingNextRoundCount += 1;
     }
 
     let hasCompleteWindow = index + maximumHorizon < rows.length;
@@ -121,10 +470,7 @@ export function buildFollowerTop5HitCurve(rows) {
       return;
     }
 
-    const top5 = new Set(rankFollowerNumbers(
-      counts[number],
-      lastOccurredAt[number],
-    ));
+    const top5 = new Set(rankedTop5);
     let firstHitOffset = null;
     for (let offset = 1; offset <= maximumHorizon; offset += 1) {
       if (top5.has(Number(rows[index + offset].result_number))) {
@@ -142,6 +488,32 @@ export function buildFollowerTop5HitCurve(rows) {
       }
     });
   });
+
+  const warmMissCount = warmNextRound.signalCount - warmNextRound.hitCount;
+  const warmNoSignalCount =
+    warmNextRound.eligibleCount - warmNextRound.signalCount;
+  const warmHitRate = warmNextRound.signalCount > 0
+    ? warmNextRound.hitCount / warmNextRound.signalCount
+    : null;
+  const warmTicketHitRate = warmNextRound.selectionCount > 0
+    ? warmNextRound.hitCount / warmNextRound.selectionCount
+    : null;
+  const warmCoverage = warmNextRound.eligibleCount > 0
+    ? warmNextRound.signalCount / warmNextRound.eligibleCount
+    : null;
+  const warmAverageSelectionCount = warmNextRound.signalCount > 0
+    ? warmNextRound.selectionCount / warmNextRound.signalCount
+    : null;
+  const currentWarmSignal = currentFollowerWarmSignal(
+    rows,
+    counts,
+    lastOccurredAt,
+    observedFollowerCounts,
+    currentContinuityEpoch,
+  );
+  if (currentWarmSignal.status === "gap") {
+    resetFollowerWarmLadderAtGap(warmHistoricalAccount);
+  }
 
   return {
     schemaVersion: 1,
@@ -166,6 +538,38 @@ export function buildFollowerTop5HitCurve(rows) {
       eligibleCount: bucket.eligibleCount,
       points: followerHitPoints(bucket),
     })),
+    warmNextRound: {
+      schemaVersion: 1,
+      algorithmVersion: FOLLOWER_WARM_ALGORITHM_VERSION,
+      threshold: FOLLOWER_WARM_THRESHOLD_PERCENT / 100,
+      comparison: "individual-share-gte",
+      candidatePool: "dynamic-top5",
+      topCount: FOLLOWER_TOP5_COUNT,
+      minimumObservedFollowerCount: FOLLOWER_TOP5_MINIMUM_OBSERVED,
+      evaluationMode: "saved-sequence-retrospective",
+      cohort: "anchors-with-known-next-round",
+      eligibleCount: warmNextRound.eligibleCount,
+      signalCount: warmNextRound.signalCount,
+      noSignalCount: warmNoSignalCount,
+      hitCount: warmNextRound.hitCount,
+      missCount: warmMissCount,
+      selectionCount: warmNextRound.selectionCount,
+      hitRate: warmHitRate,
+      ticketHitRate: warmTicketHitRate,
+      coverage: warmCoverage,
+      averageSelectionCount: warmAverageSelectionCount,
+      randomBaselineRate:
+        warmAverageSelectionCount === null
+          ? null
+          : warmAverageSelectionCount / ROULETTE_NUMBERS.length,
+      excludedMissingNextRoundCount:
+        warmNextRound.excludedMissingNextRoundCount,
+      currentSignal: currentWarmSignal,
+      historicalAccount: followerWarmHistoricalAccountForApi(
+        warmHistoricalAccount,
+        currentWarmSignal,
+      ),
+    },
   };
 }
 
@@ -4313,6 +4717,16 @@ export class RouletteDatabase {
         WHERE source = ? AND instrument = ?
       `)
       .get(safeSource, safeInstrument);
+    const streamState = this.sqlite
+      .prepare(`
+        SELECT continuity_epoch
+        FROM stream_state
+        WHERE source = ? AND instrument = ?
+      `)
+      .get(safeSource, safeInstrument);
+    const currentContinuityEpoch = streamState?.continuity_epoch == null
+      ? null
+      : Number(streamState.continuity_epoch);
     const cacheKey = `${safeSource}\u0000${safeInstrument}`;
     const signature = [
       Number(revision.result_count),
@@ -4323,6 +4737,7 @@ export class RouletteDatabase {
       revision.continuity_epoch_checksum == null
         ? null
         : Number(revision.continuity_epoch_checksum),
+      currentContinuityEpoch,
     ].join(":");
     const cached = this.followerTop5HitCurveCache.get(cacheKey);
     if (cached?.signature === signature) {
@@ -4337,7 +4752,7 @@ export class RouletteDatabase {
       `)
       .all(safeSource, safeInstrument);
 
-    const value = buildFollowerTop5HitCurve(rows);
+    const value = buildFollowerTop5HitCurve(rows, { currentContinuityEpoch });
     this.followerTop5HitCurveCache.set(cacheKey, { signature, value });
     return value;
   }

@@ -43,7 +43,7 @@ test("top-5 horizon block exposes all renderer targets and cumulative horizons",
   assert.match(html, /Ретроспективная реконструкция/);
 });
 
-test("dynamic top-5 next-round summary uses the validated full-20 cohort", () => {
+test("warm next-round forecast exposes a strict 5-percent walk-forward contract", () => {
   for (const id of [
     "follower-dynamic-next",
     "follower-dynamic-next-status",
@@ -51,27 +51,89 @@ test("dynamic top-5 next-round summary uses the validated full-20 cohort", () =>
     "follower-dynamic-next-misses",
     "follower-dynamic-next-rate",
     "follower-dynamic-next-sample",
+    "follower-dynamic-next-source",
+    "follower-dynamic-next-picks",
+    "follower-dynamic-next-current-meta",
+    "follower-dynamic-next-audit",
   ]) {
     assert.match(html, new RegExp(`\\bid="${id}"`));
     assert.match(app, new RegExp(`getElementById\\("${id}"\\)`));
   }
 
+  assert.match(app, /const FOLLOWER_WARM_THRESHOLD = 0\.05/);
+  assert.match(app, /function normalizedFollowerWarmNextRound\(\)/);
+  assert.match(app, /follower-warm-top5-next-v1/);
+  assert.match(app, /anchors-with-known-next-round/);
+  assert.match(
+    app,
+    /candidate\.occurrenceCount \* 100 >= sampleSize \* 5/,
+  );
+  assert.match(app, /\["ready", "no_signal", "waiting_training", "gap", "empty"\]/);
+  assert.match(app, /function renderFollowerWarmCurrent\(signal\)/);
   assert.match(app, /function renderFollowerDynamicNext\(\)/);
-  assert.match(app, /normalizedFollowerAllPoints\(\)/);
-  assert.match(app, /point\.horizon === 1/);
-  assert.match(app, /const misses = sample - hits/);
   assert.match(
     app,
     /function renderFollowerHitCurve\(\) \{\s*renderFollowerDynamicNext\(\);/,
   );
-  assert.match(html, /пятёрка заново рассчитывалась только по уже известным данным/);
-  assert.match(html, /полными 20 будущими раундами/);
-  assert.match(html, /не текущая серия с зафиксированной пятёркой/);
+  assert.match(html, /id="follower-dynamic-next-title"[^>]*>[^<]*≥5%/);
+  assert.match(html, /id="follower-dynamic-next-note"[^>]*>[\s\S]*?5%/);
+  assert.match(html, /styles\.css\?v=23/);
+  assert.match(html, /app\.js\?v=23/);
   assert.match(styles, /\.follower-dynamic-next\s*\{/);
+  assert.match(styles, /\.follower-warm-current\s*\{/);
+  assert.match(styles, /\.follower-warm-picks\s*\{/);
   assert.match(styles, /\.follower-dynamic-next__metrics\s*\{/);
   assert.match(
     styles,
-    /@media \(max-width: 680px\)[\s\S]*?\.follower-dynamic-next__metrics\s*\{\s*grid-template-columns: repeat\(2, minmax\(0, 1fr\)\)/,
+    /@media \(max-width: 680px\)[\s\S]*?\.follower-warm-picks\s*\{\s*grid-template-columns: repeat\(2, minmax\(0, 1fr\)\)/,
+  );
+});
+
+test("warm top-1 archival account is simulated, strict, and compact", () => {
+  for (const id of [
+    "follower-warm-account",
+    "follower-warm-account-status",
+    "follower-warm-account-balance",
+    "follower-warm-account-result-card",
+    "follower-warm-account-result",
+    "follower-warm-account-bets",
+    "follower-warm-account-record",
+    "follower-warm-account-drawdown",
+    "follower-warm-account-risk",
+    "follower-warm-account-audit",
+  ]) {
+    assert.match(html, new RegExp(`\\bid="${id}"`));
+    assert.match(app, new RegExp(`getElementById\\("${id}"\\)`));
+  }
+
+  assert.match(app, /function normalizedFollowerWarmHistoricalAccount\(value, currentSignal\)/);
+  assert.match(app, /follower-warm-top1-ladder-v1/);
+  assert.match(app, /strategy\?\.rank !== 1/);
+  assert.match(app, /strategy\?\.threshold !== FOLLOWER_WARM_THRESHOLD/);
+  assert.match(app, /noSignalPolicy !== "pause"/);
+  assert.match(app, /gapPolicy !== "reset-ladder-keep-balance"/);
+  assert.match(app, /exhaustionPolicy !== "permanent-stop"/);
+  assert.match(app, /model\?\.initialStake !== 10/);
+  assert.match(app, /model\?\.stakeStep !== 10/);
+  assert.match(app, /model\?\.maxStake !== 2_500/);
+  assert.match(app, /model\?\.grossPayoutMultiplier !== 36/);
+  assert.match(app, /value\.executionEnabled !== false/);
+  assert.match(app, /betCount \+ skippedAfterExhaustionCount !== signalCount/);
+  assert.match(app, /totalGrossPayout - totalStaked !== netResult/);
+  assert.match(app, /function renderFollowerWarmHistoricalAccount\(account,/);
+  assert.match(app, /"Для счёта"/);
+  assert.match(html, /Архивная симуляция · только кандидат №1/);
+  assert.match(html, /Стартовая ставка 10, шаг 10, максимум 2 500, валовая выплата ×36/);
+  assert.match(styles, /\.follower-warm-account\s*\{/);
+  assert.match(styles, /\.follower-warm-account__metrics\s*\{/);
+  assert.match(styles, /\.follower-warm-pick\.is-account-pick\s*\{/);
+  assert.match(
+    styles,
+    /@media \(max-width: 680px\)[\s\S]*?\.follower-warm-account__metrics\s*\{\s*grid-template-columns: repeat\(2, minmax\(0, 1fr\)\)/,
+  );
+  assert.match(
+    styles,
+    /@media \(max-width: 360px\)[\s\S]*?\.follower-warm-account__metrics\s*\{[\s\S]*?grid-template-columns: minmax\(0, 1fr\)/,
   );
 });
 
@@ -161,8 +223,8 @@ test("cycle comparison language is descriptive, responsive, and cache-busted", (
   assert.match(block, /не прогноз/);
   assert.match(block, /не предсказывает следующее число/);
   assert.doesNotMatch(block, /должн/iu);
-  assert.match(html, /href="\/styles\.css\?v=21"/);
-  assert.match(html, /src="\/app\.js\?v=21"/);
+  assert.match(html, /href="\/styles\.css\?v=23"/);
+  assert.match(html, /src="\/app\.js\?v=23"/);
   assert.match(styles, /\.cycle-sequence-list\s*\{[\s\S]*?repeat\(auto-fill, minmax\(50px, 1fr\)\)/);
   assert.match(
     styles,
