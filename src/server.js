@@ -238,6 +238,24 @@ function dashboardState() {
   };
 }
 
+function virtualBettorForApi() {
+  const state = db.getVirtualBettorState('buleto', config.instrument);
+  const candidate = state.longestCandidate;
+  return {
+    mode: state.mode,
+    executionEnabled: state.executionEnabled,
+    status: state.status,
+    currentBalance: state.testBank.currentBalance,
+    longestSeries: candidate
+      ? {
+          number: candidate.number,
+          progress: candidate.roundsSinceLast,
+          target: state.triggerThreshold,
+        }
+      : null,
+  };
+}
+
 function clampLimit(rawValue, fallback, max) {
   if (rawValue === null || rawValue === '') return fallback;
   const value = Number(rawValue);
@@ -406,6 +424,11 @@ const server = createServer((request, response) => {
         items: matches.slice(0, limit),
         hasMore: matches.length > limit,
       });
+      return;
+    }
+
+    if (pathname === '/api/virtual-bettor') {
+      sendJson(response, 200, virtualBettorForApi());
       return;
     }
 

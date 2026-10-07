@@ -220,10 +220,30 @@ npm.cmd run backup -- ./data/buleto.sqlite ./seed/buleto.sqlite
 - `GET /api/forecasts/hits?limit=20` — последние проверенные прогнозы, в которых фактическое число вошло в неизменно сохранённый ценовой top‑3.
 - `GET /api/cycles?limit=10` — завершённые циклы.
 - `GET /api/sequences?limit=50` — повторяющиеся последовательности из трёх результатов.
+- `GET /api/virtual-bettor` — компактное состояние симуляции: остаток виртуального банка, число с самой длинной текущей серией без выпадения и её прогресс до порога.
 - `GET /api/virtual-bettor/sessions?limit=20` — история виртуальных сессий; реальные ставки всегда отключены.
 - `GET /api/events` — Server-Sent Events для мгновенного обновления панели.
 - `GET /api/live` — liveness-проверка процесса для Docker/Render.
 - `GET /api/health` — состояние процесса, базы и внешнего сборщика.
+
+Пример ответа `GET /api/virtual-bettor`:
+
+```json
+{
+  "mode": "simulation",
+  "executionEnabled": false,
+  "status": "waiting",
+  "currentBalance": 87700,
+  "longestSeries": {
+    "number": 17,
+    "progress": 143,
+    "target": 200
+  }
+}
+```
+
+Если в текущем непрерывном участке ещё нет результатов, `longestSeries` будет
+`null`.
 
 ## Ограничения
 
