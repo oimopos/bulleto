@@ -251,6 +251,117 @@ function markResultsCreatedAtObservation(database, fingerprintPrefix) {
     .run(`${fingerprintPrefix}%`);
 }
 
+function markForecastSettlementsCreatedAtSettlement(database) {
+  database.sqlite
+    .prepare("UPDATE forecast_settlements SET created_at = settled_at")
+    .run();
+}
+
+function cloneSettledAdaptiveForecast(
+  database,
+  {
+    templateForecastId,
+    externalRoundId,
+    settledAt,
+    observedAt = settledAt,
+    createdAt = observedAt,
+    settlementCreatedAt = createdAt,
+    price = 5.36,
+    rawCell = 23,
+  },
+) {
+  const templateSnapshotId = Number(
+    database.sqlite
+      .prepare("SELECT snapshot_id FROM round_forecasts WHERE id = ?")
+      .get(templateForecastId).snapshot_id,
+  );
+  const snapshot = database.sqlite
+    .prepare(`
+      INSERT INTO forecast_snapshots (
+        source, instrument, external_round_id, horizon_seconds,
+        betting_closes_at, round_ends_at, factor_at, locked_at,
+        lead_time_ms, persisted_at, persisted_lead_time_ms,
+        current_price, start_price, current_number,
+        cells_json, features_json, created_at
+      )
+      SELECT
+        source, instrument, ?, horizon_seconds,
+        betting_closes_at, round_ends_at, factor_at, locked_at,
+        lead_time_ms, persisted_at, persisted_lead_time_ms,
+        current_price, start_price, current_number,
+        cells_json, features_json, created_at
+      FROM forecast_snapshots
+      WHERE id = ?
+    `)
+    .run(externalRoundId, templateSnapshotId);
+  const forecast = database.sqlite
+    .prepare(`
+      INSERT INTO round_forecasts (
+        snapshot_id, model_version, predicted_price, predicted_number,
+        ranked_numbers_json, created_at
+      )
+      SELECT ?, model_version, predicted_price, predicted_number,
+             ranked_numbers_json, created_at
+      FROM round_forecasts
+      WHERE id = ?
+    `)
+    .run(Number(snapshot.lastInsertRowid), templateForecastId);
+  const forecastId = Number(forecast.lastInsertRowid);
+  database.sqlite
+    .prepare(`
+      INSERT INTO forecast_trajectory_shadows (
+        forecast_id, trajectory_id, schema_version, model_version,
+        status, reason, cutoff_at, lock_price, median_cell_width,
+        direction, probabilities_json, expected_delta_cell_widths,
+        sample_json, nearest_ids_json, parameters_json,
+        current_prefix_json, integration_json, created_at
+      )
+      SELECT ?, trajectory_id, schema_version, model_version,
+             status, reason, cutoff_at, lock_price, median_cell_width,
+             direction, probabilities_json, expected_delta_cell_widths,
+             sample_json, nearest_ids_json, parameters_json,
+             current_prefix_json, integration_json, created_at
+      FROM forecast_trajectory_shadows
+      WHERE forecast_id = ?
+    `)
+    .run(forecastId, templateForecastId);
+  const canonicalNumber = rawCell === 37 ? 0 : rawCell;
+  const result = database.sqlite
+    .prepare(`
+      INSERT INTO round_results (
+        source, instrument, settled_at, result_number, price, observed_at,
+        external_round_id, raw_cell, fingerprint, raw_payload,
+        continuity_epoch, created_at
+      ) VALUES ('buleto', 'PRIMECOIN(XPM)/RUB', ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+    `)
+    .run(
+      settledAt,
+      canonicalNumber,
+      price,
+      observedAt,
+      externalRoundId,
+      rawCell,
+      `adaptive-learning-${externalRoundId}`,
+      JSON.stringify({ c: rawCell }),
+      createdAt,
+    );
+  database.sqlite
+    .prepare(`
+      INSERT INTO forecast_settlements (
+        forecast_id, round_result_id, actual_number, settled_at,
+        top1_hit, top3_hit, current_cell_hit, created_at
+      ) VALUES (?, ?, ?, ?, 0, 0, 0, ?)
+    `)
+    .run(
+      forecastId,
+      Number(result.lastInsertRowid),
+      canonicalNumber,
+      settledAt,
+      settlementCreatedAt,
+    );
+  return forecastId;
+}
+
 function virtualTriggerEvents(
   prefix,
   targetNumber = 1,
@@ -649,11 +760,15 @@ test("pre-close forecast freezes an insufficient trajectory shadow instead of us
     clockMs = BASE_TIME + 52_000;
     assert.equal(database.recordPrecloseForecast(attempt).inserted, true);
 
-    const latest = database.getPrecloseForecastState(
+    const state = database.getPrecloseForecastState(
       "buleto",
       "PRIMECOIN(XPM)/RUB",
-    ).latest;
-    assert.equal(latest.trajectoryShadow.version, "trajectory-shadow-knn-v1");
+    );
+    const latest = state.latest;
+    assert.equal(
+      latest.trajectoryShadow.version,
+      "trajectory-shadow-adaptive-v2",
+    );
     assert.equal(latest.trajectoryShadow.status, "insufficient_current");
     assert.equal(
       latest.trajectoryShadow.reason,
@@ -662,6 +777,8 @@ test("pre-close forecast freezes an insufficient trajectory shadow instead of us
     assert.equal(latest.trajectoryShadow.direction, null);
     assert.equal(latest.trajectoryShadow.probabilities, null);
     assert.equal(latest.trajectoryShadow.numberArea, null);
+    assert.equal(latest.trajectoryShadow.displayRange, null);
+    assert.equal(latest.trajectoryShadow.adaptive, null);
     assert.equal(latest.trajectoryShadow.evaluation, null);
     assert.deepEqual(latest.trajectoryShadow.integration.currentCoverage, {
       tickCount: 3,
@@ -675,6 +792,22 @@ test("pre-close forecast freezes an insufficient trajectory shadow instead of us
         .get().count,
       1,
     );
+    assert.deepEqual(state.trajectoryMetrics, {
+      modelVersion: "trajectory-shadow-adaptive-v2",
+      displayRangeVersion: "trajectory-display-range-v1",
+      readyCount: 0,
+      settledCount: 0,
+      pendingCount: 0,
+      evaluatedCount: 0,
+      ungradableCount: 0,
+      displayRangeHits: 0,
+      q50ExactHits: 0,
+      fullCorridorHits: 0,
+      displayRangeRate: null,
+      q50ExactRate: null,
+      fullCorridorRate: null,
+      coverageRate: null,
+    });
   } finally {
     database.close();
   }
@@ -741,7 +874,7 @@ test("trajectory shadow freezes a correction-aware past-only READY prediction an
           externalRoundId: roundId,
           settledAt: iso(endsAtMs),
           observedAt: iso(endsAtMs),
-          price: index >= 27 ? 5.22 : 5.36,
+          price: index >= 26 ? 5.22 : 5.36,
         }),
       );
     }
@@ -767,6 +900,20 @@ test("trajectory shadow freezes a correction-aware past-only READY prediction an
         factors: completePrefix(poisonStartMs),
       }),
     );
+    clockMs = poisonStartMs + 52_000;
+    assert.equal(
+      database.recordPrecloseForecast(
+        precloseForecast(poisonRoundId, {
+          bettingClosesAt: iso(poisonStartMs + 60_000),
+          roundEndsAt: iso(poisonStartMs + 100_000),
+          factorAt: iso(poisonStartMs + 51_000),
+          lockedAt: iso(poisonStartMs + 51_000),
+          currentPrice: 5.34,
+          startPrice: 5.35,
+        }),
+      ).inserted,
+      true,
+    );
     database.ingestBatch([
       event(19, "trajectory-same-cutoff-poison", 0, {
         externalRoundId: poisonRoundId,
@@ -782,6 +929,11 @@ test("trajectory shadow freezes a correction-aware past-only READY prediction an
         WHERE fingerprint = 'trajectory-same-cutoff-poison'
       `)
       .run();
+    assert.deepEqual(
+      database.settlePrecloseForecasts("buleto", "PRIMECOIN(XPM)/RUB"),
+      { settled: 1 },
+    );
+    markForecastSettlementsCreatedAtSettlement(database);
     const poisonResultId = Number(
       database.sqlite
         .prepare(`
@@ -833,31 +985,61 @@ test("trajectory shadow freezes a correction-aware past-only READY prediction an
       inserted: true,
       roundId: currentRoundId,
     });
+    const currentForecastId = Number(
+      database.sqlite
+        .prepare(`
+          SELECT forecasts.id
+          FROM round_forecasts AS forecasts
+          JOIN forecast_snapshots AS snapshots ON snapshots.id = forecasts.snapshot_id
+          WHERE snapshots.external_round_id = ?
+        `)
+        .get(currentRoundId).id,
+    );
 
     let latest = database.getPrecloseForecastState(
       "buleto",
       "PRIMECOIN(XPM)/RUB",
     ).latest;
     const shadow = latest.trajectoryShadow;
-    assert.equal(shadow.version, "trajectory-shadow-knn-v1");
+    assert.equal(shadow.version, "trajectory-shadow-adaptive-v2");
     assert.equal(shadow.status, "ready");
     assert.equal(shadow.reason, null);
     assert.equal(shadow.direction, "up");
-    assert.ok(Math.abs(shadow.probabilities.up - 0.8) < 1e-12);
-    assert.ok(Math.abs(shadow.probabilities.down - 0.2) < 1e-12);
+    assert.ok(shadow.probabilities.up > shadow.probabilities.down);
     assert.equal(shadow.probabilities.flat, 0);
+    assert.ok(
+      Math.abs(
+        shadow.probabilities.up +
+          shadow.probabilities.down +
+          shadow.probabilities.flat -
+          1,
+      ) < 1e-12,
+    );
     assert.equal(shadow.sample.historyCount, 30);
     assert.equal(shadow.sample.eligibleCount, 30);
-    assert.equal(shadow.sample.neighborCount, 15);
+    assert.equal(shadow.sample.neighborCount, 10);
     assert.equal(shadow.sample.requiredHistory, 30);
     assert.equal(shadow.sample.requiredNeighbors, 10);
-    assert.equal(shadow.nearestIds.length, 15);
+    assert.equal(shadow.nearestIds.length, 20);
+    assert.equal(shadow.adaptive.trainingCount, 0);
+    assert.equal(shadow.adaptive.eligibleLearningRowCount, 0);
+    assert.equal(shadow.adaptive.experts.length, 3);
+    assert.deepEqual(shadow.adaptive.currentWeights, {
+      "local-12x10-r3": 1 / 3,
+      "balanced-16x15-r4": 1 / 3,
+      "broad-20x20-r5": 1 / 3,
+    });
+    assert.equal(shadow.adaptive.learningCutoffAt, iso(currentLockedMs));
     assert.equal(shadow.integration.candidateLimit, 500);
     assert.equal(shadow.integration.queriedCandidateCount, 30);
     assert.equal(shadow.integration.usableHistoryCount, 30);
     assert.equal(shadow.integration.excludedCoverageCount, 0);
     assert.equal(shadow.integration.historyMaxResultId, historyMaxResultId);
     assert.equal(shadow.integration.historyCutoffAt, iso(currentLockedMs));
+    assert.equal(shadow.integration.learningLimit, 500);
+    assert.equal(shadow.integration.queriedLearningRowCount, 0);
+    assert.equal(shadow.integration.usableLearningRowCount, 0);
+    assert.equal(shadow.integration.excludedLearningRowCount, 0);
     assert.deepEqual(shadow.integration.currentCoverage, {
       tickCount: 11,
       firstAt: iso(currentStartMs + 1_000),
@@ -867,7 +1049,7 @@ test("trajectory shadow freezes a correction-aware past-only READY prediction an
     assert.equal(shadow.currentPrefix.at(-1).price, 5.34);
     assert.equal(shadow.lockPrice, 5.34);
     assert.ok(Math.abs(shadow.medianCellWidth - 0.01) < 1e-12);
-    assert.ok(Math.abs(shadow.expectedDeltaCellWidths + 0.8) < 1e-9);
+    assert.ok(shadow.expectedDeltaCellWidths < 0);
     assert.equal(shadow.numberArea.version, "trajectory-number-area-v1");
     assert.equal(
       shadow.numberArea.basis,
@@ -905,13 +1087,28 @@ test("trajectory shadow freezes a correction-aware past-only READY prediction an
     assert.equal(shadow.numberArea.corridor.clippedTop, false);
     assert.equal(shadow.numberArea.corridor.clippedBottom, false);
     assert.deepEqual(shadow.integration.numberArea, shadow.numberArea);
+    assert.deepEqual(shadow.displayRange, {
+      version: "trajectory-display-range-v1",
+      policy: "q50-centered-contiguous-max6-v1",
+      maxCells: 6,
+      top: { wireCell: 23, number: 23 },
+      bottom: { wireCell: 28, number: 28 },
+      cells: [23, 24, 25, 26, 27, 28].map((wireCell) => ({
+        wireCell,
+        number: wireCell,
+      })),
+    });
+    assert.deepEqual(shadow.integration.displayRange, shadow.displayRange);
+    assert.deepEqual(shadow.integration.adaptive, shadow.adaptive);
     assert.equal(shadow.evaluation, null);
 
     const frozenShadow = {
-      ...database.sqlite.prepare("SELECT * FROM forecast_trajectory_shadows").get(),
+      ...database.sqlite
+        .prepare("SELECT * FROM forecast_trajectory_shadows WHERE forecast_id = ?")
+        .get(currentForecastId),
     };
     database.ingestBatch([
-      event(7, "trajectory-current-result", 0, {
+      event(23, "trajectory-current-result", 0, {
         externalRoundId: currentRoundId,
         settledAt: iso(currentEndMs),
         observedAt: iso(currentEndMs),
@@ -923,38 +1120,576 @@ test("trajectory shadow freezes a correction-aware past-only READY prediction an
       { settled: 1 },
     );
     assert.deepEqual(
-      { ...database.sqlite.prepare("SELECT * FROM forecast_trajectory_shadows").get() },
+      {
+        ...database.sqlite
+          .prepare("SELECT * FROM forecast_trajectory_shadows WHERE forecast_id = ?")
+          .get(currentForecastId),
+      },
       frozenShadow,
       "settlement must not mutate the frozen shadow",
     );
+    markForecastSettlementsCreatedAtSettlement(database);
 
     latest = database.getPrecloseForecastState(
       "buleto",
       "PRIMECOIN(XPM)/RUB",
     ).latest;
     assert.equal(latest.trajectoryShadow.evaluation.actualPrice, 5.36);
+    assert.equal(latest.trajectoryShadow.evaluation.rawCell, 23);
     assert.equal(latest.trajectoryShadow.evaluation.actualDirection, "up");
     assert.equal(latest.trajectoryShadow.evaluation.directionHit, true);
+    assert.equal(latest.trajectoryShadow.evaluation.displayRangeHit, true);
+    assert.equal(latest.trajectoryShadow.evaluation.q50ExactHit, true);
+    assert.equal(latest.trajectoryShadow.evaluation.fullCorridorHit, true);
     assert.ok(
       Math.abs(latest.trajectoryShadow.evaluation.deltaCellWidths - 2) < 1e-9,
     );
 
-    const legacyIntegration = JSON.parse(
-      database.sqlite
-        .prepare("SELECT integration_json FROM forecast_trajectory_shadows")
-        .get().integration_json,
-    );
-    delete legacyIntegration.numberArea;
+    const currentResultId = latest.trajectoryShadow.evaluation.resultId;
+    const setCurrentZero = database.sqlite.prepare(`
+      UPDATE round_results
+      SET result_number = 0, raw_cell = ?
+      WHERE id = ?
+    `);
     database.sqlite
-      .prepare("UPDATE forecast_trajectory_shadows SET integration_json = ?")
-      .run(JSON.stringify(legacyIntegration));
+      .prepare("UPDATE forecast_settlements SET actual_number = 0 WHERE forecast_id = ?")
+      .run(currentForecastId);
+    setCurrentZero.run(37, currentResultId);
     latest = database.getPrecloseForecastState(
       "buleto",
       "PRIMECOIN(XPM)/RUB",
     ).latest;
+    assert.equal(latest.trajectoryShadow.evaluation.actualNumber, 0);
+    assert.equal(latest.trajectoryShadow.evaluation.rawCell, 37);
+    assert.equal(latest.trajectoryShadow.evaluation.displayRangeHit, false);
+    assert.equal(latest.trajectoryShadow.evaluation.q50ExactHit, false);
+    assert.equal(latest.trajectoryShadow.evaluation.fullCorridorHit, true);
+
+    setCurrentZero.run(0, currentResultId);
+    latest = database.getPrecloseForecastState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    ).latest;
+    assert.equal(latest.trajectoryShadow.evaluation.rawCell, 0);
+    assert.equal(latest.trajectoryShadow.evaluation.fullCorridorHit, false);
+
+    database.sqlite
+      .prepare("UPDATE round_results SET raw_cell = NULL WHERE id = ?")
+      .run(currentResultId);
+    latest = database.getPrecloseForecastState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    assert.equal(latest.latest.trajectoryShadow.evaluation.rawCell, null);
+    assert.equal(latest.latest.trajectoryShadow.evaluation.displayRangeHit, null);
+    assert.equal(latest.trajectoryMetrics.ungradableCount, 1);
+
+    setCurrentZero.run(37, currentResultId);
+    database.sqlite
+      .prepare("UPDATE forecast_settlements SET actual_number = 23 WHERE forecast_id = ?")
+      .run(currentForecastId);
+    latest = database.getPrecloseForecastState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    assert.equal(latest.latest.trajectoryShadow.evaluation.rawCell, null);
+    assert.equal(latest.latest.trajectoryShadow.evaluation.displayRangeHit, null);
+    assert.equal(latest.latest.trajectoryShadow.evaluation.q50ExactHit, null);
+    assert.equal(latest.latest.trajectoryShadow.evaluation.fullCorridorHit, null);
+    assert.equal(latest.trajectoryMetrics.evaluatedCount, 0);
+    assert.equal(latest.trajectoryMetrics.ungradableCount, 1);
+
+    database.sqlite
+      .prepare("UPDATE round_results SET result_number = 23, raw_cell = 23 WHERE id = ?")
+      .run(currentResultId);
+    const restoredCurrentState = database.getPrecloseForecastState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    assert.deepEqual(restoredCurrentState.trajectoryMetrics, {
+      modelVersion: "trajectory-shadow-adaptive-v2",
+      displayRangeVersion: "trajectory-display-range-v1",
+      readyCount: 1,
+      settledCount: 1,
+      pendingCount: 0,
+      evaluatedCount: 1,
+      ungradableCount: 0,
+      displayRangeHits: 1,
+      q50ExactHits: 1,
+      fullCorridorHits: 1,
+      displayRangeRate: 1,
+      q50ExactRate: 1,
+      fullCorridorRate: 1,
+      coverageRate: 1,
+    });
+    markResultsCreatedAtObservation(database, "trajectory-current-result");
+
+    const legacyIntegration = JSON.parse(
+      database.sqlite
+        .prepare(
+          "SELECT integration_json FROM forecast_trajectory_shadows WHERE forecast_id = ?",
+        )
+        .get(currentForecastId).integration_json,
+    );
+    delete legacyIntegration.adaptive;
+    delete legacyIntegration.displayRange;
+    database.sqlite
+      .prepare(`
+        UPDATE forecast_trajectory_shadows
+        SET model_version = 'trajectory-shadow-knn-v1', integration_json = ?
+        WHERE forecast_id = ?
+      `)
+      .run(JSON.stringify(legacyIntegration), currentForecastId);
+    latest = database.getPrecloseForecastState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    ).latest;
+    assert.equal(latest.trajectoryShadow.version, "trajectory-shadow-knn-v1");
     assert.equal(latest.trajectoryShadow.status, "ready");
+    assert.notEqual(latest.trajectoryShadow.numberArea, null);
+    assert.equal(latest.trajectoryShadow.displayRange, null);
+    assert.equal(latest.trajectoryShadow.adaptive, null);
+
+    delete legacyIntegration.numberArea;
+    database.sqlite
+      .prepare(
+        "UPDATE forecast_trajectory_shadows SET integration_json = ? WHERE forecast_id = ?",
+      )
+      .run(JSON.stringify(legacyIntegration), currentForecastId);
+    latest = database.getPrecloseForecastState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    ).latest;
+    assert.equal(latest.trajectoryShadow.version, "trajectory-shadow-knn-v1");
     assert.equal(latest.trajectoryShadow.numberArea, null);
     assert.equal(latest.trajectoryShadow.integration.numberArea, null);
+
+    database.sqlite
+      .prepare(`
+        UPDATE forecast_trajectory_shadows
+        SET model_version = ?, integration_json = ?
+        WHERE forecast_id = ?
+      `)
+      .run(
+        frozenShadow.model_version,
+        frozenShadow.integration_json,
+        currentForecastId,
+      );
+    const tamperedIntegration = JSON.parse(frozenShadow.integration_json);
+    tamperedIntegration.adaptive.currentWeights["local-12x10-r3"] = 1;
+    database.sqlite
+      .prepare(
+        "UPDATE forecast_trajectory_shadows SET integration_json = ? WHERE forecast_id = ?",
+      )
+      .run(JSON.stringify(tamperedIntegration), currentForecastId);
+    const tamperedState = database.getPrecloseForecastState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    assert.equal(
+      tamperedState.latest.trajectoryShadow,
+      null,
+      "tampered adaptive weights must fail closed",
+    );
+    assert.equal(
+      tamperedState.trajectoryMetrics.readyCount,
+      0,
+      "tampered adaptive snapshots must be excluded from aggregate metrics",
+    );
+    database.sqlite
+      .prepare(
+        "UPDATE forecast_trajectory_shadows SET integration_json = ? WHERE forecast_id = ?",
+      )
+      .run(frozenShadow.integration_json, currentForecastId);
+    const tamperedRangeIntegration = JSON.parse(frozenShadow.integration_json);
+    tamperedRangeIntegration.displayRange.bottom = {
+      ...tamperedRangeIntegration.displayRange.cells.at(-2),
+    };
+    database.sqlite
+      .prepare(
+        "UPDATE forecast_trajectory_shadows SET integration_json = ? WHERE forecast_id = ?",
+      )
+      .run(JSON.stringify(tamperedRangeIntegration), currentForecastId);
+    const tamperedRangeState = database.getPrecloseForecastState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    assert.equal(tamperedRangeState.latest.trajectoryShadow, null);
+    assert.equal(tamperedRangeState.trajectoryMetrics.readyCount, 0);
+    database.sqlite
+      .prepare(
+        "UPDATE forecast_trajectory_shadows SET integration_json = ? WHERE forecast_id = ?",
+      )
+      .run(frozenShadow.integration_json, currentForecastId);
+
+    const assertCurrentSnapshotRejected = (message) => {
+      const state = database.getPrecloseForecastState(
+        "buleto",
+        "PRIMECOIN(XPM)/RUB",
+      );
+      assert.equal(state.latest.trajectoryShadow, null, message);
+      assert.equal(
+        state.trajectoryMetrics.readyCount,
+        0,
+        `${message}: aggregate metrics must use the same validator`,
+      );
+    };
+
+    const forgedEnsembleIntegration = JSON.parse(frozenShadow.integration_json);
+    forgedEnsembleIntegration.adaptive.ensembleWeights = {
+      "local-12x10-r3": 0.5,
+      "balanced-16x15-r4": 0.3,
+      "broad-20x20-r5": 0.2,
+    };
+    for (const expert of forgedEnsembleIntegration.adaptive.experts) {
+      expert.ensembleWeight =
+        forgedEnsembleIntegration.adaptive.ensembleWeights[expert.id];
+    }
+    database.sqlite
+      .prepare(
+        "UPDATE forecast_trajectory_shadows SET integration_json = ? WHERE forecast_id = ?",
+      )
+      .run(JSON.stringify(forgedEnsembleIntegration), currentForecastId);
+    assertCurrentSnapshotRejected(
+      "ensemble weights must be the ready experts' renormalized learned weights",
+    );
+    database.sqlite
+      .prepare(
+        "UPDATE forecast_trajectory_shadows SET integration_json = ? WHERE forecast_id = ?",
+      )
+      .run(frozenShadow.integration_json, currentForecastId);
+
+    const partialReadyIntegration = JSON.parse(frozenShadow.integration_json);
+    const broadExpert = partialReadyIntegration.adaptive.experts[2];
+    broadExpert.status = "insufficient_neighbors";
+    broadExpert.direction = null;
+    broadExpert.probabilities = null;
+    broadExpert.expectedDeltaCellWidths = null;
+    broadExpert.deltaRangeCellWidths = null;
+    broadExpert.nearestIds = [];
+    broadExpert.sample = {
+      historyCount: 30,
+      eligibleCount: 30,
+      excludedNotPastCount: 0,
+      withinDistanceCount: 0,
+      neighborCount: 0,
+      requiredHistory: 30,
+      requiredNeighbors: 10,
+    };
+    partialReadyIntegration.adaptive.ensembleWeights = {
+      "local-12x10-r3": 0.6,
+      "balanced-16x15-r4": 0.4,
+      "broad-20x20-r5": 0,
+    };
+    for (const expert of partialReadyIntegration.adaptive.experts) {
+      expert.ensembleWeight =
+        partialReadyIntegration.adaptive.ensembleWeights[expert.id];
+    }
+    database.sqlite
+      .prepare(
+        "UPDATE forecast_trajectory_shadows SET integration_json = ? WHERE forecast_id = ?",
+      )
+      .run(JSON.stringify(partialReadyIntegration), currentForecastId);
+    assertCurrentSnapshotRejected(
+      "partial-ready experts cannot carry forged ensemble weights or stale top-level output",
+    );
+    database.sqlite
+      .prepare(
+        "UPDATE forecast_trajectory_shadows SET integration_json = ? WHERE forecast_id = ?",
+      )
+      .run(frozenShadow.integration_json, currentForecastId);
+
+    const tamperedProbabilities = JSON.parse(frozenShadow.probabilities_json);
+    const probabilityShift = Math.min(0.01, tamperedProbabilities.up / 2);
+    tamperedProbabilities.up -= probabilityShift;
+    tamperedProbabilities.down += probabilityShift;
+    database.sqlite
+      .prepare(
+        "UPDATE forecast_trajectory_shadows SET probabilities_json = ? WHERE forecast_id = ?",
+      )
+      .run(JSON.stringify(tamperedProbabilities), currentForecastId);
+    assertCurrentSnapshotRejected(
+      "top-level probabilities must equal the frozen weighted expert output",
+    );
+    database.sqlite
+      .prepare(
+        "UPDATE forecast_trajectory_shadows SET probabilities_json = ? WHERE forecast_id = ?",
+      )
+      .run(frozenShadow.probabilities_json, currentForecastId);
+
+    const tamperedQ50Integration = JSON.parse(frozenShadow.integration_json);
+    const tamperedCorridor = tamperedQ50Integration.numberArea.corridor;
+    const originalMedian = tamperedCorridor.medianDeltaCellWidths;
+    const medianShift = originalMedian < tamperedCorridor.upperDeltaCellWidths
+      ? Math.min(0.001, (tamperedCorridor.upperDeltaCellWidths - originalMedian) / 2)
+      : -Math.min(0.001, (originalMedian - tamperedCorridor.lowerDeltaCellWidths) / 2);
+    assert.notEqual(medianShift, 0);
+    const tamperedMedian = originalMedian + medianShift;
+    tamperedCorridor.medianDeltaCellWidths = tamperedMedian;
+    tamperedQ50Integration.numberArea.typical.deltaCellWidths = tamperedMedian;
+    tamperedQ50Integration.numberArea.typical.price =
+      frozenShadow.lock_price + tamperedMedian * frozenShadow.median_cell_width;
+    tamperedQ50Integration.numberArea.typical.direction =
+      tamperedMedian > 0.5 ? "up" : tamperedMedian < -0.5 ? "down" : "flat";
+    tamperedQ50Integration.numberArea.typical.agreesWithDirection =
+      tamperedQ50Integration.numberArea.typical.direction ===
+      frozenShadow.direction;
+    database.sqlite
+      .prepare(
+        "UPDATE forecast_trajectory_shadows SET integration_json = ? WHERE forecast_id = ?",
+      )
+      .run(JSON.stringify(tamperedQ50Integration), currentForecastId);
+    assertCurrentSnapshotRejected(
+      "the frozen q50 must equal the weighted expert median",
+    );
+    database.sqlite
+      .prepare(
+        "UPDATE forecast_trajectory_shadows SET integration_json = ? WHERE forecast_id = ?",
+      )
+      .run(frozenShadow.integration_json, currentForecastId);
+
+    const shiftedAreaIntegration = JSON.parse(frozenShadow.integration_json);
+    const shiftPoint = (point) => ({
+      wireCell: point.wireCell - 1,
+      number: point.wireCell - 1 === 37 ? 0 : point.wireCell - 1,
+    });
+    shiftedAreaIntegration.numberArea.current = shiftPoint(
+      shiftedAreaIntegration.numberArea.current,
+    );
+    shiftedAreaIntegration.numberArea.typical = {
+      ...shiftedAreaIntegration.numberArea.typical,
+      ...shiftPoint(shiftedAreaIntegration.numberArea.typical),
+    };
+    shiftedAreaIntegration.numberArea.corridor.top = shiftPoint(
+      shiftedAreaIntegration.numberArea.corridor.top,
+    );
+    shiftedAreaIntegration.numberArea.corridor.bottom = shiftPoint(
+      shiftedAreaIntegration.numberArea.corridor.bottom,
+    );
+    shiftedAreaIntegration.numberArea.corridor.cells =
+      shiftedAreaIntegration.numberArea.corridor.cells.map(shiftPoint);
+    shiftedAreaIntegration.displayRange.top = shiftPoint(
+      shiftedAreaIntegration.displayRange.top,
+    );
+    shiftedAreaIntegration.displayRange.bottom = shiftPoint(
+      shiftedAreaIntegration.displayRange.bottom,
+    );
+    shiftedAreaIntegration.displayRange.cells =
+      shiftedAreaIntegration.displayRange.cells.map(shiftPoint);
+    database.sqlite
+      .prepare(
+        "UPDATE forecast_trajectory_shadows SET integration_json = ? WHERE forecast_id = ?",
+      )
+      .run(JSON.stringify(shiftedAreaIntegration), currentForecastId);
+    assertCurrentSnapshotRejected(
+      "a coherent but shifted number area must remain anchored to frozen bands",
+    );
+    database.sqlite
+      .prepare(
+        "UPDATE forecast_trajectory_shadows SET integration_json = ? WHERE forecast_id = ?",
+      )
+      .run(frozenShadow.integration_json, currentForecastId);
+
+    const invalidLearningForecastId = cloneSettledAdaptiveForecast(database, {
+      templateForecastId: currentForecastId,
+      externalRoundId: "adaptive-cross-field-poison",
+      settledAt: iso(currentEndMs + 1_000),
+    });
+    database.sqlite
+      .prepare(`
+        UPDATE forecast_snapshots
+        SET current_price = current_price + 0.01
+        WHERE id = (
+          SELECT snapshot_id FROM round_forecasts WHERE id = ?
+        )
+      `)
+      .run(invalidLearningForecastId);
+    const invalidLearningState = database.getPrecloseForecastState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    assert.equal(invalidLearningState.latest.id, invalidLearningForecastId);
+    assert.equal(invalidLearningState.latest.trajectoryShadow, null);
+    assert.equal(invalidLearningState.trajectoryMetrics.readyCount, 1);
+
+    const nextStartMs = currentStartMs + 120_000;
+    const nextLockedMs = nextStartMs + 51_000;
+    const nextEndMs = nextStartMs + 100_000;
+    const nextRoundId = "trajectory-adaptive-next";
+    clockMs = nextLockedMs + 100;
+    database.recordRoundTrajectory(
+      roundTrajectory(nextRoundId, {
+        startsAtMs: nextStartMs,
+        receivedAtMs: nextLockedMs,
+        cells: numberAreaCells,
+        factors: completePrefix(nextStartMs),
+      }),
+    );
+    clockMs = nextLockedMs + 2_000;
+    assert.equal(
+      database.recordPrecloseForecast(
+        precloseForecast(nextRoundId, {
+          bettingClosesAt: iso(nextStartMs + 60_000),
+          roundEndsAt: iso(nextEndMs),
+          factorAt: iso(nextLockedMs),
+          lockedAt: iso(nextLockedMs),
+          currentPrice: 5.34,
+          startPrice: 5.35,
+          cells: numberAreaCells,
+        }),
+      ).inserted,
+      true,
+    );
+    let nextState = database.getPrecloseForecastState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    const nextShadow = nextState.latest.trajectoryShadow;
+    assert.equal(nextShadow.version, "trajectory-shadow-adaptive-v2");
+    assert.equal(nextShadow.status, "ready");
+    assert.equal(nextShadow.integration.queriedLearningRowCount, 1);
+    assert.equal(nextShadow.integration.usableLearningRowCount, 1);
+    assert.equal(nextShadow.adaptive.trainingCount, 1);
+    assert.equal(nextShadow.adaptive.eligibleLearningRowCount, 1);
+    assert.equal(nextShadow.adaptive.lastTrainingCompletedAt, iso(currentEndMs));
+    assert.deepEqual(
+      nextShadow.adaptive.experts.map((expert) => expert.id),
+      ["local-12x10-r3", "balanced-16x15-r4", "broad-20x20-r5"],
+    );
+    assert.equal(nextState.trajectoryMetrics.readyCount, 2);
+    assert.equal(nextState.trajectoryMetrics.settledCount, 1);
+    assert.equal(nextState.trajectoryMetrics.pendingCount, 1);
+
+    const nextForecastId = nextState.latest.id;
+    const fullCorridorCells = new Set(
+      nextShadow.numberArea.corridor.cells.map((cell) => cell.wireCell),
+    );
+    const outsideWireCell = Array.from({ length: 38 }, (_, index) => index).find(
+      (wireCell) => !fullCorridorCells.has(wireCell),
+    );
+    assert.notEqual(outsideWireCell, undefined);
+    database.ingestBatch([
+      event(
+        outsideWireCell === 37 ? 0 : outsideWireCell,
+        "trajectory-adaptive-next-result",
+        0,
+        {
+          externalRoundId: nextRoundId,
+          settledAt: iso(nextEndMs),
+          observedAt: iso(nextEndMs),
+          price: 5.36,
+          rawPayload: { c: outsideWireCell },
+        },
+      ),
+    ]);
+    markResultsCreatedAtObservation(database, "trajectory-adaptive-next-result");
+    assert.deepEqual(
+      database.settlePrecloseForecasts("buleto", "PRIMECOIN(XPM)/RUB"),
+      { settled: 1 },
+    );
+    markForecastSettlementsCreatedAtSettlement(database);
+    nextState = database.getPrecloseForecastState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    assert.deepEqual(nextState.trajectoryMetrics, {
+      modelVersion: "trajectory-shadow-adaptive-v2",
+      displayRangeVersion: "trajectory-display-range-v1",
+      readyCount: 2,
+      settledCount: 2,
+      pendingCount: 0,
+      evaluatedCount: 2,
+      ungradableCount: 0,
+      displayRangeHits: 1,
+      q50ExactHits: 1,
+      fullCorridorHits: 1,
+      displayRangeRate: 0.5,
+      q50ExactRate: 0.5,
+      fullCorridorRate: 0.5,
+      coverageRate: 1,
+    });
+
+    const finalStartMs = nextStartMs + 120_000;
+    const finalLockedMs = finalStartMs + 51_000;
+    const finalEndMs = finalStartMs + 100_000;
+    database.sqlite.exec("BEGIN IMMEDIATE");
+    try {
+      cloneSettledAdaptiveForecast(database, {
+        templateForecastId: nextForecastId,
+        externalRoundId: "adaptive-cap-late-available",
+        settledAt: iso(nextEndMs),
+        observedAt: iso(finalLockedMs - 1_000),
+        createdAt: iso(finalLockedMs - 1_000),
+      });
+      for (let index = 0; index < 501; index += 1) {
+        cloneSettledAdaptiveForecast(database, {
+          templateForecastId: nextForecastId,
+          externalRoundId: `adaptive-cap-${index}`,
+          settledAt: iso(nextEndMs + 1_000),
+        });
+      }
+      cloneSettledAdaptiveForecast(database, {
+        templateForecastId: nextForecastId,
+        externalRoundId: "adaptive-same-cutoff-excluded",
+        settledAt: iso(nextEndMs + 1_000),
+        observedAt: iso(nextEndMs + 1_000),
+        createdAt: iso(nextEndMs + 1_000),
+        settlementCreatedAt: iso(finalLockedMs),
+      });
+      database.sqlite.exec("COMMIT");
+    } catch (error) {
+      database.sqlite.exec("ROLLBACK");
+      throw error;
+    }
+
+    const finalRoundId = "trajectory-adaptive-cap-current";
+    clockMs = finalLockedMs + 100;
+    database.recordRoundTrajectory(
+      roundTrajectory(finalRoundId, {
+        startsAtMs: finalStartMs,
+        receivedAtMs: finalLockedMs,
+        cells: numberAreaCells,
+        factors: completePrefix(finalStartMs),
+      }),
+    );
+    clockMs = finalLockedMs + 2_000;
+    assert.equal(
+      database.recordPrecloseForecast(
+        precloseForecast(finalRoundId, {
+          bettingClosesAt: iso(finalStartMs + 60_000),
+          roundEndsAt: iso(finalEndMs),
+          factorAt: iso(finalLockedMs),
+          lockedAt: iso(finalLockedMs),
+          currentPrice: 5.34,
+          startPrice: 5.35,
+          cells: numberAreaCells,
+        }),
+      ).inserted,
+      true,
+    );
+    const finalIntegration = JSON.parse(
+      database.sqlite
+        .prepare(`
+          SELECT trajectory_shadows.integration_json
+          FROM forecast_trajectory_shadows AS trajectory_shadows
+          JOIN round_forecasts AS forecasts
+            ON forecasts.id = trajectory_shadows.forecast_id
+          JOIN forecast_snapshots AS snapshots
+            ON snapshots.id = forecasts.snapshot_id
+          WHERE snapshots.external_round_id = ?
+        `)
+        .get(finalRoundId).integration_json,
+    );
+    assert.equal(finalIntegration.learningLimit, 500);
+    assert.equal(finalIntegration.queriedLearningRowCount, 500);
+    assert.equal(finalIntegration.usableLearningRowCount, 500);
+    assert.equal(finalIntegration.adaptive.trainingCount, 500);
+    assert.equal(finalIntegration.adaptive.eligibleLearningRowCount, 500);
+    assert.equal(
+      finalIntegration.adaptive.lastTrainingCompletedAt,
+      iso(finalLockedMs - 1_000),
+      "the cap must keep the latest strictly pre-lock availability, not the latest settled_at",
+    );
   } finally {
     database.close();
   }

@@ -55,6 +55,8 @@ test("trajectory shadow is additive, prospective, and observation-only", () => {
     "trajectory-shadow-status",
     "trajectory-shadow-shares",
     "trajectory-shadow-number-area",
+    "trajectory-shadow-training",
+    "trajectory-shadow-range-metrics",
     "trajectory-shadow-sample",
   ];
   const semanticIds = ["trajectory-shadow-title", "trajectory-shadow-note"];
@@ -76,31 +78,53 @@ test("trajectory shadow is additive, prospective, and observation-only", () => {
   assert.match(block, /а не следующий тик/);
   assert.match(block, /Доли похожих завершённых траекторий/);
   assert.match(block, /ПРОГНОЗ УЧАСТКА: НЕТ ДАННЫХ/);
-  assert.match(block, /не более 6 соседних цифр вокруг типичного q50/);
-  assert.match(block, /полного исторического коридора q20\/q80/);
-  assert.match(block, /сокращение отображения/);
+  assert.match(block, /не более 6 соседних ценовых полос вокруг типичного q50/);
+  assert.match(block, /полного коридора q20\/q80/);
+  assert.match(block, /Adaptive v2 фиксирует при lock/);
+  assert.match(block, /legacy KNN v1/);
   assert.match(block, /от 0 сверху к 36 снизу/);
   assert.match(block, /нижняя дублирующая нулевая полоса/);
   assert.match(
     block,
     /id="trajectory-shadow-number-area" aria-live="polite" aria-atomic="true"/,
   );
-  assert.match(block, /Outcome этого prospective shadow пока не валидирован/);
-  assert.match(block, /не меняет итоговый Top‑3 и виртуальный билет/);
-  assert.doesNotMatch(block, /вероятност|шанс/iu);
+  assert.match(block, /Обучение: — результатов/);
+  assert.match(block, /Участок: — из —/);
+  assert.match(block, /проспективные попадания/);
+  assert.match(block, /не является вероятностью следующего раунда/);
+  assert.match(block, /не меняет итоговый Top‑3, виртуальный билет и ставки/);
   assert.doesNotMatch(block, /roulette-(?:red|green|black)|is-(?:hit|positive|loss)/);
 
-  assert.match(app, /const TRAJECTORY_SHADOW_VERSION = "trajectory-shadow-knn-v1"/);
+  assert.match(app, /const TRAJECTORY_SHADOW_LEGACY_VERSION = "trajectory-shadow-knn-v1"/);
+  assert.match(app, /const TRAJECTORY_SHADOW_ADAPTIVE_VERSION = "trajectory-shadow-adaptive-v2"/);
   assert.match(app, /const TRAJECTORY_NUMBER_AREA_VERSION = "trajectory-number-area-v1"/);
+  assert.match(app, /const TRAJECTORY_DISPLAY_RANGE_VERSION = "trajectory-display-range-v1"/);
+  assert.match(app, /const TRAJECTORY_DISPLAY_RANGE_POLICY = "q50-centered-contiguous-max6-v1"/);
   assert.match(app, /const TRAJECTORY_NUMBER_AREA_MAX_DISPLAY_CELLS = 6/);
   assert.match(app, /function normalizedTrajectoryNumberArea\(value\)/);
+  assert.match(app, /function normalizedTrajectoryDisplayRange\(value, numberArea\)/);
+  assert.match(app, /function normalizedTrajectoryAdaptive\(value\)/);
+  assert.match(app, /function normalizedTrajectoryEvaluation\(value, \{ numberArea, displayRange \}\)/);
+  assert.match(app, /function normalizedTrajectoryMetrics\(value\)/);
   assert.match(app, /function trajectoryNumberAreaDisplayCells\(area\)/);
-  assert.match(app, /function trajectoryNumberAreaText\(area\)/);
+  assert.match(app, /function trajectoryShadowDisplayCells\(shadow\)/);
+  assert.match(app, /function trajectoryNumberAreaText\(shadow\)/);
   assert.match(app, /function normalizedTrajectoryShadow\(value\)/);
-  assert.match(app, /function renderTrajectoryShadow\(value\)/);
+  assert.match(app, /function renderTrajectoryShadow\(value, metricsValue\)/);
   assert.match(app, /"insufficient_current"/);
-  assert.match(app, /Текущий график неполный/);
-  assert.match(app, /renderTrajectoryShadow\(matchesCurrent \? latest\?\.trajectoryShadow : null\)/);
+  assert.match(app, /график неполный/);
+  assert.match(
+    app,
+    /renderTrajectoryShadow\(\s*matchesCurrent \? latest\?\.trajectoryShadow : null,\s*forecastState\?\.trajectoryMetrics,\s*\)/,
+  );
+  assert.match(app, /shadow\.isAdaptive\s*\? shadow\.displayRange\?\.cells \?\? \[\]/);
+  assert.match(app, /value\.modelVersion !== TRAJECTORY_SHADOW_ADAPTIVE_VERSION/);
+  assert.match(app, /value\.displayRangeVersion !== TRAJECTORY_DISPLAY_RANGE_VERSION/);
+  assert.match(app, /value\.readyCount !== value\.settledCount \+ value\.pendingCount/);
+  assert.match(app, /value\.settledCount !== value\.evaluatedCount \+ value\.ungradableCount/);
+  assert.match(app, /Обучение: \$\{trainingCount\}/);
+  assert.match(app, /Участок: \$\{displayRangeHits\} из \$\{evaluatedCount\}/);
+  assert.match(app, /проспективное наблюдение/);
   assert.match(app, /Полные сопоставимые раунды:/);
   assert.match(app, /Доли похожих завершённых траекторий:/);
   assert.ok(app.includes("ПРОГНОЗ УЧАСТКА: ОТ ${from} ДО ${to}"));
@@ -127,14 +151,17 @@ test("trajectory shadow is additive, prospective, and observation-only", () => {
 
 test("trajectory number area display keeps at most six cells around q50", () => {
   const functionStart = app.indexOf("  function trajectoryNumberAreaDisplayCells(area) {");
-  const functionEnd = app.indexOf("\n\n  function trajectoryNumberAreaText(area)", functionStart);
+  const functionEnd = app.indexOf("\n\n  function trajectoryNumberAreaText(shadow)", functionStart);
   assert.ok(functionStart >= 0 && functionEnd > functionStart);
   const functionSource = app.slice(functionStart, functionEnd);
   const build = new Function(
     "TRAJECTORY_NUMBER_AREA_MAX_DISPLAY_CELLS",
-    `"use strict"; ${functionSource}; return trajectoryNumberAreaDisplayCells;`,
+    `"use strict"; ${functionSource}; return { trajectoryNumberAreaDisplayCells, trajectoryShadowDisplayCells };`,
   );
-  const displayCells = build(6);
+  const {
+    trajectoryNumberAreaDisplayCells: displayCells,
+    trajectoryShadowDisplayCells: shadowDisplayCells,
+  } = build(6);
   const point = (wireCell) => ({
     wireCell,
     number: wireCell === 37 ? 0 : wireCell,
@@ -158,6 +185,346 @@ test("trajectory number area display keeps at most six cells around q50", () => 
   const before = structuredClone(frozenInput);
   displayCells(frozenInput);
   assert.deepEqual(frozenInput, before);
+
+  const legacy = { isAdaptive: false, numberArea: area(5, 25, 15) };
+  assert.deepEqual(
+    shadowDisplayCells(legacy).map(({ wireCell }) => wireCell),
+    [13, 14, 15, 16, 17, 18],
+  );
+  const frozenRange = [point(0), point(1), point(2)];
+  const adaptive = {
+    isAdaptive: true,
+    numberArea: area(5, 25, 15),
+    displayRange: { cells: frozenRange },
+  };
+  assert.equal(shadowDisplayCells(adaptive), frozenRange);
+});
+
+test("adaptive trajectory display range accepts only the frozen contiguous max-six contract", () => {
+  const functionStart = app.indexOf("  function normalizedTrajectoryWirePoint(point) {");
+  const functionEnd = app.indexOf("\n\n  function normalizedTrajectoryAdaptive(value)", functionStart);
+  assert.ok(functionStart >= 0 && functionEnd > functionStart);
+  const functionSource = app.slice(functionStart, functionEnd);
+  const build = new Function(
+    "TRAJECTORY_NUMBER_AREA_VERSION",
+    "TRAJECTORY_DISPLAY_RANGE_VERSION",
+    "TRAJECTORY_DISPLAY_RANGE_POLICY",
+    "TRAJECTORY_NUMBER_AREA_MAX_DISPLAY_CELLS",
+    `"use strict"; ${functionSource}; return normalizedTrajectoryDisplayRange;`,
+  );
+  const normalize = build(
+    "trajectory-number-area-v1",
+    "trajectory-display-range-v1",
+    "q50-centered-contiguous-max6-v1",
+    6,
+  );
+  const point = (wireCell) => ({
+    wireCell,
+    number: wireCell === 37 ? 0 : wireCell,
+  });
+  const area = (from, to, typical) => ({
+    typical: point(typical),
+    corridor: {
+      top: point(from),
+      bottom: point(to),
+      cells: Array.from({ length: to - from + 1 }, (_, index) => point(from + index)),
+    },
+  });
+  const range = (from, to) => ({
+    version: "trajectory-display-range-v1",
+    policy: "q50-centered-contiguous-max6-v1",
+    maxCells: 6,
+    top: point(from),
+    bottom: point(to),
+    cells: Array.from({ length: to - from + 1 }, (_, index) => point(from + index)),
+  });
+
+  assert.deepEqual(
+    normalize(range(0, 5), area(0, 20, 0)).cells.map(({ wireCell }) => wireCell),
+    [0, 1, 2, 3, 4, 5],
+  );
+  assert.deepEqual(
+    normalize(range(32, 37), area(20, 37, 37)).cells.map(({ wireCell }) => wireCell),
+    [32, 33, 34, 35, 36, 37],
+  );
+  assert.deepEqual(
+    normalize(range(1, 6), area(0, 20, 3)).cells.map(({ wireCell }) => wireCell),
+    [1, 2, 3, 4, 5, 6],
+  );
+  assert.equal(normalize(range(0, 6), area(0, 20, 3)), null);
+  assert.equal(normalize(range(0, 5), area(0, 20, 3)), null);
+  assert.equal(normalize(range(0, 5), area(0, 20, 10)), null);
+  assert.equal(
+    normalize({ ...range(0, 5), maxCells: "6" }, area(0, 20, 0)),
+    null,
+  );
+});
+
+test("adaptive trajectory metrics fail closed on inconsistent prospective counts", () => {
+  const functionStart = app.indexOf("  function normalizedTrajectoryMetrics(value) {");
+  const functionEnd = app.indexOf("\n\n  function normalizedTrajectoryShadow(value)", functionStart);
+  assert.ok(functionStart >= 0 && functionEnd > functionStart);
+  const functionSource = app.slice(functionStart, functionEnd);
+  const build = new Function(
+    "TRAJECTORY_SHADOW_ADAPTIVE_VERSION",
+    "TRAJECTORY_DISPLAY_RANGE_VERSION",
+    `"use strict"; ${functionSource}; return normalizedTrajectoryMetrics;`,
+  );
+  const normalize = build(
+    "trajectory-shadow-adaptive-v2",
+    "trajectory-display-range-v1",
+  );
+  const valid = {
+    modelVersion: "trajectory-shadow-adaptive-v2",
+    displayRangeVersion: "trajectory-display-range-v1",
+    readyCount: 5,
+    settledCount: 4,
+    pendingCount: 1,
+    evaluatedCount: 3,
+    ungradableCount: 1,
+    displayRangeHits: 2,
+    q50ExactHits: 1,
+    fullCorridorHits: 3,
+    displayRangeRate: 2 / 3,
+    q50ExactRate: 1 / 3,
+    fullCorridorRate: 1,
+    coverageRate: 3 / 4,
+  };
+
+  assert.deepEqual(normalize(valid), {
+    readyCount: 5,
+    settledCount: 4,
+    pendingCount: 1,
+    evaluatedCount: 3,
+    ungradableCount: 1,
+    displayRangeHits: 2,
+    q50ExactHits: 1,
+    fullCorridorHits: 3,
+    displayRangeRate: 2 / 3,
+    q50ExactRate: 1 / 3,
+    fullCorridorRate: 1,
+    coverageRate: 3 / 4,
+  });
+  assert.equal(normalize({ ...valid, evaluatedCount: 4 }), null);
+  assert.equal(normalize({ ...valid, displayRangeRate: 0.5 }), null);
+  assert.equal(normalize({ ...valid, readyCount: "5" }), null);
+});
+
+test("trajectory shadow normalizer keeps legacy v1 readable and requires frozen v2 fields", () => {
+  const functionStart = app.indexOf("  function normalizedTrajectoryWirePoint(point) {");
+  const functionEnd = app.indexOf("\n\n  function trajectoryNumberAreaLabel(point)", functionStart);
+  assert.ok(functionStart >= 0 && functionEnd > functionStart);
+  const functionSource = app.slice(functionStart, functionEnd);
+  const build = new Function(
+    "TRAJECTORY_SHADOW_LEGACY_VERSION",
+    "TRAJECTORY_SHADOW_ADAPTIVE_VERSION",
+    "TRAJECTORY_NUMBER_AREA_VERSION",
+    "TRAJECTORY_DISPLAY_RANGE_VERSION",
+    "TRAJECTORY_DISPLAY_RANGE_POLICY",
+    "TRAJECTORY_NUMBER_AREA_MAX_DISPLAY_CELLS",
+    "TRAJECTORY_SHADOW_DIRECTION_LABELS",
+    `"use strict"; ${functionSource}; return normalizedTrajectoryShadow;`,
+  );
+  const normalize = build(
+    "trajectory-shadow-knn-v1",
+    "trajectory-shadow-adaptive-v2",
+    "trajectory-number-area-v1",
+    "trajectory-display-range-v1",
+    "q50-centered-contiguous-max6-v1",
+    6,
+    { up: "вверх", down: "вниз", flat: "без движения" },
+  );
+  const point = (wireCell) => ({
+    wireCell,
+    number: wireCell === 37 ? 0 : wireCell,
+  });
+  const cells = Array.from({ length: 6 }, (_, wireCell) => point(wireCell));
+  const numberArea = {
+    version: "trajectory-number-area-v1",
+    basis: "weighted-neighbor-delta-q20-q50-q80",
+    centralWeight: 0.6,
+    scale: "wire-cell-top-to-bottom",
+    current: point(2),
+    typical: {
+      ...point(2),
+      price: 1,
+      deltaCellWidths: 0,
+      direction: "flat",
+      agreesWithDirection: false,
+    },
+    corridor: {
+      lowerQuantile: 0.2,
+      upperQuantile: 0.8,
+      top: point(0),
+      bottom: point(5),
+      cells,
+    },
+  };
+  const sample = {
+    historyCount: 30,
+    eligibleCount: 30,
+    excludedNotPastCount: 0,
+    withinDistanceCount: 10,
+    neighborCount: 10,
+    requiredHistory: 30,
+    requiredNeighbors: 10,
+  };
+  const base = {
+    status: "ready",
+    direction: "up",
+    probabilities: { up: 0.5, down: 0.3, flat: 0.2 },
+    sample,
+    numberArea,
+    evaluation: null,
+  };
+
+  const legacy = normalize({
+    ...base,
+    version: "trajectory-shadow-knn-v1",
+    modelVersion: "trajectory-shadow-knn-v1",
+  });
+  assert.equal(legacy.isAdaptive, false);
+  assert.equal(legacy.displayRange, null);
+
+  const displayRange = {
+    version: "trajectory-display-range-v1",
+    policy: "q50-centered-contiguous-max6-v1",
+    maxCells: 6,
+    top: point(0),
+    bottom: point(5),
+    cells,
+  };
+  const adaptiveInput = {
+    ...base,
+    version: "trajectory-shadow-adaptive-v2",
+    modelVersion: "trajectory-shadow-adaptive-v2",
+    adaptive: { trainingCount: 4 },
+    displayRange,
+  };
+  const adaptive = normalize(adaptiveInput);
+  assert.equal(adaptive.isAdaptive, true);
+  assert.equal(adaptive.adaptive.trainingCount, 4);
+  assert.deepEqual(adaptive.displayRange.cells, cells);
+  const priceLessSettlement = normalize({
+    ...adaptiveInput,
+    evaluation: {
+      rawCell: 2,
+      displayRangeHit: true,
+      q50ExactHit: true,
+      fullCorridorHit: true,
+      directionHit: null,
+    },
+  });
+  assert.notEqual(priceLessSettlement, null);
+  assert.deepEqual(priceLessSettlement.evaluation, {
+    rawCell: 2,
+    displayRangeHit: true,
+    q50ExactHit: true,
+    fullCorridorHit: true,
+    directionHit: null,
+  });
+  assert.equal(normalize({ ...adaptiveInput, displayRange: null }), null);
+  assert.equal(normalize({ ...adaptiveInput, adaptive: null }), null);
+  assert.equal(normalize({ ...adaptiveInput, adaptive: { trainingCount: "4" } }), null);
+});
+
+test("trajectory evaluation distinguishes both zero bands and leaves missing raw cells ungraded", () => {
+  const functionStart = app.indexOf("  function normalizedTrajectoryEvaluation(value, { numberArea, displayRange }) {");
+  const functionEnd = app.indexOf("\n\n  function normalizedTrajectoryMetrics(value)", functionStart);
+  assert.ok(functionStart >= 0 && functionEnd > functionStart);
+  const functionSource = app.slice(functionStart, functionEnd);
+  const normalize = new Function(
+    `"use strict"; ${functionSource}; return normalizedTrajectoryEvaluation;`,
+  )();
+  const point = (wireCell) => ({
+    wireCell,
+    number: wireCell === 37 ? 0 : wireCell,
+  });
+  const context = (from, to, typical) => {
+    const cells = Array.from(
+      { length: to - from + 1 },
+      (_, index) => point(from + index),
+    );
+    return {
+      numberArea: { typical: point(typical), corridor: { cells } },
+      displayRange: { cells },
+    };
+  };
+
+  assert.deepEqual(
+    normalize({
+      rawCell: 0,
+      displayRangeHit: true,
+      q50ExactHit: true,
+      fullCorridorHit: true,
+      directionHit: true,
+    }, context(0, 5, 0)),
+    {
+      rawCell: 0,
+      displayRangeHit: true,
+      q50ExactHit: true,
+      fullCorridorHit: true,
+      directionHit: true,
+    },
+  );
+  assert.deepEqual(
+    normalize({
+      rawCell: 37,
+      displayRangeHit: true,
+      q50ExactHit: true,
+      fullCorridorHit: true,
+      directionHit: false,
+    }, context(32, 37, 37)),
+    {
+      rawCell: 37,
+      displayRangeHit: true,
+      q50ExactHit: true,
+      fullCorridorHit: true,
+      directionHit: false,
+    },
+  );
+  assert.deepEqual(
+    normalize({
+      rawCell: 2,
+      displayRangeHit: true,
+      q50ExactHit: true,
+      fullCorridorHit: true,
+      directionHit: null,
+    }, context(0, 5, 2)),
+    {
+      rawCell: 2,
+      displayRangeHit: true,
+      q50ExactHit: true,
+      fullCorridorHit: true,
+      directionHit: null,
+    },
+  );
+  assert.deepEqual(
+    normalize({
+      rawCell: null,
+      displayRangeHit: null,
+      q50ExactHit: null,
+      fullCorridorHit: null,
+      directionHit: true,
+    }, context(0, 5, 0)),
+    {
+      rawCell: null,
+      displayRangeHit: null,
+      q50ExactHit: null,
+      fullCorridorHit: null,
+      directionHit: true,
+    },
+  );
+  assert.equal(
+    normalize({
+      rawCell: null,
+      displayRangeHit: false,
+      q50ExactHit: null,
+      fullCorridorHit: null,
+      directionHit: true,
+    }, context(0, 5, 0)),
+    false,
+  );
 });
 
 test("top-5 horizon block exposes all renderer targets and cumulative horizons", () => {
@@ -211,7 +578,7 @@ test("warm next-round forecast exposes a strict 5-percent walk-forward contract"
   assert.match(html, /id="follower-dynamic-next-title"[^>]*>[^<]*≥5%/);
   assert.match(html, /id="follower-dynamic-next-note"[^>]*>[\s\S]*?5%/);
   assert.match(html, /styles\.css\?v=27/);
-  assert.match(html, /app\.js\?v=30/);
+  assert.match(html, /app\.js\?v=31/);
   assert.match(styles, /\.follower-dynamic-next\s*\{/);
   assert.match(styles, /\.follower-warm-current\s*\{/);
   assert.match(styles, /\.follower-warm-picks\s*\{/);
@@ -432,7 +799,7 @@ test("cycle comparison language is descriptive, responsive, and cache-busted", (
   assert.match(block, /не предсказывает следующее число/);
   assert.doesNotMatch(block, /должн/iu);
   assert.match(html, /href="\/styles\.css\?v=27"/);
-  assert.match(html, /src="\/app\.js\?v=30"/);
+  assert.match(html, /src="\/app\.js\?v=31"/);
   assert.match(styles, /\.cycle-sequence-list\s*\{[\s\S]*?repeat\(auto-fill, minmax\(50px, 1fr\)\)/);
   assert.match(
     styles,

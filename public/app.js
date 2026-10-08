@@ -15,8 +15,11 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
   const FOLLOWER_LIVE_ACCOUNT_THRESHOLD = 0.8;
   const CYCLE_COMPARISON_ANCHOR_DRAWS = 20;
   const CYCLE_COMPARISON_ALGORITHM_VERSION = "cycle-analogue-prefix-v1";
-  const TRAJECTORY_SHADOW_VERSION = "trajectory-shadow-knn-v1";
+  const TRAJECTORY_SHADOW_LEGACY_VERSION = "trajectory-shadow-knn-v1";
+  const TRAJECTORY_SHADOW_ADAPTIVE_VERSION = "trajectory-shadow-adaptive-v2";
   const TRAJECTORY_NUMBER_AREA_VERSION = "trajectory-number-area-v1";
+  const TRAJECTORY_DISPLAY_RANGE_VERSION = "trajectory-display-range-v1";
+  const TRAJECTORY_DISPLAY_RANGE_POLICY = "q50-centered-contiguous-max6-v1";
   const TRAJECTORY_NUMBER_AREA_MAX_DISPLAY_CELLS = 6;
   const TRAJECTORY_SHADOW_REQUIRED_HISTORY = 30;
   const TRAJECTORY_SHADOW_REQUIRED_NEIGHBORS = 10;
@@ -62,6 +65,8 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
     trajectoryShadowStatus: document.getElementById("trajectory-shadow-status"),
     trajectoryShadowShares: document.getElementById("trajectory-shadow-shares"),
     trajectoryShadowNumberArea: document.getElementById("trajectory-shadow-number-area"),
+    trajectoryShadowTraining: document.getElementById("trajectory-shadow-training"),
+    trajectoryShadowRangeMetrics: document.getElementById("trajectory-shadow-range-metrics"),
     trajectoryShadowSample: document.getElementById("trajectory-shadow-sample"),
     precloseHitHistory: document.getElementById("preclose-hit-history"),
     precloseHitHistoryCount: document.getElementById("preclose-hit-history-count"),
@@ -1311,24 +1316,24 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
     return numbers.length === 3 ? numbers : [];
   }
 
+  function normalizedTrajectoryWirePoint(point) {
+    if (!point || typeof point !== "object" || Array.isArray(point)) return null;
+    const { wireCell, number } = point;
+    if (
+      !Number.isInteger(wireCell)
+      || wireCell < 0
+      || wireCell > 37
+      || number !== (wireCell === 37 ? 0 : wireCell)
+    ) {
+      return null;
+    }
+    return { wireCell, number };
+  }
+
   function normalizedTrajectoryNumberArea(value) {
     if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-    const normalizePoint = (point) => {
-      if (!point || typeof point !== "object" || Array.isArray(point)) return null;
-      const wireCell = Number(point.wireCell);
-      const number = Number(point.number);
-      if (
-        !Number.isInteger(wireCell)
-        || wireCell < 0
-        || wireCell > 37
-        || number !== (wireCell === 37 ? 0 : wireCell)
-      ) {
-        return null;
-      }
-      return { wireCell, number };
-    };
-    const current = normalizePoint(value.current);
-    const typicalPoint = normalizePoint(value.typical);
+    const current = normalizedTrajectoryWirePoint(value.current);
+    const typicalPoint = normalizedTrajectoryWirePoint(value.typical);
     const corridor = value.corridor;
     if (
       value.version !== TRAJECTORY_NUMBER_AREA_VERSION
@@ -1353,9 +1358,9 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
     ) {
       return null;
     }
-    const cells = corridor.cells.map(normalizePoint);
-    const top = normalizePoint(corridor.top);
-    const bottom = normalizePoint(corridor.bottom);
+    const cells = corridor.cells.map(normalizedTrajectoryWirePoint);
+    const top = normalizedTrajectoryWirePoint(corridor.top);
+    const bottom = normalizedTrajectoryWirePoint(corridor.bottom);
     if (
       cells.some((cell) => cell === null)
       || !top
@@ -1396,9 +1401,207 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
     };
   }
 
+  function normalizedTrajectoryDisplayRange(value, numberArea) {
+    if (
+      !value
+      || typeof value !== "object"
+      || Array.isArray(value)
+      || value.version !== TRAJECTORY_DISPLAY_RANGE_VERSION
+      || value.policy !== TRAJECTORY_DISPLAY_RANGE_POLICY
+      || value.maxCells !== TRAJECTORY_NUMBER_AREA_MAX_DISPLAY_CELLS
+      || !numberArea
+      || !Array.isArray(value.cells)
+      || value.cells.length < 1
+      || value.cells.length > TRAJECTORY_NUMBER_AREA_MAX_DISPLAY_CELLS
+    ) {
+      return null;
+    }
+    const cells = value.cells.map(normalizedTrajectoryWirePoint);
+    const top = normalizedTrajectoryWirePoint(value.top);
+    const bottom = normalizedTrajectoryWirePoint(value.bottom);
+    const corridorCells = numberArea.corridor.cells;
+    const typicalIndex = corridorCells.findIndex(
+      (cell) => cell.wireCell === numberArea.typical.wireCell,
+    );
+    const expectedSize = Math.min(
+      TRAJECTORY_NUMBER_AREA_MAX_DISPLAY_CELLS,
+      corridorCells.length,
+    );
+    const centeredStart = Math.round(typicalIndex - ((expectedSize - 1) / 2));
+    const expectedStart = Math.min(
+      Math.max(centeredStart, 0),
+      corridorCells.length - expectedSize,
+    );
+    const expectedCells = corridorCells.slice(
+      expectedStart,
+      expectedStart + expectedSize,
+    );
+    if (
+      cells.some((cell) => cell === null)
+      || !top
+      || !bottom
+      || typicalIndex < 0
+      || cells.length !== expectedCells.length
+      || cells.some((cell, index) => (
+        cell.wireCell !== expectedCells[index]?.wireCell
+        || cell.number !== expectedCells[index]?.number
+      ))
+      || top.wireCell !== cells[0].wireCell
+      || bottom.wireCell !== cells[cells.length - 1].wireCell
+      || cells.length !== bottom.wireCell - top.wireCell + 1
+      || cells.some((cell, index) => cell.wireCell !== top.wireCell + index)
+      || top.wireCell < numberArea.corridor.top.wireCell
+      || bottom.wireCell > numberArea.corridor.bottom.wireCell
+      || !cells.some((cell) => cell.wireCell === numberArea.typical.wireCell)
+      || cells.some((cell) => {
+        const corridorIndex = cell.wireCell - numberArea.corridor.top.wireCell;
+        return numberArea.corridor.cells[corridorIndex]?.number !== cell.number;
+      })
+    ) {
+      return null;
+    }
+    return {
+      version: value.version,
+      policy: value.policy,
+      maxCells: value.maxCells,
+      top,
+      bottom,
+      cells
+    };
+  }
+
+  function normalizedTrajectoryAdaptive(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    if (!Number.isSafeInteger(value.trainingCount) || value.trainingCount < 0) return null;
+    return { trainingCount: value.trainingCount };
+  }
+
+  function normalizedTrajectoryEvaluation(value, { numberArea, displayRange }) {
+    if (value === null || value === undefined) return null;
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    const rawCell = value.rawCell;
+    const positionalHits = [
+      value.displayRangeHit,
+      value.q50ExactHit,
+      value.fullCorridorHit
+    ];
+    if (
+      !numberArea
+      || !displayRange
+      || (value.directionHit !== null && typeof value.directionHit !== "boolean")
+    ) {
+      return false;
+    }
+    if (rawCell === null) {
+      if (positionalHits.some((hit) => hit !== null)) return false;
+    } else if (
+      !Number.isInteger(rawCell)
+      || rawCell < 0
+      || rawCell > 37
+      || positionalHits.some((hit) => typeof hit !== "boolean")
+      || value.displayRangeHit !== displayRange.cells.some((cell) => cell.wireCell === rawCell)
+      || value.q50ExactHit !== (numberArea.typical.wireCell === rawCell)
+      || value.fullCorridorHit !== numberArea.corridor.cells.some(
+        (cell) => cell.wireCell === rawCell,
+      )
+    ) {
+      return false;
+    }
+    return {
+      rawCell,
+      displayRangeHit: value.displayRangeHit,
+      q50ExactHit: value.q50ExactHit,
+      fullCorridorHit: value.fullCorridorHit,
+      directionHit: value.directionHit
+    };
+  }
+
+  function normalizedTrajectoryMetrics(value) {
+    if (
+      !value
+      || typeof value !== "object"
+      || Array.isArray(value)
+      || value.modelVersion !== TRAJECTORY_SHADOW_ADAPTIVE_VERSION
+      || value.displayRangeVersion !== TRAJECTORY_DISPLAY_RANGE_VERSION
+    ) {
+      return null;
+    }
+    const countKeys = [
+      "readyCount",
+      "settledCount",
+      "pendingCount",
+      "evaluatedCount",
+      "ungradableCount",
+      "displayRangeHits",
+      "q50ExactHits",
+      "fullCorridorHits"
+    ];
+    if (countKeys.some(
+      (key) => !Number.isSafeInteger(value[key]) || value[key] < 0,
+    )) {
+      return null;
+    }
+    const rateMatches = (rate, numerator, denominator) => {
+      if (denominator === 0) return rate === null;
+      return typeof rate === "number"
+        && Number.isFinite(rate)
+        && rate >= 0
+        && rate <= 1
+        && Math.abs(rate - (numerator / denominator)) <= 1e-9;
+    };
+    if (
+      value.readyCount !== value.settledCount + value.pendingCount
+      || value.settledCount !== value.evaluatedCount + value.ungradableCount
+      || value.q50ExactHits > value.displayRangeHits
+      || value.displayRangeHits > value.fullCorridorHits
+      || value.fullCorridorHits > value.evaluatedCount
+      || !rateMatches(
+        value.displayRangeRate,
+        value.displayRangeHits,
+        value.evaluatedCount,
+      )
+      || !rateMatches(value.q50ExactRate, value.q50ExactHits, value.evaluatedCount)
+      || !rateMatches(
+        value.fullCorridorRate,
+        value.fullCorridorHits,
+        value.evaluatedCount,
+      )
+      || !rateMatches(value.coverageRate, value.evaluatedCount, value.settledCount)
+    ) {
+      return null;
+    }
+    return Object.fromEntries([
+      ...countKeys.map((key) => [key, value[key]]),
+      ["displayRangeRate", value.displayRangeRate],
+      ["q50ExactRate", value.q50ExactRate],
+      ["fullCorridorRate", value.fullCorridorRate],
+      ["coverageRate", value.coverageRate]
+    ]);
+  }
+
   function normalizedTrajectoryShadow(value) {
     if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-    if (value.version !== TRAJECTORY_SHADOW_VERSION) return null;
+    const isAdaptive = value.version === TRAJECTORY_SHADOW_ADAPTIVE_VERSION;
+    const isLegacy = value.version === TRAJECTORY_SHADOW_LEGACY_VERSION;
+    if (
+      (!isAdaptive && !isLegacy)
+      || (isAdaptive && value.modelVersion !== TRAJECTORY_SHADOW_ADAPTIVE_VERSION)
+      || (isLegacy
+        && value.modelVersion !== undefined
+        && value.modelVersion !== null
+        && value.modelVersion !== TRAJECTORY_SHADOW_LEGACY_VERSION)
+    ) {
+      return null;
+    }
+    const adaptive = isAdaptive && value.adaptive !== null
+      ? normalizedTrajectoryAdaptive(value.adaptive)
+      : null;
+    if (
+      (isAdaptive && value.adaptive !== null && !adaptive)
+      || (isLegacy && value.adaptive !== undefined && value.adaptive !== null)
+    ) {
+      return null;
+    }
 
     const status = String(value.status || "");
     if (
@@ -1411,6 +1614,7 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
     ) {
       return null;
     }
+    if (isAdaptive && status !== "insufficient_current" && !adaptive) return null;
 
     if (status === "insufficient_current") {
       if (
@@ -1422,23 +1626,32 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
         return null;
       }
       return {
+        version: value.version,
+        isAdaptive,
+        adaptive,
         status,
         direction: null,
         probabilities: null,
-        sample: null
+        sample: null,
+        numberArea: null,
+        displayRange: null,
+        evaluation: null
       };
     }
 
     const source = value.sample;
     if (!source || typeof source !== "object" || Array.isArray(source)) return null;
+    const normalizedCount = (count) => (
+      Number.isSafeInteger(count) && count >= 0 ? count : null
+    );
     const sample = {
-      historyCount: asOptionalNonNegativeInteger(source.historyCount),
-      eligibleCount: asOptionalNonNegativeInteger(source.eligibleCount),
-      excludedNotPastCount: asOptionalNonNegativeInteger(source.excludedNotPastCount),
-      withinDistanceCount: asOptionalNonNegativeInteger(source.withinDistanceCount),
-      neighborCount: asOptionalNonNegativeInteger(source.neighborCount),
-      requiredHistory: asOptionalNonNegativeInteger(source.requiredHistory),
-      requiredNeighbors: asOptionalNonNegativeInteger(source.requiredNeighbors)
+      historyCount: normalizedCount(source.historyCount),
+      eligibleCount: normalizedCount(source.eligibleCount),
+      excludedNotPastCount: normalizedCount(source.excludedNotPastCount),
+      withinDistanceCount: normalizedCount(source.withinDistanceCount),
+      neighborCount: normalizedCount(source.neighborCount),
+      requiredHistory: normalizedCount(source.requiredHistory),
+      requiredNeighbors: normalizedCount(source.requiredNeighbors)
     };
     if (
       Object.values(sample).some((count) => count === null)
@@ -1452,16 +1665,48 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
     }
 
     if (status === "insufficient_history") {
-      return sample.eligibleCount < sample.requiredHistory
-        ? { status, direction: null, probabilities: null, sample }
-        : null;
+      if (
+        value.direction !== null
+        || value.probabilities !== null
+        || sample.eligibleCount >= sample.requiredHistory
+      ) {
+        return null;
+      }
+      return {
+        version: value.version,
+        isAdaptive,
+        adaptive,
+        status,
+        direction: null,
+        probabilities: null,
+        sample,
+        numberArea: null,
+        displayRange: null,
+        evaluation: null
+      };
     }
     if (status === "insufficient_neighbors") {
-      return sample.eligibleCount >= sample.requiredHistory
-        && sample.withinDistanceCount < sample.requiredNeighbors
-        && sample.neighborCount === 0
-        ? { status, direction: null, probabilities: null, sample }
-        : null;
+      if (
+        value.direction !== null
+        || value.probabilities !== null
+        || sample.eligibleCount < sample.requiredHistory
+        || sample.withinDistanceCount >= sample.requiredNeighbors
+        || sample.neighborCount !== 0
+      ) {
+        return null;
+      }
+      return {
+        version: value.version,
+        isAdaptive,
+        adaptive,
+        status,
+        direction: null,
+        probabilities: null,
+        sample,
+        numberArea: null,
+        displayRange: null,
+        evaluation: null
+      };
     }
 
     const direction = String(value.direction || "");
@@ -1491,12 +1736,27 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
       return null;
     }
 
+    const numberArea = normalizedTrajectoryNumberArea(value.numberArea);
+    const displayRange = isAdaptive
+      ? normalizedTrajectoryDisplayRange(value.displayRange, numberArea)
+      : null;
+    if (isAdaptive && (!adaptive || !numberArea || !displayRange)) return null;
+    const evaluation = isAdaptive
+      ? normalizedTrajectoryEvaluation(value.evaluation, { numberArea, displayRange })
+      : null;
+    if (evaluation === false) return null;
+
     return {
+      version: value.version,
+      isAdaptive,
+      adaptive,
       status,
       direction,
       probabilities: shares,
       sample,
-      numberArea: normalizedTrajectoryNumberArea(value.numberArea)
+      numberArea,
+      displayRange,
+      evaluation
     };
   }
 
@@ -1519,23 +1779,68 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
     return cells.slice(start, start + size);
   }
 
-  function trajectoryNumberAreaText(area) {
-    const cells = trajectoryNumberAreaDisplayCells(area);
+  function trajectoryShadowDisplayCells(shadow) {
+    if (!shadow) return [];
+    return shadow.isAdaptive
+      ? shadow.displayRange?.cells ?? []
+      : trajectoryNumberAreaDisplayCells(shadow.numberArea);
+  }
+
+  function trajectoryNumberAreaText(shadow) {
+    const cells = trajectoryShadowDisplayCells(shadow);
     if (cells.length === 0) return "ПРОГНОЗ УЧАСТКА: НЕТ ДАННЫХ";
     const from = trajectoryNumberAreaLabel(cells[0]);
     const to = trajectoryNumberAreaLabel(cells[cells.length - 1]);
     return `ПРОГНОЗ УЧАСТКА: ОТ ${from} ДО ${to}`;
   }
 
-  function renderTrajectoryShadow(value) {
+  function renderTrajectoryShadow(value, metricsValue) {
     const shadow = normalizedTrajectoryShadow(value);
+    const metrics = normalizedTrajectoryMetrics(metricsValue);
     elements.trajectoryShadowPanel.setAttribute("aria-busy", "false");
 
+    if (shadow?.isAdaptive && shadow.adaptive) {
+      const trainingCount = shadow.adaptive.trainingCount;
+      setTextIfChanged(
+        elements.trajectoryShadowTraining,
+        trainingCount === 0
+          ? "Обучение: 0 результатов · равные стартовые веса."
+          : `Обучение: ${trainingCount} ${pluralForm(trainingCount, "результат", "результата", "результатов")} · только завершённые снимки до lock.`,
+      );
+    } else if (shadow && !shadow.isAdaptive) {
+      setTextIfChanged(
+        elements.trajectoryShadowTraining,
+        "Обучение: KNN v1 · фиксированные параметры, без адаптивного обучения.",
+      );
+    } else {
+      setTextIfChanged(
+        elements.trajectoryShadowTraining,
+        "Обучение: — результатов · adaptive-снимок для этого раунда отсутствует.",
+      );
+    }
+
+    if (metrics) {
+      const { displayRangeHits, evaluatedCount, displayRangeRate } = metrics;
+      setTextIfChanged(
+        elements.trajectoryShadowRangeMetrics,
+        evaluatedCount === 0
+          ? "Участок: 0 из 0 (нет оценённых исходов) · Adaptive v2, проспективное наблюдение."
+          : `Участок: ${displayRangeHits} из ${evaluatedCount} (${trajectoryShadowShareFormatter.format(displayRangeRate)}) · Adaptive v2, проспективное наблюдение.`,
+      );
+      elements.trajectoryShadowRangeMetrics.title = `Adaptive v2: готово ${metrics.readyCount}; завершено ${metrics.settledCount}; ждут результата ${metrics.pendingCount}; оценено ${metrics.evaluatedCount}; неопределимо ${metrics.ungradableCount}.`;
+    } else {
+      setTextIfChanged(
+        elements.trajectoryShadowRangeMetrics,
+        "Участок: — из — (нет данных) · Adaptive v2, проспективное наблюдение.",
+      );
+      elements.trajectoryShadowRangeMetrics.title = "";
+    }
+
     if (!shadow) {
-      elements.trajectoryShadowBadge.textContent = "Сбор истории";
+      elements.trajectoryShadowBadge.textContent = "Снимка нет";
       setTextIfChanged(
         elements.trajectoryShadowStatus,
-        "Prospective shadow для текущего снимка ещё не опубликован; сбор полных завершённых траекторий продолжается.",
+        "Adaptive-снимок для текущего раунда ещё не опубликован; это не сигнал и не ошибка основного прогноза.",
       );
       setTextIfChanged(
         elements.trajectoryShadowShares,
@@ -1552,8 +1857,9 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
       return;
     }
 
+    const modelLabel = shadow.isAdaptive ? "Adaptive v2" : "KNN v1";
     if (shadow.status === "insufficient_current") {
-      elements.trajectoryShadowBadge.textContent = "Текущий график неполный";
+      elements.trajectoryShadowBadge.textContent = `${modelLabel} · график неполный`;
       setTextIfChanged(
         elements.trajectoryShadowStatus,
         "Направление не рассчитывается: текущая траектория началась не от старта раунда, содержит разрыв или не дошла до точки фиксации.",
@@ -1575,7 +1881,7 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
 
     const { sample } = shadow;
     if (shadow.status === "insufficient_history") {
-      elements.trajectoryShadowBadge.textContent = `Сбор · ${sample.eligibleCount}/${sample.requiredHistory}`;
+      elements.trajectoryShadowBadge.textContent = `${modelLabel} · сбор ${sample.eligibleCount}/${sample.requiredHistory}`;
       setTextIfChanged(
         elements.trajectoryShadowStatus,
         "Направление не рассчитывается: накапливается prospective-история полных завершённых раундов.",
@@ -1596,7 +1902,7 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
     }
 
     if (shadow.status === "insufficient_neighbors") {
-      elements.trajectoryShadowBadge.textContent = `Сбор соседей · ${sample.withinDistanceCount}/${sample.requiredNeighbors}`;
+      elements.trajectoryShadowBadge.textContent = `${modelLabel} · соседи ${sample.withinDistanceCount}/${sample.requiredNeighbors}`;
       setTextIfChanged(
         elements.trajectoryShadowStatus,
         "Направление не рассчитывается: пока недостаточно завершённых траекторий с похожей формой.",
@@ -1616,18 +1922,20 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
       return;
     }
 
-    elements.trajectoryShadowBadge.textContent = "Prospective shadow";
+    elements.trajectoryShadowBadge.textContent = `${modelLabel} · наблюдение`;
     setTextIfChanged(
       elements.trajectoryShadowStatus,
       `Наблюдательное направление цены от последней доступной точки перед forecast lock до финального ed: ${TRAJECTORY_SHADOW_DIRECTION_LABELS[shadow.direction]}. Точка может быть не старше 5 секунд; исход shadow для этого раунда ещё не валидирован.`,
     );
     setTextIfChanged(
       elements.trajectoryShadowShares,
-      `Доли похожих завершённых траекторий: вверх ${trajectoryShadowShareFormatter.format(shadow.probabilities.up)} · вниз ${trajectoryShadowShareFormatter.format(shadow.probabilities.down)} · без движения ${trajectoryShadowShareFormatter.format(shadow.probabilities.flat)}.`,
+      shadow.isAdaptive
+        ? `Взвешенные архивные доли направлений: вверх ${trajectoryShadowShareFormatter.format(shadow.probabilities.up)} · вниз ${trajectoryShadowShareFormatter.format(shadow.probabilities.down)} · без движения ${trajectoryShadowShareFormatter.format(shadow.probabilities.flat)}.`
+        : `Доли похожих завершённых траекторий: вверх ${trajectoryShadowShareFormatter.format(shadow.probabilities.up)} · вниз ${trajectoryShadowShareFormatter.format(shadow.probabilities.down)} · без движения ${trajectoryShadowShareFormatter.format(shadow.probabilities.flat)}.`,
     );
     setTextIfChanged(
       elements.trajectoryShadowNumberArea,
-      trajectoryNumberAreaText(shadow.numberArea),
+      trajectoryNumberAreaText(shadow),
     );
     setTextIfChanged(
       elements.trajectoryShadowSample,
@@ -1972,7 +2280,10 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
       ? `${top3Hits} из ${settledCount} · ${(top3Rate * 100).toFixed(1).replace(".", ",")}%`
       : `${top3Hits} из ${settledCount} · мало данных`;
     renderPrecloseComparison(matchesCurrent ? latest : null, finalForecast);
-    renderTrajectoryShadow(matchesCurrent ? latest?.trajectoryShadow : null);
+    renderTrajectoryShadow(
+      matchesCurrent ? latest?.trajectoryShadow : null,
+      forecastState?.trajectoryMetrics,
+    );
 
     if (!matchesCurrent) {
       elements.precloseRanking.setAttribute("aria-busy", "true");

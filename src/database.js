@@ -23,10 +23,14 @@ import {
   rankPrecloseForecastCells,
 } from "./preclose-forecast.js";
 import {
-  TRAJECTORY_SHADOW_DEFAULTS,
   TRAJECTORY_SHADOW_VERSION,
-  predictTrajectoryShadow,
 } from "./trajectory-shadow.js";
+import {
+  TRAJECTORY_SHADOW_ADAPTIVE_DEFAULTS,
+  TRAJECTORY_SHADOW_ADAPTIVE_EXPERTS,
+  TRAJECTORY_SHADOW_ADAPTIVE_VERSION,
+  predictAdaptiveTrajectoryShadow,
+} from "./trajectory-shadow-adaptive.js";
 import {
   CYCLE_ANALOGUE_ALGORITHM_VERSION,
   CYCLE_ANALOGUE_ANCHOR_DRAW_COUNT,
@@ -39,8 +43,13 @@ const DEFAULT_VIRTUAL_STARTING_BALANCE = 87_700;
 const ROUND_TRAJECTORY_SCHEMA_VERSION = 1;
 const TRAJECTORY_SHADOW_SCHEMA_VERSION = 1;
 const TRAJECTORY_SHADOW_CANDIDATE_LIMIT = 500;
+const TRAJECTORY_SHADOW_LEARNING_LIMIT = 500;
 const TRAJECTORY_PREFIX_EDGE_TOLERANCE_MS = 5_000;
 const TRAJECTORY_NUMBER_AREA_VERSION = "trajectory-number-area-v1";
+const TRAJECTORY_DISPLAY_RANGE_VERSION = "trajectory-display-range-v1";
+const TRAJECTORY_DISPLAY_RANGE_POLICY =
+  "q50-centered-contiguous-max6-v1";
+const TRAJECTORY_DISPLAY_RANGE_MAX_CELLS = 6;
 const FOLLOWER_TOP5_HORIZONS = Object.freeze([1, 2, 3, 5, 10, 20]);
 const FOLLOWER_TOP5_ALL_HORIZONS = Object.freeze(
   Array.from({ length: 20 }, (_, index) => index + 1),
@@ -1620,6 +1629,30 @@ function buildTrajectoryNumberArea({
   };
 }
 
+function buildTrajectoryDisplayRange(numberArea) {
+  const cells = numberArea?.corridor?.cells;
+  if (!Array.isArray(cells) || cells.length === 0) return null;
+  const typicalIndex = cells.findIndex(
+    (cell) => cell.wireCell === numberArea?.typical?.wireCell,
+  );
+  if (typicalIndex < 0) return null;
+  const size = Math.min(TRAJECTORY_DISPLAY_RANGE_MAX_CELLS, cells.length);
+  const centeredStart = Math.round(typicalIndex - (size - 1) / 2);
+  const start = Math.min(Math.max(centeredStart, 0), cells.length - size);
+  const displayedCells = cells.slice(start, start + size).map((cell) => ({
+    wireCell: cell.wireCell,
+    number: cell.number,
+  }));
+  return {
+    version: TRAJECTORY_DISPLAY_RANGE_VERSION,
+    policy: TRAJECTORY_DISPLAY_RANGE_POLICY,
+    maxCells: TRAJECTORY_DISPLAY_RANGE_MAX_CELLS,
+    top: { ...displayedCells[0] },
+    bottom: { ...displayedCells.at(-1) },
+    cells: displayedCells,
+  };
+}
+
 function normalizedLimit(value, fallback = DEFAULT_LIMIT) {
   const limit = value === undefined ? fallback : Number(value);
   if (!Number.isInteger(limit) || limit < 1 || limit > MAX_LIMIT) {
@@ -2177,6 +2210,632 @@ function normalizeTrajectoryNumberArea(
   };
 }
 
+function normalizeTrajectoryDisplayRange(value, numberArea) {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    value.version !== TRAJECTORY_DISPLAY_RANGE_VERSION ||
+    value.policy !== TRAJECTORY_DISPLAY_RANGE_POLICY ||
+    value.maxCells !== TRAJECTORY_DISPLAY_RANGE_MAX_CELLS
+  ) {
+    return null;
+  }
+  const expected = buildTrajectoryDisplayRange(numberArea);
+  if (!expected || !Array.isArray(value.cells)) return null;
+  const samePoint = (left, right) =>
+    left &&
+    typeof left === "object" &&
+    !Array.isArray(left) &&
+    left.wireCell === right.wireCell &&
+    left.number === right.number;
+  if (
+    !samePoint(value.top, expected.top) ||
+    !samePoint(value.bottom, expected.bottom) ||
+    value.cells.length !== expected.cells.length ||
+    value.cells.some((cell, index) => !samePoint(cell, expected.cells[index]))
+  ) {
+    return null;
+  }
+  return expected;
+}
+
+const TRAJECTORY_DIRECTIONS = Object.freeze(["up", "down", "flat"]);
+const TRAJECTORY_SAMPLE_KEYS = Object.freeze([
+  "historyCount",
+  "eligibleCount",
+  "excludedNotPastCount",
+  "withinDistanceCount",
+  "neighborCount",
+  "requiredHistory",
+  "requiredNeighbors",
+]);
+const TRAJECTORY_ADAPTIVE_VALIDATOR_SQL_FUNCTION =
+  "trajectory_adaptive_snapshot_valid_v2";
+
+function trajectoryNumbersEqual(left, right, tolerance = 1e-9) {
+  return (
+    Number.isFinite(left) &&
+    Number.isFinite(right) &&
+    Math.abs(left - right) <=
+      tolerance * Math.max(1, Math.abs(left), Math.abs(right))
+  );
+}
+
+function sameTrajectoryValue(left, right) {
+  if (typeof left === "number" || typeof right === "number") {
+    return (
+      typeof left === "number" &&
+      typeof right === "number" &&
+      trajectoryNumbersEqual(left, right)
+    );
+  }
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return (
+      Array.isArray(left) &&
+      Array.isArray(right) &&
+      left.length === right.length &&
+      left.every((value, index) => sameTrajectoryValue(value, right[index]))
+    );
+  }
+  if (
+    left &&
+    right &&
+    typeof left === "object" &&
+    typeof right === "object"
+  ) {
+    const leftKeys = Object.keys(left).sort();
+    const rightKeys = Object.keys(right).sort();
+    return (
+      leftKeys.length === rightKeys.length &&
+      leftKeys.every((key, index) => key === rightKeys[index]) &&
+      leftKeys.every((key) => sameTrajectoryValue(left[key], right[key]))
+    );
+  }
+  return left === right;
+}
+
+function plainTrajectoryExpertOptions(options) {
+  return {
+    resamplePoints: options.resamplePoints,
+    neighbors: options.neighbors,
+    minHistory: options.minHistory,
+    minNeighbors: options.minNeighbors,
+    maxDistanceCellWidths: options.maxDistanceCellWidths,
+    flatThresholdCellWidths: options.flatThresholdCellWidths,
+    maxAbsDeltaCellWidths: options.maxAbsDeltaCellWidths,
+  };
+}
+
+function expectedTrajectoryAdaptiveParameters() {
+  return {
+    flatThresholdCellWidths:
+      TRAJECTORY_SHADOW_ADAPTIVE_DEFAULTS.flatThresholdCellWidths,
+    maxAbsDeltaCellWidths:
+      TRAJECTORY_SHADOW_ADAPTIVE_DEFAULTS.maxAbsDeltaCellWidths,
+    eta: TRAJECTORY_SHADOW_ADAPTIVE_DEFAULTS.eta,
+    decay: TRAJECTORY_SHADOW_ADAPTIVE_DEFAULTS.decay,
+    directionLossWeight:
+      TRAJECTORY_SHADOW_ADAPTIVE_DEFAULTS.directionLossWeight,
+    deltaLossWeight: TRAJECTORY_SHADOW_ADAPTIVE_DEFAULTS.deltaLossWeight,
+    quantileAggregation: "weighted_expert_quantiles",
+    expertCount: TRAJECTORY_SHADOW_ADAPTIVE_EXPERTS.length,
+    experts: TRAJECTORY_SHADOW_ADAPTIVE_EXPERTS.map((expert) => ({
+      id: expert.id,
+      options: plainTrajectoryExpertOptions(expert.options),
+    })),
+  };
+}
+
+function trajectoryWinningDirection(probabilities, expectedDeltaCellWidths) {
+  const maximum = Math.max(
+    ...TRAJECTORY_DIRECTIONS.map((key) => probabilities[key]),
+  );
+  const tied = TRAJECTORY_DIRECTIONS.filter(
+    (key) => Math.abs(probabilities[key] - maximum) <= Number.EPSILON * 8,
+  );
+  if (tied.length === 1) return tied[0];
+  if (tied.includes("flat")) return "flat";
+  const expectedDirection = expectedDeltaCellWidths >= 0 ? "up" : "down";
+  return tied.includes(expectedDirection)
+    ? expectedDirection
+    : [...tied].sort()[0];
+}
+
+function validTrajectorySample(sample, status, options) {
+  if (!sample || typeof sample !== "object" || Array.isArray(sample)) {
+    return false;
+  }
+  const keys = Object.keys(sample).sort();
+  const expectedKeys = [...TRAJECTORY_SAMPLE_KEYS].sort();
+  if (
+    keys.length !== expectedKeys.length ||
+    keys.some((key, index) => key !== expectedKeys[index]) ||
+    TRAJECTORY_SAMPLE_KEYS.some(
+      (key) => !Number.isSafeInteger(sample[key]) || sample[key] < 0,
+    ) ||
+    sample.requiredHistory !== options.minHistory ||
+    sample.requiredNeighbors !== options.minNeighbors ||
+    sample.eligibleCount + sample.excludedNotPastCount !==
+      sample.historyCount ||
+    sample.withinDistanceCount > sample.eligibleCount
+  ) {
+    return false;
+  }
+  if (status === "ready") {
+    return (
+      sample.eligibleCount >= options.minHistory &&
+      sample.neighborCount ===
+        Math.min(options.neighbors, sample.withinDistanceCount) &&
+      sample.neighborCount >= options.minNeighbors
+    );
+  }
+  if (status === "insufficient_history") {
+    return sample.eligibleCount < options.minHistory && sample.neighborCount === 0;
+  }
+  return (
+    status === "insufficient_neighbors" &&
+    sample.eligibleCount >= options.minHistory &&
+    sample.withinDistanceCount < options.minNeighbors &&
+    sample.neighborCount === 0
+  );
+}
+
+function validTrajectoryNearestIds(nearestIds, expectedCount) {
+  return (
+    Array.isArray(nearestIds) &&
+    nearestIds.length === expectedCount &&
+    nearestIds.every(
+      (id) => typeof id === "string" && id.trim() !== "",
+    ) &&
+    new Set(nearestIds).size === nearestIds.length
+  );
+}
+
+function normalizeTrajectoryAdaptive(
+  value,
+  {
+    status,
+    cutoffAt,
+    snapshotLockedAt,
+    direction,
+    probabilities,
+    expectedDeltaCellWidths,
+    sample,
+    nearestIds,
+    parameters,
+    lockPrice,
+    snapshotCurrentPrice,
+    medianCellWidth,
+    currentPrefix,
+    cells,
+    numberArea,
+    displayRange,
+    storedNumberArea,
+    storedDisplayRange,
+  } = {},
+) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const countKeys = [
+    "trainingCount",
+    "eligibleLearningRowCount",
+    "skippedNotCommonReadyCount",
+    "excludedNotPastCount",
+  ];
+  const expectedIds = TRAJECTORY_SHADOW_ADAPTIVE_EXPERTS.map(
+    (expert) => expert.id,
+  );
+  const sortedExpectedIds = [...expectedIds].sort();
+  const validWeightObject = (weights, expectedTotal) => {
+    if (!weights || typeof weights !== "object" || Array.isArray(weights)) {
+      return false;
+    }
+    const keys = Object.keys(weights).sort();
+    if (
+      keys.length !== sortedExpectedIds.length ||
+      keys.some((key, index) => key !== sortedExpectedIds[index])
+    ) {
+      return false;
+    }
+    const values = expectedIds.map((id) => weights[id]);
+    return (
+      values.every(
+        (weight) => Number.isFinite(weight) && weight >= 0 && weight <= 1,
+      ) &&
+      trajectoryNumbersEqual(
+        values.reduce((sum, weight) => sum + weight, 0),
+        expectedTotal,
+      )
+    );
+  };
+  const learningCutoffMs = Date.parse(value.learningCutoffAt);
+  const shadowCutoffMs = Date.parse(cutoffAt);
+  const snapshotLockedMs = Date.parse(snapshotLockedAt);
+  const lastTrainingMs = value.lastTrainingCompletedAt === null
+    ? null
+    : Date.parse(value.lastTrainingCompletedAt);
+  const validCurrentPrefix =
+    Array.isArray(currentPrefix) &&
+    currentPrefix.length >= 3 &&
+    currentPrefix.every((point, index) => {
+      if (
+        !point ||
+        typeof point !== "object" ||
+        Array.isArray(point) ||
+        Object.keys(point).sort().join(",") !== "at,price" ||
+        !Number.isFinite(Date.parse(point.at)) ||
+        !Number.isFinite(point.price) ||
+        Date.parse(point.at) > shadowCutoffMs
+      ) {
+        return false;
+      }
+      return index === 0 || Date.parse(currentPrefix[index - 1].at) < Date.parse(point.at);
+    });
+  if (
+    !Array.isArray(value.experts) ||
+    value.experts.length !== expectedIds.length ||
+    countKeys.some(
+      (key) => !Number.isSafeInteger(value[key]) || value[key] < 0,
+    ) ||
+    value.trainingCount + value.skippedNotCommonReadyCount !==
+      value.eligibleLearningRowCount ||
+    !Number.isFinite(learningCutoffMs) ||
+    !Number.isFinite(shadowCutoffMs) ||
+    !Number.isFinite(snapshotLockedMs) ||
+    shadowCutoffMs !== snapshotLockedMs ||
+    learningCutoffMs !== shadowCutoffMs ||
+    !Number.isFinite(lockPrice) ||
+    !Number.isFinite(snapshotCurrentPrice) ||
+    !trajectoryNumbersEqual(lockPrice, snapshotCurrentPrice) ||
+    !validCurrentPrefix ||
+    !trajectoryNumbersEqual(currentPrefix.at(-1).price, lockPrice) ||
+    (value.trainingCount === 0) !==
+      (value.lastTrainingCompletedAt === null) ||
+    (lastTrainingMs !== null &&
+      (!Number.isFinite(lastTrainingMs) || lastTrainingMs >= learningCutoffMs)) ||
+    !sameTrajectoryValue(parameters, expectedTrajectoryAdaptiveParameters())
+  ) {
+    return null;
+  }
+  const equalPriorWeight = 1 / expectedIds.length;
+  if (
+    !validWeightObject(value.priorWeights, 1) ||
+    !validWeightObject(value.currentWeights, 1) ||
+    expectedIds.some(
+      (id) => !trajectoryNumbersEqual(value.priorWeights[id], equalPriorWeight),
+    )
+  ) {
+    return null;
+  }
+
+  const normalizedExperts = [];
+  for (const [index, expert] of value.experts.entries()) {
+    const expected = TRAJECTORY_SHADOW_ADAPTIVE_EXPERTS[index];
+    const expectedOptions = plainTrajectoryExpertOptions(expected.options);
+    const options = expert?.options;
+    const expertStatus = expert?.status;
+    const ready = expertStatus === "ready";
+    if (
+      !expert ||
+      typeof expert !== "object" ||
+      Array.isArray(expert) ||
+      expert.id !== expected.id ||
+      expert.modelVersion !== TRAJECTORY_SHADOW_VERSION ||
+      !sameTrajectoryValue(options, expectedOptions) ||
+      !["ready", "insufficient_history", "insufficient_neighbors"].includes(
+        expertStatus,
+      ) ||
+      !validTrajectorySample(expert.sample, expertStatus, expectedOptions) ||
+      !Number.isFinite(expert.priorWeight) ||
+      !Number.isFinite(expert.learnedWeight) ||
+      !Number.isFinite(expert.ensembleWeight) ||
+      !trajectoryNumbersEqual(
+        expert.priorWeight,
+        value.priorWeights?.[expected.id],
+      ) ||
+      !trajectoryNumbersEqual(
+        expert.learnedWeight,
+        value.currentWeights?.[expected.id],
+      ) ||
+      !trajectoryNumbersEqual(
+        expert.ensembleWeight,
+        value.ensembleWeights?.[expected.id],
+      )
+    ) {
+      return null;
+    }
+    if (ready) {
+      const expertProbabilities = expert.probabilities;
+      const range = expert.deltaRangeCellWidths;
+      if (
+        !TRAJECTORY_DIRECTIONS.includes(expert.direction) ||
+        !expertProbabilities ||
+        typeof expertProbabilities !== "object" ||
+        Array.isArray(expertProbabilities) ||
+        TRAJECTORY_DIRECTIONS.some(
+          (key) =>
+            !Number.isFinite(expertProbabilities[key]) ||
+            expertProbabilities[key] < 0 ||
+            expertProbabilities[key] > 1,
+        ) ||
+        !trajectoryNumbersEqual(
+          TRAJECTORY_DIRECTIONS.reduce(
+            (total, key) => total + expertProbabilities[key],
+            0,
+          ),
+          1,
+        ) ||
+        !Number.isFinite(expert.expectedDeltaCellWidths) ||
+        Math.abs(expert.expectedDeltaCellWidths) >
+          TRAJECTORY_SHADOW_ADAPTIVE_DEFAULTS.maxAbsDeltaCellWidths ||
+        !range ||
+        typeof range !== "object" ||
+        Array.isArray(range) ||
+        !trajectoryNumbersEqual(range.lowerQuantile, 0.2) ||
+        !trajectoryNumbersEqual(range.upperQuantile, 0.8) ||
+        !Number.isFinite(range.lower) ||
+        !Number.isFinite(range.median) ||
+        !Number.isFinite(range.upper) ||
+        [range.lower, range.median, range.upper].some(
+          (delta) =>
+            Math.abs(delta) >
+            TRAJECTORY_SHADOW_ADAPTIVE_DEFAULTS.maxAbsDeltaCellWidths,
+        ) ||
+        range.lower > range.median ||
+        range.median > range.upper ||
+        expert.direction !==
+          trajectoryWinningDirection(
+            expertProbabilities,
+            expert.expectedDeltaCellWidths,
+          ) ||
+        !validTrajectoryNearestIds(
+          expert.nearestIds,
+          expert.sample.neighborCount,
+        )
+      ) {
+        return null;
+      }
+    } else if (
+      expert.direction !== null ||
+      expert.probabilities !== null ||
+      expert.expectedDeltaCellWidths !== null ||
+      expert.deltaRangeCellWidths !== null ||
+      !validTrajectoryNearestIds(expert.nearestIds, 0)
+    ) {
+      return null;
+    }
+    normalizedExperts.push({ ...expert, options: { ...options } });
+  }
+
+  const readyExperts = normalizedExperts.filter(
+    (expert) => expert.status === "ready",
+  );
+  const expectedEnsembleTotal = readyExperts.length > 0 ? 1 : 0;
+  const readyCurrentWeightTotal = readyExperts.reduce(
+    (total, expert) => total + value.currentWeights[expert.id],
+    0,
+  );
+  if (
+    !validWeightObject(value.ensembleWeights, expectedEnsembleTotal) ||
+    (status === "ready") !== (readyExperts.length > 0) ||
+    (readyExperts.length > 0 && !(readyCurrentWeightTotal > 0)) ||
+    expectedIds.some((id) => {
+      const ready = readyExperts.some((expert) => expert.id === id);
+      const expectedWeight = ready
+        ? value.currentWeights[id] / readyCurrentWeightTotal
+        : 0;
+      return !trajectoryNumbersEqual(value.ensembleWeights[id], expectedWeight);
+    })
+  ) {
+    return null;
+  }
+
+  if (readyExperts.length === 0) {
+    const representative =
+      normalizedExperts.find(
+        (expert) => expert.status === "insufficient_history",
+      ) ?? normalizedExperts[0];
+    if (
+      status !== representative.status ||
+      direction !== null ||
+      probabilities !== null ||
+      expectedDeltaCellWidths !== null ||
+      !sameTrajectoryValue(sample, representative.sample) ||
+      !sameTrajectoryValue(nearestIds, []) ||
+      numberArea !== null ||
+      displayRange !== null ||
+      storedNumberArea !== null ||
+      storedDisplayRange !== null
+    ) {
+      return null;
+    }
+  } else {
+    const expectedProbabilities = { up: 0, down: 0, flat: 0 };
+    const expectedRange = {
+      lowerQuantile: 0.2,
+      upperQuantile: 0.8,
+      lower: 0,
+      median: 0,
+      upper: 0,
+    };
+    let expectedDelta = 0;
+    for (const expert of readyExperts) {
+      const weight = value.ensembleWeights[expert.id];
+      for (const key of TRAJECTORY_DIRECTIONS) {
+        expectedProbabilities[key] += weight * expert.probabilities[key];
+      }
+      expectedDelta += weight * expert.expectedDeltaCellWidths;
+      expectedRange.lower += weight * expert.deltaRangeCellWidths.lower;
+      expectedRange.median += weight * expert.deltaRangeCellWidths.median;
+      expectedRange.upper += weight * expert.deltaRangeCellWidths.upper;
+    }
+    const probabilityTotal = TRAJECTORY_DIRECTIONS.reduce(
+      (total, key) => total + expectedProbabilities[key],
+      0,
+    );
+    for (const key of TRAJECTORY_DIRECTIONS) {
+      expectedProbabilities[key] /= probabilityTotal;
+    }
+    const reference = readyExperts.reduce((best, expert) =>
+      value.ensembleWeights[expert.id] > value.ensembleWeights[best.id]
+        ? expert
+        : best,
+    );
+    const expectedNearestIds = [];
+    const seenNearestIds = new Set();
+    for (const expert of readyExperts) {
+      for (const id of expert.nearestIds) {
+        if (seenNearestIds.has(id)) continue;
+        seenNearestIds.add(id);
+        expectedNearestIds.push(id);
+      }
+    }
+    let bands;
+    try {
+      bands = trajectoryBandsFromForecastCells(cells);
+    } catch {
+      return null;
+    }
+    const expectedMedianCellWidth = trajectoryMedianCellWidth(bands);
+    const expectedDirection = trajectoryWinningDirection(
+      expectedProbabilities,
+      expectedDelta,
+    );
+    const expectedNumberArea = buildTrajectoryNumberArea({
+      bands,
+      lockPrice,
+      medianCellWidth,
+      deltaRangeCellWidths: expectedRange,
+      direction: expectedDirection,
+      flatThresholdCellWidths:
+        TRAJECTORY_SHADOW_ADAPTIVE_DEFAULTS.flatThresholdCellWidths,
+    });
+    const expectedDisplayRange = buildTrajectoryDisplayRange(expectedNumberArea);
+    if (
+      !sameTrajectoryValue(probabilities, expectedProbabilities) ||
+      !trajectoryNumbersEqual(expectedDeltaCellWidths, expectedDelta) ||
+      direction !== expectedDirection ||
+      !sameTrajectoryValue(sample, reference.sample) ||
+      !sameTrajectoryValue(nearestIds, expectedNearestIds) ||
+      !trajectoryNumbersEqual(medianCellWidth, expectedMedianCellWidth) ||
+      expectedNumberArea === null ||
+      !sameTrajectoryValue(numberArea, expectedNumberArea) ||
+      !sameTrajectoryValue(storedNumberArea, expectedNumberArea) ||
+      expectedDisplayRange === null ||
+      !sameTrajectoryValue(displayRange, expectedDisplayRange) ||
+      !sameTrajectoryValue(storedDisplayRange, expectedDisplayRange)
+    ) {
+      return null;
+    }
+  }
+
+  return {
+    ...value,
+    experts: normalizedExperts,
+    currentWeights: { ...value.currentWeights },
+    ensembleWeights: { ...value.ensembleWeights },
+    priorWeights: { ...value.priorWeights },
+  };
+}
+
+function validAdaptiveTrajectorySnapshotSql(
+  status,
+  cutoffAt,
+  snapshotLockedAt,
+  lockPrice,
+  snapshotCurrentPrice,
+  medianCellWidth,
+  direction,
+  probabilitiesJson,
+  expectedDeltaCellWidths,
+  sampleJson,
+  nearestIdsJson,
+  parametersJson,
+  currentPrefixJson,
+  integrationJson,
+  cellsJson,
+) {
+  try {
+    const probabilities = deserializeJson(probabilitiesJson);
+    const sample = deserializeJson(sampleJson);
+    const nearestIds = deserializeJson(nearestIdsJson);
+    const parameters = deserializeJson(parametersJson);
+    const currentPrefix = deserializeJson(currentPrefixJson);
+    const integration = deserializeJson(integrationJson);
+    const cells = deserializeJson(cellsJson);
+    const numericLockPrice = lockPrice == null ? null : Number(lockPrice);
+    const numericMedianCellWidth =
+      medianCellWidth == null ? null : Number(medianCellWidth);
+    const numericSnapshotCurrentPrice =
+      snapshotCurrentPrice == null ? null : Number(snapshotCurrentPrice);
+    const numericExpectedDelta =
+      expectedDeltaCellWidths == null
+        ? null
+        : Number(expectedDeltaCellWidths);
+    const numberArea = normalizeTrajectoryNumberArea(integration?.numberArea, {
+      direction,
+      lockPrice: numericLockPrice,
+      medianCellWidth: numericMedianCellWidth,
+      flatThresholdCellWidths: Number(parameters?.flatThresholdCellWidths),
+    });
+    const displayRange = normalizeTrajectoryDisplayRange(
+      integration?.displayRange,
+      numberArea,
+    );
+    return normalizeTrajectoryAdaptive(integration?.adaptive, {
+      status,
+      cutoffAt,
+      snapshotLockedAt,
+      direction,
+      probabilities,
+      expectedDeltaCellWidths: numericExpectedDelta,
+      sample,
+      nearestIds,
+      parameters,
+      lockPrice: numericLockPrice,
+      snapshotCurrentPrice: numericSnapshotCurrentPrice,
+      medianCellWidth: numericMedianCellWidth,
+      currentPrefix,
+      cells,
+      numberArea,
+      displayRange,
+      storedNumberArea: integration?.numberArea ?? null,
+      storedDisplayRange: integration?.displayRange ?? null,
+    }) === null
+      ? 0
+      : 1;
+  } catch {
+    return 0;
+  }
+}
+
+function consistentTrajectoryRawCell(rawCellValue, actualNumberValue) {
+  if (
+    rawCellValue === null ||
+    rawCellValue === undefined ||
+    rawCellValue === "" ||
+    actualNumberValue === null ||
+    actualNumberValue === undefined ||
+    actualNumberValue === ""
+  ) {
+    return null;
+  }
+  const rawCell = Number(rawCellValue);
+  const actualNumber = Number(actualNumberValue);
+  if (
+    !Number.isInteger(rawCell) ||
+    rawCell < 0 ||
+    rawCell > 37 ||
+    !Number.isInteger(actualNumber) ||
+    actualNumber < 0 ||
+    actualNumber > 36 ||
+    canonicalRouletteNumber(rawCell) !== actualNumber
+  ) {
+    return null;
+  }
+  return rawCell;
+}
+
 function mapForecastTrajectoryShadow(row) {
   if (
     row?.trajectory_shadow_forecast_id === null ||
@@ -2196,15 +2855,19 @@ function mapForecastTrajectoryShadow(row) {
   const parameters = deserializeJson(row.trajectory_shadow_parameters_json);
   const currentPrefix = deserializeJson(row.trajectory_shadow_current_prefix_json);
   const integration = deserializeJson(row.trajectory_shadow_integration_json);
+  const cells = deserializeJson(row.trajectory_cells_json);
   const status = row.trajectory_shadow_status;
   const direction = row.trajectory_shadow_direction;
+  const modelVersion = row.trajectory_shadow_model_version;
   const flatThresholdCellWidths = Number(
     parameters?.flatThresholdCellWidths,
   );
   if (
     Number(row.trajectory_shadow_schema_version) !==
       TRAJECTORY_SHADOW_SCHEMA_VERSION ||
-    row.trajectory_shadow_model_version !== TRAJECTORY_SHADOW_VERSION ||
+    ![TRAJECTORY_SHADOW_VERSION, TRAJECTORY_SHADOW_ADAPTIVE_VERSION].includes(
+      modelVersion,
+    ) ||
     !allowedStatuses.has(status) ||
     !Array.isArray(nearestIds) ||
     !parameters ||
@@ -2239,6 +2902,33 @@ function mapForecastTrajectoryShadow(row) {
     medianCellWidth,
     flatThresholdCellWidths,
   });
+  const displayRange = normalizeTrajectoryDisplayRange(
+    integration?.displayRange,
+    numberArea,
+  );
+  const adaptive = modelVersion === TRAJECTORY_SHADOW_ADAPTIVE_VERSION
+    ? normalizeTrajectoryAdaptive(integration?.adaptive, {
+        status,
+        cutoffAt: row.trajectory_shadow_cutoff_at,
+        snapshotLockedAt: row.locked_at,
+        direction,
+        probabilities,
+        expectedDeltaCellWidths,
+        sample,
+        nearestIds,
+        parameters,
+        lockPrice,
+        snapshotCurrentPrice:
+          row.current_price == null ? null : Number(row.current_price),
+        medianCellWidth,
+        currentPrefix,
+        cells,
+        numberArea,
+        displayRange,
+        storedNumberArea: integration?.numberArea ?? null,
+        storedDisplayRange: integration?.displayRange ?? null,
+      })
+    : null;
   const readyProbabilitiesValid =
     probabilities !== null &&
     typeof probabilities === "object" &&
@@ -2270,40 +2960,77 @@ function mapForecastTrajectoryShadow(row) {
         typeof row.trajectory_shadow_reason === "string" &&
         row.trajectory_shadow_reason.length > 0;
   if (!readyShapeValid) return null;
+  if (
+    modelVersion === TRAJECTORY_SHADOW_ADAPTIVE_VERSION &&
+    status !== "insufficient_current" &&
+    (adaptive === null ||
+      (status === "ready" &&
+        (numberArea === null || displayRange === null)))
+  ) {
+    return null;
+  }
 
   let evaluation = null;
-  if (
-    actualPrice !== null &&
-    Number.isFinite(actualPrice) &&
-    Number.isFinite(lockPrice) &&
-    Number.isFinite(medianCellWidth) &&
-    medianCellWidth > 0
-  ) {
-    const delta = actualPrice - lockPrice;
-    const deltaCellWidths = delta / medianCellWidth;
-    const actualDirection = trajectoryDirection(
-      deltaCellWidths,
-      Number(parameters.flatThresholdCellWidths),
+  const actualNumber = Number(row.actual_number);
+  const hasSettlement =
+    row.round_result_id !== null &&
+    row.round_result_id !== undefined &&
+    Number.isInteger(actualNumber) &&
+    actualNumber >= 0 &&
+    actualNumber <= 36;
+  if (hasSettlement) {
+    const directionEvaluable =
+      actualPrice !== null &&
+      Number.isFinite(actualPrice) &&
+      Number.isFinite(lockPrice) &&
+      Number.isFinite(medianCellWidth) &&
+      medianCellWidth > 0;
+    const delta = directionEvaluable ? actualPrice - lockPrice : null;
+    const deltaCellWidths = directionEvaluable
+      ? delta / medianCellWidth
+      : null;
+    const actualDirection = directionEvaluable
+      ? trajectoryDirection(
+          deltaCellWidths,
+          Number(parameters.flatThresholdCellWidths),
+        )
+      : null;
+    const rawCell = consistentTrajectoryRawCell(
+      row.trajectory_actual_raw_cell,
+      actualNumber,
     );
     evaluation = {
       resultId: Number(row.round_result_id),
-      actualNumber: Number(row.actual_number),
+      actualNumber,
+      rawCell,
       actualPrice,
       settledAt: row.settled_at,
       delta,
       deltaCellWidths,
       actualDirection,
       directionHit:
-        status === "ready"
+        status === "ready" && actualDirection !== null
           ? row.trajectory_shadow_direction === actualDirection
+          : null,
+      displayRangeHit:
+        status === "ready" && rawCell !== null && displayRange !== null
+          ? displayRange.cells.some((cell) => cell.wireCell === rawCell)
+          : null,
+      q50ExactHit:
+        status === "ready" && rawCell !== null && numberArea !== null
+          ? numberArea.typical.wireCell === rawCell
+          : null,
+      fullCorridorHit:
+        status === "ready" && rawCell !== null && numberArea !== null
+          ? numberArea.corridor.cells.some((cell) => cell.wireCell === rawCell)
           : null,
     };
   }
 
   return {
     schemaVersion: Number(row.trajectory_shadow_schema_version),
-    version: row.trajectory_shadow_model_version,
-    modelVersion: row.trajectory_shadow_model_version,
+    version: modelVersion,
+    modelVersion,
     status,
     reason: row.trajectory_shadow_reason,
     trajectoryId:
@@ -2322,11 +3049,42 @@ function mapForecastTrajectoryShadow(row) {
     currentPrefix,
     integration: {
       ...integration,
+      adaptive,
       numberArea: status === "ready" ? numberArea : null,
+      displayRange: status === "ready" ? displayRange : null,
     },
+    adaptive,
     numberArea: status === "ready" ? numberArea : null,
+    displayRange: status === "ready" ? displayRange : null,
     evaluation,
     createdAt: row.trajectory_shadow_created_at,
+  };
+}
+
+function mapTrajectoryMetrics(row) {
+  const readyCount = Number(row?.ready_count ?? 0);
+  const settledCount = Number(row?.settled_count ?? 0);
+  const evaluatedCount = Number(row?.evaluated_count ?? 0);
+  const displayRangeHits = Number(row?.display_range_hits ?? 0);
+  const q50ExactHits = Number(row?.q50_exact_hits ?? 0);
+  const fullCorridorHits = Number(row?.full_corridor_hits ?? 0);
+  return {
+    modelVersion: TRAJECTORY_SHADOW_ADAPTIVE_VERSION,
+    displayRangeVersion: TRAJECTORY_DISPLAY_RANGE_VERSION,
+    readyCount,
+    settledCount,
+    pendingCount: Math.max(0, readyCount - settledCount),
+    evaluatedCount,
+    ungradableCount: Math.max(0, settledCount - evaluatedCount),
+    displayRangeHits,
+    q50ExactHits,
+    fullCorridorHits,
+    displayRangeRate:
+      evaluatedCount > 0 ? displayRangeHits / evaluatedCount : null,
+    q50ExactRate: evaluatedCount > 0 ? q50ExactHits / evaluatedCount : null,
+    fullCorridorRate:
+      evaluatedCount > 0 ? fullCorridorHits / evaluatedCount : null,
+    coverageRate: settledCount > 0 ? evaluatedCount / settledCount : null,
   };
 }
 
@@ -2517,6 +3275,11 @@ export class RouletteDatabase {
     this.sqlite = new DatabaseSync(path);
 
     try {
+      this.sqlite.function(
+        TRAJECTORY_ADAPTIVE_VALIDATOR_SQL_FUNCTION,
+        { deterministic: true },
+        validAdaptiveTrajectorySnapshotSql,
+      );
       this.sqlite.exec("PRAGMA foreign_keys = ON");
       this.sqlite.exec("PRAGMA busy_timeout = 5000");
       this.sqlite.exec("PRAGMA journal_mode = WAL");
@@ -6646,6 +7409,13 @@ export class RouletteDatabase {
       historyMaxResultId: null,
       historyCutoffAt: lockedAt,
       currentCoverage: null,
+      learningLimit: TRAJECTORY_SHADOW_LEARNING_LIMIT,
+      queriedLearningRowCount: 0,
+      usableLearningRowCount: 0,
+      excludedLearningRowCount: 0,
+      adaptive: null,
+      numberArea: null,
+      displayRange: null,
     };
     const unavailableCurrent = (
       reason,
@@ -6657,6 +7427,7 @@ export class RouletteDatabase {
         integration = baseIntegration,
       } = {},
     ) => ({
+      modelVersion: TRAJECTORY_SHADOW_ADAPTIVE_VERSION,
       trajectoryId,
       status: "insufficient_current",
       reason,
@@ -6668,7 +7439,7 @@ export class RouletteDatabase {
       expectedDeltaCellWidths: null,
       sample: null,
       nearestIds: [],
-      parameters: { ...TRAJECTORY_SHADOW_DEFAULTS },
+      parameters: { ...TRAJECTORY_SHADOW_ADAPTIVE_DEFAULTS },
       currentPrefix,
       integration,
     });
@@ -6733,7 +7504,12 @@ export class RouletteDatabase {
           results.price AS result_price,
           results.settled_at AS result_settled_at,
           results.observed_at AS result_observed_at,
-          results.created_at AS result_created_at
+          results.created_at AS result_created_at,
+          MAX(
+            results.settled_at,
+            results.observed_at,
+            results.created_at
+          ) AS completed_at
         FROM round_trajectories AS trajectories
         JOIN round_results AS results
           ON results.source = trajectories.source
@@ -6747,7 +7523,7 @@ export class RouletteDatabase {
           AND results.settled_at < ?
           AND results.observed_at < ?
           AND results.created_at < ?
-        ORDER BY results.settled_at DESC, results.id DESC
+        ORDER BY completed_at DESC, results.id DESC
         LIMIT ?
       `)
       .all(
@@ -6808,7 +7584,122 @@ export class RouletteDatabase {
       });
     }
 
-    const result = predictTrajectoryShadow({
+    const learningCandidates = this.sqlite
+      .prepare(`
+        SELECT
+          shadows.forecast_id,
+          shadows.lock_price,
+          shadows.median_cell_width,
+          shadows.integration_json,
+          snapshots.locked_at,
+          settlements.created_at AS settlement_created_at,
+          results.price AS result_price,
+          results.settled_at AS result_settled_at,
+          results.observed_at AS result_observed_at,
+          results.created_at AS result_created_at,
+          MAX(
+            results.settled_at,
+            results.observed_at,
+            results.created_at,
+            settlements.created_at
+          ) AS completed_at
+        FROM forecast_trajectory_shadows AS shadows
+        JOIN round_forecasts AS forecasts
+          ON forecasts.id = shadows.forecast_id
+        JOIN forecast_snapshots AS snapshots
+          ON snapshots.id = forecasts.snapshot_id
+        JOIN forecast_settlements AS settlements
+          ON settlements.forecast_id = forecasts.id
+        JOIN round_results AS results
+          ON results.id = settlements.round_result_id
+        WHERE snapshots.source = ?
+          AND snapshots.instrument = ?
+          AND shadows.model_version = ?
+          AND shadows.status = 'ready'
+          AND trajectory_adaptive_snapshot_valid_v2(
+            shadows.status,
+            shadows.cutoff_at,
+            snapshots.locked_at,
+            shadows.lock_price,
+            snapshots.current_price,
+            shadows.median_cell_width,
+            shadows.direction,
+            shadows.probabilities_json,
+            shadows.expected_delta_cell_widths,
+            shadows.sample_json,
+            shadows.nearest_ids_json,
+            shadows.parameters_json,
+            shadows.current_prefix_json,
+            shadows.integration_json,
+            snapshots.cells_json
+          ) = 1
+          AND shadows.created_at < ?
+          AND shadows.cutoff_at < ?
+          AND forecasts.created_at < ?
+          AND snapshots.locked_at < ?
+          AND results.price IS NOT NULL
+          AND settlements.settled_at < ?
+          AND settlements.created_at < ?
+          AND results.settled_at < ?
+          AND results.observed_at < ?
+          AND results.created_at < ?
+        ORDER BY completed_at DESC, results.id DESC, shadows.forecast_id DESC
+        LIMIT ?
+      `)
+      .all(
+        source,
+        instrument,
+        TRAJECTORY_SHADOW_ADAPTIVE_VERSION,
+        lockedAt,
+        lockedAt,
+        lockedAt,
+        lockedAt,
+        lockedAt,
+        lockedAt,
+        lockedAt,
+        lockedAt,
+        lockedAt,
+        TRAJECTORY_SHADOW_LEARNING_LIMIT,
+      );
+    const learningRows = [];
+    let excludedLearningRowCount = 0;
+    for (const candidate of learningCandidates) {
+      const lockPrice = Number(candidate.lock_price);
+      const candidateCellWidth = Number(candidate.median_cell_width);
+      const actualPrice = Number(candidate.result_price);
+      const integrationSnapshot = deserializeJson(candidate.integration_json);
+      const completedMs = Date.parse(candidate.completed_at);
+      const candidateLockedMs = Date.parse(candidate.locked_at);
+      if (
+        !Number.isFinite(lockPrice) ||
+        !Number.isFinite(candidateCellWidth) ||
+        candidateCellWidth <= 0 ||
+        !Number.isFinite(actualPrice) ||
+        !Number.isFinite(completedMs) ||
+        !Number.isFinite(candidateLockedMs) ||
+        candidateLockedMs >= completedMs ||
+        !Array.isArray(integrationSnapshot?.adaptive?.experts)
+      ) {
+        excludedLearningRowCount += 1;
+        continue;
+      }
+      learningRows.push({
+        id: String(candidate.forecast_id),
+        lockedAt: candidate.locked_at,
+        completedAt: new Date(completedMs).toISOString(),
+        actualDeltaCellWidths:
+          (actualPrice - lockPrice) / candidateCellWidth,
+        experts: integrationSnapshot.adaptive.experts,
+      });
+    }
+    learningRows.sort(
+      (left, right) =>
+        Date.parse(left.completedAt) - Date.parse(right.completedAt) ||
+        Date.parse(left.lockedAt) - Date.parse(right.lockedAt) ||
+        left.id.localeCompare(right.id),
+    );
+
+    const result = predictAdaptiveTrajectoryShadow({
       current: {
         id: String(trajectoryId),
         lockedAt,
@@ -6816,6 +7707,7 @@ export class RouletteDatabase {
         cellWidths: bands.map((band) => band.upper - band.lower),
       },
       history,
+      learningRows,
     });
     const numberArea = result.status === "ready"
       ? buildTrajectoryNumberArea({
@@ -6827,7 +7719,11 @@ export class RouletteDatabase {
           flatThresholdCellWidths: result.parameters.flatThresholdCellWidths,
         })
       : null;
+    const displayRange = numberArea === null
+      ? null
+      : buildTrajectoryDisplayRange(numberArea);
     return {
+      modelVersion: result.version,
       trajectoryId,
       status: result.status,
       reason: result.status === "ready" ? null : result.status,
@@ -6850,7 +7746,12 @@ export class RouletteDatabase {
           candidates.length === 0
             ? null
             : Math.max(...candidates.map((candidate) => Number(candidate.result_id))),
+        queriedLearningRowCount: learningCandidates.length,
+        usableLearningRowCount: learningRows.length,
+        excludedLearningRowCount,
+        adaptive: result.adaptive,
         numberArea,
+        displayRange,
       },
     };
   }
@@ -6870,7 +7771,7 @@ export class RouletteDatabase {
         forecastId,
         shadow.trajectoryId,
         TRAJECTORY_SHADOW_SCHEMA_VERSION,
-        TRAJECTORY_SHADOW_VERSION,
+        shadow.modelVersion,
         shadow.status,
         shadow.reason,
         shadow.cutoffAt,
@@ -7671,6 +8572,7 @@ export class RouletteDatabase {
           snapshots.current_price,
           snapshots.start_price,
           snapshots.current_number,
+          snapshots.cells_json AS trajectory_cells_json,
           snapshots.features_json,
           settlements.round_result_id,
           settlements.actual_number,
@@ -7732,7 +8634,8 @@ export class RouletteDatabase {
           trajectory_shadows.integration_json
             AS trajectory_shadow_integration_json,
           trajectory_shadows.created_at AS trajectory_shadow_created_at,
-          settlement_results.price AS trajectory_actual_price
+          settlement_results.price AS trajectory_actual_price,
+          settlement_results.raw_cell AS trajectory_actual_raw_cell
         FROM round_forecasts AS forecasts
         JOIN forecast_snapshots AS snapshots ON snapshots.id = forecasts.snapshot_id
         LEFT JOIN forecast_settlements AS settlements
@@ -7784,12 +8687,101 @@ export class RouletteDatabase {
         };
     const forecastCount = Number(metrics.forecast_count);
     const settledCount = Number(metrics.settled_count);
+    const trajectoryMetrics = mapTrajectoryMetrics(
+      this.sqlite
+        .prepare(`
+          WITH eligible AS (
+            SELECT
+              trajectory_shadows.integration_json,
+              settlements.round_result_id,
+              settlements.actual_number,
+              settlement_results.raw_cell,
+              json_extract(
+                trajectory_shadows.integration_json,
+                '$.numberArea.typical.wireCell'
+              ) AS q50_wire_cell
+            FROM forecast_trajectory_shadows AS trajectory_shadows
+            JOIN round_forecasts AS forecasts
+              ON forecasts.id = trajectory_shadows.forecast_id
+            JOIN forecast_snapshots AS snapshots
+              ON snapshots.id = forecasts.snapshot_id
+            LEFT JOIN forecast_settlements AS settlements
+              ON settlements.forecast_id = forecasts.id
+            LEFT JOIN round_results AS settlement_results
+              ON settlement_results.id = settlements.round_result_id
+            WHERE snapshots.source = ?
+              AND snapshots.instrument = ?
+              AND trajectory_shadows.model_version = ?
+              AND trajectory_shadows.status = 'ready'
+              AND trajectory_adaptive_snapshot_valid_v2(
+                trajectory_shadows.status,
+                trajectory_shadows.cutoff_at,
+                snapshots.locked_at,
+                trajectory_shadows.lock_price,
+                snapshots.current_price,
+                trajectory_shadows.median_cell_width,
+                trajectory_shadows.direction,
+                trajectory_shadows.probabilities_json,
+                trajectory_shadows.expected_delta_cell_widths,
+                trajectory_shadows.sample_json,
+                trajectory_shadows.nearest_ids_json,
+                trajectory_shadows.parameters_json,
+                trajectory_shadows.current_prefix_json,
+                trajectory_shadows.integration_json,
+                snapshots.cells_json
+              ) = 1
+          ), graded AS (
+            SELECT
+              *,
+              CASE
+                WHEN round_result_id IS NOT NULL
+                  AND raw_cell BETWEEN 0 AND 37
+                  AND actual_number = CASE WHEN raw_cell = 37 THEN 0 ELSE raw_cell END
+                THEN 1 ELSE 0
+              END AS is_gradable
+            FROM eligible
+          )
+          SELECT
+            COUNT(*) AS ready_count,
+            COALESCE(SUM(round_result_id IS NOT NULL), 0) AS settled_count,
+            COALESCE(SUM(is_gradable), 0) AS evaluated_count,
+            COALESCE(SUM(
+              is_gradable AND EXISTS (
+                SELECT 1
+                FROM json_each(
+                  graded.integration_json,
+                  '$.displayRange.cells'
+                ) AS displayed
+                WHERE json_extract(displayed.value, '$.wireCell') = graded.raw_cell
+              )
+            ), 0) AS display_range_hits,
+            COALESCE(SUM(is_gradable AND q50_wire_cell = raw_cell), 0)
+              AS q50_exact_hits,
+            COALESCE(SUM(
+              is_gradable AND EXISTS (
+                SELECT 1
+                FROM json_each(
+                  graded.integration_json,
+                  '$.numberArea.corridor.cells'
+                ) AS corridor
+                WHERE json_extract(corridor.value, '$.wireCell') = graded.raw_cell
+              )
+            ), 0) AS full_corridor_hits
+          FROM graded
+        `)
+        .get(
+          safeSource,
+          safeInstrument,
+          TRAJECTORY_SHADOW_ADAPTIVE_VERSION,
+        ),
+    );
     return {
       mode: "observation",
       executionEnabled: false,
       captureLeadSeconds: { min: 8, max: 10 },
       minimumPersistedLeadSeconds: 5,
       latest,
+      trajectoryMetrics,
       metrics: {
         forecastCount,
         settledCount,
