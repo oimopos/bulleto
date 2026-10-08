@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   BuletoCollector,
+  ROUND_TRAJECTORY_SCHEMA_VERSION,
   canonicalRouletteNumber,
   normalizeLastResults,
   normalizeWireResult,
@@ -66,6 +67,31 @@ function forecastRound({ id, bettingClosesAtMs, result } = {}) {
     ed: iso(bettingClosesAtMs + 40_000),
     sv: 20,
     cls: forecastCells(),
+  };
+  if (result !== undefined) round.rr = result;
+  return round;
+}
+
+function trajectoryRound({
+  id,
+  baseMs,
+  startsAtMs = baseMs - 20_000,
+  bettingClosesAtMs = baseMs + 30_000,
+  status = 2,
+  result,
+} = {}) {
+  const round = {
+    id,
+    s: status,
+    sd: iso(startsAtMs),
+    bcd: iso(bettingClosesAtMs),
+    btd: iso(bettingClosesAtMs + 10_000),
+    ed: iso(bettingClosesAtMs + 40_000),
+    sv: 20,
+    bv: 1,
+    tv: 37,
+    cls: forecastCells().map((cell) => ({ ...cell, vendorCellField: 'ignored' })),
+    vendorRoundField: 'ignored',
   };
   if (result !== undefined) round.rr = result;
   return round;
@@ -159,6 +185,212 @@ test('same settled result has same fingerprint with or without round id', () => 
     { externalRoundId: 123 },
   );
   assert.equal(fromSnapshot.fingerprint, fromRound.fingerprint);
+});
+
+test('collector emits a whitelisted round trajectory and associates cached factors by time', (t) => {
+  const { collector, socket } = startFakeCollector(t);
+  const trajectories = [];
+  collector.on('round-trajectory', (trajectory) => trajectories.push(trajectory));
+
+  const baseMs = Date.now();
+  const firstAt = iso(baseMs - 8_000);
+  const secondAt = iso(baseMs - 3_000);
+  socket.message({
+    type: 'factors',
+    data: [
+      { dt: iso(baseMs - 25_000), v: 18, vendorFactorField: 'ignored' },
+      { dt: firstAt, v: 19.5, vendorFactorField: 'ignored' },
+      { dt: firstAt, v: 19.5, duplicate: true },
+      { dt: secondAt, v: 20 },
+      { dt: iso(baseMs + 2_000), v: 999_999 },
+      { dt: iso(baseMs - 1_000), v: '20.1' },
+    ],
+  });
+  socket.message({
+    type: 'round',
+    data: trajectoryRound({ id: 601, baseMs }),
+  });
+
+  assert.equal(trajectories.length, 1);
+  const trajectory = trajectories[0];
+  assert.equal(trajectory.schemaVersion, ROUND_TRAJECTORY_SCHEMA_VERSION);
+  assert.deepEqual(Object.keys(trajectory).sort(), [
+    'factors',
+    'instrument',
+    'receivedAt',
+    'round',
+    'schemaVersion',
+    'source',
+  ]);
+  assert.deepEqual(Object.keys(trajectory.round).sort(), [
+    'bettingClosesAt',
+    'bettingStopsAt',
+    'bottomPrice',
+    'cellBands',
+    'endsAt',
+    'externalRoundId',
+    'startPrice',
+    'startsAt',
+    'status',
+    'topPrice',
+  ]);
+  assert.deepEqual(
+    {
+      externalRoundId: trajectory.round.externalRoundId,
+      status: trajectory.round.status,
+      startPrice: trajectory.round.startPrice,
+      bottomPrice: trajectory.round.bottomPrice,
+      topPrice: trajectory.round.topPrice,
+    },
+    {
+      externalRoundId: '601',
+      status: 2,
+      startPrice: 20,
+      bottomPrice: 1,
+      topPrice: 37,
+    },
+  );
+  assert.equal(trajectory.round.cellBands.length, 38);
+  assert.deepEqual(trajectory.round.cellBands[0], {
+    wireCell: 0,
+    number: 0,
+    lower: 37,
+    upper: 38,
+  });
+  assert.deepEqual(trajectory.round.cellBands[37], {
+    wireCell: 37,
+    number: 0,
+    lower: 0,
+    upper: 1,
+  });
+  assert.deepEqual(
+    trajectory.factors.map(({ at, price }) => ({ at, price })),
+    [
+      { at: firstAt, price: 19.5 },
+      { at: secondAt, price: 20 },
+    ],
+  );
+  for (const factor of trajectory.factors) {
+    assert.deepEqual(Object.keys(factor).sort(), ['at', 'price', 'receivedAt']);
+    assert.ok(Date.parse(factor.at) <= Date.parse(factor.receivedAt));
+  }
+  assert.equal('vendorRoundField' in trajectory.round, false);
+  assert.equal('vendorCellField' in trajectory.round.cellBands[0], false);
+  assert.equal('vendorFactorField' in trajectory.factors[0], false);
+});
+
+test('round trajectory emits only new exact observations and never leaks across closed rounds', (t) => {
+  const { collector, socket } = startFakeCollector(t);
+  const trajectories = [];
+  collector.on('round-trajectory', (trajectory) => trajectories.push(trajectory));
+
+  const baseMs = Date.now();
+  const repeatedAt = iso(baseMs - 8_000);
+  const nextAt = iso(baseMs - 4_000);
+  socket.message({ type: 'round', data: trajectoryRound({ id: 701, baseMs }) });
+  socket.message({
+    type: 'factors',
+    data: [{ dt: repeatedAt, v: 19.5 }],
+  });
+  socket.message({
+    type: 'factors',
+    data: [
+      { dt: repeatedAt, v: 19.5 },
+      { dt: repeatedAt, v: 19.6 },
+      { dt: nextAt, v: 20 },
+    ],
+  });
+
+  assert.deepEqual(
+    trajectories.map((trajectory) => trajectory.factors.map(({ at, price }) => ({ at, price }))),
+    [
+      [],
+      [{ at: repeatedAt, price: 19.5 }],
+      [
+        { at: repeatedAt, price: 19.6 },
+        { at: nextAt, price: 20 },
+      ],
+    ],
+  );
+
+  socket.message({
+    type: 'round',
+    data: trajectoryRound({ id: 701, baseMs, result: null }),
+  });
+  socket.message({ type: 'factors', data: [{ dt: iso(baseMs - 2_000), v: 20.2 }] });
+  assert.equal(trajectories.length, 3, 'rr presence closes capture even when rr is null');
+
+  const secondStartMs = baseMs - 5_000;
+  const beforeSecondRound = iso(baseMs - 8_000);
+  const insideSecondRound = iso(baseMs - 2_000);
+  socket.message({
+    type: 'round',
+    data: trajectoryRound({ id: 702, baseMs, startsAtMs: secondStartMs, status: 4 }),
+  });
+  socket.message({
+    type: 'factors',
+    data: [
+      { dt: beforeSecondRound, v: 19.8 },
+      { dt: insideSecondRound, v: 20.1 },
+    ],
+  });
+  socket.message({
+    type: 'round',
+    data: trajectoryRound({ id: 702, baseMs, startsAtMs: secondStartMs }),
+  });
+
+  assert.equal(trajectories.length, 4);
+  assert.equal(trajectories[3].round.externalRoundId, '702');
+  assert.deepEqual(
+    trajectories[3].factors.map(({ at, price }) => ({ at, price })),
+    [{ at: insideSecondRound, price: 20.1 }],
+  );
+});
+
+test('same-message trajectory always precedes pre-close forecast for both wire orders', (t) => {
+  const { collector, socket } = startFakeCollector(t);
+  const order = [];
+  collector.on('round-trajectory', (trajectory) => {
+    order.push({ type: 'trajectory', roundId: trajectory.round.externalRoundId });
+  });
+  collector.on('preclose-forecast', (forecast) => {
+    order.push({ type: 'forecast', roundId: forecast.round.externalRoundId });
+  });
+
+  const baseMs = Date.now() - 250;
+  const bettingClosesAtMs = baseMs + 9_250;
+  const factors = [
+    { dt: iso(baseMs - 4_000), v: 19.6 },
+    { dt: iso(baseMs - 2_000), v: 19.8 },
+    { dt: iso(baseMs), v: 20 },
+  ];
+
+  socket.message({
+    type: 'round',
+    data: trajectoryRound({ id: 801, baseMs, bettingClosesAtMs }),
+  });
+  order.length = 0;
+  socket.message({ type: 'factors', data: factors });
+  assert.deepEqual(order, [
+    { type: 'trajectory', roundId: '801' },
+    { type: 'forecast', roundId: '801' },
+  ]);
+
+  socket.message({
+    type: 'round',
+    data: trajectoryRound({ id: 801, baseMs, bettingClosesAtMs, result: null }),
+  });
+  order.length = 0;
+  socket.message({ type: 'factors', data: factors });
+  assert.deepEqual(order, [], 'factors wait while there is no trusted open round');
+  socket.message({
+    type: 'round',
+    data: trajectoryRound({ id: 802, baseMs, bettingClosesAtMs }),
+  });
+  assert.deepEqual(order, [
+    { type: 'trajectory', roundId: '802' },
+    { type: 'forecast', roundId: '802' },
+  ]);
 });
 
 test('collector emits a pre-close forecast in the safe window and ignores future factors', (t) => {

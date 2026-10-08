@@ -506,6 +506,97 @@ const server = createServer((request, response) => {
 let pipelineRetryTimer = null;
 let pipelineFlushTimer = null;
 let pipelineRetryAttempt = 0;
+const MAX_PENDING_ROUND_TRAJECTORIES = 4_096;
+const MAX_ROUND_TRAJECTORY_RETRIES = 8;
+const pendingRoundTrajectories = [];
+let roundTrajectoryRetryTimer = null;
+let roundTrajectoryDrainActive = false;
+let roundTrajectoryOverflowLogged = false;
+
+function isPermanentRoundTrajectoryError(error) {
+  return (
+    error instanceof TypeError ||
+    error instanceof RangeError ||
+    /^SQLITE_(?:CONSTRAINT|MISMATCH|CORRUPT|NOTADB|SCHEMA)/.test(error?.code ?? '')
+  );
+}
+
+function scheduleRoundTrajectoryRetry() {
+  if (roundTrajectoryRetryTimer || shuttingDown) return;
+  const failureCount = pendingRoundTrajectories[0]?.failureCount ?? 1;
+  const delay = Math.min(
+    30_000,
+    1_000 * 2 ** Math.min(Math.max(0, failureCount - 1), 5),
+  );
+  roundTrajectoryRetryTimer = setTimeout(() => {
+    roundTrajectoryRetryTimer = null;
+    drainRoundTrajectoryQueue();
+  }, delay);
+  roundTrajectoryRetryTimer.unref?.();
+}
+
+function drainRoundTrajectoryQueue({ retry = true } = {}) {
+  if (roundTrajectoryDrainActive) {
+    return pendingRoundTrajectories.length === 0;
+  }
+  roundTrajectoryDrainActive = true;
+  let persistenceError = null;
+  try {
+    while (pendingRoundTrajectories.length > 0) {
+      const pending = pendingRoundTrajectories[0];
+      try {
+        db.recordRoundTrajectory(pending.trajectory);
+      } catch (error) {
+        pending.failureCount += 1;
+        if (
+          isPermanentRoundTrajectoryError(error) ||
+          pending.failureCount >= MAX_ROUND_TRAJECTORY_RETRIES
+        ) {
+          pendingRoundTrajectories.shift();
+          console.error(
+            `[trajectory] dropped round ${pending.trajectory.round.externalRoundId} after ${pending.failureCount} failed persistence attempt(s)`,
+            error,
+          );
+          continue;
+        }
+        persistenceError = error;
+        break;
+      }
+      pendingRoundTrajectories.shift();
+    }
+  } finally {
+    roundTrajectoryDrainActive = false;
+  }
+
+  if (persistenceError) {
+    console.error('[trajectory] persistence failed; event retained for retry', persistenceError);
+    if (retry) scheduleRoundTrajectoryRetry();
+    return false;
+  }
+
+  clearTimeout(roundTrajectoryRetryTimer);
+  roundTrajectoryRetryTimer = null;
+  roundTrajectoryOverflowLogged = false;
+  return pendingRoundTrajectories.length === 0;
+}
+
+function enqueueRoundTrajectory(trajectory) {
+  if (pendingRoundTrajectories.length >= MAX_PENDING_ROUND_TRAJECTORIES) {
+    if (!roundTrajectoryOverflowLogged) {
+      roundTrajectoryOverflowLogged = true;
+      console.error(
+        `[trajectory] retry queue reached ${MAX_PENDING_ROUND_TRAJECTORIES} events; newest event was not queued`,
+      );
+    }
+    return false;
+  }
+  pendingRoundTrajectories.push({
+    trajectory: structuredClone(trajectory),
+    failureCount: 0,
+  });
+  if (!roundTrajectoryRetryTimer) drainRoundTrajectoryQueue();
+  return pendingRoundTrajectories.length === 0;
+}
 
 function publishPipelineOutcome(outcome) {
   if (!outcome) return;
@@ -564,6 +655,14 @@ collector.on('results', (results) => {
     publishPipelineOutcome(outcome);
   } catch (error) {
     schedulePipelineRetry(error);
+  }
+});
+
+collector.on('round-trajectory', (trajectory) => {
+  try {
+    enqueueRoundTrajectory(trajectory);
+  } catch (error) {
+    console.error('[trajectory] event could not be queued; shadow input was omitted', error);
   }
 });
 
@@ -656,6 +755,8 @@ function shutdown(signal) {
     console.error('[collector] failed to expose pending shutdown results', error);
   }
   collector.stop();
+  clearTimeout(roundTrajectoryRetryTimer);
+  roundTrajectoryRetryTimer = null;
   clearTimeout(pipelineFlushTimer);
   pipelineFlushTimer = null;
   clearTimeout(pipelineRetryTimer);
@@ -668,6 +769,7 @@ function shutdown(signal) {
   let forceExitTimer = null;
 
   const finish = (exitCode) => {
+    clearTimeout(roundTrajectoryRetryTimer);
     clearTimeout(persistenceRetryTimer);
     clearTimeout(forceExitTimer);
     try {
@@ -680,10 +782,11 @@ function shutdown(signal) {
   };
 
   const drainAndExit = () => {
+    const trajectoriesPersisted = drainRoundTrajectoryQueue({ retry: false });
     try {
       publishPipelineOutcome(resultPipeline.drain());
       const pending = resultPipeline.getPendingCounts();
-      if (pending.results === 0 && pending.gaps === 0) {
+      if (trajectoriesPersisted && pending.results === 0 && pending.gaps === 0) {
         finish(0);
         return;
       }

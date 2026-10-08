@@ -8,6 +8,153 @@ import {
 
 const DEFAULT_SOURCE = 'buleto';
 const DEFAULT_INSTRUMENT = 'XPM/RUB';
+export const ROUND_TRAJECTORY_SCHEMA_VERSION = 1;
+
+function wireTimestamp(value) {
+  if (typeof value !== 'string' || value.trim() === '') return null;
+  const milliseconds = Date.parse(value);
+  if (!Number.isFinite(milliseconds)) return null;
+  return { milliseconds, iso: new Date(milliseconds).toISOString() };
+}
+
+function wireFiniteNumber(value) {
+  return typeof value === 'number' && Number.isFinite(value)
+    ? Object.is(value, -0)
+      ? 0
+      : value
+    : null;
+}
+
+function normalizeTrajectoryCells(cells) {
+  if (!Array.isArray(cells) || cells.length !== 38) return null;
+  const seen = new Set();
+  const normalized = [];
+  for (const cell of cells) {
+    if (!cell || typeof cell !== 'object' || Array.isArray(cell)) return null;
+    const wireCell = cell.c;
+    const upper = wireFiniteNumber(cell.vt);
+    const lower = wireFiniteNumber(cell.vf);
+    if (
+      !Number.isInteger(wireCell) ||
+      wireCell < 0 ||
+      wireCell > 37 ||
+      seen.has(wireCell) ||
+      upper === null ||
+      lower === null ||
+      upper <= lower
+    ) {
+      return null;
+    }
+    seen.add(wireCell);
+    normalized.push({
+      wireCell,
+      number: wireCell === 37 ? 0 : wireCell,
+      lower,
+      upper,
+    });
+  }
+  return normalized.sort((left, right) => left.wireCell - right.wireCell);
+}
+
+function normalizeTrajectoryRound(round, receivedAt) {
+  if (
+    !round ||
+    typeof round !== 'object' ||
+    Array.isArray(round) ||
+    'rr' in round ||
+    round.s !== 2
+  ) {
+    return null;
+  }
+  if (
+    (typeof round.id !== 'string' && typeof round.id !== 'number') ||
+    (typeof round.id === 'number' && !Number.isSafeInteger(round.id)) ||
+    String(round.id).trim() === ''
+  ) {
+    return null;
+  }
+
+  const startsAt = wireTimestamp(round.sd);
+  const bettingClosesAt = wireTimestamp(round.bcd);
+  const bettingStopsAt = wireTimestamp(round.btd);
+  const endsAt = wireTimestamp(round.ed);
+  if (!startsAt || !bettingClosesAt || !bettingStopsAt || !endsAt) return null;
+  if (
+    startsAt.milliseconds >= bettingClosesAt.milliseconds ||
+    bettingClosesAt.milliseconds > bettingStopsAt.milliseconds ||
+    bettingStopsAt.milliseconds >= endsAt.milliseconds
+  ) {
+    return null;
+  }
+
+  const receivedAtMs = receivedAt.getTime();
+  if (receivedAtMs < startsAt.milliseconds || receivedAtMs > endsAt.milliseconds) {
+    return null;
+  }
+
+  const startPrice = wireFiniteNumber(round.sv);
+  const bottomPrice = wireFiniteNumber(round.bv);
+  const topPrice = wireFiniteNumber(round.tv);
+  const cellBands = normalizeTrajectoryCells(round.cls);
+  if (
+    startPrice === null ||
+    bottomPrice === null ||
+    topPrice === null ||
+    bottomPrice >= topPrice ||
+    startPrice < bottomPrice ||
+    startPrice > topPrice ||
+    !cellBands
+  ) {
+    return null;
+  }
+
+  const externalRoundId = String(round.id).trim();
+  return {
+    associationKey: `${externalRoundId}\u0000${startsAt.iso}`,
+    startsAtMs: startsAt.milliseconds,
+    endsAtMs: endsAt.milliseconds,
+    metadata: {
+      externalRoundId,
+      status: 2,
+      startsAt: startsAt.iso,
+      bettingClosesAt: bettingClosesAt.iso,
+      bettingStopsAt: bettingStopsAt.iso,
+      endsAt: endsAt.iso,
+      startPrice,
+      bottomPrice,
+      topPrice,
+      cellBands,
+    },
+  };
+}
+
+function normalizeTrajectoryFactors(factors, receivedAt) {
+  if (!Array.isArray(factors)) return [];
+  const receivedAtMs = receivedAt.getTime();
+  const receivedAtIso = receivedAt.toISOString();
+  const unique = new Map();
+  for (let index = 0; index < factors.length; index += 1) {
+    const factor = factors[index];
+    if (!factor || typeof factor !== 'object' || Array.isArray(factor)) continue;
+    const at = wireTimestamp(factor.dt);
+    const price = wireFiniteNumber(factor.v);
+    if (!at || price === null || at.milliseconds > receivedAtMs) continue;
+    const key = `${at.iso}\u0000${String(price)}`;
+    if (unique.has(key)) continue;
+    unique.set(key, {
+      key,
+      index,
+      at: at.iso,
+      atMs: at.milliseconds,
+      price,
+      receivedAt: receivedAtIso,
+      receivedAtMs,
+    });
+  }
+  return [...unique.values()].sort(
+    (left, right) => left.atMs - right.atMs || left.index - right.index,
+  );
+}
 
 export function canonicalRouletteNumber(value) {
   if (
@@ -146,6 +293,9 @@ export class BuletoCollector extends EventEmitter {
     this.forecastRound = null;
     this.latestFactors = [];
     this.forecastErrorRoundId = null;
+    this.trajectoryRound = null;
+    this.latestTrajectoryFactors = [];
+    this.trajectoryFactorKeys = new Set();
     this.stopped = true;
     this.generation = 0;
     this.retryAttempt = 0;
@@ -178,6 +328,7 @@ export class BuletoCollector extends EventEmitter {
     this.forecastRound = null;
     this.latestFactors = [];
     this.forecastErrorRoundId = null;
+    this.#resetRoundTrajectory();
     this.generation += 1;
     this.#connect(this.generation);
     this.watchdogTimer = setInterval(() => this.#watchdog(), 15_000);
@@ -239,6 +390,7 @@ export class BuletoCollector extends EventEmitter {
     this.forecastRound = null;
     this.latestFactors = [];
     this.forecastErrorRoundId = null;
+    this.#resetRoundTrajectory();
 
     this.#setState({
       status: this.retryAttempt === 0 ? 'connecting' : 'reconnecting',
@@ -421,6 +573,8 @@ export class BuletoCollector extends EventEmitter {
     if (message.type === 'factors') {
       if (Array.isArray(message.data)) {
         this.latestFactors = message.data;
+        this.latestTrajectoryFactors = normalizeTrajectoryFactors(message.data, receivedAt);
+        this.#emitRoundTrajectory(receivedAt, this.latestTrajectoryFactors, true);
         this.#tryEmitPrecloseForecast(receivedAt);
       }
       return;
@@ -440,10 +594,22 @@ export class BuletoCollector extends EventEmitter {
 
       if (!('rr' in message.data) && message.data.s === 2) {
         this.forecastRound = message.data;
-        this.#tryEmitPrecloseForecast(receivedAt);
       } else {
         this.forecastRound = null;
       }
+
+      const trajectoryRound = normalizeTrajectoryRound(message.data, receivedAt);
+      if (trajectoryRound) {
+        if (trajectoryRound.associationKey !== this.trajectoryRound?.associationKey) {
+          this.trajectoryFactorKeys = new Set();
+        }
+        this.trajectoryRound = trajectoryRound;
+        this.#emitRoundTrajectory(receivedAt, this.latestTrajectoryFactors, true);
+      } else {
+        this.#resetRoundTrajectory();
+      }
+
+      this.#tryEmitPrecloseForecast(receivedAt);
 
       // В финальном сообщении round поле rr содержит тот же результат, что
       // позже попадёт в last-results, но здесь доступен стабильный id раунда.
@@ -467,6 +633,50 @@ export class BuletoCollector extends EventEmitter {
         }
       }
     }
+  }
+
+  #resetRoundTrajectory() {
+    this.trajectoryRound = null;
+    this.latestTrajectoryFactors = [];
+    this.trajectoryFactorKeys = new Set();
+  }
+
+  #emitRoundTrajectory(receivedAt, factors, includeEmpty = false) {
+    const round = this.trajectoryRound;
+    if (!round) return;
+    const receivedAtMs = receivedAt.getTime();
+    if (receivedAtMs > round.endsAtMs) {
+      this.#resetRoundTrajectory();
+      return;
+    }
+
+    const uniqueFactors = [];
+    for (const factor of factors) {
+      if (
+        factor.atMs < round.startsAtMs ||
+        factor.atMs > round.endsAtMs ||
+        factor.atMs > factor.receivedAtMs ||
+        this.trajectoryFactorKeys.has(factor.key)
+      ) {
+        continue;
+      }
+      this.trajectoryFactorKeys.add(factor.key);
+      uniqueFactors.push({
+        at: factor.at,
+        price: factor.price,
+        receivedAt: factor.receivedAt,
+      });
+    }
+    if (!includeEmpty && uniqueFactors.length === 0) return;
+
+    this.emit('round-trajectory', {
+      schemaVersion: ROUND_TRAJECTORY_SCHEMA_VERSION,
+      source: this.source,
+      instrument: this.instrument,
+      receivedAt: receivedAt.toISOString(),
+      round: structuredClone(round.metadata),
+      factors: uniqueFactors,
+    });
   }
 
   #tryEmitPrecloseForecast(receivedAt) {

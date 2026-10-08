@@ -9,6 +9,10 @@ import { createDatabase } from "../src/database.js";
 
 const BASE_TIME = Date.parse("2026-09-21T00:00:00.000Z");
 
+function iso(milliseconds) {
+  return new Date(milliseconds).toISOString();
+}
+
 function event(resultNumber, fingerprint, offsetSeconds = 0, extra = {}) {
   const settledAt = new Date(BASE_TIME + offsetSeconds * 1_000).toISOString();
   return {
@@ -96,6 +100,51 @@ function startPriceForecast(externalRoundId, overrides = {}) {
             currentPrice + features.slopePerSecond * features.secondsToEnd,
         },
     },
+  };
+}
+
+function roundTrajectory(
+  externalRoundId,
+  {
+    startsAtMs = BASE_TIME,
+    bettingClosesAtMs = startsAtMs + 60_000,
+    bettingStopsAtMs = startsAtMs + 70_000,
+    endsAtMs = startsAtMs + 100_000,
+    receivedAtMs = startsAtMs + 50_000,
+    startPrice = 5.35,
+    bottomPrice = 5,
+    topPrice = 6.1,
+    cells = precloseForecast(externalRoundId).cells,
+    factors = [],
+  } = {},
+) {
+  return {
+    schemaVersion: 1,
+    source: "buleto",
+    instrument: "PRIMECOIN(XPM)/RUB",
+    receivedAt: iso(receivedAtMs),
+    round: {
+      externalRoundId: String(externalRoundId),
+      status: 2,
+      startsAt: iso(startsAtMs),
+      bettingClosesAt: iso(bettingClosesAtMs),
+      bettingStopsAt: iso(bettingStopsAtMs),
+      endsAt: iso(endsAtMs),
+      startPrice,
+      bottomPrice,
+      topPrice,
+      cellBands: cells.map((cell) => ({
+        wireCell: cell.c,
+        number: cell.c === 37 ? 0 : cell.c,
+        lower: cell.vf,
+        upper: cell.vt,
+      })),
+    },
+    factors: factors.map((factor) => ({
+      at: iso(factor.atMs),
+      price: factor.price,
+      receivedAt: iso(factor.receivedAtMs ?? factor.atMs),
+    })),
   };
 }
 
@@ -247,16 +296,19 @@ test("schema contains all persistence tables", () => {
       "forecast_pair_snapshots",
       "forecast_settlements",
       "forecast_snapshots",
+      "forecast_trajectory_shadows",
       "incident_resolutions",
       "incidents",
       "round_forecasts",
       "round_results",
+      "round_trajectories",
+      "round_trajectory_ticks",
       "stream_state",
       "virtual_bankrolls",
       "virtual_bet_sessions",
       "virtual_bets",
     ]);
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 14);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 15);
     assert.deepEqual(
       database.sqlite
         .prepare("PRAGMA table_info(forecast_pair_snapshots)")
@@ -307,6 +359,115 @@ test("schema contains all persistence tables", () => {
   }
 });
 
+test("round trajectory persistence is strict, idempotent, and append-only for corrections", () => {
+  let clockMs = BASE_TIME + 50_500;
+  const database = createDatabase({
+    path: ":memory:",
+    clock: () => new Date(clockMs),
+  });
+  const initial = roundTrajectory("trajectory-1", {
+    receivedAtMs: BASE_TIME + 50_000,
+    factors: [
+      { atMs: BASE_TIME + 1_000, price: 5.31 },
+      { atMs: BASE_TIME + 10_000, price: 5.32 },
+    ],
+  });
+
+  try {
+    assert.deepEqual(database.recordRoundTrajectory(initial), {
+      inserted: true,
+      trajectoryId: 1,
+      ticksInserted: 2,
+    });
+    assert.deepEqual(database.recordRoundTrajectory(initial), {
+      inserted: false,
+      trajectoryId: 1,
+      ticksInserted: 0,
+    });
+
+    clockMs = BASE_TIME + 51_500;
+    const correction = roundTrajectory("trajectory-1", {
+      receivedAtMs: BASE_TIME + 51_000,
+      factors: [
+        {
+          atMs: BASE_TIME + 10_000,
+          price: 5.325,
+          receivedAtMs: BASE_TIME + 51_000,
+        },
+      ],
+    });
+    assert.deepEqual(database.recordRoundTrajectory(correction), {
+      inserted: false,
+      trajectoryId: 1,
+      ticksInserted: 1,
+    });
+    assert.deepEqual(
+      database.sqlite
+        .prepare(`
+          SELECT factor_at, price, received_at
+          FROM round_trajectory_ticks
+          ORDER BY id
+        `)
+        .all()
+        .map((row) => ({ ...row })),
+      [
+        {
+          factor_at: iso(BASE_TIME + 1_000),
+          price: 5.31,
+          received_at: iso(BASE_TIME + 1_000),
+        },
+        {
+          factor_at: iso(BASE_TIME + 10_000),
+          price: 5.32,
+          received_at: iso(BASE_TIME + 10_000),
+        },
+        {
+          factor_at: iso(BASE_TIME + 10_000),
+          price: 5.325,
+          received_at: iso(BASE_TIME + 51_000),
+        },
+      ],
+    );
+
+    clockMs = BASE_TIME + 52_500;
+    assert.throws(
+      () =>
+        database.recordRoundTrajectory(
+          roundTrajectory("trajectory-1", {
+            receivedAtMs: BASE_TIME + 52_000,
+            topPrice: 6.2,
+          }),
+        ),
+      {
+        name: "RangeError",
+        message: /immutable metadata mismatch/,
+      },
+    );
+    assert.equal(
+      database.sqlite.prepare("SELECT COUNT(*) AS count FROM round_trajectory_ticks").get()
+        .count,
+      3,
+    );
+
+    assert.throws(
+      () =>
+        database.recordRoundTrajectory(
+          roundTrajectory("trajectory-future", {
+            receivedAtMs: BASE_TIME + 53_000,
+          }),
+        ),
+      /receivedAt cannot be in the future/,
+    );
+    assert.equal(
+      database.sqlite.prepare("SELECT COUNT(*) AS count FROM round_trajectories").get()
+        .count,
+      1,
+    );
+  } finally {
+    database.close();
+  }
+});
+
 test("version 13 creates one live follower tracker at the current tail", () => {
   const directory = mkdtempSync(join(tmpdir(), "roulette-v13-follower-"));
   const path = join(directory, "tracker.sqlite");
@@ -333,7 +494,7 @@ test("version 13 creates one live follower tracker at the current tail", () => {
       "buleto",
       "PRIMECOIN(XPM)/RUB",
     );
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 14);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 15);
     assert.equal(migrated.status, "armed");
     assert.equal(migrated.currentSession.sourceNumber, 9);
     assert.deepEqual(migrated.currentSession.fixedNumbers, [5, 4, 3, 2, 1]);
@@ -460,6 +621,274 @@ test("pre-close forecasts enforce the five-second lock boundary and fresh factor
       database.sqlite.prepare("SELECT COUNT(*) AS count FROM round_forecasts").get()
         .count,
       1,
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test("pre-close forecast freezes an insufficient trajectory shadow instead of using partial coverage", () => {
+  let clockMs = BASE_TIME + 50_500;
+  const database = createDatabase({
+    path: ":memory:",
+    clock: () => new Date(clockMs),
+  });
+  const attempt = precloseForecast("trajectory-partial");
+
+  try {
+    database.recordRoundTrajectory(
+      roundTrajectory("trajectory-partial", {
+        receivedAtMs: BASE_TIME + 50_000,
+        factors: [
+          { atMs: BASE_TIME + 1_000, price: 5.31 },
+          { atMs: BASE_TIME + 30_000, price: 5.34 },
+          { atMs: BASE_TIME + 50_000, price: 5.4 },
+        ],
+      }),
+    );
+    clockMs = BASE_TIME + 52_000;
+    assert.equal(database.recordPrecloseForecast(attempt).inserted, true);
+
+    const latest = database.getPrecloseForecastState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    ).latest;
+    assert.equal(latest.trajectoryShadow.version, "trajectory-shadow-knn-v1");
+    assert.equal(latest.trajectoryShadow.status, "insufficient_current");
+    assert.equal(
+      latest.trajectoryShadow.reason,
+      "prefix_gap_exceeds_tolerance",
+    );
+    assert.equal(latest.trajectoryShadow.direction, null);
+    assert.equal(latest.trajectoryShadow.probabilities, null);
+    assert.equal(latest.trajectoryShadow.evaluation, null);
+    assert.deepEqual(latest.trajectoryShadow.integration.currentCoverage, {
+      tickCount: 3,
+      firstAt: iso(BASE_TIME + 1_000),
+      lastAt: iso(BASE_TIME + 50_000),
+      maxGapMs: 29_000,
+    });
+    assert.equal(
+      database.sqlite
+        .prepare("SELECT COUNT(*) AS count FROM forecast_trajectory_shadows")
+        .get().count,
+      1,
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test("trajectory shadow freezes a correction-aware past-only READY prediction and evaluates it", () => {
+  const currentStartMs = BASE_TIME + 4_000_000;
+  const currentLockedMs = currentStartMs + 51_000;
+  const currentEndMs = currentStartMs + 100_000;
+  let clockMs = BASE_TIME;
+  const database = createDatabase({
+    path: ":memory:",
+    clock: () => new Date(clockMs),
+  });
+  const completePrefix = (startsAtMs) => [
+    ...[1, 5, 10, 15, 20, 25, 30, 35, 40, 45].map((seconds) => ({
+      atMs: startsAtMs + seconds * 1_000,
+      price: 5.3 + seconds * 0.0006,
+    })),
+    { atMs: startsAtMs + 50_000, price: 5.33 },
+    {
+      atMs: startsAtMs + 50_000,
+      price: 5.34,
+      receivedAtMs: startsAtMs + 51_000,
+    },
+  ];
+
+  try {
+    const historicalResults = [];
+    for (let index = 0; index < 30; index += 1) {
+      const roundId = `trajectory-history-${index}`;
+      const startsAtMs = currentStartMs - (30 - index) * 120_000;
+      const cutoffMs = startsAtMs + 51_000;
+      const endsAtMs = startsAtMs + 100_000;
+      clockMs = cutoffMs + 100;
+      database.recordRoundTrajectory(
+        roundTrajectory(roundId, {
+          startsAtMs,
+          receivedAtMs: cutoffMs,
+          factors: completePrefix(startsAtMs),
+        }),
+      );
+      clockMs = cutoffMs + 1_100;
+      database.recordRoundTrajectory(
+        roundTrajectory(roundId, {
+          startsAtMs,
+          receivedAtMs: cutoffMs + 1_000,
+          factors: [
+            {
+              atMs: startsAtMs + 50_000,
+              price: 5.9,
+              receivedAtMs: cutoffMs + 1_000,
+            },
+          ],
+        }),
+      );
+      historicalResults.push(
+        event(7, `trajectory-history-${index}`, 0, {
+          externalRoundId: roundId,
+          settledAt: iso(endsAtMs),
+          observedAt: iso(endsAtMs),
+          price: 5.36,
+        }),
+      );
+    }
+    database.ingestBatch(historicalResults);
+    markResultsCreatedAtObservation(database, "trajectory-history-");
+    const historyMaxResultId = Number(
+      database.sqlite
+        .prepare(`
+          SELECT MAX(id) AS id
+          FROM round_results
+          WHERE fingerprint LIKE 'trajectory-history-%'
+        `)
+        .get().id,
+    );
+
+    const poisonRoundId = "trajectory-same-cutoff-poison";
+    const poisonStartMs = currentStartMs - 60_000;
+    clockMs = poisonStartMs + 51_100;
+    database.recordRoundTrajectory(
+      roundTrajectory(poisonRoundId, {
+        startsAtMs: poisonStartMs,
+        receivedAtMs: poisonStartMs + 51_000,
+        factors: completePrefix(poisonStartMs),
+      }),
+    );
+    database.ingestBatch([
+      event(19, "trajectory-same-cutoff-poison", 0, {
+        externalRoundId: poisonRoundId,
+        settledAt: iso(poisonStartMs + 100_000),
+        observedAt: iso(currentLockedMs),
+        price: 5.0,
+      }),
+    ]);
+    database.sqlite
+      .prepare(`
+        UPDATE round_results
+        SET created_at = observed_at
+        WHERE fingerprint = 'trajectory-same-cutoff-poison'
+      `)
+      .run();
+    const poisonResultId = Number(
+      database.sqlite
+        .prepare(`
+          SELECT id
+          FROM round_results
+          WHERE fingerprint = 'trajectory-same-cutoff-poison'
+        `)
+        .get().id,
+    );
+    assert.ok(poisonResultId > historyMaxResultId);
+
+    const currentRoundId = "trajectory-current-ready";
+    clockMs = currentLockedMs + 100;
+    database.recordRoundTrajectory(
+      roundTrajectory(currentRoundId, {
+        startsAtMs: currentStartMs,
+        receivedAtMs: currentLockedMs,
+        factors: completePrefix(currentStartMs),
+      }),
+    );
+    clockMs = currentLockedMs + 1_100;
+    database.recordRoundTrajectory(
+      roundTrajectory(currentRoundId, {
+        startsAtMs: currentStartMs,
+        receivedAtMs: currentLockedMs + 1_000,
+        factors: [
+          {
+            atMs: currentStartMs + 50_000,
+            price: 5.9,
+            receivedAtMs: currentLockedMs + 1_000,
+          },
+        ],
+      }),
+    );
+
+    const attempt = precloseForecast(currentRoundId, {
+      bettingClosesAt: iso(currentStartMs + 60_000),
+      roundEndsAt: iso(currentEndMs),
+      factorAt: iso(currentLockedMs),
+      lockedAt: iso(currentLockedMs),
+      currentPrice: 5.34,
+      startPrice: 5.35,
+    });
+    clockMs = currentLockedMs + 2_000;
+    assert.deepEqual(database.recordPrecloseForecast(attempt), {
+      inserted: true,
+      roundId: currentRoundId,
+    });
+
+    let latest = database.getPrecloseForecastState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    ).latest;
+    const shadow = latest.trajectoryShadow;
+    assert.equal(shadow.version, "trajectory-shadow-knn-v1");
+    assert.equal(shadow.status, "ready");
+    assert.equal(shadow.reason, null);
+    assert.equal(shadow.direction, "up");
+    assert.deepEqual(shadow.probabilities, { up: 1, down: 0, flat: 0 });
+    assert.equal(shadow.sample.historyCount, 30);
+    assert.equal(shadow.sample.eligibleCount, 30);
+    assert.equal(shadow.sample.neighborCount, 15);
+    assert.equal(shadow.sample.requiredHistory, 30);
+    assert.equal(shadow.sample.requiredNeighbors, 10);
+    assert.equal(shadow.nearestIds.length, 15);
+    assert.equal(shadow.integration.candidateLimit, 500);
+    assert.equal(shadow.integration.queriedCandidateCount, 30);
+    assert.equal(shadow.integration.usableHistoryCount, 30);
+    assert.equal(shadow.integration.excludedCoverageCount, 0);
+    assert.equal(shadow.integration.historyMaxResultId, historyMaxResultId);
+    assert.equal(shadow.integration.historyCutoffAt, iso(currentLockedMs));
+    assert.deepEqual(shadow.integration.currentCoverage, {
+      tickCount: 11,
+      firstAt: iso(currentStartMs + 1_000),
+      lastAt: iso(currentStartMs + 50_000),
+      maxGapMs: 5_000,
+    });
+    assert.equal(shadow.currentPrefix.at(-1).price, 5.34);
+    assert.equal(shadow.lockPrice, 5.34);
+    assert.ok(Math.abs(shadow.medianCellWidth - 0.01) < 1e-12);
+    assert.ok(Math.abs(shadow.expectedDeltaCellWidths - 2) < 1e-9);
+    assert.equal(shadow.evaluation, null);
+
+    const frozenShadow = {
+      ...database.sqlite.prepare("SELECT * FROM forecast_trajectory_shadows").get(),
+    };
+    database.ingestBatch([
+      event(7, "trajectory-current-result", 0, {
+        externalRoundId: currentRoundId,
+        settledAt: iso(currentEndMs),
+        observedAt: iso(currentEndMs),
+        price: 5.36,
+      }),
+    ]);
+    assert.deepEqual(
+      database.settlePrecloseForecasts("buleto", "PRIMECOIN(XPM)/RUB"),
+      { settled: 1 },
+    );
+    assert.deepEqual(
+      { ...database.sqlite.prepare("SELECT * FROM forecast_trajectory_shadows").get() },
+      frozenShadow,
+      "settlement must not mutate the frozen shadow",
+    );
+
+    latest = database.getPrecloseForecastState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    ).latest;
+    assert.equal(latest.trajectoryShadow.evaluation.actualPrice, 5.36);
+    assert.equal(latest.trajectoryShadow.evaluation.actualDirection, "up");
+    assert.equal(latest.trajectoryShadow.evaluation.directionHit, true);
+    assert.ok(
+      Math.abs(latest.trajectoryShadow.evaluation.deltaCellWidths - 2) < 1e-9,
     );
   } finally {
     database.close();
@@ -720,6 +1149,65 @@ test("pre-close forecast rolls back when the transaction finishes inside the fiv
         `${table} must roll back with the late transaction`,
       );
     }
+  } finally {
+    database.close();
+  }
+});
+
+test("trajectory shadow failure cannot roll back the primary forecast transaction", () => {
+  const errors = [];
+  const database = createDatabase({
+    path: ":memory:",
+    clock: () => new Date(BASE_TIME + 52_000),
+    logger: {
+      error(payload, message) {
+        errors.push({ payload, message });
+      },
+    },
+  });
+
+  try {
+    database.sqlite.exec(`
+      CREATE TRIGGER reject_trajectory_shadow
+      BEFORE INSERT ON forecast_trajectory_shadows
+      BEGIN
+        SELECT RAISE(ABORT, 'shadow sabotage');
+      END;
+    `);
+
+    assert.deepEqual(
+      database.recordPrecloseForecast(precloseForecast("shadow-isolated")),
+      { inserted: true, roundId: "shadow-isolated" },
+    );
+    for (const table of [
+      "forecast_snapshots",
+      "round_forecasts",
+      "forecast_pair_snapshots",
+      "forecast_consensus_snapshots",
+    ]) {
+      assert.equal(
+        database.sqlite.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get().count,
+        1,
+        `${table} must remain committed after the shadow failure`,
+      );
+    }
+    assert.equal(
+      database.sqlite
+        .prepare("SELECT COUNT(*) AS count FROM forecast_trajectory_shadows")
+        .get().count,
+      0,
+    );
+    assert.equal(
+      database.getPrecloseForecastState("buleto", "PRIMECOIN(XPM)/RUB")
+        .latest.trajectoryShadow,
+      null,
+    );
+    assert.equal(errors.length, 1);
+    assert.equal(
+      errors[0].message,
+      "trajectory shadow persistence failed after primary forecast commit",
+    );
+    assert.match(errors[0].payload.error.message, /shadow sabotage/);
   } finally {
     database.close();
   }
@@ -1290,7 +1778,7 @@ test("versions 11 and 12 do not backfill derived snapshots for version 10 foreca
       path,
       clock: () => new Date(BASE_TIME + 52_000),
     });
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 14);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 15);
     assert.equal(
       Number(
         database.sqlite
@@ -1369,7 +1857,7 @@ test("version 12 does not backfill consensus for legacy version 11 forecasts", (
       path,
       clock: () => new Date(BASE_TIME + 52_000),
     });
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 14);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 15);
     assert.equal(
       database.sqlite
         .prepare("SELECT COUNT(*) AS count FROM forecast_consensus_snapshots")
@@ -1431,7 +1919,7 @@ test("version 14 migration preserves a legacy Borda consensus row exactly", () =
       clock: () => new Date(BASE_TIME + 52_000),
     });
 
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 14);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 15);
     const migratedRow = {
       ...database.sqlite.prepare("SELECT * FROM forecast_consensus_snapshots").get(),
     };
@@ -1450,6 +1938,56 @@ test("version 14 migration preserves a legacy Borda consensus row exactly", () =
         reason: "pair_not_ready",
       },
     );
+  } finally {
+    database.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("version 15 adds empty trajectory tables without backfilling legacy forecasts", () => {
+  const directory = mkdtempSync(join(tmpdir(), "roulette-trajectory-v14-"));
+  const path = join(directory, "legacy-forecast.sqlite");
+  let database = createDatabase({
+    path,
+    clock: () => new Date(BASE_TIME + 52_000),
+  });
+
+  try {
+    assert.equal(
+      database.recordPrecloseForecast(precloseForecast("legacy-before-v15"))
+        .inserted,
+      true,
+    );
+    database.sqlite.exec(`
+      DROP TABLE forecast_trajectory_shadows;
+      DROP TABLE round_trajectory_ticks;
+      DROP TABLE round_trajectories;
+      PRAGMA user_version = 14;
+    `);
+    database.close();
+
+    database = createDatabase({
+      path,
+      clock: () => new Date(BASE_TIME + 52_000),
+    });
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 15);
+    assert.equal(
+      database.sqlite.prepare("SELECT COUNT(*) AS count FROM round_trajectories").get()
+        .count,
+      0,
+    );
+    assert.equal(
+      database.sqlite
+        .prepare("SELECT COUNT(*) AS count FROM forecast_trajectory_shadows")
+        .get().count,
+      0,
+    );
+    const latest = database.getPrecloseForecastState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    ).latest;
+    assert.equal(latest.roundId, "legacy-before-v15");
+    assert.equal(latest.trajectoryShadow, null);
   } finally {
     database.close();
     rmSync(directory, { recursive: true, force: true });
@@ -1752,7 +2290,7 @@ test("version 5 history is backfilled into continuity epochs before migration co
 
   const database = createDatabase({ path });
   try {
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 14);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 15);
     assert.deepEqual(
       database.sqlite
         .prepare("SELECT continuity_epoch FROM round_results ORDER BY settled_at, id")
@@ -1812,7 +2350,7 @@ test("version 9 reconciles a proven contiguous shutdown boundary without deletin
 
     database = createDatabase({ path, gapThresholdSeconds: 135 });
     const state = database.getDashboardState();
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 14);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 15);
     assert.equal(state.totals.results, 5, "raw results are never recreated or deleted");
     assert.equal(state.totals.cycles, 1);
     assert.equal(state.totals.invalidCycles, 0);
@@ -3854,7 +4392,7 @@ test("v7 paper history initializes v8 bankroll with all known net results exactl
       "buleto",
       "PRIMECOIN(XPM)/RUB",
     );
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 14);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 15);
     assert.equal(state.testBank.initialBalance, 87_700);
     assert.equal(state.testBank.currentBalance, 87_910);
     assert.equal(state.testBank.netResult, 210);

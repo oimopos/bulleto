@@ -8,7 +8,7 @@
     <meta name="description" content="Онлайн-монитор результатов рулетки и циклов исключения чисел от 0 до 36">
     <title>Круг 37 — монитор результатов</title>
     <link rel="stylesheet" href="/styles.css?v=26">
-    <script type="module" src="/app.js?v=26"></script>
+    <script type="module" src="/app.js?v=27"></script>
   </head>
   <body>
     <a class="skip-link" href="#main-content">Перейти к содержимому</a>
@@ -227,6 +227,20 @@
           <p class="preclose-comparison__status" id="preclose-comparison-status" role="status" aria-live="polite" aria-atomic="true">Политика итогового списка будет показана после фиксации прогноза.</p>
           <p class="preclose-comparison__warning" id="preclose-comparison-warning" hidden></p>
           <p class="preclose-comparison__note" id="preclose-comparison-note">Для start-price-v2 основная модель авторитетна; история переходов и legacy OLS shadow остаются диагностикой.</p>
+        </section>
+
+        <section class="preclose-comparison" id="trajectory-shadow-panel" aria-labelledby="trajectory-shadow-title" aria-describedby="trajectory-shadow-status trajectory-shadow-shares trajectory-shadow-sample trajectory-shadow-note" aria-busy="true">
+          <div class="preclose-comparison__header">
+            <div>
+              <p class="eyebrow">Shadow · только наблюдение</p>
+              <h3 id="trajectory-shadow-title">Форма траектории перед lock → ed</h3>
+            </div>
+            <span class="preclose-comparison__badge" id="trajectory-shadow-badge">Сбор истории</span>
+          </div>
+          <p class="preclose-comparison__status" id="trajectory-shadow-status" role="status" aria-live="polite" aria-atomic="true">Prospective shadow появится после накопления полных завершённых траекторий.</p>
+          <p class="preclose-comparison__status" id="trajectory-shadow-shares">Доли похожих завершённых траекторий: вверх — · вниз — · без движения —.</p>
+          <p class="preclose-comparison__status" id="trajectory-shadow-sample">Полные сопоставимые раунды: —/30; соседи формы: —/10.</p>
+          <p class="preclose-comparison__note" id="trajectory-shadow-note">Цель — направление цены от последней доступной точки перед forecast lock (возраст точки не более 5 с) до финальной цены результата <code>ed</code>, а не следующий тик и не порядок чисел рулетки. Используются только полные траектории завершённых раундов, известные до текущего lock. Outcome этого prospective shadow пока не валидирован; он не меняет итоговый Top‑3 и виртуальный билет.</p>
         </section>
 
         <details class="preclose-hit-history disclosure disclosure--inset" id="preclose-hit-history" data-state="loading" aria-labelledby="preclose-hit-history-title" aria-describedby="preclose-hit-history-status" aria-busy="true">

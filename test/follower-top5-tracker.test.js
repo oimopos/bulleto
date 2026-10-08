@@ -2005,7 +2005,7 @@ test("version 12 history upgrades by arming only its latest tail without backfil
 
     database = createDatabase({ path });
     const state = trackerState(database);
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 14);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 15);
     assert.equal(state.status, "armed");
     assert.equal(state.currentSession.anchor.number, 9);
     assert.equal(state.currentSession.attemptCount, 0);

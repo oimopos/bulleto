@@ -23,6 +23,11 @@ import {
   rankPrecloseForecastCells,
 } from "./preclose-forecast.js";
 import {
+  TRAJECTORY_SHADOW_DEFAULTS,
+  TRAJECTORY_SHADOW_VERSION,
+  predictTrajectoryShadow,
+} from "./trajectory-shadow.js";
+import {
   CYCLE_ANALOGUE_ALGORITHM_VERSION,
   CYCLE_ANALOGUE_ANCHOR_DRAW_COUNT,
   selectCycleAnalogue,
@@ -31,6 +36,10 @@ import {
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 500;
 const DEFAULT_VIRTUAL_STARTING_BALANCE = 87_700;
+const ROUND_TRAJECTORY_SCHEMA_VERSION = 1;
+const TRAJECTORY_SHADOW_SCHEMA_VERSION = 1;
+const TRAJECTORY_SHADOW_CANDIDATE_LIMIT = 500;
+const TRAJECTORY_PREFIX_EDGE_TOLERANCE_MS = 5_000;
 const FOLLOWER_TOP5_HORIZONS = Object.freeze([1, 2, 3, 5, 10, 20]);
 const FOLLOWER_TOP5_ALL_HORIZONS = Object.freeze(
   Array.from({ length: 20 }, (_, index) => index + 1),
@@ -1279,6 +1288,203 @@ function deserializeJson(value) {
   }
 }
 
+function asStrictFiniteNumber(value, label) {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new TypeError(`${label} must be a finite number`);
+  }
+  return Object.is(value, -0) ? 0 : value;
+}
+
+function normalizeTrajectoryBands(value, label = "round.cellBands") {
+  if (!Array.isArray(value) || value.length !== 38) {
+    throw new TypeError(`${label} must contain all 38 wire bands`);
+  }
+  const seen = new Set();
+  return value
+    .map((band, index) => {
+      if (!band || typeof band !== "object" || Array.isArray(band)) {
+        throw new TypeError(`${label}[${index}] must be an object`);
+      }
+      const wireCell = band.wireCell;
+      const number = band.number;
+      const lower = asStrictFiniteNumber(
+        band.lower,
+        `${label}[${index}].lower`,
+      );
+      const upper = asStrictFiniteNumber(
+        band.upper,
+        `${label}[${index}].upper`,
+      );
+      if (
+        !Number.isInteger(wireCell) ||
+        wireCell < 0 ||
+        wireCell > 37 ||
+        seen.has(wireCell)
+      ) {
+        throw new TypeError(`${label}[${index}].wireCell is invalid`);
+      }
+      const expectedNumber = wireCell === 37 ? 0 : wireCell;
+      if (number !== expectedNumber) {
+        throw new TypeError(`${label}[${index}].number is not canonical`);
+      }
+      if (!(upper > lower)) {
+        throw new RangeError(`${label}[${index}] must have upper above lower`);
+      }
+      seen.add(wireCell);
+      return { wireCell, number, lower, upper };
+    })
+    .sort((left, right) => left.wireCell - right.wireCell);
+}
+
+function normalizeRoundTrajectoryEvent(event, persistedAt) {
+  if (!event || typeof event !== "object" || Array.isArray(event)) {
+    throw new TypeError("round trajectory event must be an object");
+  }
+  if (event.schemaVersion !== ROUND_TRAJECTORY_SCHEMA_VERSION) {
+    throw new RangeError(
+      `round trajectory schemaVersion must be ${ROUND_TRAJECTORY_SCHEMA_VERSION}`,
+    );
+  }
+  if (!event.round || typeof event.round !== "object" || Array.isArray(event.round)) {
+    throw new TypeError("round trajectory round must be an object");
+  }
+  if (event.round.status !== 2) {
+    throw new RangeError("round trajectory must describe an open status=2 round");
+  }
+
+  const source = asNonEmptyText(event.source, "buleto", "source");
+  const instrument = asNonEmptyText(
+    event.instrument,
+    "default",
+    "instrument",
+  );
+  const externalRoundId = asNonEmptyText(
+    String(event.round.externalRoundId ?? ""),
+    undefined,
+    "round.externalRoundId",
+  );
+  const receivedAt = asTimestamp(event.receivedAt, undefined, "receivedAt");
+  const startsAt = asTimestamp(event.round.startsAt, undefined, "round.startsAt");
+  const bettingClosesAt = asTimestamp(
+    event.round.bettingClosesAt,
+    undefined,
+    "round.bettingClosesAt",
+  );
+  const bettingStopsAt = asTimestamp(
+    event.round.bettingStopsAt,
+    undefined,
+    "round.bettingStopsAt",
+  );
+  const roundEndsAt = asTimestamp(event.round.endsAt, undefined, "round.endsAt");
+  const startsMs = Date.parse(startsAt);
+  const closesMs = Date.parse(bettingClosesAt);
+  const stopsMs = Date.parse(bettingStopsAt);
+  const endsMs = Date.parse(roundEndsAt);
+  const receivedMs = Date.parse(receivedAt);
+  const persistedMs = Date.parse(persistedAt);
+  if (!(startsMs < closesMs && closesMs <= stopsMs && stopsMs < endsMs)) {
+    throw new RangeError("round trajectory timestamps are not ordered");
+  }
+  if (receivedMs < startsMs || receivedMs > endsMs) {
+    throw new RangeError("round trajectory receivedAt must be inside the round");
+  }
+  if (receivedMs > persistedMs) {
+    throw new RangeError("round trajectory receivedAt cannot be in the future");
+  }
+
+  const startPrice = asStrictFiniteNumber(
+    event.round.startPrice,
+    "round.startPrice",
+  );
+  const bottomPrice = asStrictFiniteNumber(
+    event.round.bottomPrice,
+    "round.bottomPrice",
+  );
+  const topPrice = asStrictFiniteNumber(
+    event.round.topPrice,
+    "round.topPrice",
+  );
+  if (!(bottomPrice < topPrice) || startPrice < bottomPrice || startPrice > topPrice) {
+    throw new RangeError("round trajectory prices are inconsistent");
+  }
+  const bands = normalizeTrajectoryBands(event.round.cellBands);
+  if (!Array.isArray(event.factors)) {
+    throw new TypeError("round trajectory factors must be an array");
+  }
+  const factors = event.factors.map((factor, index) => {
+    if (!factor || typeof factor !== "object" || Array.isArray(factor)) {
+      throw new TypeError(`factors[${index}] must be an object`);
+    }
+    const at = asTimestamp(factor.at, undefined, `factors[${index}].at`);
+    const factorReceivedAt = asTimestamp(
+      factor.receivedAt,
+      undefined,
+      `factors[${index}].receivedAt`,
+    );
+    const atMs = Date.parse(at);
+    const factorReceivedMs = Date.parse(factorReceivedAt);
+    if (atMs < startsMs || atMs > endsMs) {
+      throw new RangeError(`factors[${index}].at must be inside the round`);
+    }
+    if (factorReceivedMs < atMs || factorReceivedMs > receivedMs) {
+      throw new RangeError(
+        `factors[${index}] must be observed no earlier than at and no later than event receivedAt`,
+      );
+    }
+    return {
+      at,
+      price: asStrictFiniteNumber(factor.price, `factors[${index}].price`),
+      receivedAt: factorReceivedAt,
+    };
+  });
+
+  return {
+    source,
+    instrument,
+    externalRoundId,
+    startsAt,
+    bettingClosesAt,
+    bettingStopsAt,
+    roundEndsAt,
+    startPrice,
+    bottomPrice,
+    topPrice,
+    bands,
+    bandsJson: JSON.stringify(bands),
+    receivedAt,
+    factors,
+  };
+}
+
+function trajectoryBandsFromForecastCells(cells) {
+  return cells
+    .map((cell) => ({
+      wireCell: cell.c,
+      number: cell.c === 37 ? 0 : cell.c,
+      lower: cell.vf,
+      upper: cell.vt,
+    }))
+    .sort((left, right) => left.wireCell - right.wireCell);
+}
+
+function trajectoryMedianCellWidth(bands) {
+  const widths = bands
+    .map((band) => Number(band.upper) - Number(band.lower))
+    .filter((width) => Number.isFinite(width) && width > 0)
+    .sort((left, right) => left - right);
+  if (widths.length !== bands.length || widths.length === 0) return null;
+  const middle = Math.floor(widths.length / 2);
+  return widths.length % 2 === 1
+    ? widths[middle]
+    : (widths[middle - 1] + widths[middle]) / 2;
+}
+
+function trajectoryDirection(deltaCellWidths, flatThresholdCellWidths) {
+  if (deltaCellWidths > flatThresholdCellWidths) return "up";
+  if (deltaCellWidths < -flatThresholdCellWidths) return "down";
+  return "flat";
+}
+
 function normalizedLimit(value, fallback = DEFAULT_LIMIT) {
   const limit = value === undefined ? fallback : Number(value);
   if (!Number.isInteger(limit) || limit < 1 || limit > MAX_LIMIT) {
@@ -1704,6 +1910,149 @@ function mapForecastConsensus(row, modelTop3) {
   };
 }
 
+function mapForecastTrajectoryShadow(row) {
+  if (
+    row?.trajectory_shadow_forecast_id === null ||
+    row?.trajectory_shadow_forecast_id === undefined
+  ) {
+    return null;
+  }
+  const allowedStatuses = new Set([
+    "ready",
+    "insufficient_current",
+    "insufficient_history",
+    "insufficient_neighbors",
+  ]);
+  const probabilities = deserializeJson(row.trajectory_shadow_probabilities_json);
+  const sample = deserializeJson(row.trajectory_shadow_sample_json);
+  const nearestIds = deserializeJson(row.trajectory_shadow_nearest_ids_json);
+  const parameters = deserializeJson(row.trajectory_shadow_parameters_json);
+  const currentPrefix = deserializeJson(row.trajectory_shadow_current_prefix_json);
+  const integration = deserializeJson(row.trajectory_shadow_integration_json);
+  const status = row.trajectory_shadow_status;
+  const direction = row.trajectory_shadow_direction;
+  const flatThresholdCellWidths = Number(
+    parameters?.flatThresholdCellWidths,
+  );
+  if (
+    Number(row.trajectory_shadow_schema_version) !==
+      TRAJECTORY_SHADOW_SCHEMA_VERSION ||
+    row.trajectory_shadow_model_version !== TRAJECTORY_SHADOW_VERSION ||
+    !allowedStatuses.has(status) ||
+    !Array.isArray(nearestIds) ||
+    !parameters ||
+    typeof parameters !== "object" ||
+    Array.isArray(parameters) ||
+    !Array.isArray(currentPrefix) ||
+    !integration ||
+    typeof integration !== "object" ||
+    Array.isArray(integration) ||
+    !Number.isFinite(flatThresholdCellWidths) ||
+    flatThresholdCellWidths < 0
+  ) {
+    return null;
+  }
+
+  const lockPrice = row.trajectory_shadow_lock_price == null
+    ? null
+    : Number(row.trajectory_shadow_lock_price);
+  const medianCellWidth = row.trajectory_shadow_median_cell_width == null
+    ? null
+    : Number(row.trajectory_shadow_median_cell_width);
+  const expectedDeltaCellWidths =
+    row.trajectory_shadow_expected_delta_cell_widths == null
+      ? null
+      : Number(row.trajectory_shadow_expected_delta_cell_widths);
+  const actualPrice = row.trajectory_actual_price == null
+    ? null
+    : Number(row.trajectory_actual_price);
+  const readyProbabilitiesValid =
+    probabilities !== null &&
+    typeof probabilities === "object" &&
+    !Array.isArray(probabilities) &&
+    ["up", "down", "flat"].every(
+      (key) =>
+        Number.isFinite(probabilities[key]) &&
+        probabilities[key] >= 0 &&
+        probabilities[key] <= 1,
+    ) &&
+    Math.abs(
+      probabilities.up + probabilities.down + probabilities.flat - 1,
+    ) <= 1e-9;
+  const readyShapeValid =
+    status === "ready"
+      ? ["up", "down", "flat"].includes(direction) &&
+        readyProbabilitiesValid &&
+        Number.isFinite(expectedDeltaCellWidths) &&
+        Number.isFinite(lockPrice) &&
+        Number.isFinite(medianCellWidth) &&
+        medianCellWidth > 0 &&
+        sample !== null &&
+        typeof sample === "object" &&
+        !Array.isArray(sample) &&
+        row.trajectory_shadow_reason === null
+      : direction === null &&
+        probabilities === null &&
+        expectedDeltaCellWidths === null &&
+        typeof row.trajectory_shadow_reason === "string" &&
+        row.trajectory_shadow_reason.length > 0;
+  if (!readyShapeValid) return null;
+
+  let evaluation = null;
+  if (
+    actualPrice !== null &&
+    Number.isFinite(actualPrice) &&
+    Number.isFinite(lockPrice) &&
+    Number.isFinite(medianCellWidth) &&
+    medianCellWidth > 0
+  ) {
+    const delta = actualPrice - lockPrice;
+    const deltaCellWidths = delta / medianCellWidth;
+    const actualDirection = trajectoryDirection(
+      deltaCellWidths,
+      Number(parameters.flatThresholdCellWidths),
+    );
+    evaluation = {
+      resultId: Number(row.round_result_id),
+      actualNumber: Number(row.actual_number),
+      actualPrice,
+      settledAt: row.settled_at,
+      delta,
+      deltaCellWidths,
+      actualDirection,
+      directionHit:
+        status === "ready"
+          ? row.trajectory_shadow_direction === actualDirection
+          : null,
+    };
+  }
+
+  return {
+    schemaVersion: Number(row.trajectory_shadow_schema_version),
+    version: row.trajectory_shadow_model_version,
+    modelVersion: row.trajectory_shadow_model_version,
+    status,
+    reason: row.trajectory_shadow_reason,
+    trajectoryId:
+      row.trajectory_shadow_trajectory_id == null
+        ? null
+        : Number(row.trajectory_shadow_trajectory_id),
+    cutoffAt: row.trajectory_shadow_cutoff_at,
+    lockPrice,
+    medianCellWidth,
+    direction,
+    probabilities,
+    expectedDeltaCellWidths,
+    sample,
+    nearestIds,
+    parameters,
+    currentPrefix,
+    integration,
+    evaluation,
+    createdAt: row.trajectory_shadow_created_at,
+  };
+}
+
 function mapPrecloseForecast(row) {
   if (!row) return null;
   const rawRankedNumbers = deserializeJson(row.ranked_numbers_json);
@@ -1712,6 +2061,7 @@ function mapPrecloseForecast(row) {
     : [];
   const pairHistory = mapForecastPairHistory(row);
   const consensus = mapForecastConsensus(row, rankedNumbers);
+  const trajectoryShadow = mapForecastTrajectoryShadow(row);
   return {
     id: Number(row.forecast_id ?? row.id),
     snapshotId: Number(row.snapshot_id),
@@ -1736,6 +2086,7 @@ function mapPrecloseForecast(row) {
     features: deserializeJson(row.features_json),
     pairHistory,
     consensus,
+    trajectoryShadow,
     settlement:
       row.actual_number === null || row.actual_number === undefined
         ? null
@@ -2228,6 +2579,7 @@ export class RouletteDatabase {
     this.#migrateForecastConsensusSnapshotsV12();
     this.#migrateFollowerTop5TrackerV13();
     this.#migrateForecastConsensusPolicyV14();
+    this.#migrateRoundTrajectoriesV15();
   }
 
   #migratePrecloseForecastsV10() {
@@ -2663,6 +3015,144 @@ export class RouletteDatabase {
       }
       throw error;
     }
+  }
+
+  #migrateRoundTrajectoriesV15() {
+    this.sqlite.exec(`
+      BEGIN IMMEDIATE;
+
+      CREATE TABLE IF NOT EXISTS round_trajectories (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+        source TEXT NOT NULL,
+        instrument TEXT NOT NULL,
+        external_round_id TEXT NOT NULL,
+        starts_at TEXT NOT NULL,
+        betting_closes_at TEXT NOT NULL,
+        betting_stops_at TEXT NOT NULL,
+        round_ends_at TEXT NOT NULL,
+        start_price REAL NOT NULL,
+        bottom_price REAL NOT NULL,
+        top_price REAL NOT NULL,
+        bands_json TEXT NOT NULL CHECK (
+          json_valid(bands_json)
+          AND json_type(bands_json) = 'array'
+          AND json_array_length(bands_json) = 38
+        ),
+        first_received_at TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(source, instrument, external_round_id),
+        CHECK (starts_at < betting_closes_at),
+        CHECK (betting_closes_at <= betting_stops_at),
+        CHECK (betting_stops_at < round_ends_at),
+        CHECK (bottom_price < top_price),
+        CHECK (start_price BETWEEN bottom_price AND top_price),
+        CHECK (starts_at <= first_received_at),
+        CHECK (first_received_at <= round_ends_at),
+        CHECK (first_received_at <= created_at)
+      );
+
+      CREATE INDEX IF NOT EXISTS round_trajectories_stream_end_idx
+        ON round_trajectories(
+          source, instrument, round_ends_at DESC, id DESC
+        );
+
+      CREATE TABLE IF NOT EXISTS round_trajectory_ticks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        trajectory_id INTEGER NOT NULL REFERENCES round_trajectories(id),
+        factor_at TEXT NOT NULL,
+        price REAL NOT NULL,
+        received_at TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(trajectory_id, factor_at, price),
+        CHECK (factor_at <= received_at),
+        CHECK (received_at <= created_at)
+      );
+
+      CREATE INDEX IF NOT EXISTS round_trajectory_ticks_prefix_idx
+        ON round_trajectory_ticks(
+          trajectory_id, factor_at, received_at, id
+        );
+
+      CREATE TABLE IF NOT EXISTS forecast_trajectory_shadows (
+        forecast_id INTEGER PRIMARY KEY REFERENCES round_forecasts(id),
+        trajectory_id INTEGER REFERENCES round_trajectories(id),
+        schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+        model_version TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (
+          status IN (
+            'ready',
+            'insufficient_current',
+            'insufficient_history',
+            'insufficient_neighbors'
+          )
+        ),
+        reason TEXT,
+        cutoff_at TEXT NOT NULL,
+        lock_price REAL,
+        median_cell_width REAL CHECK (
+          median_cell_width IS NULL OR median_cell_width > 0
+        ),
+        direction TEXT CHECK (
+          direction IS NULL OR direction IN ('up', 'down', 'flat')
+        ),
+        probabilities_json TEXT NOT NULL CHECK (
+          json_valid(probabilities_json)
+          AND json_type(probabilities_json) IN ('object', 'null')
+        ),
+        expected_delta_cell_widths REAL,
+        sample_json TEXT NOT NULL CHECK (
+          json_valid(sample_json)
+          AND json_type(sample_json) IN ('object', 'null')
+        ),
+        nearest_ids_json TEXT NOT NULL CHECK (
+          json_valid(nearest_ids_json)
+          AND json_type(nearest_ids_json) = 'array'
+        ),
+        parameters_json TEXT NOT NULL CHECK (
+          json_valid(parameters_json)
+          AND json_type(parameters_json) = 'object'
+        ),
+        current_prefix_json TEXT NOT NULL CHECK (
+          json_valid(current_prefix_json)
+          AND json_type(current_prefix_json) = 'array'
+        ),
+        integration_json TEXT NOT NULL CHECK (
+          json_valid(integration_json)
+          AND json_type(integration_json) = 'object'
+        ),
+        created_at TEXT NOT NULL,
+        CHECK (cutoff_at <= created_at),
+        CHECK (
+          (
+            status = 'ready'
+            AND trajectory_id IS NOT NULL
+            AND reason IS NULL
+            AND lock_price IS NOT NULL
+            AND median_cell_width IS NOT NULL
+            AND direction IS NOT NULL
+            AND json_type(probabilities_json) = 'object'
+            AND expected_delta_cell_widths IS NOT NULL
+          )
+          OR
+          (
+            status <> 'ready'
+            AND reason IS NOT NULL
+            AND direction IS NULL
+            AND json_type(probabilities_json) = 'null'
+            AND expected_delta_cell_widths IS NULL
+          )
+        )
+      );
+
+      CREATE INDEX IF NOT EXISTS forecast_trajectory_shadows_model_idx
+        ON forecast_trajectory_shadows(model_version, forecast_id DESC);
+      CREATE INDEX IF NOT EXISTS forecast_trajectory_shadows_trajectory_idx
+        ON forecast_trajectory_shadows(trajectory_id, forecast_id);
+
+      PRAGMA user_version = 15;
+      COMMIT;
+    `);
   }
 
   #migrateContinuityReconciliationV9() {
@@ -5668,6 +6158,448 @@ export class RouletteDatabase {
     return value;
   }
 
+  recordRoundTrajectory(event) {
+    this.#assertOpen();
+    const persistedAt = asTimestamp(
+      this.clock(),
+      undefined,
+      "round trajectory persistedAt",
+    );
+    const input = normalizeRoundTrajectoryEvent(event, persistedAt);
+    return this.#transaction(() => {
+      let row = this.sqlite
+        .prepare(`
+          SELECT *
+          FROM round_trajectories
+          WHERE source = ? AND instrument = ? AND external_round_id = ?
+          LIMIT 1
+        `)
+        .get(input.source, input.instrument, input.externalRoundId);
+      let inserted = false;
+      if (!row) {
+        const insertion = this.sqlite
+          .prepare(`
+            INSERT INTO round_trajectories (
+              schema_version, source, instrument, external_round_id,
+              starts_at, betting_closes_at, betting_stops_at, round_ends_at,
+              start_price, bottom_price, top_price, bands_json,
+              first_received_at, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `)
+          .run(
+            ROUND_TRAJECTORY_SCHEMA_VERSION,
+            input.source,
+            input.instrument,
+            input.externalRoundId,
+            input.startsAt,
+            input.bettingClosesAt,
+            input.bettingStopsAt,
+            input.roundEndsAt,
+            input.startPrice,
+            input.bottomPrice,
+            input.topPrice,
+            input.bandsJson,
+            input.receivedAt,
+            persistedAt,
+          );
+        row = this.sqlite
+          .prepare("SELECT * FROM round_trajectories WHERE id = ?")
+          .get(Number(insertion.lastInsertRowid));
+        inserted = true;
+      } else {
+        const immutableValuesMatch =
+          Number(row.schema_version) === ROUND_TRAJECTORY_SCHEMA_VERSION &&
+          row.starts_at === input.startsAt &&
+          row.betting_closes_at === input.bettingClosesAt &&
+          row.betting_stops_at === input.bettingStopsAt &&
+          row.round_ends_at === input.roundEndsAt &&
+          Number(row.start_price) === input.startPrice &&
+          Number(row.bottom_price) === input.bottomPrice &&
+          Number(row.top_price) === input.topPrice &&
+          row.bands_json === input.bandsJson;
+        if (!immutableValuesMatch) {
+          throw new RangeError("round trajectory immutable metadata mismatch");
+        }
+        if (input.receivedAt < row.first_received_at) {
+          throw new RangeError(
+            "round trajectory event predates the frozen first receipt",
+          );
+        }
+      }
+
+      const insertTick = this.sqlite.prepare(`
+        INSERT INTO round_trajectory_ticks (
+          trajectory_id, factor_at, price, received_at, created_at
+        ) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(trajectory_id, factor_at, price) DO NOTHING
+      `);
+      let ticksInserted = 0;
+      for (const factor of input.factors) {
+        ticksInserted += Number(
+          insertTick.run(
+            Number(row.id),
+            factor.at,
+            factor.price,
+            factor.receivedAt,
+            persistedAt,
+          ).changes,
+        );
+      }
+      return {
+        inserted,
+        trajectoryId: Number(row.id),
+        ticksInserted,
+      };
+    });
+  }
+
+  #roundTrajectoryPrefix(
+    trajectoryId,
+    startsAt,
+    cutoffAt,
+    { createdBefore = null } = {},
+  ) {
+    const rows = this.sqlite
+      .prepare(`
+        SELECT id, factor_at, price, received_at, created_at
+        FROM round_trajectory_ticks
+        WHERE trajectory_id = ?
+          AND factor_at <= ?
+          AND received_at <= ?
+          AND (? IS NULL OR created_at < ?)
+        ORDER BY factor_at, received_at, id
+      `)
+      .all(
+        trajectoryId,
+        cutoffAt,
+        cutoffAt,
+        createdBefore,
+        createdBefore,
+      );
+    const latestByTimestamp = new Map();
+    for (const row of rows) latestByTimestamp.set(row.factor_at, row);
+    const prefix = [...latestByTimestamp.values()].map((row) => ({
+      at: row.factor_at,
+      price: Number(row.price),
+    }));
+    let maxGapMs = null;
+    if (prefix.length > 1) {
+      maxGapMs = 0;
+      for (let index = 1; index < prefix.length; index += 1) {
+        maxGapMs = Math.max(
+          maxGapMs,
+          Date.parse(prefix[index].at) - Date.parse(prefix[index - 1].at),
+        );
+      }
+    }
+    const coverage = {
+      tickCount: prefix.length,
+      firstAt: prefix[0]?.at ?? null,
+      lastAt: prefix.at(-1)?.at ?? null,
+      maxGapMs,
+    };
+    if (prefix.length < 3) {
+      return {
+        usable: false,
+        reason: "fewer_than_three_distinct_timestamps",
+        prefix,
+        coverage,
+      };
+    }
+    const startsMs = Date.parse(startsAt);
+    const cutoffMs = Date.parse(cutoffAt);
+    const firstMs = Date.parse(prefix[0].at);
+    const lastMs = Date.parse(prefix.at(-1).at);
+    if (!(cutoffMs > startsMs) || !(lastMs > firstMs)) {
+      return {
+        usable: false,
+        reason: "non_positive_prefix_span",
+        prefix,
+        coverage,
+      };
+    }
+    if (firstMs > startsMs + TRAJECTORY_PREFIX_EDGE_TOLERANCE_MS) {
+      return {
+        usable: false,
+        reason: "prefix_starts_after_round_tolerance",
+        prefix,
+        coverage,
+      };
+    }
+    if (lastMs < cutoffMs - TRAJECTORY_PREFIX_EDGE_TOLERANCE_MS) {
+      return {
+        usable: false,
+        reason: "prefix_ends_before_cutoff_tolerance",
+        prefix,
+        coverage,
+      };
+    }
+    if (maxGapMs > TRAJECTORY_PREFIX_EDGE_TOLERANCE_MS) {
+      return {
+        usable: false,
+        reason: "prefix_gap_exceeds_tolerance",
+        prefix,
+        coverage,
+      };
+    }
+    return {
+      usable: true,
+      reason: null,
+      prefix,
+      coverage,
+      lockPrice: prefix.at(-1).price,
+    };
+  }
+
+  #buildForecastTrajectoryShadow({
+    source,
+    instrument,
+    externalRoundId,
+    bettingClosesAt,
+    roundEndsAt,
+    lockedAt,
+    startPrice,
+    cells,
+  }) {
+    const baseIntegration = {
+      candidateLimit: TRAJECTORY_SHADOW_CANDIDATE_LIMIT,
+      queriedCandidateCount: 0,
+      usableHistoryCount: 0,
+      excludedCoverageCount: 0,
+      historyMaxResultId: null,
+      historyCutoffAt: lockedAt,
+      currentCoverage: null,
+    };
+    const unavailableCurrent = (
+      reason,
+      {
+        trajectoryId = null,
+        lockPrice = null,
+        medianCellWidth = null,
+        currentPrefix = [],
+        integration = baseIntegration,
+      } = {},
+    ) => ({
+      trajectoryId,
+      status: "insufficient_current",
+      reason,
+      cutoffAt: lockedAt,
+      lockPrice,
+      medianCellWidth,
+      direction: null,
+      probabilities: null,
+      expectedDeltaCellWidths: null,
+      sample: null,
+      nearestIds: [],
+      parameters: { ...TRAJECTORY_SHADOW_DEFAULTS },
+      currentPrefix,
+      integration,
+    });
+
+    const trajectory = this.sqlite
+      .prepare(`
+        SELECT *
+        FROM round_trajectories
+        WHERE source = ? AND instrument = ? AND external_round_id = ?
+        LIMIT 1
+      `)
+      .get(source, instrument, externalRoundId);
+    if (!trajectory) return unavailableCurrent("trajectory_not_found");
+
+    const trajectoryId = Number(trajectory.id);
+    const bands = deserializeJson(trajectory.bands_json);
+    const forecastBandsJson = JSON.stringify(
+      trajectoryBandsFromForecastCells(cells),
+    );
+    const medianCellWidth = Array.isArray(bands)
+      ? trajectoryMedianCellWidth(bands)
+      : null;
+    if (
+      trajectory.betting_closes_at !== bettingClosesAt ||
+      trajectory.round_ends_at !== roundEndsAt ||
+      Number(trajectory.start_price) !== startPrice ||
+      trajectory.bands_json !== forecastBandsJson ||
+      !Number.isFinite(medianCellWidth) ||
+      medianCellWidth <= 0
+    ) {
+      return unavailableCurrent("trajectory_metadata_mismatch", {
+        trajectoryId,
+        medianCellWidth,
+      });
+    }
+
+    const currentPrefix = this.#roundTrajectoryPrefix(
+      trajectoryId,
+      trajectory.starts_at,
+      lockedAt,
+    );
+    const integration = {
+      ...baseIntegration,
+      currentCoverage: currentPrefix.coverage,
+    };
+    if (!currentPrefix.usable) {
+      return unavailableCurrent(currentPrefix.reason, {
+        trajectoryId,
+        medianCellWidth,
+        currentPrefix: currentPrefix.prefix,
+        integration,
+      });
+    }
+
+    const lockedMs = Date.parse(lockedAt);
+    const secondsToEndMs = Date.parse(roundEndsAt) - lockedMs;
+    const candidates = this.sqlite
+      .prepare(`
+        SELECT
+          trajectories.*,
+          results.id AS result_id,
+          results.price AS result_price,
+          results.settled_at AS result_settled_at,
+          results.observed_at AS result_observed_at,
+          results.created_at AS result_created_at
+        FROM round_trajectories AS trajectories
+        JOIN round_results AS results
+          ON results.source = trajectories.source
+         AND results.instrument = trajectories.instrument
+         AND results.external_round_id = trajectories.external_round_id
+        WHERE trajectories.source = ?
+          AND trajectories.instrument = ?
+          AND trajectories.id <> ?
+          AND trajectories.created_at < ?
+          AND results.price IS NOT NULL
+          AND results.settled_at < ?
+          AND results.observed_at < ?
+          AND results.created_at < ?
+        ORDER BY results.settled_at DESC, results.id DESC
+        LIMIT ?
+      `)
+      .all(
+        source,
+        instrument,
+        trajectoryId,
+        lockedAt,
+        lockedAt,
+        lockedAt,
+        lockedAt,
+        TRAJECTORY_SHADOW_CANDIDATE_LIMIT,
+      );
+
+    const history = [];
+    let excludedCoverageCount = 0;
+    for (const candidate of candidates) {
+      const cutoffMs = Date.parse(candidate.round_ends_at) - secondsToEndMs;
+      const startsMs = Date.parse(candidate.starts_at);
+      const endsMs = Date.parse(candidate.round_ends_at);
+      if (!(cutoffMs > startsMs) || cutoffMs >= endsMs) {
+        excludedCoverageCount += 1;
+        continue;
+      }
+      const cutoffAt = new Date(cutoffMs).toISOString();
+      const prefix = this.#roundTrajectoryPrefix(
+        Number(candidate.id),
+        candidate.starts_at,
+        cutoffAt,
+        { createdBefore: lockedAt },
+      );
+      const candidateBands = deserializeJson(candidate.bands_json);
+      const cellWidths = Array.isArray(candidateBands)
+        ? candidateBands.map((band) => Number(band.upper) - Number(band.lower))
+        : [];
+      if (
+        !prefix.usable ||
+        cellWidths.length !== 38 ||
+        cellWidths.some((width) => !Number.isFinite(width) || width <= 0)
+      ) {
+        excludedCoverageCount += 1;
+        continue;
+      }
+      const completedAt = new Date(
+        Math.max(
+          Date.parse(candidate.result_settled_at),
+          Date.parse(candidate.result_observed_at),
+          Date.parse(candidate.result_created_at),
+        ),
+      ).toISOString();
+      history.push({
+        id: String(candidate.id),
+        lockedAt: cutoffAt,
+        completedAt,
+        prefix: prefix.prefix,
+        cellWidths,
+        lockPrice: prefix.lockPrice,
+        endPrice: Number(candidate.result_price),
+      });
+    }
+
+    const result = predictTrajectoryShadow({
+      current: {
+        id: String(trajectoryId),
+        lockedAt,
+        prefix: currentPrefix.prefix,
+        cellWidths: bands.map((band) => band.upper - band.lower),
+      },
+      history,
+    });
+    return {
+      trajectoryId,
+      status: result.status,
+      reason: result.status === "ready" ? null : result.status,
+      cutoffAt: lockedAt,
+      lockPrice: currentPrefix.lockPrice,
+      medianCellWidth,
+      direction: result.direction,
+      probabilities: result.probabilities,
+      expectedDeltaCellWidths: result.expectedDeltaCellWidths,
+      sample: result.sample,
+      nearestIds: result.nearestIds,
+      parameters: result.parameters,
+      currentPrefix: currentPrefix.prefix,
+      integration: {
+        ...integration,
+        queriedCandidateCount: candidates.length,
+        usableHistoryCount: history.length,
+        excludedCoverageCount,
+        historyMaxResultId:
+          candidates.length === 0
+            ? null
+            : Math.max(...candidates.map((candidate) => Number(candidate.result_id))),
+      },
+    };
+  }
+
+  #insertForecastTrajectoryShadow(forecastId, shadow, createdAt) {
+    this.sqlite
+      .prepare(`
+        INSERT INTO forecast_trajectory_shadows (
+          forecast_id, trajectory_id, schema_version, model_version,
+          status, reason, cutoff_at, lock_price, median_cell_width,
+          direction, probabilities_json, expected_delta_cell_widths,
+          sample_json, nearest_ids_json, parameters_json,
+          current_prefix_json, integration_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        forecastId,
+        shadow.trajectoryId,
+        TRAJECTORY_SHADOW_SCHEMA_VERSION,
+        TRAJECTORY_SHADOW_VERSION,
+        shadow.status,
+        shadow.reason,
+        shadow.cutoffAt,
+        shadow.lockPrice,
+        shadow.medianCellWidth,
+        shadow.direction,
+        JSON.stringify(shadow.probabilities),
+        shadow.expectedDeltaCellWidths,
+        JSON.stringify(shadow.sample),
+        JSON.stringify(shadow.nearestIds),
+        JSON.stringify(shadow.parameters),
+        JSON.stringify(shadow.currentPrefix),
+        JSON.stringify(shadow.integration),
+        createdAt,
+      );
+  }
+
   #buildForecastPairSnapshot({
     source,
     instrument,
@@ -6153,7 +7085,7 @@ export class RouletteDatabase {
       }
     }
 
-    return this.#transaction(() => {
+    const primaryOutcome = this.#transaction(() => {
       const existing = this.sqlite
         .prepare(`
           SELECT id
@@ -6262,8 +7194,50 @@ export class RouletteDatabase {
           "forecast transaction must finish at least five seconds before betting closes",
         );
       }
-      return { inserted: true, roundId: externalRoundId };
+      return { inserted: true, roundId: externalRoundId, forecastId };
     });
+
+    if (!primaryOutcome.inserted) return primaryOutcome;
+
+    try {
+      this.#transaction(() => {
+        const trajectoryShadow = this.#buildForecastTrajectoryShadow({
+          source,
+          instrument,
+          externalRoundId,
+          bettingClosesAt,
+          roundEndsAt,
+          lockedAt,
+          startPrice,
+          cells,
+        });
+        const shadowCreatedAt = asTimestamp(
+          this.clock(),
+          undefined,
+          "trajectory shadow createdAt",
+        );
+        this.#insertForecastTrajectoryShadow(
+          primaryOutcome.forecastId,
+          trajectoryShadow,
+          shadowCreatedAt,
+        );
+      });
+    } catch (error) {
+      emitLog(
+        this.logger,
+        "error",
+        {
+          error,
+          source,
+          instrument,
+          externalRoundId,
+          forecastId: primaryOutcome.forecastId,
+        },
+        "trajectory shadow persistence failed after primary forecast commit",
+      );
+    }
+
+    return { inserted: true, roundId: externalRoundId };
   }
 
   settlePrecloseForecasts(source = "buleto", instrument = "default") {
@@ -6444,7 +7418,33 @@ export class RouletteDatabase {
           consensus_snapshots.derived_from_snapshot_at
             AS consensus_derived_from_snapshot_at,
           consensus_snapshots.reason AS consensus_reason,
-          consensus_snapshots.created_at AS consensus_created_at
+          consensus_snapshots.created_at AS consensus_created_at,
+          trajectory_shadows.forecast_id AS trajectory_shadow_forecast_id,
+          trajectory_shadows.trajectory_id AS trajectory_shadow_trajectory_id,
+          trajectory_shadows.schema_version AS trajectory_shadow_schema_version,
+          trajectory_shadows.model_version AS trajectory_shadow_model_version,
+          trajectory_shadows.status AS trajectory_shadow_status,
+          trajectory_shadows.reason AS trajectory_shadow_reason,
+          trajectory_shadows.cutoff_at AS trajectory_shadow_cutoff_at,
+          trajectory_shadows.lock_price AS trajectory_shadow_lock_price,
+          trajectory_shadows.median_cell_width
+            AS trajectory_shadow_median_cell_width,
+          trajectory_shadows.direction AS trajectory_shadow_direction,
+          trajectory_shadows.probabilities_json
+            AS trajectory_shadow_probabilities_json,
+          trajectory_shadows.expected_delta_cell_widths
+            AS trajectory_shadow_expected_delta_cell_widths,
+          trajectory_shadows.sample_json AS trajectory_shadow_sample_json,
+          trajectory_shadows.nearest_ids_json
+            AS trajectory_shadow_nearest_ids_json,
+          trajectory_shadows.parameters_json
+            AS trajectory_shadow_parameters_json,
+          trajectory_shadows.current_prefix_json
+            AS trajectory_shadow_current_prefix_json,
+          trajectory_shadows.integration_json
+            AS trajectory_shadow_integration_json,
+          trajectory_shadows.created_at AS trajectory_shadow_created_at,
+          settlement_results.price AS trajectory_actual_price
         FROM round_forecasts AS forecasts
         JOIN forecast_snapshots AS snapshots ON snapshots.id = forecasts.snapshot_id
         LEFT JOIN forecast_settlements AS settlements
@@ -6453,6 +7453,10 @@ export class RouletteDatabase {
           ON pair_snapshots.forecast_id = forecasts.id
         LEFT JOIN forecast_consensus_snapshots AS consensus_snapshots
           ON consensus_snapshots.forecast_id = forecasts.id
+        LEFT JOIN forecast_trajectory_shadows AS trajectory_shadows
+          ON trajectory_shadows.forecast_id = forecasts.id
+        LEFT JOIN round_results AS settlement_results
+          ON settlement_results.id = settlements.round_result_id
         WHERE snapshots.source = ? AND snapshots.instrument = ?
         ORDER BY snapshots.locked_at DESC, forecasts.id DESC
         LIMIT 1

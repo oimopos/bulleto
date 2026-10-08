@@ -15,6 +15,19 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
   const FOLLOWER_LIVE_ACCOUNT_THRESHOLD = 0.8;
   const CYCLE_COMPARISON_ANCHOR_DRAWS = 20;
   const CYCLE_COMPARISON_ALGORITHM_VERSION = "cycle-analogue-prefix-v1";
+  const TRAJECTORY_SHADOW_VERSION = "trajectory-shadow-knn-v1";
+  const TRAJECTORY_SHADOW_REQUIRED_HISTORY = 30;
+  const TRAJECTORY_SHADOW_REQUIRED_NEIGHBORS = 10;
+  const TRAJECTORY_SHADOW_DIRECTION_LABELS = Object.freeze({
+    up: "вверх",
+    down: "вниз",
+    flat: "без заметного движения"
+  });
+  const trajectoryShadowShareFormatter = new Intl.NumberFormat("ru-RU", {
+    style: "percent",
+    minimumFractionDigits: 1,
+    maximumFractionDigits: 1
+  });
 
   const elements = {
     main: document.querySelector("main"),
@@ -42,6 +55,11 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
     precloseComparisonBadge: document.getElementById("preclose-comparison-badge"),
     precloseComparisonStatus: document.getElementById("preclose-comparison-status"),
     precloseComparisonWarning: document.getElementById("preclose-comparison-warning"),
+    trajectoryShadowPanel: document.getElementById("trajectory-shadow-panel"),
+    trajectoryShadowBadge: document.getElementById("trajectory-shadow-badge"),
+    trajectoryShadowStatus: document.getElementById("trajectory-shadow-status"),
+    trajectoryShadowShares: document.getElementById("trajectory-shadow-shares"),
+    trajectoryShadowSample: document.getElementById("trajectory-shadow-sample"),
     precloseHitHistory: document.getElementById("preclose-hit-history"),
     precloseHitHistoryCount: document.getElementById("preclose-hit-history-count"),
     precloseHitHistoryList: document.getElementById("preclose-hit-history-list"),
@@ -1290,6 +1308,192 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
     return numbers.length === 3 ? numbers : [];
   }
 
+  function normalizedTrajectoryShadow(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    if (value.version !== TRAJECTORY_SHADOW_VERSION) return null;
+
+    const status = String(value.status || "");
+    if (
+      ![
+        "ready",
+        "insufficient_current",
+        "insufficient_history",
+        "insufficient_neighbors"
+      ].includes(status)
+    ) {
+      return null;
+    }
+
+    if (status === "insufficient_current") {
+      if (
+        value.direction !== null
+        || value.probabilities !== null
+        || typeof value.reason !== "string"
+        || value.reason.length === 0
+      ) {
+        return null;
+      }
+      return {
+        status,
+        direction: null,
+        probabilities: null,
+        sample: null
+      };
+    }
+
+    const source = value.sample;
+    if (!source || typeof source !== "object" || Array.isArray(source)) return null;
+    const sample = {
+      historyCount: asOptionalNonNegativeInteger(source.historyCount),
+      eligibleCount: asOptionalNonNegativeInteger(source.eligibleCount),
+      excludedNotPastCount: asOptionalNonNegativeInteger(source.excludedNotPastCount),
+      withinDistanceCount: asOptionalNonNegativeInteger(source.withinDistanceCount),
+      neighborCount: asOptionalNonNegativeInteger(source.neighborCount),
+      requiredHistory: asOptionalNonNegativeInteger(source.requiredHistory),
+      requiredNeighbors: asOptionalNonNegativeInteger(source.requiredNeighbors)
+    };
+    if (
+      Object.values(sample).some((count) => count === null)
+      || sample.requiredHistory < 1
+      || sample.requiredNeighbors < 1
+      || sample.eligibleCount + sample.excludedNotPastCount !== sample.historyCount
+      || sample.withinDistanceCount > sample.eligibleCount
+      || sample.neighborCount > sample.withinDistanceCount
+    ) {
+      return null;
+    }
+
+    if (status === "insufficient_history") {
+      return sample.eligibleCount < sample.requiredHistory
+        ? { status, direction: null, probabilities: null, sample }
+        : null;
+    }
+    if (status === "insufficient_neighbors") {
+      return sample.eligibleCount >= sample.requiredHistory
+        && sample.withinDistanceCount < sample.requiredNeighbors
+        && sample.neighborCount === 0
+        ? { status, direction: null, probabilities: null, sample }
+        : null;
+    }
+
+    const direction = String(value.direction || "");
+    const probabilities = value.probabilities;
+    if (
+      !(direction in TRAJECTORY_SHADOW_DIRECTION_LABELS)
+      || !probabilities
+      || typeof probabilities !== "object"
+      || Array.isArray(probabilities)
+      || sample.eligibleCount < sample.requiredHistory
+      || sample.withinDistanceCount < sample.requiredNeighbors
+      || sample.neighborCount < sample.requiredNeighbors
+    ) {
+      return null;
+    }
+    const shares = {
+      up: probabilities.up,
+      down: probabilities.down,
+      flat: probabilities.flat
+    };
+    if (
+      Object.values(shares).some(
+        (share) => typeof share !== "number" || !Number.isFinite(share) || share < 0 || share > 1,
+      )
+      || Math.abs(shares.up + shares.down + shares.flat - 1) > 1e-6
+    ) {
+      return null;
+    }
+
+    return { status, direction, probabilities: shares, sample };
+  }
+
+  function renderTrajectoryShadow(value) {
+    const shadow = normalizedTrajectoryShadow(value);
+    elements.trajectoryShadowPanel.setAttribute("aria-busy", "false");
+
+    if (!shadow) {
+      elements.trajectoryShadowBadge.textContent = "Сбор истории";
+      setTextIfChanged(
+        elements.trajectoryShadowStatus,
+        "Prospective shadow для текущего снимка ещё не опубликован; сбор полных завершённых траекторий продолжается.",
+      );
+      setTextIfChanged(
+        elements.trajectoryShadowShares,
+        "Доли похожих завершённых траекторий: вверх — · вниз — · без движения —.",
+      );
+      setTextIfChanged(
+        elements.trajectoryShadowSample,
+        `Полные сопоставимые раунды: —/${TRAJECTORY_SHADOW_REQUIRED_HISTORY}; соседи формы: —/${TRAJECTORY_SHADOW_REQUIRED_NEIGHBORS}.`,
+      );
+      return;
+    }
+
+    if (shadow.status === "insufficient_current") {
+      elements.trajectoryShadowBadge.textContent = "Текущий график неполный";
+      setTextIfChanged(
+        elements.trajectoryShadowStatus,
+        "Направление не рассчитывается: текущая траектория началась не от старта раунда, содержит разрыв или не дошла до точки фиксации.",
+      );
+      setTextIfChanged(
+        elements.trajectoryShadowShares,
+        "Обрезанный график не сравнивается с полной историей и не создаёт shadow-прогноз.",
+      );
+      setTextIfChanged(
+        elements.trajectoryShadowSample,
+        "Система дождётся следующего полного непрерывного раунда; основной Top-3 продолжает работать независимо.",
+      );
+      return;
+    }
+
+    const { sample } = shadow;
+    if (shadow.status === "insufficient_history") {
+      elements.trajectoryShadowBadge.textContent = `Сбор · ${sample.eligibleCount}/${sample.requiredHistory}`;
+      setTextIfChanged(
+        elements.trajectoryShadowStatus,
+        "Направление не рассчитывается: накапливается prospective-история полных завершённых раундов.",
+      );
+      setTextIfChanged(
+        elements.trajectoryShadowShares,
+        "Доли похожих завершённых траекторий появятся только после минимальной выборки.",
+      );
+      setTextIfChanged(
+        elements.trajectoryShadowSample,
+        `Полные сопоставимые раунды: ${sample.eligibleCount}/${sample.requiredHistory}; похожие траектории в радиусе: ${sample.withinDistanceCount}/${sample.requiredNeighbors}.`,
+      );
+      return;
+    }
+
+    if (shadow.status === "insufficient_neighbors") {
+      elements.trajectoryShadowBadge.textContent = `Сбор соседей · ${sample.withinDistanceCount}/${sample.requiredNeighbors}`;
+      setTextIfChanged(
+        elements.trajectoryShadowStatus,
+        "Направление не рассчитывается: пока недостаточно завершённых траекторий с похожей формой.",
+      );
+      setTextIfChanged(
+        elements.trajectoryShadowShares,
+        "Доли похожих завершённых траекторий появятся только при достаточном числе соседей.",
+      );
+      setTextIfChanged(
+        elements.trajectoryShadowSample,
+        `Полные сопоставимые раунды: ${sample.eligibleCount}/${sample.requiredHistory}; похожие траектории в радиусе: ${sample.withinDistanceCount}/${sample.requiredNeighbors}.`,
+      );
+      return;
+    }
+
+    elements.trajectoryShadowBadge.textContent = "Prospective shadow";
+    setTextIfChanged(
+      elements.trajectoryShadowStatus,
+      `Наблюдательное направление цены от последней доступной точки перед forecast lock до финального ed: ${TRAJECTORY_SHADOW_DIRECTION_LABELS[shadow.direction]}. Точка может быть не старше 5 секунд; исход shadow для этого раунда ещё не валидирован.`,
+    );
+    setTextIfChanged(
+      elements.trajectoryShadowShares,
+      `Доли похожих завершённых траекторий: вверх ${trajectoryShadowShareFormatter.format(shadow.probabilities.up)} · вниз ${trajectoryShadowShareFormatter.format(shadow.probabilities.down)} · без движения ${trajectoryShadowShareFormatter.format(shadow.probabilities.flat)}.`,
+    );
+    setTextIfChanged(
+      elements.trajectoryShadowSample,
+      `Полные сопоставимые раунды: ${sample.eligibleCount}/${sample.requiredHistory}; использовано соседей формы: ${sample.neighborCount} (минимум ${sample.requiredNeighbors}).`,
+    );
+  }
+
   function resolveFinalForecast(latest) {
     const consensus = latest?.consensus;
     const hasConsensus = consensus !== null
@@ -1627,6 +1831,7 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
       ? `${top3Hits} из ${settledCount} · ${(top3Rate * 100).toFixed(1).replace(".", ",")}%`
       : `${top3Hits} из ${settledCount} · мало данных`;
     renderPrecloseComparison(matchesCurrent ? latest : null, finalForecast);
+    renderTrajectoryShadow(matchesCurrent ? latest?.trajectoryShadow : null);
 
     if (!matchesCurrent) {
       elements.precloseRanking.setAttribute("aria-busy", "true");
