@@ -40,6 +40,7 @@ const ROUND_TRAJECTORY_SCHEMA_VERSION = 1;
 const TRAJECTORY_SHADOW_SCHEMA_VERSION = 1;
 const TRAJECTORY_SHADOW_CANDIDATE_LIMIT = 500;
 const TRAJECTORY_PREFIX_EDGE_TOLERANCE_MS = 5_000;
+const TRAJECTORY_NUMBER_AREA_VERSION = "trajectory-number-area-v1";
 const FOLLOWER_TOP5_HORIZONS = Object.freeze([1, 2, 3, 5, 10, 20]);
 const FOLLOWER_TOP5_ALL_HORIZONS = Object.freeze(
   Array.from({ length: 20 }, (_, index) => index + 1),
@@ -1485,6 +1486,140 @@ function trajectoryDirection(deltaCellWidths, flatThresholdCellWidths) {
   return "flat";
 }
 
+function trajectoryBandPoint(band) {
+  return {
+    wireCell: band.wireCell,
+    number: band.number,
+  };
+}
+
+function buildTrajectoryNumberArea({
+  bands,
+  lockPrice,
+  medianCellWidth,
+  deltaRangeCellWidths,
+  direction,
+  flatThresholdCellWidths,
+}) {
+  if (
+    !Array.isArray(bands) ||
+    bands.length !== 38 ||
+    !Number.isFinite(lockPrice) ||
+    !Number.isFinite(medianCellWidth) ||
+    medianCellWidth <= 0 ||
+    !["up", "down", "flat"].includes(direction) ||
+    !Number.isFinite(flatThresholdCellWidths) ||
+    flatThresholdCellWidths < 0 ||
+    !deltaRangeCellWidths ||
+    typeof deltaRangeCellWidths !== "object" ||
+    Array.isArray(deltaRangeCellWidths)
+  ) {
+    return null;
+  }
+  const {
+    lowerQuantile,
+    upperQuantile,
+    lower,
+    median,
+    upper,
+  } = deltaRangeCellWidths;
+  if (
+    !Number.isFinite(lowerQuantile) ||
+    !Number.isFinite(upperQuantile) ||
+    Math.abs(lowerQuantile - 0.2) > 1e-12 ||
+    Math.abs(upperQuantile - 0.8) > 1e-12 ||
+    !Number.isFinite(lower) ||
+    !Number.isFinite(median) ||
+    !Number.isFinite(upper) ||
+    lower > median ||
+    median > upper
+  ) {
+    return null;
+  }
+  const centers = bands.map((band) => (band.lower + band.upper) / 2);
+  if (
+    bands.some(
+      (band, index) =>
+        band.wireCell !== index ||
+        band.number !== (index === 37 ? 0 : index) ||
+        !Number.isFinite(band.lower) ||
+        !Number.isFinite(band.upper) ||
+        !(band.upper > band.lower),
+    ) ||
+    centers.some(
+      (center, index) => index > 0 && !(centers[index - 1] > center),
+    ) ||
+    bands.some(
+      (band, index) =>
+        index > 0 &&
+        !(
+          bands[index - 1].upper > band.upper &&
+          bands[index - 1].lower > band.lower
+        ),
+    ) ||
+    lockPrice < bands.at(-1).lower ||
+    lockPrice > bands[0].upper
+  ) {
+    return null;
+  }
+
+  const forecastCells = bands.map((band) => ({
+    c: band.wireCell,
+    vf: band.lower,
+    vt: band.upper,
+  }));
+  const locate = (price) =>
+    trajectoryBandPoint(rankPrecloseForecastCells(forecastCells, price)[0]);
+  const lowerPrice = lockPrice + lower * medianCellWidth;
+  const upperPrice = lockPrice + upper * medianCellWidth;
+  const typicalPrice = lockPrice + median * medianCellWidth;
+  const firstEndpoint = locate(lowerPrice);
+  const secondEndpoint = locate(upperPrice);
+  const topWireCell = Math.min(
+    firstEndpoint.wireCell,
+    secondEndpoint.wireCell,
+  );
+  const bottomWireCell = Math.max(
+    firstEndpoint.wireCell,
+    secondEndpoint.wireCell,
+  );
+  const cells = bands
+    .slice(topWireCell, bottomWireCell + 1)
+    .map(trajectoryBandPoint);
+
+  return {
+    version: TRAJECTORY_NUMBER_AREA_VERSION,
+    basis: "weighted-neighbor-delta-q20-q50-q80",
+    centralWeight: upperQuantile - lowerQuantile,
+    scale: "wire-cell-top-to-bottom",
+    current: trajectoryBandPoint(
+      rankPrecloseForecastCells(forecastCells, lockPrice)[0],
+    ),
+    typical: {
+      ...locate(typicalPrice),
+      price: typicalPrice,
+      deltaCellWidths: median,
+      direction: trajectoryDirection(median, flatThresholdCellWidths),
+      agreesWithDirection:
+        trajectoryDirection(median, flatThresholdCellWidths) === direction,
+    },
+    corridor: {
+      lowerQuantile,
+      upperQuantile,
+      lowerDeltaCellWidths: lower,
+      medianDeltaCellWidths: median,
+      upperDeltaCellWidths: upper,
+      lowerPrice,
+      upperPrice,
+      top: trajectoryBandPoint(bands[topWireCell]),
+      bottom: trajectoryBandPoint(bands[bottomWireCell]),
+      cells,
+      clippedTop: upperPrice > bands[0].upper,
+      clippedBottom: lowerPrice < bands.at(-1).lower,
+    },
+  };
+}
+
 function normalizedLimit(value, fallback = DEFAULT_LIMIT) {
   const limit = value === undefined ? fallback : Number(value);
   if (!Number.isInteger(limit) || limit < 1 || limit > MAX_LIMIT) {
@@ -1910,6 +2045,138 @@ function mapForecastConsensus(row, modelTop3) {
   };
 }
 
+function normalizeTrajectoryNumberArea(
+  value,
+  { direction, lockPrice, medianCellWidth, flatThresholdCellWidths } = {},
+) {
+  if (value === null || value === undefined) return null;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const validPoint = (point) =>
+    point &&
+    typeof point === "object" &&
+    !Array.isArray(point) &&
+    Number.isInteger(point.wireCell) &&
+    point.wireCell >= 0 &&
+    point.wireCell <= 37 &&
+    point.number === (point.wireCell === 37 ? 0 : point.wireCell);
+  const { current, typical, corridor } = value;
+  if (
+    value.version !== TRAJECTORY_NUMBER_AREA_VERSION ||
+    value.basis !== "weighted-neighbor-delta-q20-q50-q80" ||
+    value.scale !== "wire-cell-top-to-bottom" ||
+    !Number.isFinite(value.centralWeight) ||
+    !validPoint(current) ||
+    !validPoint(typical) ||
+    !Number.isFinite(typical.price) ||
+    !Number.isFinite(typical.deltaCellWidths) ||
+    !["up", "down", "flat"].includes(typical.direction) ||
+    typeof typical.agreesWithDirection !== "boolean" ||
+    !corridor ||
+    typeof corridor !== "object" ||
+    Array.isArray(corridor) ||
+    !validPoint(corridor.top) ||
+    !validPoint(corridor.bottom) ||
+    !Array.isArray(corridor.cells) ||
+    corridor.cells.length < 1 ||
+    corridor.cells.some((cell) => !validPoint(cell)) ||
+    !Number.isFinite(corridor.lowerQuantile) ||
+    !Number.isFinite(corridor.upperQuantile) ||
+    !Number.isFinite(corridor.lowerDeltaCellWidths) ||
+    !Number.isFinite(corridor.medianDeltaCellWidths) ||
+    !Number.isFinite(corridor.upperDeltaCellWidths) ||
+    !Number.isFinite(corridor.lowerPrice) ||
+    !Number.isFinite(corridor.upperPrice) ||
+    typeof corridor.clippedTop !== "boolean" ||
+    typeof corridor.clippedBottom !== "boolean"
+  ) {
+    return null;
+  }
+  if (
+    Math.abs(corridor.lowerQuantile - 0.2) > 1e-12 ||
+    Math.abs(corridor.upperQuantile - 0.8) > 1e-12 ||
+    Math.abs(
+      value.centralWeight -
+        (corridor.upperQuantile - corridor.lowerQuantile),
+    ) > 1e-12 ||
+    !Number.isFinite(lockPrice) ||
+    !Number.isFinite(medianCellWidth) ||
+    medianCellWidth <= 0 ||
+    !Number.isFinite(flatThresholdCellWidths) ||
+    flatThresholdCellWidths < 0 ||
+    !["up", "down", "flat"].includes(direction) ||
+    corridor.lowerDeltaCellWidths > corridor.medianDeltaCellWidths ||
+    corridor.medianDeltaCellWidths > corridor.upperDeltaCellWidths ||
+    Math.abs(typical.deltaCellWidths - corridor.medianDeltaCellWidths) > 1e-12 ||
+    typical.direction !==
+      trajectoryDirection(
+        corridor.medianDeltaCellWidths,
+        flatThresholdCellWidths,
+      ) ||
+    typical.agreesWithDirection !== (typical.direction === direction) ||
+    Math.abs(
+      typical.price -
+        (lockPrice + corridor.medianDeltaCellWidths * medianCellWidth),
+    ) > 1e-9 ||
+    Math.abs(
+      corridor.lowerPrice -
+        (lockPrice + corridor.lowerDeltaCellWidths * medianCellWidth),
+    ) > 1e-9 ||
+    Math.abs(
+      corridor.upperPrice -
+        (lockPrice + corridor.upperDeltaCellWidths * medianCellWidth),
+    ) > 1e-9 ||
+    corridor.lowerPrice > corridor.upperPrice ||
+    corridor.top.wireCell > corridor.bottom.wireCell ||
+    corridor.cells.length !==
+      corridor.bottom.wireCell - corridor.top.wireCell + 1 ||
+    corridor.cells.some(
+      (cell, index) => cell.wireCell !== corridor.top.wireCell + index,
+    ) ||
+    corridor.cells[0].wireCell !== corridor.top.wireCell ||
+    corridor.cells.at(-1).wireCell !== corridor.bottom.wireCell
+  ) {
+    return null;
+  }
+  return {
+    version: value.version,
+    basis: value.basis,
+    centralWeight: value.centralWeight,
+    scale: value.scale,
+    current: { wireCell: current.wireCell, number: current.number },
+    typical: {
+      wireCell: typical.wireCell,
+      number: typical.number,
+      price: typical.price,
+      deltaCellWidths: typical.deltaCellWidths,
+      direction: typical.direction,
+      agreesWithDirection: typical.agreesWithDirection,
+    },
+    corridor: {
+      lowerQuantile: corridor.lowerQuantile,
+      upperQuantile: corridor.upperQuantile,
+      lowerDeltaCellWidths: corridor.lowerDeltaCellWidths,
+      medianDeltaCellWidths: corridor.medianDeltaCellWidths,
+      upperDeltaCellWidths: corridor.upperDeltaCellWidths,
+      lowerPrice: corridor.lowerPrice,
+      upperPrice: corridor.upperPrice,
+      top: {
+        wireCell: corridor.top.wireCell,
+        number: corridor.top.number,
+      },
+      bottom: {
+        wireCell: corridor.bottom.wireCell,
+        number: corridor.bottom.number,
+      },
+      cells: corridor.cells.map((cell) => ({
+        wireCell: cell.wireCell,
+        number: cell.number,
+      })),
+      clippedTop: corridor.clippedTop,
+      clippedBottom: corridor.clippedBottom,
+    },
+  };
+}
+
 function mapForecastTrajectoryShadow(row) {
   if (
     row?.trajectory_shadow_forecast_id === null ||
@@ -1966,6 +2233,12 @@ function mapForecastTrajectoryShadow(row) {
   const actualPrice = row.trajectory_actual_price == null
     ? null
     : Number(row.trajectory_actual_price);
+  const numberArea = normalizeTrajectoryNumberArea(integration?.numberArea, {
+    direction,
+    lockPrice,
+    medianCellWidth,
+    flatThresholdCellWidths,
+  });
   const readyProbabilitiesValid =
     probabilities !== null &&
     typeof probabilities === "object" &&
@@ -2047,7 +2320,11 @@ function mapForecastTrajectoryShadow(row) {
     nearestIds,
     parameters,
     currentPrefix,
-    integration,
+    integration: {
+      ...integration,
+      numberArea: status === "ready" ? numberArea : null,
+    },
+    numberArea: status === "ready" ? numberArea : null,
     evaluation,
     createdAt: row.trajectory_shadow_created_at,
   };
@@ -6540,6 +6817,16 @@ export class RouletteDatabase {
       },
       history,
     });
+    const numberArea = result.status === "ready"
+      ? buildTrajectoryNumberArea({
+          bands,
+          lockPrice: currentPrefix.lockPrice,
+          medianCellWidth,
+          deltaRangeCellWidths: result.deltaRangeCellWidths,
+          direction: result.direction,
+          flatThresholdCellWidths: result.parameters.flatThresholdCellWidths,
+        })
+      : null;
     return {
       trajectoryId,
       status: result.status,
@@ -6563,6 +6850,7 @@ export class RouletteDatabase {
           candidates.length === 0
             ? null
             : Math.max(...candidates.map((candidate) => Number(candidate.result_id))),
+        numberArea,
       },
     };
   }

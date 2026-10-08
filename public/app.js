@@ -16,6 +16,7 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
   const CYCLE_COMPARISON_ANCHOR_DRAWS = 20;
   const CYCLE_COMPARISON_ALGORITHM_VERSION = "cycle-analogue-prefix-v1";
   const TRAJECTORY_SHADOW_VERSION = "trajectory-shadow-knn-v1";
+  const TRAJECTORY_NUMBER_AREA_VERSION = "trajectory-number-area-v1";
   const TRAJECTORY_SHADOW_REQUIRED_HISTORY = 30;
   const TRAJECTORY_SHADOW_REQUIRED_NEIGHBORS = 10;
   const TRAJECTORY_SHADOW_DIRECTION_LABELS = Object.freeze({
@@ -59,6 +60,7 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
     trajectoryShadowBadge: document.getElementById("trajectory-shadow-badge"),
     trajectoryShadowStatus: document.getElementById("trajectory-shadow-status"),
     trajectoryShadowShares: document.getElementById("trajectory-shadow-shares"),
+    trajectoryShadowNumberArea: document.getElementById("trajectory-shadow-number-area"),
     trajectoryShadowSample: document.getElementById("trajectory-shadow-sample"),
     precloseHitHistory: document.getElementById("preclose-hit-history"),
     precloseHitHistoryCount: document.getElementById("preclose-hit-history-count"),
@@ -1308,6 +1310,88 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
     return numbers.length === 3 ? numbers : [];
   }
 
+  function normalizedTrajectoryNumberArea(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    const normalizePoint = (point) => {
+      if (!point || typeof point !== "object" || Array.isArray(point)) return null;
+      const wireCell = Number(point.wireCell);
+      const number = Number(point.number);
+      if (
+        !Number.isInteger(wireCell)
+        || wireCell < 0
+        || wireCell > 37
+        || number !== (wireCell === 37 ? 0 : wireCell)
+      ) {
+        return null;
+      }
+      return { wireCell, number };
+    };
+    const current = normalizePoint(value.current);
+    const typicalPoint = normalizePoint(value.typical);
+    const corridor = value.corridor;
+    if (
+      value.version !== TRAJECTORY_NUMBER_AREA_VERSION
+      || value.basis !== "weighted-neighbor-delta-q20-q50-q80"
+      || value.scale !== "wire-cell-top-to-bottom"
+      || typeof value.centralWeight !== "number"
+      || !Number.isFinite(value.centralWeight)
+      || !current
+      || !typicalPoint
+      || !value.typical
+      || typeof value.typical.price !== "number"
+      || !Number.isFinite(value.typical.price)
+      || typeof value.typical.deltaCellWidths !== "number"
+      || !Number.isFinite(value.typical.deltaCellWidths)
+      || !["up", "down", "flat"].includes(value.typical.direction)
+      || typeof value.typical.agreesWithDirection !== "boolean"
+      || !corridor
+      || typeof corridor !== "object"
+      || Array.isArray(corridor)
+      || !Array.isArray(corridor.cells)
+      || corridor.cells.length < 1
+    ) {
+      return null;
+    }
+    const cells = corridor.cells.map(normalizePoint);
+    const top = normalizePoint(corridor.top);
+    const bottom = normalizePoint(corridor.bottom);
+    if (
+      cells.some((cell) => cell === null)
+      || !top
+      || !bottom
+      || top.wireCell > bottom.wireCell
+      || cells.length !== bottom.wireCell - top.wireCell + 1
+      || cells.some((cell, index) => cell.wireCell !== top.wireCell + index)
+      || typeof corridor.lowerQuantile !== "number"
+      || !Number.isFinite(corridor.lowerQuantile)
+      || typeof corridor.upperQuantile !== "number"
+      || !Number.isFinite(corridor.upperQuantile)
+      || Math.abs(corridor.lowerQuantile - 0.2) > 1e-6
+      || Math.abs(corridor.upperQuantile - 0.8) > 1e-6
+      || Math.abs(
+        value.centralWeight - (corridor.upperQuantile - corridor.lowerQuantile),
+      ) > 1e-6
+    ) {
+      return null;
+    }
+    return {
+      centralWeight: value.centralWeight,
+      current,
+      typical: {
+        ...typicalPoint,
+        direction: value.typical.direction,
+        agreesWithDirection: value.typical.agreesWithDirection
+      },
+      corridor: {
+        top,
+        bottom,
+        cells,
+        clippedTop: corridor.clippedTop === true,
+        clippedBottom: corridor.clippedBottom === true
+      }
+    };
+  }
+
   function normalizedTrajectoryShadow(value) {
     if (!value || typeof value !== "object" || Array.isArray(value)) return null;
     if (value.version !== TRAJECTORY_SHADOW_VERSION) return null;
@@ -1403,7 +1487,40 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
       return null;
     }
 
-    return { status, direction, probabilities: shares, sample };
+    return {
+      status,
+      direction,
+      probabilities: shares,
+      sample,
+      numberArea: normalizedTrajectoryNumberArea(value.numberArea)
+    };
+  }
+
+  function trajectoryNumberAreaLabel(point) {
+    if (point.wireCell === 0) return "0 (верхняя полоса)";
+    if (point.wireCell === 37) return "0 (нижняя полоса)";
+    return String(point.number);
+  }
+
+  function trajectoryNumberAreaText(area) {
+    if (!area) {
+      return "Ориентировочный участок цифр к ed: для этого снимка ещё недоступен.";
+    }
+    const { cells } = area.corridor;
+    const corridor = cells.length <= 8
+      ? cells.map(trajectoryNumberAreaLabel).join(" → ")
+      : `от ${trajectoryNumberAreaLabel(area.corridor.top)} через … до ${trajectoryNumberAreaLabel(area.corridor.bottom)}, ${cells.length} полос по шкале`;
+    const clippedEdges = [
+      area.corridor.clippedTop ? "верхний край" : null,
+      area.corridor.clippedBottom ? "нижний край" : null
+    ].filter(Boolean);
+    const edgeText = clippedEdges.length > 0
+      ? ` Коридор ограничен шкалой: ${clippedEdges.join(" и ")}.`
+      : "";
+    const typicalText = area.typical.agreesWithDirection
+      ? `типичный исход q50 к ed ${trajectoryNumberAreaLabel(area.typical)}`
+      : `типичный исход q50 ${trajectoryNumberAreaLabel(area.typical)} расходится с лидирующей долей направлений`;
+    return `Ориентир цифр: у lock ${trajectoryNumberAreaLabel(area.current)}; ${typicalText}; исторический коридор похожих траекторий (взвешенные квантили q20–q80): ${corridor}.${edgeText}`;
   }
 
   function renderTrajectoryShadow(value) {
@@ -1421,6 +1538,10 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
         "Доли похожих завершённых траекторий: вверх — · вниз — · без движения —.",
       );
       setTextIfChanged(
+        elements.trajectoryShadowNumberArea,
+        "Ориентировочный участок цифр к ed: —.",
+      );
+      setTextIfChanged(
         elements.trajectoryShadowSample,
         `Полные сопоставимые раунды: —/${TRAJECTORY_SHADOW_REQUIRED_HISTORY}; соседи формы: —/${TRAJECTORY_SHADOW_REQUIRED_NEIGHBORS}.`,
       );
@@ -1436,6 +1557,10 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
       setTextIfChanged(
         elements.trajectoryShadowShares,
         "Обрезанный график не сравнивается с полной историей и не создаёт shadow-прогноз.",
+      );
+      setTextIfChanged(
+        elements.trajectoryShadowNumberArea,
+        "Ориентировочный участок цифр к ed: текущий график неполный.",
       );
       setTextIfChanged(
         elements.trajectoryShadowSample,
@@ -1456,6 +1581,10 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
         "Доли похожих завершённых траекторий появятся только после минимальной выборки.",
       );
       setTextIfChanged(
+        elements.trajectoryShadowNumberArea,
+        "Ориентировочный участок цифр к ed появится после минимальной выборки.",
+      );
+      setTextIfChanged(
         elements.trajectoryShadowSample,
         `Полные сопоставимые раунды: ${sample.eligibleCount}/${sample.requiredHistory}; похожие траектории в радиусе: ${sample.withinDistanceCount}/${sample.requiredNeighbors}.`,
       );
@@ -1473,6 +1602,10 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
         "Доли похожих завершённых траекторий появятся только при достаточном числе соседей.",
       );
       setTextIfChanged(
+        elements.trajectoryShadowNumberArea,
+        "Ориентировочный участок цифр к ed появится при достаточном числе похожих графиков.",
+      );
+      setTextIfChanged(
         elements.trajectoryShadowSample,
         `Полные сопоставимые раунды: ${sample.eligibleCount}/${sample.requiredHistory}; похожие траектории в радиусе: ${sample.withinDistanceCount}/${sample.requiredNeighbors}.`,
       );
@@ -1487,6 +1620,10 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
     setTextIfChanged(
       elements.trajectoryShadowShares,
       `Доли похожих завершённых траекторий: вверх ${trajectoryShadowShareFormatter.format(shadow.probabilities.up)} · вниз ${trajectoryShadowShareFormatter.format(shadow.probabilities.down)} · без движения ${trajectoryShadowShareFormatter.format(shadow.probabilities.flat)}.`,
+    );
+    setTextIfChanged(
+      elements.trajectoryShadowNumberArea,
+      trajectoryNumberAreaText(shadow.numberArea),
     );
     setTextIfChanged(
       elements.trajectoryShadowSample,

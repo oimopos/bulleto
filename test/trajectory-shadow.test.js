@@ -70,6 +70,7 @@ function predictiveFields(result) {
     direction: result.direction,
     probabilities: result.probabilities,
     expectedDeltaCellWidths: result.expectedDeltaCellWidths,
+    deltaRangeCellWidths: result.deltaRangeCellWidths,
     nearestIds: result.nearestIds,
   };
 }
@@ -116,6 +117,13 @@ test("normalizes offsets and cell scale before deterministic weighted kNN", () =
   assert.ok(Math.abs(result.probabilities.down - 1 / 3) < 1e-12);
   assert.equal(result.probabilities.flat, 0);
   assert.ok(Math.abs(result.expectedDeltaCellWidths - 2 / 3) < 1e-12);
+  assert.deepEqual(result.deltaRangeCellWidths, {
+    lowerQuantile: 0.2,
+    upperQuantile: 0.8,
+    lower: -1,
+    median: 1,
+    upper: 2,
+  });
   assert.deepEqual(result.sample, {
     historyCount: 3,
     eligibleCount: 3,
@@ -174,6 +182,7 @@ test("fails closed until the minimum past history exists", () => {
   assert.equal(result.direction, null);
   assert.equal(result.probabilities, null);
   assert.equal(result.expectedDeltaCellWidths, null);
+  assert.equal(result.deltaRangeCellWidths, null);
   assert.deepEqual(result.nearestIds, []);
   assert.equal(result.sample.eligibleCount, 2);
   assert.equal(result.sample.neighborCount, 0);
@@ -209,6 +218,67 @@ test("bounds shape distance and gives a closer neighbor more weight", () => {
   assert.equal(result.sample.withinDistanceCount, 2);
   assert.ok(result.probabilities.up > result.probabilities.down);
   assert.equal(result.direction, "up");
+});
+
+test("weighted quantiles follow similarity weight instead of raw neighbor count", () => {
+  const result = predictTrajectoryShadow({
+    current: current(),
+    history: [
+      completed("exact-up", { ageMinutes: 40, delta: 5 }),
+      completed("far-down-1", {
+        ageMinutes: 30,
+        prices: [10, 15, 20],
+        delta: -5,
+      }),
+      completed("far-down-2", {
+        ageMinutes: 20,
+        prices: [20, 25, 30],
+        delta: -5,
+      }),
+      completed("far-down-3", {
+        ageMinutes: 10,
+        prices: [30, 35, 40],
+        delta: -5,
+      }),
+    ],
+    options: {
+      ...SMALL_OPTIONS,
+      neighbors: 4,
+      minHistory: 4,
+      minNeighbors: 4,
+      maxDistanceCellWidths: 10,
+    },
+  });
+
+  assert.equal(result.status, "ready");
+  assert.deepEqual(result.deltaRangeCellWidths, {
+    lowerQuantile: 0.2,
+    upperQuantile: 0.8,
+    lower: 5,
+    median: 5,
+    upper: 5,
+  });
+});
+
+test("delta corridor uses the same frozen clipping limit as the weighted mean", () => {
+  const result = predictTrajectoryShadow({
+    current: current(),
+    history: [
+      completed("extreme-down", { ageMinutes: 30, delta: -100 }),
+      completed("flat", { ageMinutes: 20, delta: 0 }),
+      completed("extreme-up", { ageMinutes: 10, delta: 100 }),
+    ],
+    options: SMALL_OPTIONS,
+  });
+
+  assert.equal(result.status, "ready");
+  assert.deepEqual(result.deltaRangeCellWidths, {
+    lowerQuantile: 0.2,
+    upperQuantile: 0.8,
+    lower: -12,
+    median: 0,
+    upper: 12,
+  });
 });
 
 test("fails closed when too few candidates are inside the distance bound", () => {

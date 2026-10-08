@@ -11,6 +11,8 @@ export const TRAJECTORY_SHADOW_DEFAULTS = Object.freeze({
 });
 
 const DIRECTIONS = Object.freeze(["up", "down", "flat"]);
+const DELTA_RANGE_LOWER_QUANTILE = 0.2;
+const DELTA_RANGE_UPPER_QUANTILE = 0.8;
 
 function asObject(value, label) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -266,10 +268,40 @@ function unavailable(status, sample, options) {
     direction: null,
     probabilities: null,
     expectedDeltaCellWidths: null,
+    deltaRangeCellWidths: null,
     sample,
     nearestIds: [],
     parameters: { ...options },
   };
+}
+
+function neighborWeight(candidate) {
+  return 1 / (1 + candidate.distance * candidate.distance);
+}
+
+function weightedDeltaQuantile(neighbors, quantile) {
+  const ordered = neighbors
+    .map((neighbor) => ({
+      id: neighbor.id,
+      delta: neighbor.delta,
+      weight: neighborWeight(neighbor),
+    }))
+    .sort(
+      (left, right) =>
+        left.delta - right.delta ||
+        (left.id < right.id ? -1 : left.id > right.id ? 1 : 0),
+    );
+  const totalWeight = ordered.reduce(
+    (sum, candidate) => sum + candidate.weight,
+    0,
+  );
+  const threshold = totalWeight * quantile;
+  let cumulativeWeight = 0;
+  for (const candidate of ordered) {
+    cumulativeWeight += candidate.weight;
+    if (cumulativeWeight >= threshold) return candidate.delta;
+  }
+  return ordered.at(-1).delta;
 }
 
 function winningDirection(probabilities, expectedDelta) {
@@ -416,7 +448,7 @@ export function predictTrajectoryShadow({ current, history, options } = {}) {
   let totalWeight = 0;
   let weightedDelta = 0;
   for (const neighbor of nearest) {
-    const weight = 1 / (1 + neighbor.distance * neighbor.distance);
+    const weight = neighborWeight(neighbor);
     totalWeight += weight;
     weightedDelta += weight * neighbor.delta;
     weightedDirections[neighbor.direction] += weight;
@@ -427,6 +459,13 @@ export function predictTrajectoryShadow({ current, history, options } = {}) {
     flat: weightedDirections.flat / totalWeight,
   };
   const expectedDeltaCellWidths = weightedDelta / totalWeight;
+  const deltaRangeCellWidths = {
+    lowerQuantile: DELTA_RANGE_LOWER_QUANTILE,
+    upperQuantile: DELTA_RANGE_UPPER_QUANTILE,
+    lower: weightedDeltaQuantile(nearest, DELTA_RANGE_LOWER_QUANTILE),
+    median: weightedDeltaQuantile(nearest, 0.5),
+    upper: weightedDeltaQuantile(nearest, DELTA_RANGE_UPPER_QUANTILE),
+  };
 
   return {
     version: TRAJECTORY_SHADOW_VERSION,
@@ -434,6 +473,7 @@ export function predictTrajectoryShadow({ current, history, options } = {}) {
     direction: winningDirection(probabilities, expectedDeltaCellWidths),
     probabilities,
     expectedDeltaCellWidths,
+    deltaRangeCellWidths,
     sample: { ...sample, neighborCount: nearest.length },
     nearestIds: nearest.map((neighbor) => neighbor.id),
     parameters: { ...settings },

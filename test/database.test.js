@@ -661,6 +661,7 @@ test("pre-close forecast freezes an insufficient trajectory shadow instead of us
     );
     assert.equal(latest.trajectoryShadow.direction, null);
     assert.equal(latest.trajectoryShadow.probabilities, null);
+    assert.equal(latest.trajectoryShadow.numberArea, null);
     assert.equal(latest.trajectoryShadow.evaluation, null);
     assert.deepEqual(latest.trajectoryShadow.integration.currentCoverage, {
       tickCount: 3,
@@ -688,6 +689,11 @@ test("trajectory shadow freezes a correction-aware past-only READY prediction an
     path: ":memory:",
     clock: () => new Date(clockMs),
   });
+  const numberAreaCells = Array.from({ length: 38 }, (_, wireCell) => ({
+    c: wireCell,
+    vt: 5.6 - wireCell / 100,
+    vf: 5.59 - wireCell / 100,
+  }));
   const completePrefix = (startsAtMs) => [
     ...[1, 5, 10, 15, 20, 25, 30, 35, 40, 45].map((seconds) => ({
       atMs: startsAtMs + seconds * 1_000,
@@ -735,7 +741,7 @@ test("trajectory shadow freezes a correction-aware past-only READY prediction an
           externalRoundId: roundId,
           settledAt: iso(endsAtMs),
           observedAt: iso(endsAtMs),
-          price: 5.36,
+          price: index >= 27 ? 5.22 : 5.36,
         }),
       );
     }
@@ -793,6 +799,7 @@ test("trajectory shadow freezes a correction-aware past-only READY prediction an
       roundTrajectory(currentRoundId, {
         startsAtMs: currentStartMs,
         receivedAtMs: currentLockedMs,
+        cells: numberAreaCells,
         factors: completePrefix(currentStartMs),
       }),
     );
@@ -801,6 +808,7 @@ test("trajectory shadow freezes a correction-aware past-only READY prediction an
       roundTrajectory(currentRoundId, {
         startsAtMs: currentStartMs,
         receivedAtMs: currentLockedMs + 1_000,
+        cells: numberAreaCells,
         factors: [
           {
             atMs: currentStartMs + 50_000,
@@ -818,6 +826,7 @@ test("trajectory shadow freezes a correction-aware past-only READY prediction an
       lockedAt: iso(currentLockedMs),
       currentPrice: 5.34,
       startPrice: 5.35,
+      cells: numberAreaCells,
     });
     clockMs = currentLockedMs + 2_000;
     assert.deepEqual(database.recordPrecloseForecast(attempt), {
@@ -834,7 +843,9 @@ test("trajectory shadow freezes a correction-aware past-only READY prediction an
     assert.equal(shadow.status, "ready");
     assert.equal(shadow.reason, null);
     assert.equal(shadow.direction, "up");
-    assert.deepEqual(shadow.probabilities, { up: 1, down: 0, flat: 0 });
+    assert.ok(Math.abs(shadow.probabilities.up - 0.8) < 1e-12);
+    assert.ok(Math.abs(shadow.probabilities.down - 0.2) < 1e-12);
+    assert.equal(shadow.probabilities.flat, 0);
     assert.equal(shadow.sample.historyCount, 30);
     assert.equal(shadow.sample.eligibleCount, 30);
     assert.equal(shadow.sample.neighborCount, 15);
@@ -856,7 +867,44 @@ test("trajectory shadow freezes a correction-aware past-only READY prediction an
     assert.equal(shadow.currentPrefix.at(-1).price, 5.34);
     assert.equal(shadow.lockPrice, 5.34);
     assert.ok(Math.abs(shadow.medianCellWidth - 0.01) < 1e-12);
-    assert.ok(Math.abs(shadow.expectedDeltaCellWidths - 2) < 1e-9);
+    assert.ok(Math.abs(shadow.expectedDeltaCellWidths + 0.8) < 1e-9);
+    assert.equal(shadow.numberArea.version, "trajectory-number-area-v1");
+    assert.equal(
+      shadow.numberArea.basis,
+      "weighted-neighbor-delta-q20-q50-q80",
+    );
+    assert.deepEqual(shadow.numberArea.current, { wireCell: 25, number: 25 });
+    assert.deepEqual(
+      {
+        wireCell: shadow.numberArea.typical.wireCell,
+        number: shadow.numberArea.typical.number,
+      },
+      { wireCell: 23, number: 23 },
+    );
+    assert.ok(Math.abs(shadow.numberArea.typical.price - 5.36) < 1e-12);
+    assert.equal(shadow.numberArea.typical.direction, "up");
+    assert.equal(shadow.numberArea.typical.agreesWithDirection, true);
+    assert.deepEqual(shadow.numberArea.corridor.top, {
+      wireCell: 23,
+      number: 23,
+    });
+    assert.deepEqual(shadow.numberArea.corridor.bottom, {
+      wireCell: 37,
+      number: 0,
+    });
+    assert.deepEqual(
+      shadow.numberArea.corridor.cells.slice(-4),
+      [
+        { wireCell: 34, number: 34 },
+        { wireCell: 35, number: 35 },
+        { wireCell: 36, number: 36 },
+        { wireCell: 37, number: 0 },
+      ],
+      "the lower zero must remain a positional cell after 36",
+    );
+    assert.equal(shadow.numberArea.corridor.clippedTop, false);
+    assert.equal(shadow.numberArea.corridor.clippedBottom, false);
+    assert.deepEqual(shadow.integration.numberArea, shadow.numberArea);
     assert.equal(shadow.evaluation, null);
 
     const frozenShadow = {
@@ -890,6 +938,23 @@ test("trajectory shadow freezes a correction-aware past-only READY prediction an
     assert.ok(
       Math.abs(latest.trajectoryShadow.evaluation.deltaCellWidths - 2) < 1e-9,
     );
+
+    const legacyIntegration = JSON.parse(
+      database.sqlite
+        .prepare("SELECT integration_json FROM forecast_trajectory_shadows")
+        .get().integration_json,
+    );
+    delete legacyIntegration.numberArea;
+    database.sqlite
+      .prepare("UPDATE forecast_trajectory_shadows SET integration_json = ?")
+      .run(JSON.stringify(legacyIntegration));
+    latest = database.getPrecloseForecastState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    ).latest;
+    assert.equal(latest.trajectoryShadow.status, "ready");
+    assert.equal(latest.trajectoryShadow.numberArea, null);
+    assert.equal(latest.trajectoryShadow.integration.numberArea, null);
   } finally {
     database.close();
   }
