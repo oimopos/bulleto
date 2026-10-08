@@ -261,6 +261,22 @@ npm.cmd run backup -- ./data/buleto.sqlite ./seed/buleto.sqlite
 - `GET /api/sequences?limit=50` — повторяющиеся последовательности из трёх результатов.
 - `GET /api/virtual-bettor` — состояние симуляции для polling: последний результат, баланс и профит, активная цель, команда `WAIT`/`BET`, итог последней ставки и live-время окна.
 - `GET /api/virtual-bettor/sessions?limit=20` — история виртуальных сессий; реальные ставки всегда отключены.
+- `GET /api/follower-top5-gated` — отдельный read-only сигнал архивного счёта frozen Top‑5: текущая попытка и пороговые evidence, пять целей, ставка на число и полный билет, стабильный `actionId`, баланс и live-окно. `BET` означает только информационный сигнал; `advisoryOnly` всегда `true`, а `executionEnabled` — `false`. Endpoint не принимает команды и не выполняет ставки.
+
+  Перед `BET` endpoint также сверяет cursor трекера с последним сохранённым
+  результатом. Пока предыдущий `rr` ждёт подтверждения snapshot, очередь записи
+  не пуста, cursors расходятся или id открытого раунда не следует сразу за id
+  последнего сохранённого раунда, возвращается `WAIT` с причиной
+  `tracker_not_synced`. Поэтому архивная карточка `/api/state` может уже показывать
+  зафиксированную стратегию, когда отдельный live-сигнал ещё ждёт открытого окна
+  либо синхронизации.
+
+  Поле `signal.reason` использует значения `waiting_training`, `gap`,
+  `below_threshold`, `insufficient_history`, `threshold_not_reached`,
+  `bankroll_exhausted`, `strategy_not_ready`, `collector_unavailable`,
+  `tracker_not_synced`, `betting_closed` и `ready`. В `/api/state`
+  `currentAction.would_bet` — архивное решение стратегии; только отдельный endpoint
+  переводит его в live-команду `BET` после проверки синхронизации и окна.
 - `GET /api/events` — Server-Sent Events для мгновенного обновления панели.
 - `GET /api/live` — liveness-проверка процесса для Docker/Render.
 - `GET /api/health` — состояние процесса, базы и внешнего сборщика.

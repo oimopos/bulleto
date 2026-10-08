@@ -161,7 +161,11 @@ export class BuletoCollector extends EventEmitter {
   }
 
   getStatus() {
-    return structuredClone(this.state);
+    return structuredClone({
+      ...this.state,
+      resultConfirmationPending: this.pendingRoundResults.length > 0,
+      pendingResultCount: this.pendingRoundResults.length,
+    });
   }
 
   start() {

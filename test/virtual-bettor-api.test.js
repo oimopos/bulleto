@@ -227,6 +227,130 @@ test(
         },
         latestOutcome: null,
       });
+
+      const gatedResponse = await fetch(`${baseUrl}/api/follower-top5-gated`);
+      assert.equal(gatedResponse.status, 200, logs());
+      assert.match(
+        gatedResponse.headers.get("content-type") ?? "",
+        /^application\/json\b/,
+      );
+      assert.equal(gatedResponse.headers.get("cache-control"), "no-store");
+      const gated = await gatedResponse.json();
+      assert.equal(new Date(gated.serverTime).toISOString(), gated.serverTime);
+      assert.deepEqual(gated, {
+        schemaVersion: 1,
+        algorithmVersion: "follower-top5-cumulative80-ladder-v1",
+        mode: "persisted-session-retrospective",
+        executionEnabled: false,
+        advisoryOnly: true,
+        source: SOURCE,
+        instrument: INSTRUMENT,
+        status: "waiting",
+        currentBalance: 10_000,
+        profit: 0,
+        serverTime: gated.serverTime,
+        strategy: {
+          selectionMode: "frozen-top5",
+          selectionCount: 5,
+          thresholdMetric: "cumulative-hit-by-attempt",
+          threshold: 0.8,
+          comparison: "gte",
+          cohort: "anchors-with-complete-20-round-window",
+          maximumCalibratedAttempt: 20,
+          evaluationTiming: "pre-attempt-walk-forward",
+          startPolicy: "latch-for-session",
+          noCrossingPolicy: "observe-only",
+          minimumEligibleCount: 1,
+        },
+        model: {
+          modelVersion: "2.0.0",
+          initialStakePerNumber: 10,
+          stakeStepPerNumber: 10,
+          maxStakePerNumber: 2_500,
+          numbersPerRound: 5,
+          grossPayoutMultiplier: 36,
+          netHitMultiplier: 31,
+          payoutIncludesStake: true,
+        },
+        account: {
+          status: "waiting",
+          initialBalance: 10_000,
+          currentBalance: 10_000,
+          profit: 0,
+          nextStakePerNumber: 10,
+          nextRoundCost: 50,
+          canAffordNextRound: true,
+          shortfall: 0,
+          ladder: { missCount: 0, totalLoss: 0 },
+          dataComplete: true,
+        },
+        gate: {
+          thresholdMetric: "cumulative-hit-by-attempt",
+          threshold: 0.8,
+          comparison: "gte",
+          maximumCalibratedAttempt: 20,
+          bettingStarted: false,
+          startAttempt: null,
+          startEvidence: null,
+          currentEvidence: null,
+        },
+        currentAttempt: null,
+        freshness: {
+          trackerSynced: false,
+          trackerResultId: null,
+          latestPersistedResultId: 3,
+          latestPersistedRoundId: null,
+          latestPersistedAt: "2026-10-07T00:00:02.000Z",
+          currentRoundId: null,
+          expectedRoundId: null,
+          collectorLastResultAt: null,
+          roundCursorMatches: false,
+          resultConfirmationPending: false,
+          pendingResultCount: 0,
+          persistencePendingResults: 0,
+          persistencePendingGaps: 0,
+        },
+        latestResult: {
+          id: 3,
+          roundId: null,
+          number: 1,
+          settledAt: "2026-10-07T00:00:02.000Z",
+        },
+        betting: null,
+        signal: {
+          action: "WAIT",
+          actionable: false,
+          reason: "waiting_training",
+          actionId: null,
+          sessionId: null,
+          attemptNumber: null,
+          roundId: null,
+          targetNumbers: [],
+          stakePerNumber: null,
+          totalStake: null,
+          thresholdEvidence: null,
+          validUntil: null,
+        },
+        latestOutcome: null,
+      });
+
+      const gatedHead = await fetch(`${baseUrl}/api/follower-top5-gated`, {
+        method: "HEAD",
+      });
+      assert.equal(gatedHead.status, 200, logs());
+      assert.equal(gatedHead.headers.get("cache-control"), "no-store");
+      assert.match(
+        gatedHead.headers.get("content-type") ?? "",
+        /^application\/json\b/,
+      );
+      assert.equal(await gatedHead.text(), "");
+
+      const gatedPost = await fetch(`${baseUrl}/api/follower-top5-gated`, {
+        method: "POST",
+      });
+      assert.equal(gatedPost.status, 405, logs());
+      assert.equal(gatedPost.headers.get("cache-control"), "no-store");
+      assert.deepEqual(await gatedPost.json(), { error: "Метод не разрешён" });
     } finally {
       await stopChild(child);
       rmSync(directory, {

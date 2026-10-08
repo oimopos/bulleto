@@ -11,6 +11,7 @@ import { dirname, extname, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { BuletoCollector } from './collector.js';
 import { createDatabase } from './database.js';
+import { followerTop5GatedSnapshotForApi } from './follower-top5-gated-api.js';
 import { ResultPipeline } from './result-pipeline.js';
 import { virtualBettorSnapshotForApi } from './virtual-bettor-api.js';
 
@@ -250,6 +251,21 @@ function virtualBettorForApi() {
   });
 }
 
+function followerTop5GatedForApi() {
+  const source = 'buleto';
+  const instrument = config.instrument;
+  const trackerState = db.getFollowerTop5TrackerState(source, instrument);
+  return followerTop5GatedSnapshotForApi({
+    trackerState,
+    collectorState: collector.getStatus(),
+    latestResult: db.getLatestResult(source, instrument),
+    pipelinePending: resultPipeline.getPendingCounts(),
+    source,
+    instrument,
+    now: new Date(),
+  });
+}
+
 function clampLimit(rawValue, fallback, max) {
   if (rawValue === null || rawValue === '') return fallback;
   const value = Number(rawValue);
@@ -433,6 +449,11 @@ const server = createServer((request, response) => {
         executionEnabled: false,
         items: db.getVirtualBetSessions('buleto', config.instrument, limit),
       });
+      return;
+    }
+
+    if (pathname === '/api/follower-top5-gated') {
+      sendJson(response, 200, followerTop5GatedForApi());
       return;
     }
 
