@@ -192,6 +192,17 @@ test('collector emits a pre-close forecast in the safe window and ignores future
   assert.ok(forecasts[0].features.leadTimeMs <= 10_000);
   assert.equal(forecasts[0].features.factorCount, 3);
   assert.equal(forecasts[0].features.latestPrice, 20);
+  assert.equal(forecasts[0].modelVersion, 'start-price-v2');
+  assert.equal(forecasts[0].features.projectedPrice, 20);
+  assert.equal(forecasts[0].prediction.basis, 'start_price');
+  assert.equal(
+    forecasts[0].features.shadow.modelVersion,
+    'linear-trend-12s-to-ed-v1',
+  );
+  assert.notEqual(
+    forecasts[0].features.shadow.projectedPrice,
+    forecasts[0].features.projectedPrice,
+  );
   assert.equal(
     forecasts[0].features.factorPoints.some((point) => point.price === 999_999),
     false,

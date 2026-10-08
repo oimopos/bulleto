@@ -63,6 +63,135 @@ function precloseForecast(externalRoundId, overrides = {}) {
   };
 }
 
+function startPriceForecast(externalRoundId, overrides = {}) {
+  const base = precloseForecast(externalRoundId);
+  const factorAt = overrides.factorAt ?? base.factorAt;
+  const roundEndsAt = overrides.roundEndsAt ?? base.roundEndsAt;
+  const features = {
+    ...base.features,
+    windowSeconds: 12,
+    secondsToEnd: (Date.parse(roundEndsAt) - Date.parse(factorAt)) / 1_000,
+    ...(overrides.features ?? {}),
+  };
+  const currentPrice = overrides.currentPrice ?? base.currentPrice;
+  const startPrice = overrides.startPrice ?? base.startPrice;
+  return {
+    ...base,
+    ...overrides,
+    currentPrice,
+    startPrice,
+    predictedPrice: overrides.predictedPrice ?? startPrice,
+    currentNumber: overrides.currentNumber ?? 0,
+    predictedNumber: overrides.predictedNumber ?? 0,
+    rankedNumbers: overrides.rankedNumbers ?? [0, 36, 35],
+    modelVersion: "start-price-v2",
+    features: {
+      ...features,
+      predictionBasis: features.predictionBasis ?? "start_price",
+      shadow:
+        features.shadow ??
+        {
+          modelVersion: "linear-trend-12s-to-ed-v1",
+          projectedPrice:
+            currentPrice + features.slopePerSecond * features.secondsToEnd,
+        },
+    },
+  };
+}
+
+function replaceConsensusTableWithV13Schema(database) {
+  database.sqlite.exec(`
+    PRAGMA foreign_keys = OFF;
+    BEGIN IMMEDIATE;
+    ALTER TABLE forecast_consensus_snapshots
+      RENAME TO forecast_consensus_snapshots_v14_source;
+    CREATE TABLE forecast_consensus_snapshots (
+      forecast_id INTEGER PRIMARY KEY REFERENCES round_forecasts(id),
+      schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+      algorithm_version TEXT NOT NULL CHECK (
+        algorithm_version = 'consensus-borda-v1'
+      ),
+      status TEXT NOT NULL CHECK (
+        status IN ('combined', 'model_fallback', 'pair_fallback', 'unavailable')
+      ),
+      top3_json TEXT NOT NULL CHECK (json_valid(top3_json)),
+      inputs_used_json TEXT NOT NULL CHECK (json_valid(inputs_used_json)),
+      pair_sample_size INTEGER CHECK (
+        pair_sample_size IS NULL OR pair_sample_size >= 0
+      ),
+      derived_from_snapshot_at TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      CHECK (json_type(top3_json) = 'array'),
+      CHECK (json_type(inputs_used_json) = 'array'),
+      CHECK (
+        (status = 'unavailable' AND json_array_length(top3_json) = 0)
+        OR
+        (status <> 'unavailable' AND json_array_length(top3_json) = 3)
+      ),
+      CHECK (
+        status = 'unavailable'
+        OR (
+          json_type(top3_json, '$[0]') = 'integer'
+          AND json_type(top3_json, '$[1]') = 'integer'
+          AND json_type(top3_json, '$[2]') = 'integer'
+          AND json_extract(top3_json, '$[0]') BETWEEN 0 AND 36
+          AND json_extract(top3_json, '$[1]') BETWEEN 0 AND 36
+          AND json_extract(top3_json, '$[2]') BETWEEN 0 AND 36
+          AND json_extract(top3_json, '$[0]') <> json_extract(top3_json, '$[1]')
+          AND json_extract(top3_json, '$[0]') <> json_extract(top3_json, '$[2]')
+          AND json_extract(top3_json, '$[1]') <> json_extract(top3_json, '$[2]')
+        )
+      ),
+      CHECK (
+        (status = 'combined' AND inputs_used_json = '["model","pair"]')
+        OR
+        (status = 'model_fallback' AND inputs_used_json = '["model"]')
+        OR
+        (status = 'pair_fallback' AND inputs_used_json = '["pair"]')
+        OR
+        (status = 'unavailable' AND inputs_used_json = '[]')
+      ),
+      CHECK (
+        (status = 'combined' AND reason = 'frozen_model_and_pair')
+        OR
+        (status = 'model_fallback' AND reason IN (
+          'pair_not_ready',
+          'invalid_pair_ranking',
+          'empty_pair_ranking',
+          'pair_snapshot_model_mismatch'
+        ))
+        OR
+        (status = 'pair_fallback' AND reason = 'model_unavailable')
+        OR
+        (status = 'unavailable' AND reason IN (
+          'incomplete_model_ranking',
+          'invalid_model_ranking'
+        ))
+      ),
+      CHECK (
+        status NOT IN ('combined', 'pair_fallback')
+        OR (pair_sample_size IS NOT NULL AND pair_sample_size > 0)
+      ),
+      CHECK (derived_from_snapshot_at <= created_at)
+    );
+    INSERT INTO forecast_consensus_snapshots (
+      forecast_id, schema_version, algorithm_version, status,
+      top3_json, inputs_used_json, pair_sample_size,
+      derived_from_snapshot_at, reason, created_at
+    )
+    SELECT
+      forecast_id, schema_version, algorithm_version, status,
+      top3_json, inputs_used_json, pair_sample_size,
+      derived_from_snapshot_at, reason, created_at
+    FROM forecast_consensus_snapshots_v14_source;
+    DROP TABLE forecast_consensus_snapshots_v14_source;
+    PRAGMA user_version = 13;
+    COMMIT;
+    PRAGMA foreign_keys = ON;
+  `);
+}
+
 function markResultsCreatedAtObservation(database, fingerprintPrefix) {
   database.sqlite
     .prepare(`
@@ -127,7 +256,7 @@ test("schema contains all persistence tables", () => {
       "virtual_bet_sessions",
       "virtual_bets",
     ]);
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 13);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 14);
     assert.deepEqual(
       database.sqlite
         .prepare("PRAGMA table_info(forecast_pair_snapshots)")
@@ -204,7 +333,7 @@ test("version 13 creates one live follower tracker at the current tail", () => {
       "buleto",
       "PRIMECOIN(XPM)/RUB",
     );
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 13);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 14);
     assert.equal(migrated.status, "armed");
     assert.equal(migrated.currentSession.sourceNumber, 9);
     assert.deepEqual(migrated.currentSession.fixedNumbers, [5, 4, 3, 2, 1]);
@@ -332,6 +461,189 @@ test("pre-close forecasts enforce the five-second lock boundary and fresh factor
         .count,
       1,
     );
+  } finally {
+    database.close();
+  }
+});
+
+test("start-price v2 round-trips its prediction basis and frozen OLS shadow", () => {
+  const directory = mkdtempSync(join(tmpdir(), "roulette-start-price-v2-"));
+  const path = join(directory, "forecast.sqlite");
+  const attempt = startPriceForecast("start-price-v2-round-trip");
+  const expectedShadowPrice =
+    attempt.currentPrice +
+    attempt.features.slopePerSecond * attempt.features.secondsToEnd;
+  let database = createDatabase({
+    path,
+    clock: () => new Date(BASE_TIME + 52_000),
+  });
+
+  try {
+    assert.deepEqual(database.recordPrecloseForecast(attempt), {
+      inserted: true,
+      roundId: "start-price-v2-round-trip",
+    });
+    const storedFeatures = JSON.parse(
+      database.sqlite
+        .prepare("SELECT features_json FROM forecast_snapshots")
+        .get().features_json,
+    );
+    assert.deepEqual(
+      {
+        samples: storedFeatures.samples,
+        sampleCount: storedFeatures.sampleCount,
+        windowSeconds: storedFeatures.windowSeconds,
+        slopePerSecond: storedFeatures.slopePerSecond,
+        secondsToEnd: storedFeatures.secondsToEnd,
+        predictionBasis: storedFeatures.predictionBasis,
+        shadowModelVersion: storedFeatures.shadow?.modelVersion,
+        shadowProjectedPrice: storedFeatures.shadow?.projectedPrice,
+      },
+      {
+        samples: attempt.features.samples,
+        sampleCount: attempt.features.samples.length,
+        windowSeconds: attempt.features.windowSeconds,
+        slopePerSecond: attempt.features.slopePerSecond,
+        secondsToEnd: attempt.features.secondsToEnd,
+        predictionBasis: "start_price",
+        shadowModelVersion: "linear-trend-12s-to-ed-v1",
+        shadowProjectedPrice: expectedShadowPrice,
+      },
+    );
+
+    database.close();
+    database = createDatabase({
+      path,
+      clock: () => new Date(BASE_TIME + 52_000),
+    });
+    const latest = database.getPrecloseForecastState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    ).latest;
+    assert.equal(latest.modelVersion, "start-price-v2");
+    assert.equal(latest.projectedPrice, attempt.startPrice);
+    assert.equal(latest.features.predictionBasis, "start_price");
+    assert.equal(
+      latest.features.shadow.modelVersion,
+      "linear-trend-12s-to-ed-v1",
+    );
+    assert.equal(latest.features.shadow.projectedPrice, expectedShadowPrice);
+  } finally {
+    database.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("corrupt start-price v2 invariants reject without partial persistence", () => {
+  const database = createDatabase({
+    path: ":memory:",
+    clock: () => new Date(BASE_TIME + 52_000),
+  });
+  const wrongPrice = startPriceForecast("start-v2-wrong-price", {
+    predictedPrice: 5.351,
+  });
+  const wrongBasis = startPriceForecast("start-v2-wrong-basis", {
+    features: { predictionBasis: "ols_projection" },
+  });
+  const wrongShadowModel = startPriceForecast("start-v2-wrong-shadow-model", {
+    features: {
+      shadow: {
+        modelVersion: "another-model",
+        projectedPrice: 5.63,
+      },
+    },
+  });
+  const wrongShadowPrice = startPriceForecast("start-v2-wrong-shadow-price", {
+    features: {
+      shadow: {
+        modelVersion: "linear-trend-12s-to-ed-v1",
+        projectedPrice: 5.64,
+      },
+    },
+  });
+  const wrongFrozenTail = startPriceForecast("start-v2-wrong-frozen-tail", {
+    features: {
+      samples: [
+        { dt: new Date(BASE_TIME + 47_000).toISOString(), v: 5.38 },
+        { dt: new Date(BASE_TIME + 49_000).toISOString(), v: 5.39 },
+        { dt: new Date(BASE_TIME + 51_000).toISOString(), v: 5.401 },
+      ],
+    },
+  });
+  const wrongRanking = startPriceForecast("start-v2-wrong-ranking", {
+    predictedNumber: 7,
+    rankedNumbers: [7, 11, 19],
+  });
+  const wrongCurrentNumber = startPriceForecast("start-v2-wrong-current-number", {
+    currentNumber: 11,
+  });
+  const wrongWindow = startPriceForecast("start-v2-wrong-window", {
+    features: { windowSeconds: 4 },
+  });
+  const wrongHorizon = startPriceForecast("start-v2-wrong-horizon", {
+    features: { secondsToEnd: 48 },
+  });
+  const wrongSlope = startPriceForecast("start-v2-wrong-slope", {
+    features: { slopePerSecond: 0.006 },
+  });
+  const unorderedSamples = startPriceForecast("start-v2-unordered-samples", {
+    features: {
+      samples: [
+        { dt: new Date(BASE_TIME + 49_000).toISOString(), v: 5.39 },
+        { dt: new Date(BASE_TIME + 47_000).toISOString(), v: 5.38 },
+        { dt: new Date(BASE_TIME + 51_000).toISOString(), v: 5.4 },
+      ],
+    },
+  });
+  const duplicateSamples = startPriceForecast("start-v2-duplicate-samples", {
+    features: {
+      samples: [
+        { dt: new Date(BASE_TIME + 47_000).toISOString(), v: 5.38 },
+        { dt: new Date(BASE_TIME + 47_000).toISOString(), v: 5.39 },
+        { dt: new Date(BASE_TIME + 51_000).toISOString(), v: 5.4 },
+      ],
+    },
+  });
+  const outOfWindowSample = startPriceForecast("start-v2-old-sample", {
+    features: {
+      samples: [
+        { dt: new Date(BASE_TIME + 38_999).toISOString(), v: 5.38 },
+        { dt: new Date(BASE_TIME + 49_000).toISOString(), v: 5.39 },
+        { dt: new Date(BASE_TIME + 51_000).toISOString(), v: 5.4 },
+      ],
+    },
+  });
+
+  try {
+    for (const [attempt, pattern] of [
+      [wrongPrice, /must predict its frozen start price/],
+      [wrongBasis, /must declare start_price basis/],
+      [wrongShadowModel, /must include the frozen OLS shadow/],
+      [wrongShadowPrice, /OLS shadow does not match/],
+      [wrongFrozenTail, /samples must end at the frozen current price/],
+      [wrongRanking, /ranking must match its frozen cells and start price/],
+      [wrongCurrentNumber, /current number must match its frozen cells and current price/],
+      [wrongWindow, /factor window must be 12 seconds/],
+      [wrongHorizon, /secondsToEnd must match its frozen timestamps/],
+      [wrongSlope, /slope must match its frozen OLS samples/],
+      [unorderedSamples, /strictly increasing with distinct timestamps/],
+      [duplicateSamples, /strictly increasing with distinct timestamps/],
+      [outOfWindowSample, /inside the frozen factor window/],
+    ]) {
+      assert.throws(() => database.recordPrecloseForecast(attempt), pattern);
+    }
+    for (const table of [
+      "forecast_snapshots",
+      "round_forecasts",
+      "forecast_pair_snapshots",
+      "forecast_consensus_snapshots",
+    ]) {
+      assert.equal(
+        database.sqlite.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get().count,
+        0,
+        `${table} must remain empty after every rejected v2 forecast`,
+      );
+    }
   } finally {
     database.close();
   }
@@ -619,6 +931,108 @@ test("forecast pair snapshot fixes deterministic anchor, ranking, ties, and over
   }
 });
 
+test("start-price v2 keeps a ready pair diagnostic but freezes model-authoritative Top3", () => {
+  let clockMs = BASE_TIME + 40_000;
+  const database = createDatabase({
+    path: ":memory:",
+    clock: () => new Date(clockMs),
+  });
+  const numbers = [9, 12, 9, 16, 9, 32, 9, 12, 9, 16, 9, 32, 9, 12, 9];
+  const attempt = startPriceForecast("7015");
+
+  try {
+    database.ingestBatch(
+      numbers.map((number, index) =>
+        event(number, `start-v2-pair-ready-${index}`, index, {
+          externalRoundId: String(7000 + index),
+        }),
+      ),
+    );
+    markResultsCreatedAtObservation(database, "start-v2-pair-ready-");
+    clockMs = BASE_TIME + 52_000;
+    assert.equal(database.recordPrecloseForecast(attempt).inserted, true);
+
+    const latest = database.getPrecloseForecastState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    ).latest;
+    assert.equal(latest.pairHistory.status, "ready");
+    assert.equal(latest.pairHistory.sampleSize, 7);
+    assert.deepEqual(
+      latest.pairHistory.top3.map((item) => item.number),
+      [12, 32, 16],
+    );
+    assert.deepEqual(latest.pairHistory.comparison, {
+      modelTop3: attempt.rankedNumbers,
+      pairTop3: [12, 32, 16],
+      overlapNumbers: [],
+      overlapCount: 0,
+      sameTop1: false,
+      exactOrder: false,
+    });
+    assert.deepEqual(latest.consensus, {
+      status: "model_fallback",
+      top3: attempt.rankedNumbers,
+      algorithmVersion: "model-authoritative-v1",
+      pairSampleSize: 7,
+      derivedFromSnapshotAt: new Date(clockMs).toISOString(),
+      inputsUsed: ["model"],
+      reason: "authoritative_model",
+    });
+
+    const storedPair = database.sqlite
+      .prepare("SELECT * FROM forecast_pair_snapshots")
+      .get();
+    assert.equal(storedPair.status, "ready");
+    assert.equal(storedPair.pair_top3_json, JSON.stringify([
+      {
+        number: 12,
+        occurrenceCount: 3,
+        firstOccurredAt: new Date(BASE_TIME + 1_000).toISOString(),
+        lastOccurredAt: new Date(BASE_TIME + 13_000).toISOString(),
+      },
+      {
+        number: 32,
+        occurrenceCount: 2,
+        firstOccurredAt: new Date(BASE_TIME + 5_000).toISOString(),
+        lastOccurredAt: new Date(BASE_TIME + 11_000).toISOString(),
+      },
+      {
+        number: 16,
+        occurrenceCount: 2,
+        firstOccurredAt: new Date(BASE_TIME + 3_000).toISOString(),
+        lastOccurredAt: new Date(BASE_TIME + 9_000).toISOString(),
+      },
+    ]));
+    assert.deepEqual(
+      {
+        algorithmVersion: database.sqlite
+          .prepare("SELECT algorithm_version FROM forecast_consensus_snapshots")
+          .get().algorithm_version,
+        status: database.sqlite
+          .prepare("SELECT status FROM forecast_consensus_snapshots")
+          .get().status,
+        top3: JSON.parse(
+          database.sqlite
+            .prepare("SELECT top3_json FROM forecast_consensus_snapshots")
+            .get().top3_json,
+        ),
+        reason: database.sqlite
+          .prepare("SELECT reason FROM forecast_consensus_snapshots")
+          .get().reason,
+      },
+      {
+        algorithmVersion: "model-authoritative-v1",
+        status: "model_fallback",
+        top3: attempt.rankedNumbers,
+        reason: "authoritative_model",
+      },
+    );
+  } finally {
+    database.close();
+  }
+});
+
 test("forecast consensus remains immutable when its frozen source snapshot later diverges", () => {
   let clockMs = BASE_TIME + 40_000;
   const database = createDatabase({
@@ -876,7 +1290,7 @@ test("versions 11 and 12 do not backfill derived snapshots for version 10 foreca
       path,
       clock: () => new Date(BASE_TIME + 52_000),
     });
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 13);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 14);
     assert.equal(
       Number(
         database.sqlite
@@ -955,7 +1369,7 @@ test("version 12 does not backfill consensus for legacy version 11 forecasts", (
       path,
       clock: () => new Date(BASE_TIME + 52_000),
     });
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 13);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 14);
     assert.equal(
       database.sqlite
         .prepare("SELECT COUNT(*) AS count FROM forecast_consensus_snapshots")
@@ -976,6 +1390,65 @@ test("version 12 does not backfill consensus for legacy version 11 forecasts", (
         .get().count,
       0,
       "reading or replaying a legacy forecast must not create a consensus",
+    );
+  } finally {
+    database.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("version 14 migration preserves a legacy Borda consensus row exactly", () => {
+  const directory = mkdtempSync(join(tmpdir(), "roulette-consensus-v13-"));
+  const path = join(directory, "legacy-borda.sqlite");
+  const attempt = precloseForecast("legacy-borda-v13");
+  let database = createDatabase({
+    path,
+    clock: () => new Date(BASE_TIME + 52_000),
+  });
+
+  try {
+    assert.equal(database.recordPrecloseForecast(attempt).inserted, true);
+    replaceConsensusTableWithV13Schema(database);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 13);
+    const legacySchema = database.sqlite
+      .prepare(`
+        SELECT sql
+        FROM sqlite_master
+        WHERE type = 'table' AND name = 'forecast_consensus_snapshots'
+      `)
+      .get().sql;
+    assert.match(legacySchema, /algorithm_version = 'consensus-borda-v1'/);
+    assert.doesNotMatch(legacySchema, /model-authoritative-v1/);
+    const legacyRow = {
+      ...database.sqlite.prepare("SELECT * FROM forecast_consensus_snapshots").get(),
+    };
+    assert.equal(legacyRow.algorithm_version, "consensus-borda-v1");
+    const legacyBytes = JSON.stringify(legacyRow);
+
+    database.close();
+    database = createDatabase({
+      path,
+      clock: () => new Date(BASE_TIME + 52_000),
+    });
+
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 14);
+    const migratedRow = {
+      ...database.sqlite.prepare("SELECT * FROM forecast_consensus_snapshots").get(),
+    };
+    assert.equal(JSON.stringify(migratedRow), legacyBytes);
+    assert.deepEqual(migratedRow, legacyRow);
+    assert.deepEqual(
+      database.getPrecloseForecastState("buleto", "PRIMECOIN(XPM)/RUB")
+        .latest.consensus,
+      {
+        status: "model_fallback",
+        top3: attempt.rankedNumbers,
+        algorithmVersion: "consensus-borda-v1",
+        pairSampleSize: 0,
+        derivedFromSnapshotAt: new Date(BASE_TIME + 52_000).toISOString(),
+        inputsUsed: ["model"],
+        reason: "pair_not_ready",
+      },
     );
   } finally {
     database.close();
@@ -1279,7 +1752,7 @@ test("version 5 history is backfilled into continuity epochs before migration co
 
   const database = createDatabase({ path });
   try {
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 13);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 14);
     assert.deepEqual(
       database.sqlite
         .prepare("SELECT continuity_epoch FROM round_results ORDER BY settled_at, id")
@@ -1339,7 +1812,7 @@ test("version 9 reconciles a proven contiguous shutdown boundary without deletin
 
     database = createDatabase({ path, gapThresholdSeconds: 135 });
     const state = database.getDashboardState();
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 13);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 14);
     assert.equal(state.totals.results, 5, "raw results are never recreated or deleted");
     assert.equal(state.totals.cycles, 1);
     assert.equal(state.totals.invalidCycles, 0);
@@ -3381,7 +3854,7 @@ test("v7 paper history initializes v8 bankroll with all known net results exactl
       "buleto",
       "PRIMECOIN(XPM)/RUB",
     );
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 13);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 14);
     assert.equal(state.testBank.initialBalance, 87_700);
     assert.equal(state.testBank.currentBalance, 87_910);
     assert.equal(state.testBank.netResult, 210);

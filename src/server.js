@@ -595,6 +595,11 @@ collector.on('preclose-forecast', (forecast) => {
         windowSeconds: features.factorWindowMs / 1_000,
         slopePerSecond: features.trendPerSecond,
         secondsToEnd: features.projectionSeconds,
+        predictionBasis: forecast.prediction.basis,
+        shadow: {
+          modelVersion: features.shadow.modelVersion,
+          projectedPrice: features.shadow.projectedPrice,
+        },
       },
       modelVersion: forecast.modelVersion,
       predictedPrice: features.projectedPrice,

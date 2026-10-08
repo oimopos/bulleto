@@ -5,7 +5,11 @@ import {
   PRECLOSE_FORECAST_CONSTANTS,
   PRECLOSE_FORECAST_MAX_LEAD_MS,
   PRECLOSE_FORECAST_MIN_LEAD_MS,
+  PRECLOSE_FORECAST_MODEL_VERSION,
+  PRECLOSE_FORECAST_SHADOW_MODEL_VERSION,
+  PRECLOSE_START_PRICE_MODEL_VERSION,
   buildPrecloseForecast,
+  calculatePrecloseOlsSlope,
 } from "../src/preclose-forecast.js";
 
 function cells() {
@@ -35,9 +39,12 @@ const factors = [
   { dt: "2026-09-25T11:59:51Z", v: 20 },
 ];
 
-test("builds a whitelisted linear projection locked before bcd", () => {
+test("builds a versioned start-price forecast with the legacy OLS shadow", () => {
   const forecast = buildPrecloseForecast({ round: round(), factors, receivedAt });
 
+  assert.equal(forecast.modelVersion, "start-price-v2");
+  assert.equal(PRECLOSE_START_PRICE_MODEL_VERSION, "start-price-v2");
+  assert.equal(forecast.modelVersion, PRECLOSE_FORECAST_MODEL_VERSION);
   assert.equal(forecast.status, "predicted");
   assert.equal(forecast.horizonSeconds, 8);
   assert.equal(forecast.round.externalRoundId, "4090339");
@@ -47,15 +54,41 @@ test("builds a whitelisted linear projection locked before bcd", () => {
   assert.equal(forecast.features.startPrice, 20);
   assert.equal(forecast.features.currentNumber, 17);
   assert.ok(Math.abs(forecast.features.trendPerSecond - 0.1) < 1e-12);
-  assert.ok(Math.abs(forecast.features.projectedPrice - 24.9) < 1e-10);
-  assert.equal(forecast.prediction.number, 13);
+  assert.equal(forecast.features.projectedPrice, 20);
+  assert.deepEqual(Object.keys(forecast.features.shadow).sort(), [
+    "modelVersion",
+    "projectedPrice",
+  ]);
+  assert.equal(
+    forecast.features.shadow.modelVersion,
+    PRECLOSE_FORECAST_SHADOW_MODEL_VERSION,
+  );
+  assert.ok(Math.abs(forecast.features.shadow.projectedPrice - 24.9) < 1e-10);
+  assert.equal(forecast.prediction.basis, "start_price");
+  assert.equal(forecast.prediction.number, 17);
   assert.deepEqual(
     forecast.prediction.top3.map((item) => item.number),
-    [13, 12, 14],
+    [17, 18, 16],
   );
   assert.equal(new Set(forecast.prediction.top3.map((item) => item.number)).size, 3);
   assert.equal("probabilities" in forecast.prediction, false);
   assert.equal("confidence" in forecast.prediction, false);
+});
+
+test("calculates the frozen OLS slope without sorting or mutating samples", () => {
+  const samples = factors.map((factor) => ({ ...factor }));
+  const before = structuredClone(samples);
+
+  assert.ok(Math.abs(calculatePrecloseOlsSlope(samples) - 0.1) < 1e-12);
+  assert.deepEqual(samples, before);
+  assert.throws(
+    () => calculatePrecloseOlsSlope([samples[1], samples[0], samples[2]]),
+    /strictly increasing with distinct timestamps/,
+  );
+  assert.throws(
+    () => calculatePrecloseOlsSlope([samples[0], samples[0], samples[2]]),
+    /strictly increasing with distinct timestamps/,
+  );
 });
 
 test("rejects a final round even when rr is null", () => {
@@ -155,6 +188,10 @@ test("ignores factor points timestamped after receivedAt", () => {
     baseline.features.projectedPrice,
   );
   assert.equal(
+    withFuturePoint.features.shadow.projectedPrice,
+    baseline.features.shadow.projectedPrice,
+  );
+  assert.equal(
     withFuturePoint.features.factorPoints.some((point) => point.at.includes("11:59:52")),
     false,
   );
@@ -192,7 +229,7 @@ test("canonicalizes the lower wire band c=37 to zero and keeps top3 unique", () 
     { dt: "2026-09-25T11:59:51Z", v: 10 },
   ];
   const forecast = buildPrecloseForecast({
-    round: round(),
+    round: round({ sv: 0.5 }),
     factors: fallingFactors,
     receivedAt,
   });
@@ -213,7 +250,7 @@ test("uses the upper wire cell on an exact shared boundary", () => {
     { dt: "2026-09-25T11:59:51Z", v: 1 },
   ];
   const forecast = buildPrecloseForecast({
-    round: round(),
+    round: round({ sv: 1 }),
     factors: boundaryFactors,
     receivedAt,
   });
@@ -246,4 +283,9 @@ test("returns only whitelisted audit fields", () => {
   assert.equal(serialized.includes('"rr"'), false);
   assert.equal(PRECLOSE_FORECAST_CONSTANTS.factorWindowMs, 12_000);
   assert.equal(PRECLOSE_FORECAST_CONSTANTS.maxFactorAgeMs, 5_000);
+  assert.equal(PRECLOSE_FORECAST_CONSTANTS.modelVersion, "start-price-v2");
+  assert.equal(
+    PRECLOSE_FORECAST_CONSTANTS.shadowModelVersion,
+    "linear-trend-12s-to-ed-v1",
+  );
 });

@@ -3,7 +3,11 @@ import assert from "node:assert/strict";
 
 import {
   FORECAST_CONSENSUS_ALGORITHM_VERSION,
+  FORECAST_CONSENSUS_AUTHORITATIVE_MODEL_VERSION,
+  FORECAST_CONSENSUS_BORDA_ALGORITHM_VERSION,
+  FORECAST_CONSENSUS_MODEL_AUTHORITATIVE_ALGORITHM_VERSION,
   combineFrozenTop3,
+  resolveForecastConsensusAlgorithm,
 } from "../src/forecast-consensus.js";
 
 const SNAPSHOT_AT = "2026-09-29T12:34:56.000Z";
@@ -246,4 +250,201 @@ test("invalid optional provenance metadata is returned as null", () => {
 
   assert.equal(result.pairSampleSize, null);
   assert.equal(result.derivedFromSnapshotAt, null);
+});
+
+test("only the exact start-price-v2 model version selects model-authoritative finalization", () => {
+  assert.equal(
+    FORECAST_CONSENSUS_AUTHORITATIVE_MODEL_VERSION,
+    "start-price-v2",
+  );
+  assert.equal(
+    resolveForecastConsensusAlgorithm(
+      FORECAST_CONSENSUS_AUTHORITATIVE_MODEL_VERSION,
+    ),
+    FORECAST_CONSENSUS_MODEL_AUTHORITATIVE_ALGORITHM_VERSION,
+  );
+  assert.equal(
+    FORECAST_CONSENSUS_ALGORITHM_VERSION,
+    FORECAST_CONSENSUS_BORDA_ALGORITHM_VERSION,
+  );
+
+  for (const modelVersion of [
+    undefined,
+    null,
+    "",
+    "start-price-v1",
+    "start-price-v3",
+    "start-price-v2 ",
+    "Start-price-v2",
+    "start-price-v20",
+  ]) {
+    assert.equal(
+      resolveForecastConsensusAlgorithm(modelVersion),
+      FORECAST_CONSENSUS_BORDA_ALGORITHM_VERSION,
+      String(modelVersion),
+    );
+  }
+});
+
+test("start-price-v2 keeps its complete frozen model Top3 authoritative", () => {
+  const modelTop3 = [1, 2, 3];
+  const pairTop3 = [4, 5, 6];
+  const result = combineFrozenTop3({
+    modelVersion: FORECAST_CONSENSUS_AUTHORITATIVE_MODEL_VERSION,
+    modelTop3,
+    pairTop3,
+    pairStatus: "ready",
+    pairModelTop3: modelTop3,
+    pairSampleSize: 87,
+    derivedFromSnapshotAt: SNAPSHOT_AT,
+  });
+
+  assert.deepEqual(result, {
+    status: "model_fallback",
+    top3: [1, 2, 3],
+    algorithmVersion:
+      FORECAST_CONSENSUS_MODEL_AUTHORITATIVE_ALGORITHM_VERSION,
+    pairSampleSize: 87,
+    derivedFromSnapshotAt: SNAPSHOT_AT,
+    inputsUsed: ["model"],
+    reason: "authoritative_model",
+  });
+  assert.deepEqual(modelTop3, [1, 2, 3]);
+  assert.deepEqual(pairTop3, [4, 5, 6]);
+});
+
+test("start-price-v2 ignores pair readiness, overlap, and corruption when the model is complete", () => {
+  const cases = [
+    {
+      label: "matching ready pair",
+      pairTop3: [12, 16, 7],
+      pairStatus: "ready",
+      pairModelTop3: [12, 16, 7],
+    },
+    {
+      label: "ready pair would reorder Borda",
+      pairTop3: [7, 16, 12],
+      pairStatus: "ready",
+      pairModelTop3: [12, 16, 7],
+    },
+    {
+      label: "ready pair snapshot model mismatch",
+      pairTop3: [32, 4, 9],
+      pairStatus: "ready",
+      pairModelTop3: [1, 2, 3],
+    },
+    {
+      label: "invalid ready pair",
+      pairTop3: [32, 32, 9],
+      pairStatus: "ready",
+      pairModelTop3: [12, 16, 7],
+    },
+    {
+      label: "pair not ready",
+      pairTop3: [],
+      pairStatus: "no_samples",
+      pairModelTop3: [12, 16, 7],
+    },
+  ];
+
+  for (const testCase of cases) {
+    const result = combineFrozenTop3({
+      modelVersion: "start-price-v2",
+      modelTop3: [12, 16, 7],
+      pairTop3: testCase.pairTop3,
+      pairStatus: testCase.pairStatus,
+      pairModelTop3: testCase.pairModelTop3,
+      pairSampleSize: 40,
+      derivedFromSnapshotAt: SNAPSHOT_AT,
+    });
+
+    assert.equal(result.status, "model_fallback", testCase.label);
+    assert.deepEqual(result.top3, [12, 16, 7], testCase.label);
+    assert.equal(
+      result.algorithmVersion,
+      FORECAST_CONSENSUS_MODEL_AUTHORITATIVE_ALGORITHM_VERSION,
+      testCase.label,
+    );
+    assert.deepEqual(result.inputsUsed, ["model"], testCase.label);
+    assert.equal(result.reason, "authoritative_model", testCase.label);
+  }
+});
+
+test("start-price-v2 never falls back to a pair when its model ranking is unavailable", () => {
+  const cases = [
+    { modelTop3: null, reason: "incomplete_model_ranking" },
+    { modelTop3: [], reason: "incomplete_model_ranking" },
+    { modelTop3: [1, 2], reason: "incomplete_model_ranking" },
+    { modelTop3: [1, 1, 2], reason: "invalid_model_ranking" },
+    { modelTop3: [1, 2, 37], reason: "invalid_model_ranking" },
+  ];
+
+  for (const { modelTop3, reason } of cases) {
+    const result = combineFrozenTop3({
+      modelVersion: "start-price-v2",
+      modelTop3,
+      pairTop3: [4, 12, 16],
+      pairStatus: "ready",
+      pairModelTop3: [7, 11, 19],
+      pairSampleSize: 50,
+      derivedFromSnapshotAt: SNAPSHOT_AT,
+    });
+
+    assert.deepEqual(result, {
+      status: "unavailable",
+      top3: [],
+      algorithmVersion:
+        FORECAST_CONSENSUS_MODEL_AUTHORITATIVE_ALGORITHM_VERSION,
+      pairSampleSize: 50,
+      derivedFromSnapshotAt: SNAPSHOT_AT,
+      inputsUsed: [],
+      reason,
+    });
+  }
+});
+
+test("near-miss model versions retain historical Borda ordering", () => {
+  for (const modelVersion of [undefined, "start-price-v1", "start-price-v2 "]) {
+    const result = combineFrozenTop3({
+      modelVersion,
+      modelTop3: [1, 2, 3],
+      pairTop3: [4, 5, 6],
+      pairStatus: "ready",
+      pairModelTop3: [1, 2, 3],
+      pairSampleSize: 40,
+      derivedFromSnapshotAt: SNAPSHOT_AT,
+    });
+
+    assert.equal(result.status, "combined");
+    assert.deepEqual(result.top3, [1, 4, 2]);
+    assert.equal(
+      result.algorithmVersion,
+      FORECAST_CONSENSUS_BORDA_ALGORITHM_VERSION,
+    );
+    assert.deepEqual(result.inputsUsed, ["model", "pair"]);
+    assert.equal(result.reason, "frozen_model_and_pair");
+  }
+});
+
+test("start-price-v2 normalizes optional provenance without consulting pair data", () => {
+  const result = combineFrozenTop3({
+    modelVersion: "start-price-v2",
+    modelTop3: [0, 36, 18],
+    pairTop3: "not-a-ranking",
+    pairStatus: "ready",
+    pairModelTop3: null,
+    pairSampleSize: -1,
+    derivedFromSnapshotAt: "not-a-date",
+  });
+
+  assert.deepEqual(result, {
+    status: "model_fallback",
+    top3: [0, 36, 18],
+    algorithmVersion:
+      FORECAST_CONSENSUS_MODEL_AUTHORITATIVE_ALGORITHM_VERSION,
+    pairSampleSize: null,
+    derivedFromSnapshotAt: null,
+    inputsUsed: ["model"],
+    reason: "authoritative_model",
+  });
 });

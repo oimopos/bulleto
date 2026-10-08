@@ -1298,6 +1298,7 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
 
     if (hasConsensus) {
       const status = String(consensus.status || "");
+      const reason = String(consensus.reason || "");
       const numbers = normalizedForecastTop3(consensus.top3);
       const validStatus = ["combined", "model_fallback", "pair_fallback"].includes(status);
       if (validStatus && numbers.length === 3) {
@@ -1306,6 +1307,7 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
           status,
           pairSampleSize: asOptionalNonNegativeInteger(consensus.pairSampleSize),
           derivedFromSnapshotAt: consensus.derivedFromSnapshotAt || null,
+          reason,
           legacy: false,
         };
       }
@@ -1314,6 +1316,7 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
         status: "unavailable",
         pairSampleSize: asOptionalNonNegativeInteger(consensus.pairSampleSize),
         derivedFromSnapshotAt: consensus.derivedFromSnapshotAt || null,
+        reason,
         legacy: false,
       };
     }
@@ -1324,6 +1327,7 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
       status: legacyNumbers.length === 3 ? "model_fallback" : "unavailable",
       pairSampleSize: null,
       derivedFromSnapshotAt: null,
+      reason: "legacy_without_consensus",
       legacy: legacyNumbers.length === 3,
     };
   }
@@ -1338,12 +1342,12 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
       elements.precloseComparisonBadge.textContent = "Ждём прогноз";
       setTextIfChanged(
         elements.precloseComparisonStatus,
-        "Источники будут сопоставлены после фиксации прогноза.",
+        "Политика итогового списка будет показана после фиксации прогноза.",
       );
       return;
     }
 
-    const { status, pairSampleSize, derivedFromSnapshotAt, legacy } = finalForecast;
+    const { status, pairSampleSize, derivedFromSnapshotAt, reason, legacy } = finalForecast;
     if (status === "unavailable") {
       elements.precloseComparison.dataset.state = "unavailable";
       elements.precloseComparison.setAttribute("aria-busy", "false");
@@ -1365,7 +1369,7 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
         : ` История: ${pairSampleSize} ${pluralForm(pairSampleSize, "переход", "перехода", "переходов")}.`;
       setTextIfChanged(
         elements.precloseComparisonStatus,
-        `2 источника сопоставлены: ценовая модель и история переходов.${sampleText}`,
+        `2 источника сопоставлены: основная модель и история переходов.${sampleText}`,
       );
       if (pairSampleSize !== null && pairSampleSize < 30) {
         warnings.push(`Очень малая историческая выборка: ${pairSampleSize} ${pluralForm(pairSampleSize, "переход", "перехода", "переходов")}.`);
@@ -1379,15 +1383,24 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
         : ` Выборка: ${pairSampleSize} ${pluralForm(pairSampleSize, "переход", "перехода", "переходов")}.`;
       setTextIfChanged(
         elements.precloseComparisonStatus,
-        `Итог сформирован только по истории переходов: ценовая модель недоступна.${sampleText}`,
+        `Итог сформирован только по истории переходов: основная модель недоступна.${sampleText}`,
+      );
+    } else if (reason === "authoritative_model") {
+      elements.precloseComparisonBadge.textContent = "start-price-v2 primary";
+      const sampleText = pairSampleSize === null || pairSampleSize === 0
+        ? ""
+        : ` (${pairSampleSize} ${pluralForm(pairSampleSize, "переход", "перехода", "переходов")})`;
+      setTextIfChanged(
+        elements.precloseComparisonStatus,
+        `Основной top‑3 start-price-v2 зафиксирован без перестановки. Исторический снимок${sampleText} остаётся справочным, legacy OLS shadow — диагностическим; они не меняют итог.`,
       );
     } else {
       elements.precloseComparisonBadge.textContent = "1 источник";
       setTextIfChanged(
         elements.precloseComparisonStatus,
         legacy
-          ? "Показан ценовой top‑3 старого прогноза: сводный снимок для него ещё не сохранялся."
-          : "Итог сформирован только ценовой моделью: история переходов недоступна.",
+          ? "Показан основной top‑3 старого прогноза: сводный снимок для него ещё не сохранялся."
+          : "Итог сформирован только основной моделью: исторический снимок недоступен.",
       );
     }
     setComparisonWarning(warnings);
@@ -1448,7 +1461,7 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
     const card = createElement("li", "preclose-hit-card");
     const sequence = createElement("div", "preclose-hit-card__sequence");
     const ranking = createElement("ol", "preclose-hit-card__ranking");
-    ranking.setAttribute("aria-label", "Зафиксированный ценовой top-3");
+    ranking.setAttribute("aria-label", "Зафиксированный основной top-3");
     hit.rankedNumbers.forEach((number, index) => {
       ranking.appendChild(forecastHitPick(number, index + 1, hit.actualNumber));
     });
@@ -1526,7 +1539,7 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
         elements.precloseHitHistoryStatus,
         store.forecastHitsError
           ? "Повторим загрузку автоматически."
-          : "Загружаем сохранённые прогнозы ценовой модели с подтверждённым результатом; это наблюдение, не реальные ставки.",
+          : "Загружаем сохранённые прогнозы основной модели с подтверждённым результатом; это наблюдение, не реальные ставки.",
       );
       return;
     }
@@ -1545,13 +1558,13 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
         "empty-state",
         store.forecastHitsError
           ? "Не удалось обновить историю попаданий."
-          : "Подтверждённых попаданий ценового top-3 пока нет.",
+          : "Подтверждённых попаданий основного top-3 пока нет.",
       ));
       setTextIfChanged(
         elements.precloseHitHistoryStatus,
         store.forecastHitsError
           ? "Повторим загрузку автоматически."
-          : "Первое подтверждённое попадание ценовой модели появится здесь после проверки результата; это наблюдение, не реальные ставки.",
+          : "Первое подтверждённое попадание основной модели появится здесь после проверки результата; это наблюдение, не реальные ставки.",
       );
       return;
     }
@@ -1566,7 +1579,7 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
       elements.precloseHitHistoryCount.textContent = `${hits.length} · не обновлено`;
       setTextIfChanged(
         elements.precloseHitHistoryStatus,
-        `Показаны последние загруженные ${hits.length} ${hitLabel} ценовой модели; свежие данные временно недоступны. Это наблюдение, не реальные ставки.`,
+        `Показаны последние загруженные ${hits.length} ${hitLabel} основной модели; свежие данные временно недоступны. Это наблюдение, не реальные ставки.`,
       );
       return;
     }
@@ -1578,8 +1591,8 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
     setTextIfChanged(
       elements.precloseHitHistoryStatus,
       store.forecastHitsHasMore
-        ? `Показаны ${hits.length} последних ${hitLabel} ценовой модели; более ранние записи остаются в истории. Это наблюдение, не реальные ставки.`
-        : `Показаны все ${hits.length} ${hitLabel} ценовой модели на данный момент. Это наблюдение, не реальные ставки.`,
+        ? `Показаны ${hits.length} последних ${hitLabel} основной модели; более ранние записи остаются в истории. Это наблюдение, не реальные ставки.`
+        : `Показаны все ${hits.length} ${hitLabel} основной модели на данный момент. Это наблюдение, не реальные ставки.`,
     );
   }
 
@@ -1609,7 +1622,7 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
     elements.precloseSampleCount.textContent = settledCount < 100
       ? `${settledCount} из 100`
       : `${settledCount} проверено`;
-    elements.precloseSampleCount.title = `Ценовая модель: зафиксировано ${forecastCount}; ожидают результата ${pendingCount}`;
+    elements.precloseSampleCount.title = `Основная модель: зафиксировано ${forecastCount}; ожидают результата ${pendingCount}`;
     elements.precloseTop3Rate.textContent = settledCount >= 100 && Number.isFinite(top3Rate)
       ? `${top3Hits} из ${settledCount} · ${(top3Rate * 100).toFixed(1).replace(".", ",")}%`
       : `${top3Hits} из ${settledCount} · мало данных`;
@@ -1626,7 +1639,7 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
       if (closesMs === null || currentRoundId === null) {
         elements.preclosePanel.dataset.state = "waiting";
         elements.precloseBadge.textContent = "Ждём раунд";
-        elements.precloseStatus.textContent = "Собираем живую цену до блокировки ставок.";
+        elements.precloseStatus.textContent = "Собираем данные до блокировки ставок.";
         elements.precloseTiming.textContent = "Фиксация выполняется примерно за 8–10 секунд до bcd.";
         return;
       }
@@ -1640,7 +1653,7 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
       } else if (nowMs < closesMs) {
         elements.preclosePanel.dataset.state = "capturing";
         elements.precloseBadge.textContent = `Открыто · ${secondsUntilClose}с`;
-        elements.precloseStatus.textContent = "Фиксируем последний допустимый ценовой снимок…";
+        elements.precloseStatus.textContent = "Фиксируем последний допустимый снимок основной модели…";
         elements.precloseTiming.textContent = "Будут использованы только данные, полученные до bcd.";
       } else {
         elements.preclosePanel.dataset.state = "locked";
@@ -1653,7 +1666,7 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
 
     const rankedNumbers = finalForecast.numbers;
     const rankingLabel = finalForecast.legacy
-      ? "Ценовой список старого прогноза"
+      ? "Основной список старого прогноза"
       : "Итоговый список";
     const ranking = rankedNumbers.map((number, index) => {
       const item = createElement("li", "preclose-pick");
@@ -1691,14 +1704,21 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
     elements.precloseLivePrice.textContent = Number.isFinite(Number(latest.currentPrice))
       ? Number(latest.currentPrice).toFixed(5)
       : "—";
-    elements.precloseProjectedPrice.textContent = Number.isFinite(Number(latest.projectedPrice))
-      ? Number(latest.projectedPrice).toFixed(5)
+    const primaryPrice = latest.modelVersion === "start-price-v2"
+      ? Number(latest.startPrice)
+      : Number(latest.projectedPrice);
+    elements.precloseProjectedPrice.textContent = Number.isFinite(primaryPrice)
+      ? primaryPrice.toFixed(5)
       : "—";
     const availableLead = Number(latest.availableLeadSeconds);
     const availableLeadText = Number.isFinite(availableLead)
       ? `${availableLead.toFixed(1).replace(".", ",")} сек.`
       : "неизвестно";
-    elements.precloseTiming.textContent = `Цена получена ${formatDateTime(latest.lockedAt)}, запись сохранена ${formatDateTime(latest.persistedAt)} · за ${availableLeadText} до bcd.`;
+    const shadowPrice = Number(latest.features?.shadow?.projectedPrice);
+    const shadowText = latest.modelVersion === "start-price-v2" && Number.isFinite(shadowPrice)
+      ? ` Legacy OLS shadow: ${shadowPrice.toFixed(5)}; на итог не влияет.`
+      : "";
+    elements.precloseTiming.textContent = `Снимок получен ${formatDateTime(latest.lockedAt)}, запись сохранена ${formatDateTime(latest.persistedAt)} · за ${availableLeadText} до bcd.${shadowText}`;
 
     if (latest.settlement) {
       const actual = asRouletteNumber(latest.settlement.actualNumber);
@@ -1711,11 +1731,11 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
       const finalHit = actual !== null && rankedNumbers.includes(actual);
       elements.preclosePanel.dataset.state = finalHit ? "hit" : "miss";
       elements.precloseBadge.textContent = finalForecast.legacy
-        ? "Ценовой список · справочно"
+        ? "Старый список · справочно"
         : finalHit
           ? "Совпадение · справочно"
           : "Проверено · справочно";
-      const listLabel = finalForecast.legacy ? "ценового списка" : "итогового списка";
+      const listLabel = finalForecast.legacy ? "старого основного списка" : "итогового списка";
       const comparisonText = finalHit
         ? `Совпадение ${listLabel} (справочно).`
         : `Совпадения с ${listLabel} нет (справочно).`;

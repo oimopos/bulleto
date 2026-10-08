@@ -1,4 +1,22 @@
-export const FORECAST_CONSENSUS_ALGORITHM_VERSION = "consensus-borda-v1";
+import { PRECLOSE_START_PRICE_MODEL_VERSION } from "./preclose-forecast.js";
+
+export const FORECAST_CONSENSUS_BORDA_ALGORITHM_VERSION = "consensus-borda-v1";
+export const FORECAST_CONSENSUS_MODEL_AUTHORITATIVE_ALGORITHM_VERSION =
+  "model-authoritative-v1";
+export const FORECAST_CONSENSUS_AUTHORITATIVE_MODEL_VERSION =
+  PRECLOSE_START_PRICE_MODEL_VERSION;
+
+// Backward-compatible alias used by existing readers and callers. Historical
+// forecasts continue to mean Borda v1 unless their exact model version opts in
+// to the model-authoritative finalization policy below.
+export const FORECAST_CONSENSUS_ALGORITHM_VERSION =
+  FORECAST_CONSENSUS_BORDA_ALGORITHM_VERSION;
+
+export function resolveForecastConsensusAlgorithm(modelVersion) {
+  return modelVersion === FORECAST_CONSENSUS_AUTHORITATIVE_MODEL_VERSION
+    ? FORECAST_CONSENSUS_MODEL_AUTHORITATIVE_ALGORITHM_VERSION
+    : FORECAST_CONSENSUS_BORDA_ALGORITHM_VERSION;
+}
 
 function validateRanking(value) {
   if (value === null || value === undefined) {
@@ -42,9 +60,9 @@ function normalizeSnapshotTime(value) {
     : null;
 }
 
-function baseResult(pairSampleSize, derivedFromSnapshotAt) {
+function baseResult(pairSampleSize, derivedFromSnapshotAt, algorithmVersion) {
   return {
-    algorithmVersion: FORECAST_CONSENSUS_ALGORITHM_VERSION,
+    algorithmVersion,
     pairSampleSize: normalizeSampleSize(pairSampleSize),
     derivedFromSnapshotAt: normalizeSnapshotTime(derivedFromSnapshotAt),
   };
@@ -84,6 +102,7 @@ function rankCandidates(rankings) {
 }
 
 export function combineFrozenTop3({
+  modelVersion,
   modelTop3,
   pairTop3,
   pairStatus,
@@ -91,11 +110,40 @@ export function combineFrozenTop3({
   pairSampleSize = null,
   derivedFromSnapshotAt = null,
 } = {}) {
-  const metadata = baseResult(pairSampleSize, derivedFromSnapshotAt);
+  const algorithmVersion = resolveForecastConsensusAlgorithm(modelVersion);
+  const metadata = baseResult(
+    pairSampleSize,
+    derivedFromSnapshotAt,
+    algorithmVersion,
+  );
   const model = validateRanking(modelTop3);
   const pair = validateRanking(pairTop3);
   const snapshotModel = validateRanking(pairModelTop3);
   const completeModel = model.valid && model.numbers.length === 3;
+
+  if (
+    algorithmVersion ===
+    FORECAST_CONSENSUS_MODEL_AUTHORITATIVE_ALGORITHM_VERSION
+  ) {
+    if (completeModel) {
+      return {
+        status: "model_fallback",
+        top3: [...model.numbers],
+        ...metadata,
+        inputsUsed: ["model"],
+        reason: "authoritative_model",
+      };
+    }
+
+    return {
+      status: "unavailable",
+      top3: [],
+      ...metadata,
+      inputsUsed: [],
+      reason: model.valid ? "incomplete_model_ranking" : "invalid_model_ranking",
+    };
+  }
+
   const readyPair =
     pairStatus === "ready" && pair.valid && pair.numbers.length > 0;
   const matchingSnapshotModel =

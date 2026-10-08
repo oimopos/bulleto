@@ -27,6 +27,27 @@ test("every app DOM reference exists exactly once in the dashboard", () => {
   );
 });
 
+test("dashboard keeps the exact read-only fetch URL list", () => {
+  const fetchUrls = [...app.matchAll(/fetchJson\("([^"]+)"\)/g)].map(
+    (match) => match[1],
+  );
+
+  assert.deepEqual(fetchUrls, [
+    "/api/state",
+    "/api/results?limit=80",
+    "/api/cycles?limit=10",
+    "/api/sequences?limit=50",
+    "/api/pairs",
+    "/api/forecasts/hits?limit=20",
+    "/api/cycle-comparison",
+  ]);
+  assert.equal(
+    [...app.matchAll(/\bfetchJson\(/g)].length,
+    fetchUrls.length + 1,
+    "the helper definition plus the exact literal GET calls are the only fetchJson uses",
+  );
+});
+
 test("top-5 horizon block exposes all renderer targets and cumulative horizons", () => {
   for (const id of [
     "follower-horizon",

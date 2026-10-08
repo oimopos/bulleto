@@ -5,7 +5,11 @@ export const PRECLOSE_FORECAST_FACTOR_WINDOW_MS = 12_000;
 export const PRECLOSE_FORECAST_MAX_FACTOR_AGE_MS = 5_000;
 export const PRECLOSE_FORECAST_MIN_FACTOR_POINTS = 3;
 export const PRECLOSE_FORECAST_TOP_COUNT = 3;
-export const PRECLOSE_FORECAST_MODEL_VERSION = "linear-trend-12s-to-ed-v1";
+export const PRECLOSE_START_PRICE_MODEL_VERSION = "start-price-v2";
+export const PRECLOSE_FORECAST_MODEL_VERSION =
+  PRECLOSE_START_PRICE_MODEL_VERSION;
+export const PRECLOSE_FORECAST_SHADOW_MODEL_VERSION =
+  "linear-trend-12s-to-ed-v1";
 
 export const PRECLOSE_FORECAST_CONSTANTS = Object.freeze({
   horizonSeconds: PRECLOSE_FORECAST_HORIZON_SECONDS,
@@ -16,6 +20,7 @@ export const PRECLOSE_FORECAST_CONSTANTS = Object.freeze({
   minFactorPoints: PRECLOSE_FORECAST_MIN_FACTOR_POINTS,
   topCount: PRECLOSE_FORECAST_TOP_COUNT,
   modelVersion: PRECLOSE_FORECAST_MODEL_VERSION,
+  shadowModelVersion: PRECLOSE_FORECAST_SHADOW_MODEL_VERSION,
 });
 
 function isObject(value) {
@@ -121,19 +126,46 @@ function normalizeFactors(factors, receivedAtMs) {
     .sort((left, right) => left.milliseconds - right.milliseconds);
 }
 
-function linearTrendPerSecond(points) {
+export function calculatePrecloseOlsSlope(samples) {
+  if (!Array.isArray(samples) || samples.length < PRECLOSE_FORECAST_MIN_FACTOR_POINTS) {
+    throw new RangeError(
+      `at least ${PRECLOSE_FORECAST_MIN_FACTOR_POINTS} factor samples are required`,
+    );
+  }
+
+  let previousMilliseconds = null;
+  const points = samples.map((sample, index) => {
+    if (!isObject(sample)) {
+      throw new TypeError(`samples[${index}] must be an object`);
+    }
+    const at = timestamp(sample.dt, `samples[${index}].dt`);
+    const price = finiteNumber(sample.v, `samples[${index}].v`);
+    if (
+      previousMilliseconds !== null &&
+      at.milliseconds <= previousMilliseconds
+    ) {
+      throw new RangeError(
+        "factor samples must be strictly increasing with distinct timestamps",
+      );
+    }
+    previousMilliseconds = at.milliseconds;
+    return { milliseconds: at.milliseconds, price };
+  });
+
   const originMs = points.at(-1).milliseconds;
-  const samples = points.map((point) => ({
+  const regressionSamples = points.map((point) => ({
     seconds: (point.milliseconds - originMs) / 1_000,
     price: point.price,
   }));
   const meanSeconds =
-    samples.reduce((total, sample) => total + sample.seconds, 0) / samples.length;
+    regressionSamples.reduce((total, sample) => total + sample.seconds, 0) /
+    regressionSamples.length;
   const meanPrice =
-    samples.reduce((total, sample) => total + sample.price, 0) / samples.length;
+    regressionSamples.reduce((total, sample) => total + sample.price, 0) /
+    regressionSamples.length;
   let covariance = 0;
   let variance = 0;
-  for (const sample of samples) {
+  for (const sample of regressionSamples) {
     const timeDelta = sample.seconds - meanSeconds;
     covariance += timeDelta * (sample.price - meanPrice);
     variance += timeDelta * timeDelta;
@@ -193,6 +225,13 @@ function rankCanonicalBands(bands, projectedPrice) {
     }));
 }
 
+export function rankPrecloseForecastCells(cells, price) {
+  return rankCanonicalBands(
+    normalizeBands(cells),
+    finiteNumber(price, "price"),
+  );
+}
+
 /**
  * Builds an auditable pre-close forecast from an unfinished round and only
  * factor points that existed when the message was received. Expected absence
@@ -239,15 +278,18 @@ export function buildPrecloseForecast({ round, factors, receivedAt } = {}) {
     throw new RangeError("latest factor is more than 5 seconds old");
   }
 
-  const trendPerSecond = linearTrendPerSecond(selectedFactors);
+  const trendPerSecond = calculatePrecloseOlsSlope(
+    selectedFactors.map((factor) => ({ dt: factor.at, v: factor.price })),
+  );
   const projectionSeconds =
     (endsAt.milliseconds - latestFactor.milliseconds) / 1_000;
-  const projectedPrice =
+  const shadowProjectedPrice =
     latestFactor.price + trendPerSecond * projectionSeconds;
-  if (!Number.isFinite(projectedPrice)) {
-    throw new RangeError("projected price is not finite");
+  if (!Number.isFinite(shadowProjectedPrice)) {
+    throw new RangeError("shadow projected price is not finite");
   }
 
+  const projectedPrice = startPrice;
   const top3 = rankCanonicalBands(bands, projectedPrice);
   const currentBand = rankCanonicalBands(bands, latestFactor.price)[0];
   if (top3.length !== PRECLOSE_FORECAST_TOP_COUNT) {
@@ -282,9 +324,14 @@ export function buildPrecloseForecast({ round, factors, receivedAt } = {}) {
       trendPerSecond,
       projectionSeconds,
       projectedPrice,
+      shadow: {
+        modelVersion: PRECLOSE_FORECAST_SHADOW_MODEL_VERSION,
+        projectedPrice: shadowProjectedPrice,
+      },
       cellBands: bands,
     },
     prediction: {
+      basis: "start_price",
       number: top3[0].number,
       top3,
     },

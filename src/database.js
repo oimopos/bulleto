@@ -11,9 +11,17 @@ import {
   settleVirtualBet,
 } from "./virtual-bettor.js";
 import {
-  FORECAST_CONSENSUS_ALGORITHM_VERSION,
+  FORECAST_CONSENSUS_BORDA_ALGORITHM_VERSION,
+  FORECAST_CONSENSUS_MODEL_AUTHORITATIVE_ALGORITHM_VERSION,
   combineFrozenTop3,
 } from "./forecast-consensus.js";
+import {
+  PRECLOSE_FORECAST_FACTOR_WINDOW_MS,
+  PRECLOSE_FORECAST_SHADOW_MODEL_VERSION,
+  PRECLOSE_START_PRICE_MODEL_VERSION,
+  calculatePrecloseOlsSlope,
+  rankPrecloseForecastCells,
+} from "./preclose-forecast.js";
 import {
   CYCLE_ANALOGUE_ALGORITHM_VERSION,
   CYCLE_ANALOGUE_ANCHOR_DRAW_COUNT,
@@ -1593,29 +1601,51 @@ function mapForecastConsensus(row, modelTop3) {
   ) {
     return null;
   }
-  const allowedInputs = new Map([
-    ["combined", ["model", "pair"]],
-    ["model_fallback", ["model"]],
-    ["pair_fallback", ["pair"]],
-    ["unavailable", []],
-  ]);
-  const allowedReasons = new Map([
-    ["combined", new Set(["frozen_model_and_pair"])],
-    [
-      "model_fallback",
-      new Set([
-        "pair_not_ready",
-        "invalid_pair_ranking",
-        "empty_pair_ranking",
-        "pair_snapshot_model_mismatch",
-      ]),
-    ],
-    ["pair_fallback", new Set(["model_unavailable"])],
-    [
-      "unavailable",
-      new Set(["incomplete_model_ranking", "invalid_model_ranking"]),
-    ],
-  ]);
+  const algorithmVersion = row.consensus_algorithm_version;
+  let allowedInputs;
+  let allowedReasons;
+  if (algorithmVersion === FORECAST_CONSENSUS_BORDA_ALGORITHM_VERSION) {
+    allowedInputs = new Map([
+      ["combined", ["model", "pair"]],
+      ["model_fallback", ["model"]],
+      ["pair_fallback", ["pair"]],
+      ["unavailable", []],
+    ]);
+    allowedReasons = new Map([
+      ["combined", new Set(["frozen_model_and_pair"])],
+      [
+        "model_fallback",
+        new Set([
+          "pair_not_ready",
+          "invalid_pair_ranking",
+          "empty_pair_ranking",
+          "pair_snapshot_model_mismatch",
+        ]),
+      ],
+      ["pair_fallback", new Set(["model_unavailable"])],
+      [
+        "unavailable",
+        new Set(["incomplete_model_ranking", "invalid_model_ranking"]),
+      ],
+    ]);
+  } else if (
+    algorithmVersion ===
+    FORECAST_CONSENSUS_MODEL_AUTHORITATIVE_ALGORITHM_VERSION
+  ) {
+    allowedInputs = new Map([
+      ["model_fallback", ["model"]],
+      ["unavailable", []],
+    ]);
+    allowedReasons = new Map([
+      ["model_fallback", new Set(["authoritative_model"])],
+      [
+        "unavailable",
+        new Set(["incomplete_model_ranking", "invalid_model_ranking"]),
+      ],
+    ]);
+  } else {
+    return null;
+  }
   const status = row.consensus_status;
   const top3 = deserializeJson(row.consensus_top3_json);
   const inputsUsed = deserializeJson(row.consensus_inputs_used_json);
@@ -1633,7 +1663,6 @@ function mapForecastConsensus(row, modelTop3) {
     forecastId <= 0 ||
     forecastId !== Number(row.forecast_id) ||
     schemaVersion !== 1 ||
-    row.consensus_algorithm_version !== FORECAST_CONSENSUS_ALGORITHM_VERSION ||
     !expectedInputs ||
     !expectedReasons ||
     !expectedReasons.has(row.consensus_reason) ||
@@ -1667,7 +1696,7 @@ function mapForecastConsensus(row, modelTop3) {
   return {
     status,
     top3,
-    algorithmVersion: row.consensus_algorithm_version,
+    algorithmVersion,
     pairSampleSize,
     derivedFromSnapshotAt,
     inputsUsed,
@@ -2198,6 +2227,7 @@ export class RouletteDatabase {
     this.#migrateForecastPairSnapshotsV11();
     this.#migrateForecastConsensusSnapshotsV12();
     this.#migrateFollowerTop5TrackerV13();
+    this.#migrateForecastConsensusPolicyV14();
   }
 
   #migratePrecloseForecastsV10() {
@@ -2483,6 +2513,156 @@ export class RouletteDatabase {
       PRAGMA user_version = 13;
       COMMIT;
     `);
+  }
+
+  #migrateForecastConsensusPolicyV14() {
+    const table = this.sqlite
+      .prepare(`
+        SELECT sql
+        FROM sqlite_master
+        WHERE type = 'table' AND name = 'forecast_consensus_snapshots'
+      `)
+      .get();
+    const schemaSql = typeof table?.sql === "string" ? table.sql : "";
+    if (
+      schemaSql.includes(
+        `'${FORECAST_CONSENSUS_MODEL_AUTHORITATIVE_ALGORITHM_VERSION}'`,
+      )
+    ) {
+      this.sqlite.exec("PRAGMA user_version = 14");
+      return;
+    }
+
+    const priorCount = Number(
+      this.sqlite
+        .prepare("SELECT COUNT(*) AS count FROM forecast_consensus_snapshots")
+        .get().count,
+    );
+    this.sqlite.exec("BEGIN IMMEDIATE");
+    try {
+      this.sqlite.exec(`
+        DROP TABLE IF EXISTS forecast_consensus_snapshots_v14;
+        CREATE TABLE forecast_consensus_snapshots_v14 (
+          forecast_id INTEGER PRIMARY KEY REFERENCES round_forecasts(id),
+          schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+          algorithm_version TEXT NOT NULL CHECK (
+            algorithm_version IN (
+              'consensus-borda-v1',
+              'model-authoritative-v1'
+            )
+          ),
+          status TEXT NOT NULL CHECK (
+            status IN ('combined', 'model_fallback', 'pair_fallback', 'unavailable')
+          ),
+          top3_json TEXT NOT NULL CHECK (json_valid(top3_json)),
+          inputs_used_json TEXT NOT NULL CHECK (json_valid(inputs_used_json)),
+          pair_sample_size INTEGER CHECK (
+            pair_sample_size IS NULL OR pair_sample_size >= 0
+          ),
+          derived_from_snapshot_at TEXT NOT NULL,
+          reason TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          CHECK (json_type(top3_json) = 'array'),
+          CHECK (json_type(inputs_used_json) = 'array'),
+          CHECK (
+            (status = 'unavailable' AND json_array_length(top3_json) = 0)
+            OR
+            (status <> 'unavailable' AND json_array_length(top3_json) = 3)
+          ),
+          CHECK (
+            status = 'unavailable'
+            OR (
+              json_type(top3_json, '$[0]') = 'integer'
+              AND json_type(top3_json, '$[1]') = 'integer'
+              AND json_type(top3_json, '$[2]') = 'integer'
+              AND json_extract(top3_json, '$[0]') BETWEEN 0 AND 36
+              AND json_extract(top3_json, '$[1]') BETWEEN 0 AND 36
+              AND json_extract(top3_json, '$[2]') BETWEEN 0 AND 36
+              AND json_extract(top3_json, '$[0]') <> json_extract(top3_json, '$[1]')
+              AND json_extract(top3_json, '$[0]') <> json_extract(top3_json, '$[2]')
+              AND json_extract(top3_json, '$[1]') <> json_extract(top3_json, '$[2]')
+            )
+          ),
+          CHECK (
+            (status = 'combined' AND inputs_used_json = '["model","pair"]')
+            OR
+            (status = 'model_fallback' AND inputs_used_json = '["model"]')
+            OR
+            (status = 'pair_fallback' AND inputs_used_json = '["pair"]')
+            OR
+            (status = 'unavailable' AND inputs_used_json = '[]')
+          ),
+          CHECK (
+            (
+              algorithm_version = 'consensus-borda-v1'
+              AND (
+                (status = 'combined' AND reason = 'frozen_model_and_pair')
+                OR
+                (status = 'model_fallback' AND reason IN (
+                  'pair_not_ready',
+                  'invalid_pair_ranking',
+                  'empty_pair_ranking',
+                  'pair_snapshot_model_mismatch'
+                ))
+                OR
+                (status = 'pair_fallback' AND reason = 'model_unavailable')
+                OR
+                (status = 'unavailable' AND reason IN (
+                  'incomplete_model_ranking',
+                  'invalid_model_ranking'
+                ))
+              )
+            )
+            OR
+            (
+              algorithm_version = 'model-authoritative-v1'
+              AND (
+                (status = 'model_fallback' AND reason = 'authoritative_model')
+                OR
+                (status = 'unavailable' AND reason IN (
+                  'incomplete_model_ranking',
+                  'invalid_model_ranking'
+                ))
+              )
+            )
+          ),
+          CHECK (
+            status NOT IN ('combined', 'pair_fallback')
+            OR (pair_sample_size IS NOT NULL AND pair_sample_size > 0)
+          ),
+          CHECK (derived_from_snapshot_at <= created_at)
+        );
+      `);
+      const copy = this.sqlite.prepare(`
+        INSERT INTO forecast_consensus_snapshots_v14 (
+          forecast_id, schema_version, algorithm_version, status,
+          top3_json, inputs_used_json, pair_sample_size,
+          derived_from_snapshot_at, reason, created_at
+        )
+        SELECT
+          forecast_id, schema_version, algorithm_version, status,
+          top3_json, inputs_used_json, pair_sample_size,
+          derived_from_snapshot_at, reason, created_at
+        FROM forecast_consensus_snapshots
+      `).run();
+      if (Number(copy.changes) !== priorCount) {
+        throw new Error("forecast consensus v14 migration did not copy every row");
+      }
+      this.sqlite.exec(`
+        DROP TABLE forecast_consensus_snapshots;
+        ALTER TABLE forecast_consensus_snapshots_v14
+          RENAME TO forecast_consensus_snapshots;
+        PRAGMA user_version = 14;
+        COMMIT;
+      `);
+    } catch (error) {
+      try {
+        this.sqlite.exec("ROLLBACK");
+      } catch {
+        // Preserve the migration error.
+      }
+      throw error;
+    }
   }
 
   #migrateContinuityReconciliationV9() {
@@ -5824,18 +6004,154 @@ export class RouletteDatabase {
     ) {
       throw new TypeError("forecast feature summary is invalid");
     }
+    const predictionBasis = inputFeatures.predictionBasis === undefined
+      ? null
+      : asNonEmptyText(
+          inputFeatures.predictionBasis,
+          undefined,
+          "features.predictionBasis",
+        );
+    let shadow = null;
+    if (inputFeatures.shadow !== undefined) {
+      if (
+        !inputFeatures.shadow ||
+        typeof inputFeatures.shadow !== "object" ||
+        Array.isArray(inputFeatures.shadow)
+      ) {
+        throw new TypeError("features.shadow must be an object");
+      }
+      const shadowModelVersion = asNonEmptyText(
+        inputFeatures.shadow.modelVersion,
+        undefined,
+        "features.shadow.modelVersion",
+      );
+      const shadowProjectedPrice = asPrice(
+        inputFeatures.shadow.projectedPrice,
+      );
+      if (shadowProjectedPrice === null) {
+        throw new TypeError("features.shadow.projectedPrice must be finite");
+      }
+      shadow = {
+        modelVersion: shadowModelVersion,
+        projectedPrice: shadowProjectedPrice,
+      };
+    }
     const features = {
       samples,
       sampleCount: samples.length,
       windowSeconds,
       slopePerSecond,
       secondsToEnd,
+      ...(predictionBasis === null ? {} : { predictionBasis }),
+      ...(shadow === null ? {} : { shadow }),
     };
     const modelVersion = asNonEmptyText(
       attempt.modelVersion,
       undefined,
       "modelVersion",
     );
+    if (modelVersion === PRECLOSE_START_PRICE_MODEL_VERSION) {
+      if (predictedPrice !== startPrice) {
+        throw new RangeError("start-price forecast must predict its frozen start price");
+      }
+      if (predictionBasis !== "start_price") {
+        throw new TypeError("start-price forecast must declare start_price basis");
+      }
+      const expectedRanking = rankPrecloseForecastCells(cells, startPrice)
+        .map((item) => item.number);
+      const expectedCurrentNumber = rankPrecloseForecastCells(
+        cells,
+        currentPrice,
+      )[0]?.number;
+      if (
+        expectedRanking.length !== rankedNumbers.length ||
+        expectedRanking.some(
+          (number, index) => number !== rankedNumbers[index],
+        ) ||
+        predictedNumber !== expectedRanking[0]
+      ) {
+        throw new RangeError(
+          "start-price forecast ranking must match its frozen cells and start price",
+        );
+      }
+      if (currentNumber !== expectedCurrentNumber) {
+        throw new RangeError(
+          "start-price forecast current number must match its frozen cells and current price",
+        );
+      }
+      if (shadow?.modelVersion !== PRECLOSE_FORECAST_SHADOW_MODEL_VERSION) {
+        throw new TypeError("start-price forecast must include the frozen OLS shadow");
+      }
+      const expectedWindowSeconds = PRECLOSE_FORECAST_FACTOR_WINDOW_MS / 1_000;
+      if (windowSeconds !== expectedWindowSeconds) {
+        throw new RangeError(
+          `start-price forecast factor window must be ${expectedWindowSeconds} seconds`,
+        );
+      }
+      const windowStartsMs = lockedMs - PRECLOSE_FORECAST_FACTOR_WINDOW_MS;
+      let previousSampleMs = null;
+      for (const [index, sample] of samples.entries()) {
+        const sampleMs = Date.parse(sample.dt);
+        if (
+          previousSampleMs !== null &&
+          sampleMs <= previousSampleMs
+        ) {
+          throw new RangeError(
+            "start-price forecast samples must be strictly increasing with distinct timestamps",
+          );
+        }
+        if (sampleMs < windowStartsMs || sampleMs > factorMs) {
+          throw new RangeError(
+            `start-price forecast samples[${index}] must be inside the frozen factor window`,
+          );
+        }
+        previousSampleMs = sampleMs;
+      }
+      const latestSample = samples.at(-1);
+      if (
+        latestSample.dt !== factorAt ||
+        latestSample.v !== currentPrice
+      ) {
+        throw new RangeError(
+          "start-price forecast samples must end at the frozen current price",
+        );
+      }
+      const expectedSecondsToEnd = (roundEndsMs - factorMs) / 1_000;
+      const secondsTolerance = Math.max(
+        1e-9,
+        Math.abs(expectedSecondsToEnd) * Number.EPSILON * 16,
+      );
+      if (Math.abs(secondsToEnd - expectedSecondsToEnd) > secondsTolerance) {
+        throw new RangeError(
+          "start-price forecast secondsToEnd must match its frozen timestamps",
+        );
+      }
+      const expectedSlopePerSecond = calculatePrecloseOlsSlope(samples);
+      const slopeTolerance = Math.max(
+        1e-12,
+        Math.abs(expectedSlopePerSecond) * Number.EPSILON * 32,
+      );
+      if (
+        Math.abs(slopePerSecond - expectedSlopePerSecond) > slopeTolerance
+      ) {
+        throw new RangeError(
+          "start-price forecast slope must match its frozen OLS samples",
+        );
+      }
+      const expectedShadowPrice =
+        currentPrice + expectedSlopePerSecond * expectedSecondsToEnd;
+      const shadowTolerance = Math.max(
+        1e-12,
+        Math.abs(expectedShadowPrice) * Number.EPSILON * 16,
+      );
+      if (
+        Math.abs(shadow.projectedPrice - expectedShadowPrice) > shadowTolerance
+      ) {
+        throw new RangeError(
+          "start-price forecast OLS shadow does not match its frozen features",
+        );
+      }
+    }
 
     return this.#transaction(() => {
       const existing = this.sqlite
@@ -5869,6 +6185,7 @@ export class RouletteDatabase {
         );
       }
       const consensusSnapshot = combineFrozenTop3({
+        modelVersion,
         modelTop3: rankedNumbers,
         pairTop3: pairSnapshot.pairTop3.map((item) => item.number),
         pairStatus: pairSnapshot.status,

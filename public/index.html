@@ -200,8 +200,8 @@
 
         <div class="preclose-layout">
           <div class="preclose-signal">
-            <p class="preclose-status" id="preclose-status">Собираем цену до блокировки ставок.</p>
-            <p class="preclose-ranking-label">Итоговый top‑3 на следующий результат</p>
+            <p class="preclose-status" id="preclose-status">Собираем данные до блокировки ставок.</p>
+            <p class="preclose-ranking-label">Итоговый top‑3 основной модели</p>
             <ol class="preclose-ranking" id="preclose-ranking" aria-label="Итоговый top-3 на следующий результат" aria-busy="true">
               <li class="empty-state">Прогноз появится только до красной линии.</li>
             </ol>
@@ -209,10 +209,10 @@
           </div>
 
           <dl class="preclose-facts">
-            <div><dt>Живая цена</dt><dd id="preclose-live-price">—</dd></div>
-            <div><dt>Расчётная цена</dt><dd id="preclose-projected-price">—</dd></div>
-            <div><dt>Проверено ценовой моделью</dt><dd id="preclose-sample-count">0</dd></div>
-            <div><dt>Точность ценового top‑3</dt><dd id="preclose-top3-rate">—</dd></div>
+            <div><dt>Последний factor</dt><dd id="preclose-live-price">—</dd></div>
+            <div><dt>Цена основной модели</dt><dd id="preclose-projected-price">—</dd></div>
+            <div><dt>Проверено основной моделью</dt><dd id="preclose-sample-count">0</dd></div>
+            <div><dt>Точность основного top‑3</dt><dd id="preclose-top3-rate">—</dd></div>
           </dl>
         </div>
 
@@ -224,27 +224,27 @@
             </div>
             <span class="preclose-comparison__badge" id="preclose-comparison-badge">Ждём прогноз</span>
           </div>
-          <p class="preclose-comparison__status" id="preclose-comparison-status" role="status" aria-live="polite" aria-atomic="true">Источники будут сопоставлены после фиксации прогноза.</p>
+          <p class="preclose-comparison__status" id="preclose-comparison-status" role="status" aria-live="polite" aria-atomic="true">Политика итогового списка будет показана после фиксации прогноза.</p>
           <p class="preclose-comparison__warning" id="preclose-comparison-warning" hidden></p>
-          <p class="preclose-comparison__note" id="preclose-comparison-note">На экране показывается только одна итоговая тройка; исходные списки не дублируются.</p>
+          <p class="preclose-comparison__note" id="preclose-comparison-note">Для start-price-v2 основная модель авторитетна; история переходов и legacy OLS shadow остаются диагностикой.</p>
         </section>
 
         <details class="preclose-hit-history disclosure disclosure--inset" id="preclose-hit-history" data-state="loading" aria-labelledby="preclose-hit-history-title" aria-describedby="preclose-hit-history-status" aria-busy="true">
           <summary class="preclose-hit-history__header disclosure__summary">
             <span class="disclosure__copy">
               <span class="eyebrow">Сохранённые прогнозы · наблюдение</span>
-              <span class="disclosure__title disclosure__title--small" id="preclose-hit-history-title" role="heading" aria-level="3">История попаданий ценового top‑3</span>
+              <span class="disclosure__title disclosure__title--small" id="preclose-hit-history-title" role="heading" aria-level="3">История попаданий основного top‑3</span>
             </span>
             <span class="preclose-hit-history__badge" id="preclose-hit-history-count">Загрузка…</span>
             <span class="disclosure__chevron" aria-hidden="true"></span>
           </summary>
-          <ol class="preclose-hit-history__list" id="preclose-hit-history-list" tabindex="0" aria-label="Последние комбинации ценового top-3, в которые попало выпавшее число">
+          <ol class="preclose-hit-history__list" id="preclose-hit-history-list" tabindex="0" aria-label="Последние комбинации основного top-3, в которые попало выпавшее число">
             <li class="empty-state">Загружаем историю попаданий…</li>
           </ol>
-          <p class="preclose-hit-history__status" id="preclose-hit-history-status" role="status" aria-live="polite" aria-atomic="true">Загружаем сохранённые прогнозы ценовой модели с подтверждённым результатом; это наблюдение, не реальные ставки.</p>
+          <p class="preclose-hit-history__status" id="preclose-hit-history-status" role="status" aria-live="polite" aria-atomic="true">Загружаем сохранённые прогнозы основной модели с подтверждённым результатом; это наблюдение, не реальные ставки.</p>
         </details>
 
-        <p class="preclose-note" id="preclose-note">Итоговый top‑3 формируется из доступных снимков до <code>bcd</code> и после блокировки не меняется. Случайная база для top‑3 — 3 из 37 (≈8,1%). Показанные точность и история относятся только к ценовой модели; отдельная накопленная статистика итогового списка пока не рассчитана. Это эксперимент, не рекомендация для ставки и не обещание выигрыша.</p>
+        <p class="preclose-note" id="preclose-note">Основной top‑3 <code>start-price-v2</code> фиксируется по стартовой цене <code>sv</code> до <code>bcd</code> и после блокировки не меняется. История переходов сохраняется для сравнения, а legacy OLS shadow — только для диагностики; оба не переставляют основной список. Случайная база для top‑3 — 3 из 37 (≈8,1%). Показанные точность и история относятся к основной версии модели. Это эксперимент, не рекомендация для ставки и не обещание выигрыша.</p>
       </section>
 
       <details class="panel follower-panel disclosure disclosure--panel" id="follower-panel" data-state="loading" aria-labelledby="follower-title" aria-describedby="follower-description follower-note">
