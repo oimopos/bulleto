@@ -1497,30 +1497,16 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
   }
 
   function trajectoryNumberAreaLabel(point) {
-    if (point.wireCell === 0) return "0 (верхняя полоса)";
-    if (point.wireCell === 37) return "0 (нижняя полоса)";
+    if (point.wireCell === 0) return "0 (ВЕРХНЯЯ ПОЛОСА)";
+    if (point.wireCell === 37) return "0 (НИЖНЯЯ ПОЛОСА)";
     return String(point.number);
   }
 
   function trajectoryNumberAreaText(area) {
-    if (!area) {
-      return "Ориентировочный участок цифр к ed: для этого снимка ещё недоступен.";
-    }
-    const { cells } = area.corridor;
-    const corridor = cells.length <= 8
-      ? cells.map(trajectoryNumberAreaLabel).join(" → ")
-      : `от ${trajectoryNumberAreaLabel(area.corridor.top)} через … до ${trajectoryNumberAreaLabel(area.corridor.bottom)}, ${cells.length} полос по шкале`;
-    const clippedEdges = [
-      area.corridor.clippedTop ? "верхний край" : null,
-      area.corridor.clippedBottom ? "нижний край" : null
-    ].filter(Boolean);
-    const edgeText = clippedEdges.length > 0
-      ? ` Коридор ограничен шкалой: ${clippedEdges.join(" и ")}.`
-      : "";
-    const typicalText = area.typical.agreesWithDirection
-      ? `типичный исход q50 к ed ${trajectoryNumberAreaLabel(area.typical)}`
-      : `типичный исход q50 ${trajectoryNumberAreaLabel(area.typical)} расходится с лидирующей долей направлений`;
-    return `Ориентир цифр: у lock ${trajectoryNumberAreaLabel(area.current)}; ${typicalText}; исторический коридор похожих траекторий (взвешенные квантили q20–q80): ${corridor}.${edgeText}`;
+    if (!area) return "ПРОГНОЗ УЧАСТКА: НЕТ ДАННЫХ";
+    const from = trajectoryNumberAreaLabel(area.corridor.top);
+    const to = trajectoryNumberAreaLabel(area.corridor.bottom);
+    return `ПРОГНОЗ УЧАСТКА: ОТ ${from} ДО ${to}`;
   }
 
   function renderTrajectoryShadow(value) {
@@ -1539,7 +1525,7 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
       );
       setTextIfChanged(
         elements.trajectoryShadowNumberArea,
-        "Ориентировочный участок цифр к ed: —.",
+        "ПРОГНОЗ УЧАСТКА: НЕТ ДАННЫХ",
       );
       setTextIfChanged(
         elements.trajectoryShadowSample,
@@ -1560,7 +1546,7 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
       );
       setTextIfChanged(
         elements.trajectoryShadowNumberArea,
-        "Ориентировочный участок цифр к ed: текущий график неполный.",
+        "ПРОГНОЗ УЧАСТКА: ЖДЁМ ПОЛНЫЙ ГРАФИК",
       );
       setTextIfChanged(
         elements.trajectoryShadowSample,
@@ -1582,7 +1568,7 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
       );
       setTextIfChanged(
         elements.trajectoryShadowNumberArea,
-        "Ориентировочный участок цифр к ed появится после минимальной выборки.",
+        "ПРОГНОЗ УЧАСТКА: СОБИРАЕМ ИСТОРИЮ",
       );
       setTextIfChanged(
         elements.trajectoryShadowSample,
@@ -1603,7 +1589,7 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
       );
       setTextIfChanged(
         elements.trajectoryShadowNumberArea,
-        "Ориентировочный участок цифр к ed появится при достаточном числе похожих графиков.",
+        "ПРОГНОЗ УЧАСТКА: НЕДОСТАТОЧНО ПОХОЖИХ ГРАФИКОВ",
       );
       setTextIfChanged(
         elements.trajectoryShadowSample,

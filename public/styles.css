@@ -1048,6 +1048,16 @@ h2 {
   color: var(--muted-strong);
 }
 
+.trajectory-shadow__range {
+  margin-top: 14px;
+  color: var(--text);
+  font-size: clamp(18px, 4vw, 28px);
+  font-weight: 800;
+  letter-spacing: 0.025em;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+}
+
 .preclose-comparison__warning {
   padding: 8px 10px;
   border: 1px solid rgba(239, 173, 84, 0.24);

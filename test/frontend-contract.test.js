@@ -75,7 +75,7 @@ test("trajectory shadow is additive, prospective, and observation-only", () => {
   assert.match(block, /возраст точки не более 5 с/);
   assert.match(block, /а не следующий тик/);
   assert.match(block, /Доли похожих завершённых траекторий/);
-  assert.match(block, /Ориентировочный участок цифр/);
+  assert.match(block, /ПРОГНОЗ УЧАСТКА: НЕТ ДАННЫХ/);
   assert.match(block, /от 0 сверху к 36 снизу/);
   assert.match(block, /нижняя дублирующая нулевая полоса/);
   assert.match(
@@ -98,15 +98,17 @@ test("trajectory shadow is additive, prospective, and observation-only", () => {
   assert.match(app, /renderTrajectoryShadow\(matchesCurrent \? latest\?\.trajectoryShadow : null\)/);
   assert.match(app, /Полные сопоставимые раунды:/);
   assert.match(app, /Доли похожих завершённых траекторий:/);
-  assert.match(app, /у lock/);
-  assert.match(app, /типичный исход q50/);
-  assert.match(app, /взвешенные квантили q20–q80/);
+  assert.ok(app.includes("ПРОГНОЗ УЧАСТКА: ОТ ${from} ДО ${to}"));
+  assert.match(app, /ПРОГНОЗ УЧАСТКА: НЕДОСТАТОЧНО ПОХОЖИХ ГРАФИКОВ/);
   assert.match(
     app,
-    /if \(point\.wireCell === 37\) return "0 \(нижняя полоса\)"/,
+    /if \(point\.wireCell === 37\) return "0 \(НИЖНЯЯ ПОЛОСА\)"/,
   );
-  assert.match(app, /через … до/);
-  assert.doesNotMatch(app, /сейчас .*средний центр/);
+  assert.match(
+    app,
+    /if \(point\.wireCell === 0\) return "0 \(ВЕРХНЯЯ ПОЛОСА\)"/,
+  );
+  assert.match(styles, /\.trajectory-shadow__range\s*\{[\s\S]*?font-size: clamp\(18px, 4vw, 28px\)/);
   assert.doesNotMatch(app, /trajectoryShadowPanel\.(?:dataset|classList)/);
 });
 
@@ -160,8 +162,8 @@ test("warm next-round forecast exposes a strict 5-percent walk-forward contract"
   );
   assert.match(html, /id="follower-dynamic-next-title"[^>]*>[^<]*≥5%/);
   assert.match(html, /id="follower-dynamic-next-note"[^>]*>[\s\S]*?5%/);
-  assert.match(html, /styles\.css\?v=26/);
-  assert.match(html, /app\.js\?v=28/);
+  assert.match(html, /styles\.css\?v=27/);
+  assert.match(html, /app\.js\?v=29/);
   assert.match(styles, /\.follower-dynamic-next\s*\{/);
   assert.match(styles, /\.follower-warm-current\s*\{/);
   assert.match(styles, /\.follower-warm-picks\s*\{/);
@@ -381,8 +383,8 @@ test("cycle comparison language is descriptive, responsive, and cache-busted", (
   assert.match(block, /не прогноз/);
   assert.match(block, /не предсказывает следующее число/);
   assert.doesNotMatch(block, /должн/iu);
-  assert.match(html, /href="\/styles\.css\?v=26"/);
-  assert.match(html, /src="\/app\.js\?v=28"/);
+  assert.match(html, /href="\/styles\.css\?v=27"/);
+  assert.match(html, /src="\/app\.js\?v=29"/);
   assert.match(styles, /\.cycle-sequence-list\s*\{[\s\S]*?repeat\(auto-fill, minmax\(50px, 1fr\)\)/);
   assert.match(
     styles,
