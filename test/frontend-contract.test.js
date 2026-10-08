@@ -77,8 +77,8 @@ test("warm next-round forecast exposes a strict 5-percent walk-forward contract"
   );
   assert.match(html, /id="follower-dynamic-next-title"[^>]*>[^<]*≥5%/);
   assert.match(html, /id="follower-dynamic-next-note"[^>]*>[\s\S]*?5%/);
-  assert.match(html, /styles\.css\?v=25/);
-  assert.match(html, /app\.js\?v=25/);
+  assert.match(html, /styles\.css\?v=26/);
+  assert.match(html, /app\.js\?v=26/);
   assert.match(styles, /\.follower-dynamic-next\s*\{/);
   assert.match(styles, /\.follower-warm-current\s*\{/);
   assert.match(styles, /\.follower-warm-picks\s*\{/);
@@ -153,6 +153,62 @@ test("raw dynamic top-5 archival account uses one strict shared ticket ladder", 
   assert.match(
     styles,
     /@media \(max-width: 360px\)[\s\S]*?\.follower-warm-account__metrics\s*\{[\s\S]*?grid-template-columns: minmax\(0, 1fr\)/,
+  );
+});
+
+test("live fixed top-5 account gates one shared ticket ladder on cumulative 80 percent", () => {
+  for (const id of [
+    "follower-live-account",
+    "follower-live-account-status",
+    "follower-live-account-balance",
+    "follower-live-account-result-card",
+    "follower-live-account-result",
+    "follower-live-account-bets",
+    "follower-live-account-record",
+    "follower-live-account-stake",
+    "follower-live-account-ticket",
+    "follower-live-account-gate",
+    "follower-live-account-audit",
+  ]) {
+    assert.match(html, new RegExp(`\\bid="${id}"`));
+    assert.match(app, new RegExp(`getElementById\\("${id}"\\)`));
+  }
+  assert.match(html, /\bid="follower-live-account-note"/);
+
+  assert.match(app, /const FOLLOWER_LIVE_ACCOUNT_THRESHOLD = 0\.8/);
+  assert.match(app, /function normalizedFollowerLiveGateEvidence\(value\)/);
+  assert.match(app, /function normalizedFollowerLiveGatedAccount\(value, currentSession, trackerStatus\)/);
+  assert.match(app, /follower-top5-cumulative80-ladder-v1/);
+  assert.match(app, /persisted-session-retrospective/);
+  assert.match(app, /thresholdMetric !== "cumulative-hit-by-attempt"/);
+  assert.match(app, /evaluationTiming !== "pre-attempt-walk-forward"/);
+  assert.match(app, /startPolicy !== "latch-for-session"/);
+  assert.match(app, /noCrossingPolicy !== "observe-only"/);
+  assert.match(app, /initialBalance !== 10_000/);
+  assert.match(app, /trackedAttemptCount !== observedWithoutBetCount \+ eligibleBetCount/);
+  assert.match(app, /eligibleBetCount !== betCount \+ skippedAfterExhaustionCount/);
+  assert.match(app, /hitCount \+ missCount !== betCount/);
+  assert.match(app, /startEvidence\.rate < strategy\.threshold/);
+  assert.match(app, /function renderFollowerLiveGatedAccount\(account,/);
+  assert.match(app, /renderFollowerLiveGatedAccount\(tracker\.gatedAccount, \{ stale \}\)/);
+  assert.match(app, /liveGatePercentFormatter/);
+  assert.match(html, /Счёт с накопительным порогом 80%/);
+  assert.match(html, /Порог 80% — накопительная архивная доля/);
+  assert.match(html, /а не вероятность следующего раунда/);
+  assert.match(html, /Независимый шанс попадания пяти чисел[^<]*5 из 37/);
+  assert.match(html, /с 10 000 условных единиц/);
+  assert.match(html, /одна общая лестница/);
+  assert.match(html, /одинаково на все 5 зафиксированных чисел/);
+  assert.match(html, /чистый коэффициент восстановления равен 31/);
+  assert.match(styles, /\.follower-live-account\s*\{/);
+  assert.match(styles, /\.follower-live-account__metrics\s*\{/);
+  assert.match(
+    styles,
+    /@media \(max-width: 680px\)[\s\S]*?\.follower-live-account__metrics\s*\{\s*grid-template-columns: repeat\(2, minmax\(0, 1fr\)\)/,
+  );
+  assert.match(
+    styles,
+    /@media \(max-width: 360px\)[\s\S]*?\.follower-live-account__metrics\s*\{[\s\S]*?grid-template-columns: minmax\(0, 1fr\)/,
   );
 });
 
@@ -242,8 +298,8 @@ test("cycle comparison language is descriptive, responsive, and cache-busted", (
   assert.match(block, /не прогноз/);
   assert.match(block, /не предсказывает следующее число/);
   assert.doesNotMatch(block, /должн/iu);
-  assert.match(html, /href="\/styles\.css\?v=25"/);
-  assert.match(html, /src="\/app\.js\?v=25"/);
+  assert.match(html, /href="\/styles\.css\?v=26"/);
+  assert.match(html, /src="\/app\.js\?v=26"/);
   assert.match(styles, /\.cycle-sequence-list\s*\{[\s\S]*?repeat\(auto-fill, minmax\(50px, 1fr\)\)/);
   assert.match(
     styles,

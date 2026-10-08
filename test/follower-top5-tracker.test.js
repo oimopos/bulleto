@@ -14,6 +14,16 @@ const INSTRUMENT = "PRIMECOIN(XPM)/RUB";
 const BASE_TIME = Date.parse("2026-09-21T00:00:00.000Z");
 const TRAINING_NUMBERS = [9, 1, 9, 2, 9, 3, 9, 4, 9, 5, 9];
 const ROULETTE_NUMBERS_FOR_TEST = Array.from({ length: 37 }, (_, number) => number);
+const GATED_CALIBRATION_SEGMENTS = Object.freeze([
+  { sourceNumber: 0, followers: [1, 2, 3, 4, 5] },
+  { sourceNumber: 6, followers: [7, 8, 9, 10, 11] },
+  { sourceNumber: 12, followers: [13, 14, 15, 16, 17] },
+  { sourceNumber: 18, followers: [19, 20, 21, 22, 23] },
+  { sourceNumber: 24, followers: [25, 26, 27, 28, 29] },
+]);
+const GATED_CURRENT_SOURCE = 30;
+const GATED_CURRENT_FOLLOWERS = Object.freeze([31, 32, 33, 34, 35]);
+const GATED_FILLER = 36;
 
 function event(resultNumber, fingerprint, offsetSeconds = 0, extra = {}) {
   const settledAt = new Date(BASE_TIME + offsetSeconds * 1_000).toISOString();
@@ -69,6 +79,83 @@ function curveRows(segments) {
       };
     }),
   );
+}
+
+function createTrackerFixtureWriter(database, prefix) {
+  let offsetSeconds = 0;
+  let eventIndex = 0;
+  let gapIndex = 0;
+  return {
+    ingest(numbers) {
+      const events = numbers.map((number) => {
+        const item = event(
+          number,
+          `${prefix}-event-${eventIndex}`,
+          offsetSeconds,
+        );
+        eventIndex += 1;
+        offsetSeconds += 1;
+        return item;
+      });
+      database.ingestBatch(events);
+    },
+    gap(label = "boundary") {
+      const detectedAt = new Date(
+        BASE_TIME + offsetSeconds * 1_000,
+      ).toISOString();
+      database.ingestBatchAfterGap(
+        {
+          source: SOURCE,
+          instrument: INSTRUMENT,
+          incidentKey: `${prefix}-gap-${gapIndex}-${label}`,
+          detectedAt,
+          message: "known missing result in gated-account fixture",
+        },
+        [],
+      );
+      gapIndex += 1;
+      offsetSeconds += 1;
+    },
+  };
+}
+
+function completeTop5Window(followers, firstHitOffset = null) {
+  const numbers = Array.from({ length: 20 }, () => GATED_FILLER);
+  if (firstHitOffset !== null) {
+    numbers[firstHitOffset - 1] = followers.at(-1);
+  }
+  return numbers;
+}
+
+function ingestGatedCalibrationSegment(
+  writer,
+  segment,
+  firstHitOffset,
+  { gapAfter = true } = {},
+) {
+  writer.ingest(followerTransitionNumbers(
+    segment.sourceNumber,
+    segment.followers,
+  ));
+  writer.ingest(completeTop5Window(segment.followers, firstHitOffset));
+  if (gapAfter) writer.gap(`after-source-${segment.sourceNumber}`);
+}
+
+function ingestGatedCalibrationCohort(writer, firstHitOffsets) {
+  firstHitOffsets.forEach((firstHitOffset, index) => {
+    ingestGatedCalibrationSegment(
+      writer,
+      GATED_CALIBRATION_SEGMENTS[index],
+      firstHitOffset,
+    );
+  });
+}
+
+function armGatedCurrentSession(writer) {
+  writer.ingest(followerTransitionNumbers(
+    GATED_CURRENT_SOURCE,
+    GATED_CURRENT_FOLLOWERS,
+  ));
 }
 
 function compactWarmCandidates(candidates) {
@@ -141,6 +228,66 @@ function assertWarmAccountInvariants(account) {
   }
 }
 
+function assertGatedAccountInvariants(account) {
+  assert.equal(
+    account.observedWithoutBetCount + account.eligibleBetCount,
+    account.trackedAttemptCount,
+  );
+  assert.equal(
+    account.betCount + account.skippedAfterExhaustionCount,
+    account.eligibleBetCount,
+  );
+  assert.equal(account.hitCount + account.missCount, account.betCount);
+  assert.equal(
+    account.initialBalance - account.totalStaked + account.totalGrossPayout,
+    account.finalBalance,
+  );
+  assert.equal(account.finalBalance - account.initialBalance, account.netResult);
+  assert.equal(
+    account.nextRoundCost,
+    account.model.numbersPerRound * account.nextStakePerNumber,
+  );
+  assert.equal(
+    account.shortfall,
+    Math.max(0, account.nextRoundCost - account.finalBalance),
+  );
+  assert.equal(
+    account.canAffordNextRound,
+    account.status !== "exhausted"
+      && account.finalBalance >= account.nextRoundCost,
+  );
+  assert.equal(
+    account.maxRoundCost,
+    account.model.numbersPerRound * account.maxStakePerNumber,
+  );
+
+  if (account.latestOutcome) {
+    const outcome = account.latestOutcome;
+    assert.equal(outcome.selectionCount, account.model.numbersPerRound);
+    assert.equal(outcome.targetNumbers.length, account.model.numbersPerRound);
+    assert.equal(new Set(outcome.targetNumbers).size, account.model.numbersPerRound);
+    assert.equal(
+      outcome.totalStake,
+      account.model.numbersPerRound * outcome.stakePerNumber,
+    );
+    assert.equal(
+      outcome.grossPayout,
+      outcome.outcome === "hit"
+        ? account.model.grossPayoutMultiplier * outcome.stakePerNumber
+        : 0,
+    );
+    assert.ok(outcome.gateEvidence.eligibleCount > 0);
+    assert.equal(
+      outcome.gateEvidence.rate,
+      outcome.gateEvidence.hitCount / outcome.gateEvidence.eligibleCount,
+    );
+    assert.ok(
+      5 * outcome.gateEvidence.hitCount
+        >= 4 * outcome.gateEvidence.eligibleCount,
+    );
+  }
+}
+
 test("fixed top-5 tracker schema and empty state expose a stable simulation contract", () => {
   const database = createDatabase({ path: ":memory:" });
   try {
@@ -198,7 +345,9 @@ test("fixed top-5 tracker schema and empty state expose a stable simulation cont
     assert.equal(Number(liveIndex?.unique), 1);
     assert.equal(Number(liveIndex?.partial), 1);
 
-    assert.deepEqual(trackerState(database), {
+    const emptyState = trackerState(database);
+    const { gatedAccount, ...tracker } = emptyState;
+    assert.deepEqual(tracker, {
       schemaVersion: 1,
       algorithmVersion: "follower-top5-live-v1",
       mode: "simulation",
@@ -219,6 +368,96 @@ test("fixed top-5 tracker schema and empty state expose a stable simulation cont
         misses: 0,
       },
     });
+    assert.deepEqual(
+      {
+        schemaVersion: gatedAccount.schemaVersion,
+        algorithmVersion: gatedAccount.algorithmVersion,
+        mode: gatedAccount.mode,
+        executionEnabled: gatedAccount.executionEnabled,
+        strategy: gatedAccount.strategy,
+        model: gatedAccount.model,
+        status: gatedAccount.status,
+        initialBalance: gatedAccount.initialBalance,
+        finalBalance: gatedAccount.finalBalance,
+        nextStakePerNumber: gatedAccount.nextStakePerNumber,
+        nextRoundCost: gatedAccount.nextRoundCost,
+        trackedSessionCount: gatedAccount.trackedSessionCount,
+        trackedAttemptCount: gatedAccount.trackedAttemptCount,
+        qualifiedSessionCount: gatedAccount.qualifiedSessionCount,
+        observedWithoutBetCount: gatedAccount.observedWithoutBetCount,
+        eligibleBetCount: gatedAccount.eligibleBetCount,
+        betCount: gatedAccount.betCount,
+        hitCount: gatedAccount.hitCount,
+        missCount: gatedAccount.missCount,
+        ladder: gatedAccount.ladder,
+        latestOutcome: gatedAccount.latestOutcome,
+        currentAction: gatedAccount.currentAction,
+      },
+      {
+        schemaVersion: 1,
+        algorithmVersion: "follower-top5-cumulative80-ladder-v1",
+        mode: "persisted-session-retrospective",
+        executionEnabled: false,
+        strategy: {
+          selectionMode: "frozen-top5",
+          selectionCount: 5,
+          thresholdMetric: "cumulative-hit-by-attempt",
+          threshold: 0.8,
+          comparison: "gte",
+          cohort: "anchors-with-complete-20-round-window",
+          maximumCalibratedAttempt: 20,
+          evaluationTiming: "pre-attempt-walk-forward",
+          startPolicy: "latch-for-session",
+          noCrossingPolicy: "observe-only",
+          minimumEligibleCount: 1,
+        },
+        model: {
+          modelVersion: "2.0.0",
+          initialStakePerNumber: 10,
+          stakeStepPerNumber: 10,
+          maxStakePerNumber: 2_500,
+          numbersPerRound: 5,
+          grossPayoutMultiplier: 36,
+          netHitMultiplier: 31,
+          payoutIncludesStake: true,
+        },
+        status: "waiting",
+        initialBalance: 10_000,
+        finalBalance: 10_000,
+        nextStakePerNumber: 10,
+        nextRoundCost: 50,
+        trackedSessionCount: 0,
+        trackedAttemptCount: 0,
+        qualifiedSessionCount: 0,
+        observedWithoutBetCount: 0,
+        eligibleBetCount: 0,
+        betCount: 0,
+        hitCount: 0,
+        missCount: 0,
+        ladder: { missCount: 0, totalLoss: 0 },
+        latestOutcome: null,
+        currentAction: {
+          action: "wait",
+          reason: "waiting_training",
+          sessionId: null,
+          attemptNumber: null,
+          targetNumbers: [],
+          selectionCount: 0,
+          bettingStarted: false,
+          startAttempt: null,
+          startEvidence: null,
+          cumulativeRate: null,
+          hitCount: null,
+          eligibleCount: null,
+          historyMaxResultId: null,
+          historyThrough: null,
+          stakePerNumber: null,
+          totalStake: null,
+          anchorResultId: null,
+        },
+      },
+    );
+    assertGatedAccountInvariants(gatedAccount);
   } finally {
     database.close();
   }
@@ -1008,6 +1247,575 @@ test("warm historical account exhausts on total ticket cost and permanently skip
     anchorResultId: rows.at(-1).id,
   });
   assertWarmAccountInvariants(account);
+});
+
+test("frozen Top-5 gated account crosses exact 80 percent only on the next pre-attempt prefix", () => {
+  const database = createDatabase({ path: ":memory:" });
+  try {
+    const writer = createTrackerFixtureWriter(database, "gated-prefix");
+    ingestGatedCalibrationCohort(writer, [null, 1, 1, 1]);
+
+    const pending = GATED_CALIBRATION_SEGMENTS[4];
+    writer.ingest(followerTransitionNumbers(
+      pending.sourceNumber,
+      pending.followers,
+    ));
+    writer.ingest([
+      pending.followers.at(-1),
+      ...Array.from({ length: 7 }, () => GATED_FILLER),
+      ...followerTransitionNumbers(
+        GATED_CURRENT_SOURCE,
+        GATED_CURRENT_FOLLOWERS,
+      ),
+    ]);
+
+    let state = trackerState(database);
+    assert.equal(state.currentSession.sourceNumber, GATED_CURRENT_SOURCE);
+    assert.equal(state.currentSession.attemptCount, 0);
+    assert.deepEqual(state.currentSession.fixedNumbers, [35, 34, 33, 32, 31]);
+    assert.deepEqual(
+      {
+        action: state.gatedAccount.currentAction.action,
+        reason: state.gatedAccount.currentAction.reason,
+        attemptNumber: state.gatedAccount.currentAction.attemptNumber,
+        bettingStarted: state.gatedAccount.currentAction.bettingStarted,
+        cumulativeRate: state.gatedAccount.currentAction.cumulativeRate,
+        hitCount: state.gatedAccount.currentAction.hitCount,
+        eligibleCount: state.gatedAccount.currentAction.eligibleCount,
+      },
+      {
+        action: "observe",
+        reason: "below_threshold",
+        attemptNumber: 1,
+        bettingStarted: false,
+        cumulativeRate: 3 / 4,
+        hitCount: 3,
+        eligibleCount: 4,
+      },
+    );
+
+    writer.ingest([0]);
+    state = trackerState(database);
+    const attemptOne = state.currentSession.attempts[0];
+    const beforeAttemptTwo = state.gatedAccount;
+    assert.equal(attemptOne.attemptNumber, 1);
+    assert.equal(attemptOne.outcome, "miss");
+    assert.deepEqual(
+      {
+        action: beforeAttemptTwo.currentAction.action,
+        reason: beforeAttemptTwo.currentAction.reason,
+        attemptNumber: beforeAttemptTwo.currentAction.attemptNumber,
+        bettingStarted: beforeAttemptTwo.currentAction.bettingStarted,
+        startAttempt: beforeAttemptTwo.currentAction.startAttempt,
+        cumulativeRate: beforeAttemptTwo.currentAction.cumulativeRate,
+        hitCount: beforeAttemptTwo.currentAction.hitCount,
+        eligibleCount: beforeAttemptTwo.currentAction.eligibleCount,
+        historyMaxResultId: beforeAttemptTwo.currentAction.historyMaxResultId,
+        startEvidence: beforeAttemptTwo.currentAction.startEvidence,
+      },
+      {
+        action: "would_bet",
+        reason: "threshold_reached",
+        attemptNumber: 2,
+        bettingStarted: true,
+        startAttempt: 2,
+        cumulativeRate: 4 / 5,
+        hitCount: 4,
+        eligibleCount: 5,
+        historyMaxResultId: attemptOne.resultId,
+        startEvidence: {
+          horizon: 2,
+          hitCount: 4,
+          eligibleCount: 5,
+          rate: 4 / 5,
+          historyMaxResultId: attemptOne.resultId,
+          historyThrough: attemptOne.settledAt,
+        },
+      },
+    );
+    assert.equal(beforeAttemptTwo.betCount, 0);
+    assert.equal(beforeAttemptTwo.finalBalance, 10_000);
+
+    writer.ingest([6]);
+    const account = trackerState(database).gatedAccount;
+    assert.deepEqual(
+      {
+        status: account.status,
+        trackedSessionCount: account.trackedSessionCount,
+        trackedAttemptCount: account.trackedAttemptCount,
+        qualifiedSessionCount: account.qualifiedSessionCount,
+        observedWithoutBetCount: account.observedWithoutBetCount,
+        eligibleBetCount: account.eligibleBetCount,
+        betCount: account.betCount,
+        hitCount: account.hitCount,
+        missCount: account.missCount,
+        totalStaked: account.totalStaked,
+        finalBalance: account.finalBalance,
+        ladder: account.ladder,
+      },
+      {
+        status: "running",
+        trackedSessionCount: 6,
+        trackedAttemptCount: 26,
+        qualifiedSessionCount: 1,
+        observedWithoutBetCount: 25,
+        eligibleBetCount: 1,
+        betCount: 1,
+        hitCount: 0,
+        missCount: 1,
+        totalStaked: 50,
+        finalBalance: 9_950,
+        ladder: { missCount: 1, totalLoss: 50 },
+      },
+    );
+    assert.equal(account.latestOutcome.attemptNumber, 2);
+    assert.deepEqual(account.latestOutcome.targetNumbers, [35, 34, 33, 32, 31]);
+    assert.equal(account.latestOutcome.resultNumber, 6);
+    assert.equal(account.latestOutcome.outcome, "miss");
+    assert.deepEqual(account.latestOutcome.gateEvidence, {
+      horizon: 2,
+      hitCount: 4,
+      eligibleCount: 5,
+      rate: 4 / 5,
+      historyMaxResultId: attemptOne.resultId,
+      historyThrough: attemptOne.settledAt,
+    });
+    assertGatedAccountInvariants(account);
+  } finally {
+    database.close();
+  }
+});
+
+test("frozen Top-5 gate latches at attempt twenty, continues beyond the curve, and resets for the next session", () => {
+  const database = createDatabase({ path: ":memory:" });
+  try {
+    const writer = createTrackerFixtureWriter(database, "gated-latch");
+    ingestGatedCalibrationCohort(writer, [null, 20, 20, 20, 20]);
+    armGatedCurrentSession(writer);
+    writer.ingest(Array.from({ length: 21 }, () => GATED_FILLER));
+
+    let state = trackerState(database);
+    let account = state.gatedAccount;
+    const attemptNineteen = state.currentSession.attempts[18];
+    assert.deepEqual(
+      {
+        trackedSessionCount: account.trackedSessionCount,
+        trackedAttemptCount: account.trackedAttemptCount,
+        qualifiedSessionCount: account.qualifiedSessionCount,
+        observedWithoutBetCount: account.observedWithoutBetCount,
+        eligibleBetCount: account.eligibleBetCount,
+        betCount: account.betCount,
+        hitCount: account.hitCount,
+        missCount: account.missCount,
+        totalStaked: account.totalStaked,
+        finalBalance: account.finalBalance,
+        ladder: account.ladder,
+      },
+      {
+        trackedSessionCount: 6,
+        trackedAttemptCount: 121,
+        qualifiedSessionCount: 1,
+        observedWithoutBetCount: 119,
+        eligibleBetCount: 2,
+        betCount: 2,
+        hitCount: 0,
+        missCount: 2,
+        totalStaked: 100,
+        finalBalance: 9_900,
+        ladder: { missCount: 2, totalLoss: 100 },
+      },
+    );
+    assert.equal(account.latestOutcome.attemptNumber, 21);
+    assert.deepEqual(account.latestOutcome.gateEvidence, {
+      horizon: 20,
+      hitCount: 4,
+      eligibleCount: 5,
+      rate: 4 / 5,
+      historyMaxResultId: attemptNineteen.resultId,
+      historyThrough: attemptNineteen.settledAt,
+    });
+    assert.deepEqual(
+      {
+        action: account.currentAction.action,
+        reason: account.currentAction.reason,
+        attemptNumber: account.currentAction.attemptNumber,
+        bettingStarted: account.currentAction.bettingStarted,
+        startAttempt: account.currentAction.startAttempt,
+        startEvidence: account.currentAction.startEvidence,
+        cumulativeRate: account.currentAction.cumulativeRate,
+        hitCount: account.currentAction.hitCount,
+        eligibleCount: account.currentAction.eligibleCount,
+        stakePerNumber: account.currentAction.stakePerNumber,
+        totalStake: account.currentAction.totalStake,
+      },
+      {
+        action: "would_bet",
+        reason: "betting_started",
+        attemptNumber: 22,
+        bettingStarted: true,
+        startAttempt: 20,
+        startEvidence: account.latestOutcome.gateEvidence,
+        cumulativeRate: null,
+        hitCount: null,
+        eligibleCount: null,
+        stakePerNumber: 10,
+        totalStake: 50,
+      },
+    );
+
+    writer.ingest([GATED_CURRENT_FOLLOWERS.at(-1)]);
+    account = trackerState(database).gatedAccount;
+    assert.deepEqual(
+      {
+        trackedAttemptCount: account.trackedAttemptCount,
+        observedWithoutBetCount: account.observedWithoutBetCount,
+        eligibleBetCount: account.eligibleBetCount,
+        betCount: account.betCount,
+        hitCount: account.hitCount,
+        missCount: account.missCount,
+        totalStaked: account.totalStaked,
+        totalGrossPayout: account.totalGrossPayout,
+        finalBalance: account.finalBalance,
+        nextStakePerNumber: account.nextStakePerNumber,
+        ladder: account.ladder,
+      },
+      {
+        trackedAttemptCount: 122,
+        observedWithoutBetCount: 119,
+        eligibleBetCount: 3,
+        betCount: 3,
+        hitCount: 1,
+        missCount: 2,
+        totalStaked: 150,
+        totalGrossPayout: 360,
+        finalBalance: 10_210,
+        nextStakePerNumber: 10,
+        ladder: { missCount: 0, totalLoss: 0 },
+      },
+    );
+    assert.equal(account.latestOutcome.attemptNumber, 22);
+    assert.equal(account.latestOutcome.outcome, "hit");
+    assert.equal(account.latestOutcome.hitRank, 1);
+    assert.equal(account.latestOutcome.grossPayout, 360);
+
+    writer.ingest([GATED_CURRENT_SOURCE]);
+    state = trackerState(database);
+    assert.equal(state.currentSession.sourceNumber, GATED_CURRENT_SOURCE);
+    assert.equal(state.currentSession.attemptCount, 0);
+    assert.deepEqual(
+      {
+        action: state.gatedAccount.currentAction.action,
+        reason: state.gatedAccount.currentAction.reason,
+        attemptNumber: state.gatedAccount.currentAction.attemptNumber,
+        bettingStarted: state.gatedAccount.currentAction.bettingStarted,
+        startAttempt: state.gatedAccount.currentAction.startAttempt,
+      },
+      {
+        action: "observe",
+        reason: "below_threshold",
+        attemptNumber: 1,
+        bettingStarted: false,
+        startAttempt: null,
+      },
+    );
+    assert.ok(state.gatedAccount.currentAction.eligibleCount > 0);
+    assert.equal(
+      state.gatedAccount.currentAction.cumulativeRate,
+      state.gatedAccount.currentAction.hitCount
+        / state.gatedAccount.currentAction.eligibleCount,
+    );
+    assert.ok(state.gatedAccount.currentAction.cumulativeRate < 0.8);
+    assert.equal(state.gatedAccount.betCount, 3);
+    assert.equal(state.gatedAccount.finalBalance, 10_210);
+    assertGatedAccountInvariants(state.gatedAccount);
+  } finally {
+    database.close();
+  }
+});
+
+test("frozen Top-5 session stays observe-only after attempt twenty when its gate never crossed", () => {
+  const database = createDatabase({ path: ":memory:" });
+  try {
+    const writer = createTrackerFixtureWriter(database, "gated-no-crossing");
+    ingestGatedCalibrationCohort(writer, [null, 1, 1, 1]);
+    armGatedCurrentSession(writer);
+    writer.ingest(Array.from({ length: 21 }, () => GATED_FILLER));
+
+    const state = trackerState(database);
+    const account = state.gatedAccount;
+    assert.equal(state.currentSession.attemptCount, 21);
+    assert.deepEqual(
+      {
+        status: account.status,
+        trackedSessionCount: account.trackedSessionCount,
+        trackedAttemptCount: account.trackedAttemptCount,
+        qualifiedSessionCount: account.qualifiedSessionCount,
+        observedWithoutBetCount: account.observedWithoutBetCount,
+        eligibleBetCount: account.eligibleBetCount,
+        betCount: account.betCount,
+        totalStaked: account.totalStaked,
+        finalBalance: account.finalBalance,
+        latestOutcome: account.latestOutcome,
+        ladder: account.ladder,
+      },
+      {
+        status: "waiting",
+        trackedSessionCount: 5,
+        trackedAttemptCount: 44,
+        qualifiedSessionCount: 0,
+        observedWithoutBetCount: 44,
+        eligibleBetCount: 0,
+        betCount: 0,
+        totalStaked: 0,
+        finalBalance: 10_000,
+        latestOutcome: null,
+        ladder: { missCount: 0, totalLoss: 0 },
+      },
+    );
+    assert.deepEqual(
+      {
+        action: account.currentAction.action,
+        reason: account.currentAction.reason,
+        attemptNumber: account.currentAction.attemptNumber,
+        bettingStarted: account.currentAction.bettingStarted,
+        startAttempt: account.currentAction.startAttempt,
+        startEvidence: account.currentAction.startEvidence,
+        cumulativeRate: account.currentAction.cumulativeRate,
+        hitCount: account.currentAction.hitCount,
+        eligibleCount: account.currentAction.eligibleCount,
+        stakePerNumber: account.currentAction.stakePerNumber,
+        totalStake: account.currentAction.totalStake,
+      },
+      {
+        action: "observe",
+        reason: "threshold_not_reached",
+        attemptNumber: 22,
+        bettingStarted: false,
+        startAttempt: null,
+        startEvidence: null,
+        cumulativeRate: null,
+        hitCount: null,
+        eligibleCount: null,
+        stakePerNumber: null,
+        totalStake: null,
+      },
+    );
+    assertGatedAccountInvariants(account);
+  } finally {
+    database.close();
+  }
+});
+
+test("frozen Top-5 gated account resets the shared ladder at a gap but keeps its cash", () => {
+  const database = createDatabase({ path: ":memory:" });
+  try {
+    const writer = createTrackerFixtureWriter(database, "gated-gap");
+    ingestGatedCalibrationCohort(writer, [null, 1, 1, 1, 1]);
+    armGatedCurrentSession(writer);
+    writer.ingest(Array.from({ length: 7 }, () => GATED_FILLER));
+
+    const beforeGap = trackerState(database).gatedAccount;
+    assert.deepEqual(
+      {
+        trackedAttemptCount: beforeGap.trackedAttemptCount,
+        observedWithoutBetCount: beforeGap.observedWithoutBetCount,
+        eligibleBetCount: beforeGap.eligibleBetCount,
+        betCount: beforeGap.betCount,
+        missCount: beforeGap.missCount,
+        totalStaked: beforeGap.totalStaked,
+        finalBalance: beforeGap.finalBalance,
+        nextStakePerNumber: beforeGap.nextStakePerNumber,
+        nextRoundCost: beforeGap.nextRoundCost,
+        ladder: beforeGap.ladder,
+      },
+      {
+        trackedAttemptCount: 31,
+        observedWithoutBetCount: 24,
+        eligibleBetCount: 7,
+        betCount: 7,
+        missCount: 7,
+        totalStaked: 350,
+        finalBalance: 9_650,
+        nextStakePerNumber: 20,
+        nextRoundCost: 100,
+        ladder: { missCount: 7, totalLoss: 350 },
+      },
+    );
+
+    writer.gap("active-gated-session");
+    const afterGap = trackerState(database).gatedAccount;
+    assert.equal(afterGap.finalBalance, beforeGap.finalBalance);
+    assert.equal(afterGap.totalStaked, beforeGap.totalStaked);
+    assert.equal(afterGap.betCount, beforeGap.betCount);
+    assert.equal(afterGap.continuityGapCount, beforeGap.continuityGapCount + 1);
+    assert.equal(afterGap.dataComplete, false);
+    assert.equal(afterGap.nextStakePerNumber, 10);
+    assert.equal(afterGap.nextRoundCost, 50);
+    assert.deepEqual(afterGap.ladder, { missCount: 0, totalLoss: 0 });
+    assert.deepEqual(afterGap.currentAction, {
+      action: "wait",
+      reason: "gap",
+      sessionId: null,
+      attemptNumber: null,
+      targetNumbers: [],
+      selectionCount: 0,
+      bettingStarted: false,
+      startAttempt: null,
+      startEvidence: null,
+      cumulativeRate: null,
+      hitCount: null,
+      eligibleCount: null,
+      historyMaxResultId: null,
+      historyThrough: null,
+      stakePerNumber: null,
+      totalStake: null,
+      anchorResultId: null,
+    });
+
+    writer.ingest([GATED_CURRENT_SOURCE]);
+    writer.ingest([0]);
+    const account = trackerState(database).gatedAccount;
+    assert.deepEqual(
+      {
+        trackedSessionCount: account.trackedSessionCount,
+        trackedAttemptCount: account.trackedAttemptCount,
+        qualifiedSessionCount: account.qualifiedSessionCount,
+        observedWithoutBetCount: account.observedWithoutBetCount,
+        eligibleBetCount: account.eligibleBetCount,
+        betCount: account.betCount,
+        missCount: account.missCount,
+        totalStaked: account.totalStaked,
+        finalBalance: account.finalBalance,
+        nextStakePerNumber: account.nextStakePerNumber,
+        nextRoundCost: account.nextRoundCost,
+        ladder: account.ladder,
+      },
+      {
+        trackedSessionCount: 7,
+        trackedAttemptCount: 32,
+        qualifiedSessionCount: 2,
+        observedWithoutBetCount: 24,
+        eligibleBetCount: 8,
+        betCount: 8,
+        missCount: 8,
+        totalStaked: 400,
+        finalBalance: 9_600,
+        nextStakePerNumber: 10,
+        nextRoundCost: 50,
+        ladder: { missCount: 1, totalLoss: 50 },
+      },
+    );
+    assert.equal(account.latestOutcome.attemptNumber, 1);
+    assert.equal(account.latestOutcome.stakePerNumber, 10);
+    assert.deepEqual(account.latestOutcome.targetNumbers, [36, 35, 34, 33, 32]);
+    assert.equal(account.latestOutcome.resultNumber, 0);
+    assertGatedAccountInvariants(account);
+  } finally {
+    database.close();
+  }
+});
+
+test("frozen Top-5 gated account permanently stops after the full ticket becomes unaffordable", () => {
+  const database = createDatabase({ path: ":memory:" });
+  try {
+    const writer = createTrackerFixtureWriter(database, "gated-bankruptcy");
+    ingestGatedCalibrationCohort(writer, [null, 1, 1, 1, 1]);
+    armGatedCurrentSession(writer);
+    const armed = trackerState(database);
+    const anchor = armed.currentSession.anchor;
+    assert.deepEqual(armed.currentSession.fixedNumbers, [35, 34, 33, 32, 31]);
+
+    writer.ingest([
+      ...Array.from({ length: 27 }, () => GATED_FILLER),
+      GATED_CURRENT_FOLLOWERS.at(-1),
+    ]);
+    const state = trackerState(database);
+    const account = state.gatedAccount;
+
+    assert.equal(state.currentSession, null);
+    assert.equal(state.lastCompletedSession.attemptCount, 28);
+    assert.equal(state.lastCompletedSession.hitNumber, 35);
+    assert.deepEqual(
+      {
+        status: account.status,
+        initialBalance: account.initialBalance,
+        finalBalance: account.finalBalance,
+        netResult: account.netResult,
+        nextStakePerNumber: account.nextStakePerNumber,
+        nextRoundCost: account.nextRoundCost,
+        canAffordNextRound: account.canAffordNextRound,
+        shortfall: account.shortfall,
+        trackedSessionCount: account.trackedSessionCount,
+        trackedAttemptCount: account.trackedAttemptCount,
+        qualifiedSessionCount: account.qualifiedSessionCount,
+        observedWithoutBetCount: account.observedWithoutBetCount,
+        eligibleBetCount: account.eligibleBetCount,
+        betCount: account.betCount,
+        hitCount: account.hitCount,
+        missCount: account.missCount,
+        totalStaked: account.totalStaked,
+        totalGrossPayout: account.totalGrossPayout,
+        skippedAfterExhaustionCount: account.skippedAfterExhaustionCount,
+        peakBalance: account.peakBalance,
+        minimumBalance: account.minimumBalance,
+        maximumDrawdown: account.maximumDrawdown,
+        maxStakePerNumber: account.maxStakePerNumber,
+        maxRoundCost: account.maxRoundCost,
+        ladder: account.ladder,
+      },
+      {
+        status: "exhausted",
+        initialBalance: 10_000,
+        finalBalance: 1_000,
+        netResult: -9_000,
+        nextStakePerNumber: 300,
+        nextRoundCost: 1_500,
+        canAffordNextRound: false,
+        shortfall: 500,
+        trackedSessionCount: 6,
+        trackedAttemptCount: 52,
+        qualifiedSessionCount: 1,
+        observedWithoutBetCount: 24,
+        eligibleBetCount: 28,
+        betCount: 26,
+        hitCount: 0,
+        missCount: 26,
+        totalStaked: 9_000,
+        totalGrossPayout: 0,
+        skippedAfterExhaustionCount: 2,
+        peakBalance: 10_000,
+        minimumBalance: 1_000,
+        maximumDrawdown: 9_000,
+        maxStakePerNumber: 250,
+        maxRoundCost: 1_250,
+        ladder: { missCount: 26, totalLoss: 9_000 },
+      },
+    );
+    assert.equal(account.exhaustedAt, account.latestOutcome.occurredAt);
+    assert.equal(account.latestOutcome.attemptNumber, 26);
+    assert.equal(account.latestOutcome.resultNumber, GATED_FILLER);
+    assert.equal(account.latestOutcome.outcome, "miss");
+    assert.equal(account.latestOutcome.stakePerNumber, 250);
+    assert.equal(account.latestOutcome.totalStake, 1_250);
+    assert.equal(account.latestOutcome.balanceAfter, 1_000);
+    assert.deepEqual(account.latestOutcome.gateEvidence, {
+      horizon: 1,
+      hitCount: 4,
+      eligibleCount: 5,
+      rate: 4 / 5,
+      historyMaxResultId: anchor.resultId,
+      historyThrough: anchor.settledAt,
+    });
+    assert.ok(account.latestOutcome.resultId < state.lastAttempt.resultId);
+    assert.equal(
+      state.lastAttempt.resultNumber,
+      GATED_CURRENT_FOLLOWERS.at(-1),
+      "the later frozen-set hit closes tracking but cannot revive the bank",
+    );
+    assertGatedAccountInvariants(account);
+  } finally {
+    database.close();
+  }
 });
 
 test("a hit inside a catch-up batch closes once and re-arms only at the batch tail", () => {

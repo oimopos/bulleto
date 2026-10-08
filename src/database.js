@@ -39,6 +39,10 @@ const FOLLOWER_WARM_ACCOUNT_NET_HIT_MULTIPLIER =
 const FOLLOWER_WARM_ACCOUNT_ALGORITHM_VERSION =
   "follower-warm-top5-ladder-v2";
 const FOLLOWER_WARM_ACCOUNT_MODEL_VERSION = "2.0.0";
+const FOLLOWER_TOP5_GATE_THRESHOLD_PERCENT = 80;
+const FOLLOWER_TOP5_GATE_MAXIMUM_ATTEMPT = 20;
+const FOLLOWER_TOP5_GATE_ACCOUNT_ALGORITHM_VERSION =
+  "follower-top5-cumulative80-ladder-v1";
 
 function emptyFollowerHitBucket() {
   return {
@@ -95,7 +99,7 @@ function followerRankedCandidates(counts, lastOccurredAt) {
   }));
 }
 
-function calculateFollowerWarmAccountStake(priorSessionLoss) {
+function calculateSharedTop5Stake(priorSessionLoss) {
   const lossCoveredPerStep =
     FOLLOWER_WARM_ACCOUNT_NET_HIT_MULTIPLIER * VIRTUAL_BET_MODEL.stakeStep;
   const requiredSteps = Math.max(
@@ -115,7 +119,7 @@ function createFollowerWarmHistoricalAccount() {
   return {
     status: "waiting",
     currentBalance: FOLLOWER_WARM_ACCOUNT_STARTING_BALANCE,
-    nextStakePerNumber: calculateFollowerWarmAccountStake(0),
+    nextStakePerNumber: calculateSharedTop5Stake(0),
     eligibleAnchorCount: 0,
     betCount: 0,
     hitCount: 0,
@@ -143,7 +147,7 @@ function resetFollowerWarmLadderAtGap(account) {
   if (account.status === "exhausted") return;
   account.ladderMissCount = 0;
   account.ladderTotalLoss = 0;
-  account.nextStakePerNumber = calculateFollowerWarmAccountStake(0);
+  account.nextStakePerNumber = calculateSharedTop5Stake(0);
 }
 
 function settleFollowerWarmHistoricalAnchor(account, {
@@ -158,7 +162,7 @@ function settleFollowerWarmHistoricalAnchor(account, {
     return;
   }
 
-  const stakePerNumber = calculateFollowerWarmAccountStake(
+  const stakePerNumber = calculateSharedTop5Stake(
     account.ladderTotalLoss,
   );
   const totalStake = FOLLOWER_WARM_ACCOUNT_SELECTION_COUNT * stakePerNumber;
@@ -205,12 +209,12 @@ function settleFollowerWarmHistoricalAnchor(account, {
     account.hitCount += 1;
     account.ladderMissCount = 0;
     account.ladderTotalLoss = 0;
-    account.nextStakePerNumber = calculateFollowerWarmAccountStake(0);
+    account.nextStakePerNumber = calculateSharedTop5Stake(0);
   } else {
     account.missCount += 1;
     account.ladderMissCount += 1;
     account.ladderTotalLoss += totalStake;
-    account.nextStakePerNumber = calculateFollowerWarmAccountStake(
+    account.nextStakePerNumber = calculateSharedTop5Stake(
       account.ladderTotalLoss,
     );
     if (
@@ -620,6 +624,583 @@ export function buildFollowerTop5HitCurve(
         currentWarmSignal,
       ),
     },
+  };
+}
+
+function followerTop5GateQualifies(evidence) {
+  return evidence !== null
+    && evidence.eligibleCount >= 1
+    && evidence.hitCount * 100
+      >= evidence.eligibleCount * FOLLOWER_TOP5_GATE_THRESHOLD_PERCENT;
+}
+
+function storedFollowerTop5Numbers(session) {
+  const value = Array.isArray(session?.top_numbers_json)
+    ? session.top_numbers_json
+    : deserializeJson(session?.top_numbers_json);
+  if (
+    !Array.isArray(value)
+    || value.length !== FOLLOWER_TOP5_COUNT
+    || new Set(value.map(Number)).size !== FOLLOWER_TOP5_COUNT
+    || value.some((number) => !ROULETTE_NUMBERS.includes(Number(number)))
+  ) {
+    throw new Error("stored follower top-5 session is invalid");
+  }
+  return value.map(Number);
+}
+
+function followerTop5GateEvidenceByDecision(
+  rows,
+  decisions,
+) {
+  const decisionsByBoundary = new Map();
+  for (const decision of decisions) {
+    if (decision.attemptNumber > FOLLOWER_TOP5_GATE_MAXIMUM_ATTEMPT) continue;
+    const group = decisionsByBoundary.get(decision.boundaryResultId) ?? [];
+    group.push(decision);
+    decisionsByBoundary.set(decision.boundaryResultId, group);
+  }
+
+  const evidenceByKey = new Map();
+  const counts = ROULETTE_NUMBERS.map(() =>
+    ROULETTE_NUMBERS.map(() => 0),
+  );
+  const lastOccurredAt = ROULETTE_NUMBERS.map(() =>
+    ROULETTE_NUMBERS.map(() => null),
+  );
+  const observedFollowerCounts = ROULETTE_NUMBERS.map(() => 0);
+  const anchorSnapshots = Array(rows.length).fill(null);
+  const bucket = emptyFollowerHitBucket();
+
+  rows.forEach((row, index) => {
+    const number = Number(row.result_number);
+    const epoch = Number(row.continuity_epoch);
+    const previous = rows[index - 1];
+    if (previous && Number(previous.continuity_epoch) === epoch) {
+      const previousNumber = Number(previous.result_number);
+      if (counts[previousNumber][number] === 0) {
+        observedFollowerCounts[previousNumber] += 1;
+      }
+      counts[previousNumber][number] += 1;
+      lastOccurredAt[previousNumber][number] = row.settled_at;
+    }
+
+    if (observedFollowerCounts[number] >= FOLLOWER_TOP5_MINIMUM_OBSERVED) {
+      anchorSnapshots[index] = {
+        epoch,
+        topNumbers: rankFollowerNumbers(
+          counts[number],
+          lastOccurredAt[number],
+        ),
+      };
+    }
+
+    const matureIndex = index - FOLLOWER_TOP5_GATE_MAXIMUM_ATTEMPT;
+    const matureAnchor = matureIndex >= 0
+      ? anchorSnapshots[matureIndex]
+      : null;
+    if (matureAnchor) {
+      let complete = true;
+      let firstHitOffset = null;
+      const topNumbers = new Set(matureAnchor.topNumbers);
+      for (
+        let offset = 1;
+        offset <= FOLLOWER_TOP5_GATE_MAXIMUM_ATTEMPT;
+        offset += 1
+      ) {
+        const outcome = rows[matureIndex + offset];
+        if (Number(outcome.continuity_epoch) !== matureAnchor.epoch) {
+          complete = false;
+          break;
+        }
+        if (
+          firstHitOffset === null
+          && topNumbers.has(Number(outcome.result_number))
+        ) {
+          firstHitOffset = offset;
+        }
+      }
+      if (complete) {
+        bucket.eligibleCount += 1;
+        FOLLOWER_TOP5_ALL_HORIZONS.forEach((horizon, horizonIndex) => {
+          if (firstHitOffset !== null && firstHitOffset <= horizon) {
+            bucket.hitCounts[horizonIndex] += 1;
+          }
+        });
+      }
+    }
+
+    const boundaryDecisions = decisionsByBoundary.get(Number(row.id)) ?? [];
+    for (const decision of boundaryDecisions) {
+      const horizonIndex = decision.attemptNumber - 1;
+      const eligibleCount = bucket.eligibleCount;
+      const hitCount = bucket.hitCounts[horizonIndex];
+      evidenceByKey.set(decision.key, {
+        horizon: decision.attemptNumber,
+        hitCount,
+        eligibleCount,
+        rate: eligibleCount > 0 ? hitCount / eligibleCount : null,
+        historyMaxResultId: Number(row.id),
+        historyThrough: row.settled_at,
+      });
+    }
+  });
+
+  return evidenceByKey;
+}
+
+function emptyFollowerTop5GatedCurrentAction(status) {
+  return {
+    action: "wait",
+    reason: status === "gap" ? "gap" : "waiting_training",
+    sessionId: null,
+    attemptNumber: null,
+    targetNumbers: [],
+    selectionCount: 0,
+    bettingStarted: false,
+    startAttempt: null,
+    startEvidence: null,
+    cumulativeRate: null,
+    hitCount: null,
+    eligibleCount: null,
+    historyMaxResultId: null,
+    historyThrough: null,
+    stakePerNumber: null,
+    totalStake: null,
+    anchorResultId: null,
+  };
+}
+
+/**
+ * Replays only the persisted, batch-aware frozen Top-5 sessions. Every gate
+ * snapshot is taken at the result immediately before the evaluated attempt;
+ * outcomes that were not known at that boundary cannot enter its cohort.
+ */
+export function buildFollowerTop5GatedAccount(
+  rows,
+  sessionRows,
+  attemptRows,
+  {
+    currentContinuityEpoch = null,
+    trackerStatus = "waiting_training",
+  } = {},
+) {
+  const orderedRows = [...rows].sort(
+    (left, right) =>
+      left.settled_at.localeCompare(right.settled_at)
+      || Number(left.id) - Number(right.id),
+  );
+  const rowById = new Map(
+    orderedRows.map((row, index) => [Number(row.id), { row, index }]),
+  );
+  const attemptsBySession = new Map();
+  for (const attempt of attemptRows) {
+    const sessionId = Number(attempt.session_id);
+    const group = attemptsBySession.get(sessionId) ?? [];
+    group.push(attempt);
+    attemptsBySession.set(sessionId, group);
+  }
+  for (const attempts of attemptsBySession.values()) {
+    attempts.sort(
+      (left, right) =>
+        Number(left.attempt_number) - Number(right.attempt_number),
+    );
+  }
+
+  const sessions = [...sessionRows].sort((left, right) => {
+    const leftIndex = rowById.get(Number(left.anchor_result_id))?.index;
+    const rightIndex = rowById.get(Number(right.anchor_result_id))?.index;
+    return (leftIndex ?? Number.MAX_SAFE_INTEGER)
+      - (rightIndex ?? Number.MAX_SAFE_INTEGER)
+      || Number(left.id) - Number(right.id);
+  });
+  const decisions = [];
+  const decisionKey = (sessionId, attemptNumber) =>
+    `${sessionId}:${attemptNumber}`;
+  for (const session of sessions) {
+    const sessionId = Number(session.id);
+    const attempts = attemptsBySession.get(sessionId) ?? [];
+    attempts.forEach((attempt, index) => {
+      decisions.push({
+        key: decisionKey(sessionId, Number(attempt.attempt_number)),
+        boundaryResultId: index === 0
+          ? Number(session.anchor_result_id)
+          : Number(attempts[index - 1].round_result_id),
+        attemptNumber: Number(attempt.attempt_number),
+      });
+    });
+    if (session.status === "active") {
+      decisions.push({
+        key: `${sessionId}:current`,
+        boundaryResultId: attempts.length === 0
+          ? Number(session.anchor_result_id)
+          : Number(attempts.at(-1).round_result_id),
+        attemptNumber: attempts.length + 1,
+      });
+    }
+  }
+  const evidenceByKey = followerTop5GateEvidenceByDecision(
+    orderedRows,
+    decisions,
+  );
+
+  const account = {
+    status: "waiting",
+    currentBalance: FOLLOWER_WARM_ACCOUNT_STARTING_BALANCE,
+    nextStakePerNumber: calculateSharedTop5Stake(0),
+    trackedAttemptCount: 0,
+    qualifiedSessionCount: 0,
+    observedWithoutBetCount: 0,
+    eligibleBetCount: 0,
+    betCount: 0,
+    hitCount: 0,
+    missCount: 0,
+    totalStaked: 0,
+    totalGrossPayout: 0,
+    skippedAfterExhaustionCount: 0,
+    peakBalance: FOLLOWER_WARM_ACCOUNT_STARTING_BALANCE,
+    minimumBalance: FOLLOWER_WARM_ACCOUNT_STARTING_BALANCE,
+    maximumDrawdown: 0,
+    maxStakePerNumber: 0,
+    maxRoundCost: 0,
+    firstBetAt: null,
+    lastBetAt: null,
+    exhaustedAt: null,
+    ladderMissCount: 0,
+    ladderTotalLoss: 0,
+    latestOutcome: null,
+  };
+  const resetLadder = () => {
+    if (account.status === "exhausted") return;
+    account.ladderMissCount = 0;
+    account.ladderTotalLoss = 0;
+    account.nextStakePerNumber = calculateSharedTop5Stake(0);
+  };
+  const sessionStates = new Map();
+  let previousSessionEpoch = null;
+
+  for (const session of sessions) {
+    const sessionId = Number(session.id);
+    const sessionEpoch = Number(session.continuity_epoch);
+    if (
+      previousSessionEpoch !== null
+      && sessionEpoch !== previousSessionEpoch
+    ) {
+      resetLadder();
+    }
+    previousSessionEpoch = sessionEpoch;
+
+    const targetNumbers = storedFollowerTop5Numbers(session);
+    const attempts = attemptsBySession.get(sessionId) ?? [];
+    let bettingStarted = false;
+    let startAttempt = null;
+    let startEvidence = null;
+
+    attempts.forEach((attempt, index) => {
+      const attemptNumber = Number(attempt.attempt_number);
+      const evidence = evidenceByKey.get(
+        decisionKey(sessionId, attemptNumber),
+      ) ?? null;
+      account.trackedAttemptCount += 1;
+
+      if (!bettingStarted && followerTop5GateQualifies(evidence)) {
+        bettingStarted = true;
+        startAttempt = attemptNumber;
+        startEvidence = evidence;
+        account.qualifiedSessionCount += 1;
+      }
+      if (!bettingStarted) {
+        account.observedWithoutBetCount += 1;
+        return;
+      }
+
+      account.eligibleBetCount += 1;
+      if (account.status === "exhausted") {
+        account.skippedAfterExhaustionCount += 1;
+        return;
+      }
+
+      const boundaryResultId = index === 0
+        ? Number(session.anchor_result_id)
+        : Number(attempts[index - 1].round_result_id);
+      const boundary = rowById.get(boundaryResultId)?.row ?? null;
+      const stakePerNumber = calculateSharedTop5Stake(
+        account.ladderTotalLoss,
+      );
+      const totalStake = FOLLOWER_TOP5_COUNT * stakePerNumber;
+      account.nextStakePerNumber = stakePerNumber;
+      if (totalStake > account.currentBalance) {
+        account.status = "exhausted";
+        account.exhaustedAt = boundary?.settled_at ?? attempt.occurred_at;
+        account.skippedAfterExhaustionCount += 1;
+        return;
+      }
+
+      const resultNumber = Number(attempt.result_number);
+      const hitIndex = targetNumbers.indexOf(resultNumber);
+      const outcome = hitIndex >= 0 ? "hit" : "miss";
+      const grossPayout = outcome === "hit"
+        ? stakePerNumber * VIRTUAL_BET_MODEL.grossPayoutMultiplier
+        : 0;
+      const balanceAfter =
+        account.currentBalance - totalStake + grossPayout;
+      if (!Number.isSafeInteger(balanceAfter) || balanceAfter < 0) {
+        throw new RangeError("gated follower account balance is invalid");
+      }
+
+      account.status = "running";
+      account.currentBalance = balanceAfter;
+      account.betCount += 1;
+      account.totalStaked += totalStake;
+      account.totalGrossPayout += grossPayout;
+      account.maxStakePerNumber = Math.max(
+        account.maxStakePerNumber,
+        stakePerNumber,
+      );
+      account.maxRoundCost = Math.max(account.maxRoundCost, totalStake);
+      account.firstBetAt ??= attempt.occurred_at;
+      account.lastBetAt = attempt.occurred_at;
+      account.peakBalance = Math.max(account.peakBalance, balanceAfter);
+      account.minimumBalance = Math.min(
+        account.minimumBalance,
+        balanceAfter,
+      );
+      account.maximumDrawdown = Math.max(
+        account.maximumDrawdown,
+        account.peakBalance - balanceAfter,
+      );
+
+      if (outcome === "hit") {
+        account.hitCount += 1;
+        account.ladderMissCount = 0;
+        account.ladderTotalLoss = 0;
+        account.nextStakePerNumber = calculateSharedTop5Stake(0);
+      } else {
+        account.missCount += 1;
+        account.ladderMissCount += 1;
+        account.ladderTotalLoss += totalStake;
+        account.nextStakePerNumber = calculateSharedTop5Stake(
+          account.ladderTotalLoss,
+        );
+        if (
+          FOLLOWER_TOP5_COUNT * account.nextStakePerNumber
+          > balanceAfter
+        ) {
+          account.status = "exhausted";
+          account.exhaustedAt = attempt.occurred_at;
+        }
+      }
+
+      account.latestOutcome = {
+        sessionId,
+        attemptNumber,
+        resultId: Number(attempt.round_result_id),
+        targetNumbers: [...targetNumbers],
+        selectionCount: targetNumbers.length,
+        resultNumber,
+        hitRank: hitIndex >= 0 ? hitIndex + 1 : null,
+        stakePerNumber,
+        totalStake,
+        outcome,
+        grossPayout,
+        balanceAfter,
+        nextStakePerNumber: account.nextStakePerNumber,
+        nextRoundCost: FOLLOWER_TOP5_COUNT * account.nextStakePerNumber,
+        gateEvidence: { ...startEvidence },
+        occurredAt: attempt.occurred_at,
+      };
+    });
+
+    sessionStates.set(sessionId, {
+      bettingStarted,
+      startAttempt,
+      startEvidence,
+    });
+    if (session.status === "invalid_gap") resetLadder();
+  }
+
+  const firstSession = sessions[0] ?? null;
+  const lastSession = sessions.at(-1) ?? null;
+  const firstAnchor = firstSession
+    ? rowById.get(Number(firstSession.anchor_result_id)) ?? null
+    : null;
+  let continuityGapCount = 0;
+  if (firstAnchor) {
+    let previousEpoch = Number(firstAnchor.row.continuity_epoch);
+    for (let index = firstAnchor.index + 1; index < orderedRows.length; index += 1) {
+      const epoch = Number(orderedRows[index].continuity_epoch);
+      if (epoch !== previousEpoch) continuityGapCount += 1;
+      previousEpoch = epoch;
+    }
+    if (
+      currentContinuityEpoch !== null
+      && orderedRows.length > 0
+      && Number(orderedRows.at(-1).continuity_epoch)
+        !== Number(currentContinuityEpoch)
+    ) {
+      continuityGapCount += 1;
+      resetLadder();
+    }
+  }
+
+  const activeSession = sessions.find((session) => session.status === "active")
+    ?? null;
+  let currentAction = emptyFollowerTop5GatedCurrentAction(trackerStatus);
+  if (activeSession) {
+    const sessionId = Number(activeSession.id);
+    const attempts = attemptsBySession.get(sessionId) ?? [];
+    const attemptNumber = attempts.length + 1;
+    const boundaryResultId = attempts.length === 0
+      ? Number(activeSession.anchor_result_id)
+      : Number(attempts.at(-1).round_result_id);
+    const boundary = rowById.get(boundaryResultId)?.row ?? null;
+    const evidence = evidenceByKey.get(`${sessionId}:current`) ?? null;
+    const storedState = sessionStates.get(sessionId) ?? {
+      bettingStarted: false,
+      startAttempt: null,
+      startEvidence: null,
+    };
+    const crossesNow =
+      !storedState.bettingStarted && followerTop5GateQualifies(evidence);
+    const bettingStarted = storedState.bettingStarted || crossesNow;
+    const startAttempt = crossesNow
+      ? attemptNumber
+      : storedState.startAttempt;
+    const startEvidence = crossesNow
+      ? evidence
+      : storedState.startEvidence;
+    const targetNumbers = storedFollowerTop5Numbers(activeSession);
+    const stakePerNumber = bettingStarted
+      ? account.nextStakePerNumber
+      : null;
+    const totalStake = bettingStarted
+      ? FOLLOWER_TOP5_COUNT * account.nextStakePerNumber
+      : null;
+    let action;
+    let reason;
+    if (account.status === "exhausted") {
+      action = "wait";
+      reason = "bankroll_exhausted";
+    } else if (bettingStarted) {
+      action = "would_bet";
+      reason = crossesNow ? "threshold_reached" : "betting_started";
+    } else {
+      action = "observe";
+      if (attemptNumber > FOLLOWER_TOP5_GATE_MAXIMUM_ATTEMPT) {
+        reason = "threshold_not_reached";
+      } else if (!evidence || evidence.eligibleCount === 0) {
+        reason = "insufficient_history";
+      } else {
+        reason = "below_threshold";
+      }
+    }
+    currentAction = {
+      action,
+      reason,
+      sessionId,
+      attemptNumber,
+      targetNumbers,
+      selectionCount: targetNumbers.length,
+      bettingStarted,
+      startAttempt,
+      startEvidence,
+      cumulativeRate: evidence?.rate ?? null,
+      hitCount: evidence?.hitCount ?? null,
+      eligibleCount: evidence?.eligibleCount ?? null,
+      historyMaxResultId: evidence?.historyMaxResultId ?? boundaryResultId,
+      historyThrough: evidence?.historyThrough ?? boundary?.settled_at ?? null,
+      stakePerNumber,
+      totalStake,
+      anchorResultId: Number(activeSession.anchor_result_id),
+    };
+  }
+
+  const nextRoundCost = FOLLOWER_TOP5_COUNT * account.nextStakePerNumber;
+  const completedSessionCount = sessions.filter(
+    (session) => session.status === "completed",
+  ).length;
+  const invalidatedSessionCount = sessions.filter(
+    (session) => session.status === "invalid_gap",
+  ).length;
+  return {
+    schemaVersion: 1,
+    algorithmVersion: FOLLOWER_TOP5_GATE_ACCOUNT_ALGORITHM_VERSION,
+    mode: "persisted-session-retrospective",
+    executionEnabled: false,
+    strategy: {
+      selectionMode: "frozen-top5",
+      selectionCount: FOLLOWER_TOP5_COUNT,
+      thresholdMetric: "cumulative-hit-by-attempt",
+      threshold: FOLLOWER_TOP5_GATE_THRESHOLD_PERCENT / 100,
+      comparison: "gte",
+      cohort: "anchors-with-complete-20-round-window",
+      maximumCalibratedAttempt: FOLLOWER_TOP5_GATE_MAXIMUM_ATTEMPT,
+      evaluationTiming: "pre-attempt-walk-forward",
+      startPolicy: "latch-for-session",
+      noCrossingPolicy: "observe-only",
+      minimumEligibleCount: 1,
+    },
+    model: {
+      modelVersion: FOLLOWER_WARM_ACCOUNT_MODEL_VERSION,
+      initialStakePerNumber: VIRTUAL_BET_MODEL.initialStake,
+      stakeStepPerNumber: VIRTUAL_BET_MODEL.stakeStep,
+      maxStakePerNumber: VIRTUAL_BET_MODEL.maxStake,
+      numbersPerRound: FOLLOWER_TOP5_COUNT,
+      grossPayoutMultiplier: VIRTUAL_BET_MODEL.grossPayoutMultiplier,
+      netHitMultiplier: FOLLOWER_WARM_ACCOUNT_NET_HIT_MULTIPLIER,
+      payoutIncludesStake: VIRTUAL_BET_MODEL.payoutIncludesStake,
+    },
+    status: account.status,
+    initialBalance: FOLLOWER_WARM_ACCOUNT_STARTING_BALANCE,
+    finalBalance: account.currentBalance,
+    netResult:
+      account.currentBalance - FOLLOWER_WARM_ACCOUNT_STARTING_BALANCE,
+    nextStakePerNumber: account.nextStakePerNumber,
+    nextRoundCost,
+    canAffordNextRound:
+      account.status !== "exhausted"
+      && account.currentBalance >= nextRoundCost,
+    shortfall: Math.max(0, nextRoundCost - account.currentBalance),
+    trackedSessionCount: sessions.length,
+    trackedAttemptCount: account.trackedAttemptCount,
+    qualifiedSessionCount: account.qualifiedSessionCount,
+    observedWithoutBetCount: account.observedWithoutBetCount,
+    eligibleBetCount: account.eligibleBetCount,
+    betCount: account.betCount,
+    hitCount: account.hitCount,
+    missCount: account.missCount,
+    hitRate:
+      account.betCount > 0 ? account.hitCount / account.betCount : null,
+    totalStaked: account.totalStaked,
+    totalGrossPayout: account.totalGrossPayout,
+    skippedAfterExhaustionCount: account.skippedAfterExhaustionCount,
+    peakBalance: account.peakBalance,
+    minimumBalance: account.minimumBalance,
+    maximumDrawdown: account.maximumDrawdown,
+    maxStakePerNumber: account.maxStakePerNumber,
+    maxRoundCost: account.maxRoundCost,
+    continuityGapCount,
+    dataComplete: continuityGapCount === 0,
+    firstBetAt: account.firstBetAt,
+    lastBetAt: account.lastBetAt,
+    exhaustedAt: account.exhaustedAt,
+    coverage: {
+      scope: "persisted-follower-top5-sessions-only",
+      firstSessionId: firstSession ? Number(firstSession.id) : null,
+      firstAnchorResultId: firstSession
+        ? Number(firstSession.anchor_result_id)
+        : null,
+      firstTrackedAt: firstAnchor?.row.settled_at ?? null,
+      lastSessionId: lastSession ? Number(lastSession.id) : null,
+      completedSessionCount,
+      invalidatedSessionCount,
+    },
+    ladder: {
+      missCount: account.ladderMissCount,
+      totalLoss: account.ladderTotalLoss,
+    },
+    latestOutcome: account.latestOutcome,
+    currentAction,
   };
 }
 
@@ -1274,6 +1855,7 @@ export class RouletteDatabase {
       virtualStartingBalance,
     );
     this.followerTop5HitCurveCache = new Map();
+    this.followerTop5GatedAccountCache = new Map();
     this.closed = false;
     this.sqlite = new DatabaseSync(path);
 
@@ -4274,6 +4856,95 @@ export class RouletteDatabase {
     });
   }
 
+  #followerTop5GatedAccount(
+    source,
+    instrument,
+    trackerStatus,
+    currentContinuityEpoch,
+  ) {
+    const resultRevision = this.sqlite
+      .prepare(`
+        SELECT
+          COUNT(*) AS row_count,
+          MAX(id) AS maximum_id,
+          MAX(settled_at) AS latest_at,
+          SUM(continuity_epoch) AS epoch_checksum
+        FROM round_results
+        WHERE source = ? AND instrument = ?
+      `)
+      .get(source, instrument);
+    const sessionRevision = this.sqlite
+      .prepare(`
+        SELECT
+          COUNT(*) AS row_count,
+          MAX(id) AS maximum_id,
+          MAX(last_event_at) AS latest_at,
+          SUM(attempt_count) AS attempt_checksum,
+          SUM(miss_count) AS miss_checksum
+        FROM follower_top5_sessions
+        WHERE source = ? AND instrument = ?
+      `)
+      .get(source, instrument);
+    const attemptRevision = this.sqlite
+      .prepare(`
+        SELECT COUNT(*) AS row_count, MAX(attempts.id) AS maximum_id
+        FROM follower_top5_attempts AS attempts
+        JOIN follower_top5_sessions AS sessions ON sessions.id = attempts.session_id
+        WHERE sessions.source = ? AND sessions.instrument = ?
+      `)
+      .get(source, instrument);
+    const cacheKey = `${source}\u0000${instrument}`;
+    const signature = [
+      Number(resultRevision.row_count),
+      resultRevision.maximum_id == null ? null : Number(resultRevision.maximum_id),
+      resultRevision.latest_at,
+      Number(resultRevision.epoch_checksum ?? 0),
+      Number(sessionRevision.row_count),
+      sessionRevision.maximum_id == null ? null : Number(sessionRevision.maximum_id),
+      sessionRevision.latest_at,
+      Number(sessionRevision.attempt_checksum ?? 0),
+      Number(sessionRevision.miss_checksum ?? 0),
+      Number(attemptRevision.row_count),
+      attemptRevision.maximum_id == null ? null : Number(attemptRevision.maximum_id),
+      currentContinuityEpoch,
+      trackerStatus,
+    ].join(":");
+    const cached = this.followerTop5GatedAccountCache.get(cacheKey);
+    if (cached?.signature === signature) return cached.value;
+
+    const rows = this.sqlite
+      .prepare(`
+        SELECT id, result_number, settled_at, continuity_epoch
+        FROM round_results
+        WHERE source = ? AND instrument = ?
+        ORDER BY settled_at, id
+      `)
+      .all(source, instrument);
+    const sessions = this.sqlite
+      .prepare(`
+        SELECT *
+        FROM follower_top5_sessions
+        WHERE source = ? AND instrument = ?
+        ORDER BY id
+      `)
+      .all(source, instrument);
+    const attempts = this.sqlite
+      .prepare(`
+        SELECT attempts.*
+        FROM follower_top5_attempts AS attempts
+        JOIN follower_top5_sessions AS sessions ON sessions.id = attempts.session_id
+        WHERE sessions.source = ? AND sessions.instrument = ?
+        ORDER BY attempts.id
+      `)
+      .all(source, instrument);
+    const value = buildFollowerTop5GatedAccount(rows, sessions, attempts, {
+      currentContinuityEpoch,
+      trackerStatus,
+    });
+    this.followerTop5GatedAccountCache.set(cacheKey, { signature, value });
+    return value;
+  }
+
   getFollowerTop5TrackerState(source = "buleto", instrument = "default") {
     this.#assertOpen();
     const safeSource = asNonEmptyText(source, undefined, "source");
@@ -4414,6 +5085,17 @@ export class RouletteDatabase {
       epochShape
       && epochShape.latest_result_epoch != null
       && Number(epochShape.current_epoch) !== Number(epochShape.latest_result_epoch);
+    const trackerStatus = currentSession
+      ? currentSession.attemptCount > 0 ? "active" : "armed"
+      : gapWaiting ? "gap" : "waiting_training";
+    const gatedAccount = this.#followerTop5GatedAccount(
+      safeSource,
+      safeInstrument,
+      trackerStatus,
+      epochShape?.current_epoch == null
+        ? null
+        : Number(epochShape.current_epoch),
+    );
 
     return {
       schemaVersion: 1,
@@ -4423,9 +5105,7 @@ export class RouletteDatabase {
       trackingMode: "persisted-batch-aware",
       topCount: FOLLOWER_TOP5_COUNT,
       minimumObservedFollowerCount: FOLLOWER_TOP5_MINIMUM_OBSERVED,
-      status: currentSession
-        ? currentSession.attemptCount > 0 ? "active" : "armed"
-        : gapWaiting ? "gap" : "waiting_training",
+      status: trackerStatus,
       currentSession,
       lastCompletedSession: lastCompletedRow
         ? {
@@ -4459,6 +5139,7 @@ export class RouletteDatabase {
         hits: Number(lifetime.hits),
         misses: Number(lifetime.misses),
       },
+      gatedAccount,
     };
   }
 

@@ -12,6 +12,7 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
   const FOLLOWER_COLLAPSED_LIMIT = 5;
   const FOLLOWER_HIT_HORIZONS = [1, 2, 3, 5, 10, 20];
   const FOLLOWER_WARM_THRESHOLD = 0.05;
+  const FOLLOWER_LIVE_ACCOUNT_THRESHOLD = 0.8;
   const CYCLE_COMPARISON_ANCHOR_DRAWS = 20;
   const CYCLE_COMPARISON_ALGORITHM_VERSION = "cycle-analogue-prefix-v1";
 
@@ -56,6 +57,17 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
     followerLiveAttemptSummary: document.getElementById("follower-live-attempt-summary"),
     followerLiveHistoryRate: document.getElementById("follower-live-history-rate"),
     followerLiveHistoryDetail: document.getElementById("follower-live-history-detail"),
+    followerLiveAccount: document.getElementById("follower-live-account"),
+    followerLiveAccountStatus: document.getElementById("follower-live-account-status"),
+    followerLiveAccountBalance: document.getElementById("follower-live-account-balance"),
+    followerLiveAccountResultCard: document.getElementById("follower-live-account-result-card"),
+    followerLiveAccountResult: document.getElementById("follower-live-account-result"),
+    followerLiveAccountBets: document.getElementById("follower-live-account-bets"),
+    followerLiveAccountRecord: document.getElementById("follower-live-account-record"),
+    followerLiveAccountStake: document.getElementById("follower-live-account-stake"),
+    followerLiveAccountTicket: document.getElementById("follower-live-account-ticket"),
+    followerLiveAccountGate: document.getElementById("follower-live-account-gate"),
+    followerLiveAccountAudit: document.getElementById("follower-live-account-audit"),
     followerLiveAttemptList: document.getElementById("follower-live-attempt-list"),
     followerLiveLastHit: document.getElementById("follower-live-last-hit"),
     followerSource: document.getElementById("follower-source"),
@@ -1815,6 +1827,11 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
     minimumFractionDigits: 0,
     maximumFractionDigits: 1
   });
+  const liveGatePercentFormatter = new Intl.NumberFormat("ru-RU", {
+    style: "percent",
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 2
+  });
   const followerAverageFormatter = new Intl.NumberFormat("ru-RU", {
     minimumFractionDigits: 0,
     maximumFractionDigits: 2
@@ -2058,6 +2075,7 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
       || maxRoundCost !== model.numbersPerRound * maxStakePerNumber
       || totalStaked % (model.numbersPerRound * model.stakeStepPerNumber) !== 0
       || continuityGapCount === null
+      || value.dataComplete !== (continuityGapCount === 0)
       || value.dataComplete !== (continuityGapCount === 0)
       || ladderMissCount === null
       || ladderTotalLoss === null
@@ -2681,6 +2699,571 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
     };
   }
 
+  function normalizedFollowerLiveGateEvidence(value) {
+    if (!value || typeof value !== "object") return null;
+    const horizon = asOptionalNonNegativeInteger(value.horizon);
+    const hitCount = asOptionalNonNegativeInteger(value.hitCount);
+    const eligibleCount = asOptionalNonNegativeInteger(value.eligibleCount);
+    const rate = asOptionalFiniteNumber(value.rate);
+    const historyMaxResultId = asOptionalNonNegativeInteger(value.historyMaxResultId);
+    if (
+      horizon === null || horizon < 1 || horizon > 20
+      || hitCount === null
+      || eligibleCount === null || eligibleCount < 1
+      || hitCount > eligibleCount
+      || rate === null || rate < 0 || rate > 1
+      || Math.abs(rate - hitCount / eligibleCount) > 1e-12
+      || historyMaxResultId === null || historyMaxResultId < 1
+      || !parseDate(value.historyThrough)
+    ) {
+      return null;
+    }
+    return {
+      horizon,
+      hitCount,
+      eligibleCount,
+      rate,
+      historyMaxResultId,
+      historyThrough: value.historyThrough
+    };
+  }
+
+  function normalizedFollowerLiveGatedAccount(value, currentSession, trackerStatus) {
+    const strategy = value?.strategy;
+    const model = value?.model;
+    if (
+      !value || typeof value !== "object"
+      || value.schemaVersion !== 1
+      || value.algorithmVersion !== "follower-top5-cumulative80-ladder-v1"
+      || value.mode !== "persisted-session-retrospective"
+      || value.executionEnabled !== false
+      || strategy?.selectionMode !== "frozen-top5"
+      || strategy?.selectionCount !== 5
+      || strategy?.thresholdMetric !== "cumulative-hit-by-attempt"
+      || strategy?.threshold !== FOLLOWER_LIVE_ACCOUNT_THRESHOLD
+      || strategy?.comparison !== "gte"
+      || strategy?.cohort !== "anchors-with-complete-20-round-window"
+      || strategy?.maximumCalibratedAttempt !== 20
+      || strategy?.evaluationTiming !== "pre-attempt-walk-forward"
+      || strategy?.startPolicy !== "latch-for-session"
+      || strategy?.noCrossingPolicy !== "observe-only"
+      || strategy?.minimumEligibleCount !== 1
+      || model?.modelVersion !== "2.0.0"
+      || model?.initialStakePerNumber !== 10
+      || model?.stakeStepPerNumber !== 10
+      || model?.maxStakePerNumber !== 2_500
+      || model?.numbersPerRound !== 5
+      || model?.grossPayoutMultiplier !== 36
+      || model?.netHitMultiplier !== 31
+      || model?.payoutIncludesStake !== true
+      || !["waiting", "running", "exhausted"].includes(value.status)
+      || typeof value.dataComplete !== "boolean"
+    ) {
+      return null;
+    }
+
+    const safeInteger = (raw) => Number.isSafeInteger(raw) ? raw : null;
+    const positiveStakePerNumber = (raw) => {
+      const amount = safeInteger(raw);
+      return amount !== null
+        && amount >= model.initialStakePerNumber
+        && amount <= model.maxStakePerNumber
+        && amount % model.stakeStepPerNumber === 0
+        ? amount
+        : null;
+    };
+    const targetNumbers = (raw) => {
+      if (!Array.isArray(raw) || raw.length !== model.numbersPerRound) return null;
+      const numbers = raw.map((number) => asRouletteNumber(number));
+      return numbers.every((number) => number !== null)
+        && new Set(numbers).size === model.numbersPerRound
+        ? numbers
+        : null;
+    };
+    const sameNumbers = (left, right) =>
+      left.length === right.length
+      && left.every((number, index) => number === right[index]);
+
+    const initialBalance = asOptionalNonNegativeInteger(value.initialBalance);
+    const finalBalance = asOptionalNonNegativeInteger(value.finalBalance);
+    const netResult = safeInteger(value.netResult);
+    const nextStakePerNumber = positiveStakePerNumber(value.nextStakePerNumber);
+    const nextRoundCost = asOptionalNonNegativeInteger(value.nextRoundCost);
+    const shortfall = asOptionalNonNegativeInteger(value.shortfall);
+    const trackedSessionCount = asOptionalNonNegativeInteger(value.trackedSessionCount);
+    const trackedAttemptCount = asOptionalNonNegativeInteger(value.trackedAttemptCount);
+    const qualifiedSessionCount = asOptionalNonNegativeInteger(value.qualifiedSessionCount);
+    const observedWithoutBetCount = asOptionalNonNegativeInteger(value.observedWithoutBetCount);
+    const eligibleBetCount = asOptionalNonNegativeInteger(value.eligibleBetCount);
+    const betCount = asOptionalNonNegativeInteger(value.betCount);
+    const hitCount = asOptionalNonNegativeInteger(value.hitCount);
+    const missCount = asOptionalNonNegativeInteger(value.missCount);
+    const totalStaked = asOptionalNonNegativeInteger(value.totalStaked);
+    const totalGrossPayout = asOptionalNonNegativeInteger(value.totalGrossPayout);
+    const skippedAfterExhaustionCount = asOptionalNonNegativeInteger(
+      value.skippedAfterExhaustionCount
+    );
+    const peakBalance = asOptionalNonNegativeInteger(value.peakBalance);
+    const minimumBalance = asOptionalNonNegativeInteger(value.minimumBalance);
+    const maximumDrawdown = asOptionalNonNegativeInteger(value.maximumDrawdown);
+    const maxStakePerNumber = asOptionalNonNegativeInteger(value.maxStakePerNumber);
+    const maxRoundCost = asOptionalNonNegativeInteger(value.maxRoundCost);
+    const continuityGapCount = asOptionalNonNegativeInteger(value.continuityGapCount);
+    const ladderMissCount = asOptionalNonNegativeInteger(value.ladder?.missCount);
+    const ladderTotalLoss = asOptionalNonNegativeInteger(value.ladder?.totalLoss);
+    const expectedNextRoundCost = nextStakePerNumber === null
+      ? null
+      : model.numbersPerRound * nextStakePerNumber;
+    const expectedCanAfford = value.status !== "exhausted"
+      && finalBalance !== null
+      && expectedNextRoundCost !== null
+      && finalBalance >= expectedNextRoundCost;
+    if (
+      initialBalance !== 10_000
+      || finalBalance === null
+      || netResult === null
+      || finalBalance !== initialBalance + netResult
+      || nextStakePerNumber === null
+      || nextRoundCost !== expectedNextRoundCost
+      || typeof value.canAffordNextRound !== "boolean"
+      || value.canAffordNextRound !== expectedCanAfford
+      || shortfall === null
+      || shortfall !== Math.max(0, nextRoundCost - finalBalance)
+      || (value.status === "exhausted" && (value.canAffordNextRound || shortfall < 1))
+      || (value.status !== "exhausted" && !value.canAffordNextRound)
+      || trackedSessionCount === null
+      || trackedAttemptCount === null
+      || qualifiedSessionCount === null || qualifiedSessionCount > trackedSessionCount
+      || observedWithoutBetCount === null
+      || eligibleBetCount === null
+      || betCount === null
+      || hitCount === null
+      || missCount === null
+      || hitCount + missCount !== betCount
+      || skippedAfterExhaustionCount === null
+      || eligibleBetCount !== betCount + skippedAfterExhaustionCount
+      || trackedAttemptCount !== observedWithoutBetCount + eligibleBetCount
+      || (value.status === "waiting") !== (betCount === 0)
+      || (value.status === "running") !== (betCount > 0 && value.status !== "exhausted")
+      || totalStaked === null
+      || totalGrossPayout === null
+      || totalGrossPayout - totalStaked !== netResult
+      || totalStaked % (model.numbersPerRound * model.stakeStepPerNumber) !== 0
+      || peakBalance === null || peakBalance < initialBalance || peakBalance < finalBalance
+      || minimumBalance === null || minimumBalance > initialBalance || minimumBalance > finalBalance
+      || maximumDrawdown === null || maximumDrawdown > peakBalance
+      || maxStakePerNumber === null || maxStakePerNumber > model.maxStakePerNumber
+      || (maxStakePerNumber > 0 && (
+        maxStakePerNumber < model.initialStakePerNumber
+        || maxStakePerNumber % model.stakeStepPerNumber !== 0
+      ))
+      || maxRoundCost === null
+      || maxRoundCost !== model.numbersPerRound * maxStakePerNumber
+      || continuityGapCount === null
+      || ladderMissCount === null || ladderMissCount > missCount
+      || ladderTotalLoss === null || ladderTotalLoss > totalStaked
+      || ladderTotalLoss % (model.numbersPerRound * model.stakeStepPerNumber) !== 0
+      || (ladderMissCount === 0) !== (ladderTotalLoss === 0)
+    ) {
+      return null;
+    }
+
+    const expectedRecoverySteps = Math.max(
+      1,
+      Math.ceil(ladderTotalLoss / (model.netHitMultiplier * model.stakeStepPerNumber))
+    );
+    const expectedNextStakePerNumber = Math.min(
+      model.maxStakePerNumber,
+      Math.max(model.initialStakePerNumber, expectedRecoverySteps * model.stakeStepPerNumber)
+    );
+    if (nextStakePerNumber !== expectedNextStakePerNumber) return null;
+
+    let hitRate = null;
+    if (betCount === 0) {
+      if (
+        value.hitRate !== null
+        || totalStaked !== 0
+        || totalGrossPayout !== 0
+        || netResult !== 0
+        || finalBalance !== initialBalance
+        || maxStakePerNumber !== 0
+        || maxRoundCost !== 0
+        || maximumDrawdown !== 0
+        || peakBalance !== initialBalance
+        || minimumBalance !== initialBalance
+        || value.firstBetAt !== null
+        || value.lastBetAt !== null
+        || value.latestOutcome !== null
+      ) {
+        return null;
+      }
+    } else {
+      hitRate = asOptionalFiniteNumber(value.hitRate);
+      const firstBetAt = parseDate(value.firstBetAt);
+      const lastBetAt = parseDate(value.lastBetAt);
+      if (
+        hitRate === null
+        || Math.abs(hitRate - hitCount / betCount) > 1e-12
+        || !firstBetAt
+        || !lastBetAt
+        || firstBetAt.getTime() > lastBetAt.getTime()
+        || maxStakePerNumber < model.initialStakePerNumber
+      ) {
+        return null;
+      }
+    }
+
+    const exhaustedAt = value.exhaustedAt === null ? null : parseDate(value.exhaustedAt);
+    if (
+      (value.status === "exhausted" && !exhaustedAt)
+      || (value.status !== "exhausted" && value.exhaustedAt !== null)
+    ) {
+      return null;
+    }
+
+    const coverage = value.coverage;
+    const firstSessionId = coverage?.firstSessionId === null
+      ? null
+      : asOptionalNonNegativeInteger(coverage?.firstSessionId);
+    const firstAnchorResultId = coverage?.firstAnchorResultId === null
+      ? null
+      : asOptionalNonNegativeInteger(coverage?.firstAnchorResultId);
+    const lastSessionId = coverage?.lastSessionId === null
+      ? null
+      : asOptionalNonNegativeInteger(coverage?.lastSessionId);
+    const completedSessionCount = asOptionalNonNegativeInteger(coverage?.completedSessionCount);
+    const invalidatedSessionCount = asOptionalNonNegativeInteger(coverage?.invalidatedSessionCount);
+    const emptyCoverage = trackedSessionCount === 0;
+    if (
+      !coverage || typeof coverage !== "object"
+      || coverage.scope !== "persisted-follower-top5-sessions-only"
+      || completedSessionCount === null
+      || invalidatedSessionCount === null
+      || completedSessionCount + invalidatedSessionCount
+        + (currentSession ? 1 : 0) !== trackedSessionCount
+      || (emptyCoverage && (
+        firstSessionId !== null
+        || firstAnchorResultId !== null
+        || coverage.firstTrackedAt !== null
+        || lastSessionId !== null
+        || completedSessionCount !== 0
+        || invalidatedSessionCount !== 0
+      ))
+      || (!emptyCoverage && (
+        firstSessionId === null || firstSessionId < 1
+        || firstAnchorResultId === null || firstAnchorResultId < 1
+        || !parseDate(coverage.firstTrackedAt)
+        || lastSessionId === null || lastSessionId < firstSessionId
+      ))
+    ) {
+      return null;
+    }
+
+    let latestOutcome = null;
+    if (value.latestOutcome !== null) {
+      const outcome = value.latestOutcome;
+      const sessionId = asOptionalNonNegativeInteger(outcome?.sessionId);
+      const attemptNumber = asOptionalNonNegativeInteger(outcome?.attemptNumber);
+      const resultId = asOptionalNonNegativeInteger(outcome?.resultId);
+      const outcomeTargets = targetNumbers(outcome?.targetNumbers);
+      const selectionCount = asOptionalNonNegativeInteger(outcome?.selectionCount);
+      const resultNumber = asRouletteNumber(outcome?.resultNumber);
+      const hitRank = outcome?.hitRank === null
+        ? null
+        : asOptionalNonNegativeInteger(outcome?.hitRank);
+      const stakePerNumber = positiveStakePerNumber(outcome?.stakePerNumber);
+      const totalStake = asOptionalNonNegativeInteger(outcome?.totalStake);
+      const grossPayout = asOptionalNonNegativeInteger(outcome?.grossPayout);
+      const balanceAfter = asOptionalNonNegativeInteger(outcome?.balanceAfter);
+      const outcomeNextStake = positiveStakePerNumber(outcome?.nextStakePerNumber);
+      const outcomeNextCost = asOptionalNonNegativeInteger(outcome?.nextRoundCost);
+      const gateEvidence = normalizedFollowerLiveGateEvidence(outcome?.gateEvidence);
+      const expectedHitIndex = outcomeTargets?.indexOf(resultNumber) ?? -1;
+      const expectedOutcome = expectedHitIndex >= 0 ? "hit" : "miss";
+      if (
+        sessionId === null || sessionId < 1
+        || attemptNumber === null || attemptNumber < 1
+        || resultId === null || resultId < 1
+        || outcomeTargets === null
+        || selectionCount !== model.numbersPerRound
+        || resultNumber === null
+        || stakePerNumber === null
+        || totalStake !== model.numbersPerRound * stakePerNumber
+        || !["hit", "miss"].includes(outcome?.outcome)
+        || outcome.outcome !== expectedOutcome
+        || hitRank !== (expectedHitIndex >= 0 ? expectedHitIndex + 1 : null)
+        || grossPayout === null
+        || grossPayout !== (
+          expectedOutcome === "hit" ? stakePerNumber * model.grossPayoutMultiplier : 0
+        )
+        || balanceAfter !== finalBalance
+        || outcomeNextStake === null
+        || outcomeNextCost !== model.numbersPerRound * outcomeNextStake
+        || gateEvidence === null
+        || gateEvidence.rate < strategy.threshold
+        || !parseDate(outcome?.occurredAt)
+        || outcome.occurredAt !== value.lastBetAt
+      ) {
+        return null;
+      }
+      latestOutcome = {
+        sessionId,
+        attemptNumber,
+        resultId,
+        targetNumbers: outcomeTargets,
+        selectionCount,
+        resultNumber,
+        hitRank,
+        stakePerNumber,
+        totalStake,
+        outcome: outcome.outcome,
+        grossPayout,
+        balanceAfter,
+        nextStakePerNumber: outcomeNextStake,
+        nextRoundCost: outcomeNextCost,
+        gateEvidence,
+        occurredAt: outcome.occurredAt
+      };
+    } else if (betCount > 0) {
+      return null;
+    }
+
+    const action = value.currentAction;
+    if (!action || typeof action !== "object") return null;
+    const actionNames = new Set(["observe", "would_bet", "wait"]);
+    const reasons = new Set([
+      "below_threshold",
+      "insufficient_history",
+      "threshold_not_reached",
+      "threshold_reached",
+      "betting_started",
+      "bankroll_exhausted",
+      "gap",
+      "waiting_training"
+    ]);
+    const actionSessionId = action.sessionId === null
+      ? null
+      : asOptionalNonNegativeInteger(action.sessionId);
+    const actionAttemptNumber = action.attemptNumber === null
+      ? null
+      : asOptionalNonNegativeInteger(action.attemptNumber);
+    const actionTargets = Array.isArray(action.targetNumbers)
+      && action.targetNumbers.length === 0
+      ? []
+      : targetNumbers(action.targetNumbers);
+    const actionSelectionCount = asOptionalNonNegativeInteger(action.selectionCount);
+    const startAttempt = action.startAttempt === null
+      ? null
+      : asOptionalNonNegativeInteger(action.startAttempt);
+    const cumulativeRate = action.cumulativeRate === null
+      ? null
+      : asOptionalFiniteNumber(action.cumulativeRate);
+    const actionHitCount = action.hitCount === null
+      ? null
+      : asOptionalNonNegativeInteger(action.hitCount);
+    const actionEligibleCount = action.eligibleCount === null
+      ? null
+      : asOptionalNonNegativeInteger(action.eligibleCount);
+    const historyMaxResultId = action.historyMaxResultId === null
+      ? null
+      : asOptionalNonNegativeInteger(action.historyMaxResultId);
+    const actionStake = action.stakePerNumber === null
+      ? null
+      : positiveStakePerNumber(action.stakePerNumber);
+    const actionTotalStake = action.totalStake === null
+      ? null
+      : asOptionalNonNegativeInteger(action.totalStake);
+    const actionAnchorResultId = action.anchorResultId === null
+      ? null
+      : asOptionalNonNegativeInteger(action.anchorResultId);
+    const startEvidence = action.startEvidence === null
+      ? null
+      : normalizedFollowerLiveGateEvidence(action.startEvidence);
+    const hasNoCurrentEvidence = cumulativeRate === null
+      && actionHitCount === null
+      && actionEligibleCount === null;
+    const hasEmptyCurrentEvidence = cumulativeRate === null
+      && actionHitCount === 0
+      && actionEligibleCount === 0;
+    const hasRatedCurrentEvidence = cumulativeRate !== null
+      && actionHitCount !== null
+      && actionEligibleCount !== null
+      && actionEligibleCount >= 1
+      && actionHitCount <= actionEligibleCount
+      && Math.abs(cumulativeRate - actionHitCount / actionEligibleCount) <= 1e-12;
+    if (
+      !actionNames.has(action.action)
+      || !reasons.has(action.reason)
+      || typeof action.bettingStarted !== "boolean"
+      || (actionTargets === null)
+      || actionSelectionCount !== actionTargets.length
+      || (actionStake === null) !== (actionTotalStake === null)
+      || (actionStake !== null && actionTotalStake !== model.numbersPerRound * actionStake)
+      || (cumulativeRate !== null && (cumulativeRate < 0 || cumulativeRate > 1))
+      || (!hasNoCurrentEvidence && !hasEmptyCurrentEvidence && !hasRatedCurrentEvidence)
+      || (historyMaxResultId === null) !== (action.historyThrough === null)
+      || (action.historyThrough !== null && !parseDate(action.historyThrough))
+      || (action.bettingStarted && (
+        startAttempt === null || startAttempt < 1 || startAttempt > 20
+        || startEvidence === null
+        || startEvidence.horizon !== startAttempt
+        || startEvidence.rate < strategy.threshold
+      ))
+      || (!action.bettingStarted && (startAttempt !== null || startEvidence !== null))
+    ) {
+      return null;
+    }
+
+    if (!currentSession) {
+      if (
+        action.action !== "wait"
+        || action.reason !== trackerStatus
+        || !["gap", "waiting_training"].includes(action.reason)
+        || actionSessionId !== null
+        || actionAttemptNumber !== null
+        || actionTargets.length !== 0
+        || actionSelectionCount !== 0
+        || action.bettingStarted
+        || cumulativeRate !== null
+        || actionHitCount !== null
+        || actionEligibleCount !== null
+        || historyMaxResultId !== null
+        || actionStake !== null
+        || actionAnchorResultId !== null
+      ) {
+        return null;
+      }
+    } else {
+      const attemptInCalibratedRange = currentSession.nextAttemptNumber <= 20;
+      if (
+        actionSessionId !== currentSession.id
+        || actionAttemptNumber !== currentSession.nextAttemptNumber
+        || actionTargets.length !== model.numbersPerRound
+        || !sameNumbers(actionTargets, currentSession.fixedNumbers)
+        || actionSelectionCount !== model.numbersPerRound
+        || actionAnchorResultId !== currentSession.anchor.resultId
+        || historyMaxResultId === null || historyMaxResultId < 1
+        || (attemptInCalibratedRange && action.reason !== "insufficient_history" && (
+          actionHitCount === null || actionEligibleCount === null
+        ))
+        || (!attemptInCalibratedRange && (
+          cumulativeRate !== null || actionHitCount !== null || actionEligibleCount !== null
+        ))
+      ) {
+        return null;
+      }
+
+      if (action.action === "observe") {
+        if (
+          !["below_threshold", "insufficient_history", "threshold_not_reached"].includes(action.reason)
+          || action.bettingStarted
+          || actionStake !== null
+          || (action.reason === "below_threshold" && (
+            !attemptInCalibratedRange
+            || cumulativeRate === null
+            || cumulativeRate >= strategy.threshold
+          ))
+          || (action.reason === "insufficient_history" && (
+            !attemptInCalibratedRange
+            || cumulativeRate !== null
+            || actionHitCount !== 0
+            || actionEligibleCount !== 0
+          ))
+          || (action.reason === "threshold_not_reached" && attemptInCalibratedRange)
+        ) {
+          return null;
+        }
+      } else if (action.action === "would_bet") {
+        if (
+          !["threshold_reached", "betting_started"].includes(action.reason)
+          || !action.bettingStarted
+          || actionStake === null
+          || value.status === "exhausted"
+          || (action.reason === "threshold_reached" && (
+            startAttempt !== actionAttemptNumber
+            || cumulativeRate === null
+            || cumulativeRate < strategy.threshold
+          ))
+          || (action.reason === "betting_started" && startAttempt >= actionAttemptNumber)
+        ) {
+          return null;
+        }
+      } else if (
+        action.reason !== "bankroll_exhausted"
+        || value.status !== "exhausted"
+        || (actionStake !== null && !action.bettingStarted)
+      ) {
+        return null;
+      }
+    }
+
+    return {
+      status: value.status,
+      initialBalance,
+      finalBalance,
+      netResult,
+      nextStakePerNumber,
+      nextRoundCost,
+      canAffordNextRound: value.canAffordNextRound,
+      shortfall,
+      trackedSessionCount,
+      trackedAttemptCount,
+      qualifiedSessionCount,
+      observedWithoutBetCount,
+      eligibleBetCount,
+      betCount,
+      hitCount,
+      missCount,
+      hitRate,
+      totalStaked,
+      totalGrossPayout,
+      skippedAfterExhaustionCount,
+      peakBalance,
+      minimumBalance,
+      maximumDrawdown,
+      maxStakePerNumber,
+      maxRoundCost,
+      continuityGapCount,
+      dataComplete: value.dataComplete,
+      firstBetAt: value.firstBetAt,
+      lastBetAt: value.lastBetAt,
+      exhaustedAt: value.exhaustedAt,
+      coverage: {
+        scope: coverage.scope,
+        firstSessionId,
+        firstAnchorResultId,
+        firstTrackedAt: coverage.firstTrackedAt,
+        lastSessionId,
+        completedSessionCount,
+        invalidatedSessionCount
+      },
+      ladder: {
+        missCount: ladderMissCount,
+        totalLoss: ladderTotalLoss
+      },
+      latestOutcome,
+      currentAction: {
+        action: action.action,
+        reason: action.reason,
+        sessionId: actionSessionId,
+        attemptNumber: actionAttemptNumber,
+        targetNumbers: actionTargets,
+        selectionCount: actionSelectionCount,
+        bettingStarted: action.bettingStarted,
+        startAttempt,
+        cumulativeRate,
+        hitCount: actionHitCount,
+        eligibleCount: actionEligibleCount,
+        historyMaxResultId,
+        historyThrough: action.historyThrough,
+        stakePerNumber: actionStake,
+        totalStake: actionTotalStake,
+        anchorResultId: actionAnchorResultId,
+        startEvidence
+      }
+    };
+  }
+
   function normalizedFollowerTop5Tracker(value) {
     const statuses = new Set(["armed", "active", "gap", "waiting_training"]);
     if (
@@ -2708,12 +3291,22 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
       ? normalizedFollowerLiveSession(value.currentSession, value.status)
       : null;
     const lastCompletedSession = normalizedFollowerLastHit(value.lastCompletedSession);
-    if ((hasCurrentSession && !currentSession) || lastCompletedSession === false) return null;
+    const gatedAccount = normalizedFollowerLiveGatedAccount(
+      value.gatedAccount,
+      currentSession,
+      value.status
+    );
+    if (
+      (hasCurrentSession && !currentSession)
+      || lastCompletedSession === false
+      || !gatedAccount
+    ) return null;
 
     return {
       status: value.status,
       currentSession,
-      lastCompletedSession
+      lastCompletedSession,
+      gatedAccount
     };
   }
 
@@ -2772,12 +3365,12 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
         attempt.resultNumber
       );
       ball.setAttribute("aria-hidden", "true");
-      const outcome = createElement("span", "follower-live__attempt-outcome", "промах");
+      const outcome = createElement("span", "follower-live__attempt-outcome", "мимо Top‑5");
       const time = createElement("time", "follower-live__attempt-time", formatDateTime(attempt.settledAt));
       time.dateTime = parseDate(attempt.settledAt).toISOString();
       item.setAttribute(
         "aria-label",
-        `Попытка ${attempt.attemptNumber}: выпало ${attempt.resultNumber}, ${rouletteColorLabel(attempt.resultNumber)}, промах, ${formatDateTime(attempt.settledAt, { alwaysShowDate: true })}`
+        `Попытка ${attempt.attemptNumber}: выпало ${attempt.resultNumber}, ${rouletteColorLabel(attempt.resultNumber)}, мимо зафиксированного Top‑5, ${formatDateTime(attempt.settledAt, { alwaysShowDate: true })}`
       );
       item.append(label, ball, outcome, time);
       fragment.appendChild(item);
@@ -2841,7 +3434,145 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
     }
     setTextIfChanged(
       elements.followerLiveLastHit,
-      `Последнее попадание: число ${lastHit.hitNumber} (место №${lastHit.hitRank}) на попытке ${lastHit.attemptCount}. Серия закрыта ${formatDateTime(lastHit.completedAt, { alwaysShowDate: true })}, счёт сброшен.`
+      `Последнее попадание: число ${lastHit.hitNumber} (место №${lastHit.hitRank}) на попытке ${lastHit.attemptCount}. Серия закрыта ${formatDateTime(lastHit.completedAt, { alwaysShowDate: true })}, счётчик попыток сброшен.`
+    );
+  }
+
+  function renderFollowerLiveGatedAccount(account, {
+    loading = false,
+    failed = false,
+    stale = false
+  } = {}) {
+    const resetValues = () => {
+      setTextIfChanged(elements.followerLiveAccountBalance, "—");
+      setTextIfChanged(elements.followerLiveAccountResult, "—");
+      setTextIfChanged(elements.followerLiveAccountBets, "—");
+      setTextIfChanged(elements.followerLiveAccountRecord, "— попаданий · — промахов");
+      setTextIfChanged(elements.followerLiveAccountStake, "—");
+      setTextIfChanged(elements.followerLiveAccountTicket, "по — на число · билет —");
+      elements.followerLiveAccountResultCard.classList.remove("is-positive", "is-loss");
+    };
+
+    if (!account) {
+      elements.followerLiveAccount.dataset.state = loading ? "loading" : "error";
+      elements.followerLiveAccount.setAttribute("aria-busy", String(loading));
+      setTextIfChanged(
+        elements.followerLiveAccountStatus,
+        loading ? "Загрузка…" : failed ? "Ошибка загрузки" : "Данные отклонены"
+      );
+      setTextIfChanged(
+        elements.followerLiveAccountGate,
+        loading
+          ? "Проверяем накопительную архивную долю к текущей попытке."
+          : "Виртуальный билет не включается без подтверждённого серверного решения."
+      );
+      setTextIfChanged(
+        elements.followerLiveAccountAudit,
+        loading
+          ? "Загружаем движение отдельного счёта и состояние общей лестницы."
+          : failed
+            ? "Live‑счёт временно недоступен; повторим загрузку автоматически."
+            : "Сервер не вернул строгий контракт отдельного live‑счёта."
+      );
+      resetValues();
+      return;
+    }
+
+    const action = account.currentAction;
+    const cardState = stale
+      ? "stale"
+      : account.status === "exhausted"
+        ? "exhausted"
+        : action.action === "would_bet" ? "ready" : "waiting";
+    const status = stale
+      ? "Не обновлено · пауза"
+      : account.status === "exhausted"
+        ? "Стоп · не хватает на билет"
+        : action.action === "would_bet"
+          ? "Виртуальный билет активен"
+          : action.action === "observe" ? "Только наблюдение" : "Пауза";
+    elements.followerLiveAccount.dataset.state = cardState;
+    elements.followerLiveAccount.setAttribute("aria-busy", "false");
+    setTextIfChanged(
+      elements.followerLiveAccountStatus,
+      status
+    );
+    setTextIfChanged(
+      elements.followerLiveAccountBalance,
+      formatRiskAmount(account.finalBalance)
+    );
+    setTextIfChanged(
+      elements.followerLiveAccountResult,
+      formatSignedRiskAmount(account.netResult)
+    );
+    elements.followerLiveAccountResultCard.classList.remove("is-positive", "is-loss");
+    if (account.netResult > 0) {
+      elements.followerLiveAccountResultCard.classList.add("is-positive");
+    } else if (account.netResult < 0) {
+      elements.followerLiveAccountResultCard.classList.add("is-loss");
+    }
+    setTextIfChanged(elements.followerLiveAccountBets, formatRiskAmount(account.betCount));
+    setTextIfChanged(
+      elements.followerLiveAccountRecord,
+      `${formatRiskAmount(account.hitCount)} ${pluralForm(account.hitCount, "попадание", "попадания", "попаданий")} · ${formatRiskAmount(account.missCount)} ${pluralForm(account.missCount, "промах", "промаха", "промахов")}`
+    );
+    setTextIfChanged(
+      elements.followerLiveAccountStake,
+      `по ${formatRiskAmount(account.nextStakePerNumber)}`
+    );
+    setTextIfChanged(
+      elements.followerLiveAccountTicket,
+      `5 чисел · полный билет ${formatRiskAmount(account.nextRoundCost)}`
+    );
+
+    const evidenceText = action.cumulativeRate === null
+      ? ""
+      : `${liveGatePercentFormatter.format(action.cumulativeRate)} (${formatRiskAmount(action.hitCount)} из ${formatRiskAmount(action.eligibleCount)})`;
+    let gateText;
+    if (action.reason === "below_threshold") {
+      gateText = `К попытке №${action.attemptNumber}: накопительно ${evidenceText} < 80%. Билета нет — пятёрка только наблюдается.`;
+    } else if (action.reason === "insufficient_history") {
+      gateText = `К попытке №${action.attemptNumber} ещё нет полного архивного окна для честной оценки. Билета нет.`;
+    } else if (action.reason === "threshold_not_reached") {
+      gateText = `К 20-й попытке накопительный порог 80% не был достигнут. Текущая серия остаётся только под наблюдением без экстраполяции.`;
+    } else if (action.action === "would_bet" && action.reason === "threshold_reached") {
+      gateText = `Порог достигнут к попытке №${action.attemptNumber}: накопительно ${evidenceText} ≥ 80%. Виртуальный билет включает все 5 чисел.`;
+    } else if (action.action === "would_bet" && action.cumulativeRate !== null) {
+      gateText = `Режим зафиксирован с попытки №${action.startAttempt}. К текущей попытке №${action.attemptNumber}: накопительно ${evidenceText}; виртуальный билет включает все 5 чисел.`;
+    } else if (action.action === "would_bet") {
+      gateText = `Порог был достигнут на попытке №${action.startAttempt} и зафиксирован до конца серии. Текущая попытка №${action.attemptNumber} уже вне 20-раундового окна: билет продолжается без новой экстраполяции.`;
+    } else if (action.reason === "bankroll_exhausted") {
+      const gateState = action.bettingStarted
+        ? ` Порог был зафиксирован с попытки №${action.startAttempt}, но новые билеты больше не считаются.`
+        : " Новые билеты больше не считаются независимо от текущего порога.";
+      gateText = `Счёт остановлен: полный следующий билет ${formatRiskAmount(account.nextRoundCost)}, на счёте ${formatRiskAmount(account.finalBalance)}, не хватает ${formatRiskAmount(account.shortfall)}.${gateState}`;
+    } else if (action.reason === "gap") {
+      gateText = "Пауза после разрыва непрерывности. Ждём новую подтверждённую серию.";
+    } else {
+      gateText = "Ждём достаточно истории для новой зафиксированной пятёрки.";
+    }
+    setTextIfChanged(
+      elements.followerLiveAccountGate,
+      stale
+        ? `Данные не обновлены: новый виртуальный билет приостановлен. Последнее подтверждённое состояние — ${gateText}`
+        : gateText
+    );
+
+    const ladderText = account.ladder.missCount > 0
+      ? `В общей лестнице ${formatRiskAmount(account.ladder.missCount)} ${pluralForm(account.ladder.missCount, "промах", "промаха", "промахов")} и ${formatRiskAmount(account.ladder.totalLoss)} накопленного расхода.`
+      : "Общая лестница сейчас на стартовой ступени.";
+    const latestText = account.latestOutcome
+      ? ` Последний билет: ${account.latestOutcome.outcome === "hit" ? "попадание" : "промах"} на попытке №${account.latestOutcome.attemptNumber}, по ${formatRiskAmount(account.latestOutcome.stakePerNumber)} на число; счёт после него ${formatRiskAmount(account.latestOutcome.balanceAfter)}.`
+      : " Платных виртуальных попыток ещё не было.";
+    const gapsText = account.continuityGapCount > 0
+      ? ` Разрывов: ${formatRiskAmount(account.continuityGapCount)}.`
+      : " Разрывов в покрытии нет.";
+    const stoppedText = account.skippedAfterExhaustionCount > 0
+      ? ` После остановки пропущено ${formatRiskAmount(account.skippedAfterExhaustionCount)} ${pluralForm(account.skippedAfterExhaustionCount, "подходящий билет", "подходящих билета", "подходящих билетов")}.`
+      : "";
+    setTextIfChanged(
+      elements.followerLiveAccountAudit,
+      `Покрытие: ${formatRiskAmount(account.trackedSessionCount)} ${pluralForm(account.trackedSessionCount, "сохранённая серия", "сохранённые серии", "сохранённых серий")}, ${formatRiskAmount(account.trackedAttemptCount)} ${pluralForm(account.trackedAttemptCount, "попытка", "попытки", "попыток")}; порог достигался в ${formatRiskAmount(account.qualifiedSessionCount)} ${pluralForm(account.qualifiedSessionCount, "серии", "сериях", "сериях")}, без билета наблюдалось ${formatRiskAmount(account.observedWithoutBetCount)}. Всего поставлено ${formatRiskAmount(account.totalStaked)}, валовые выплаты ${formatRiskAmount(account.totalGrossPayout)}, максимальная просадка ${formatRiskAmount(account.maximumDrawdown)}. ${ladderText}${latestText}${gapsText}${stoppedText}`
     );
   }
 
@@ -2857,6 +3588,10 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
     renderFollowerLiveAttempts(null);
     renderFollowerLiveHistory(null);
     renderFollowerLiveLastHit(null);
+    renderFollowerLiveGatedAccount(null, {
+      loading: state === "loading",
+      failed: state === "error" && store.stateError
+    });
   }
 
   function renderFollowerTop5Tracker(value) {
@@ -2886,6 +3621,7 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
     elements.followerLive.dataset.state = stale ? "stale" : tracker.status;
     elements.followerLive.setAttribute("aria-busy", "false");
     renderFollowerLiveLastHit(tracker.lastCompletedSession);
+    renderFollowerLiveGatedAccount(tracker.gatedAccount, { stale });
 
     if (!tracker.currentSession) {
       setTextIfChanged(elements.followerLiveSource, "—");
