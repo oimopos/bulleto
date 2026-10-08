@@ -76,6 +76,9 @@ test("trajectory shadow is additive, prospective, and observation-only", () => {
   assert.match(block, /а не следующий тик/);
   assert.match(block, /Доли похожих завершённых траекторий/);
   assert.match(block, /ПРОГНОЗ УЧАСТКА: НЕТ ДАННЫХ/);
+  assert.match(block, /не более 6 соседних цифр вокруг типичного q50/);
+  assert.match(block, /полного исторического коридора q20\/q80/);
+  assert.match(block, /сокращение отображения/);
   assert.match(block, /от 0 сверху к 36 снизу/);
   assert.match(block, /нижняя дублирующая нулевая полоса/);
   assert.match(
@@ -89,7 +92,9 @@ test("trajectory shadow is additive, prospective, and observation-only", () => {
 
   assert.match(app, /const TRAJECTORY_SHADOW_VERSION = "trajectory-shadow-knn-v1"/);
   assert.match(app, /const TRAJECTORY_NUMBER_AREA_VERSION = "trajectory-number-area-v1"/);
+  assert.match(app, /const TRAJECTORY_NUMBER_AREA_MAX_DISPLAY_CELLS = 6/);
   assert.match(app, /function normalizedTrajectoryNumberArea\(value\)/);
+  assert.match(app, /function trajectoryNumberAreaDisplayCells\(area\)/);
   assert.match(app, /function trajectoryNumberAreaText\(area\)/);
   assert.match(app, /function normalizedTrajectoryShadow\(value\)/);
   assert.match(app, /function renderTrajectoryShadow\(value\)/);
@@ -99,6 +104,14 @@ test("trajectory shadow is additive, prospective, and observation-only", () => {
   assert.match(app, /Полные сопоставимые раунды:/);
   assert.match(app, /Доли похожих завершённых траекторий:/);
   assert.ok(app.includes("ПРОГНОЗ УЧАСТКА: ОТ ${from} ДО ${to}"));
+  assert.match(
+    app,
+    /return cells\.slice\(start, start \+ size\)/,
+  );
+  assert.doesNotMatch(
+    app,
+    /trajectoryNumberAreaLabel\(area\.corridor\.(?:top|bottom)\)/,
+  );
   assert.match(app, /ПРОГНОЗ УЧАСТКА: НЕДОСТАТОЧНО ПОХОЖИХ ГРАФИКОВ/);
   assert.match(
     app,
@@ -110,6 +123,41 @@ test("trajectory shadow is additive, prospective, and observation-only", () => {
   );
   assert.match(styles, /\.trajectory-shadow__range\s*\{[\s\S]*?font-size: clamp\(18px, 4vw, 28px\)/);
   assert.doesNotMatch(app, /trajectoryShadowPanel\.(?:dataset|classList)/);
+});
+
+test("trajectory number area display keeps at most six cells around q50", () => {
+  const functionStart = app.indexOf("  function trajectoryNumberAreaDisplayCells(area) {");
+  const functionEnd = app.indexOf("\n\n  function trajectoryNumberAreaText(area)", functionStart);
+  assert.ok(functionStart >= 0 && functionEnd > functionStart);
+  const functionSource = app.slice(functionStart, functionEnd);
+  const build = new Function(
+    "TRAJECTORY_NUMBER_AREA_MAX_DISPLAY_CELLS",
+    `"use strict"; ${functionSource}; return trajectoryNumberAreaDisplayCells;`,
+  );
+  const displayCells = build(6);
+  const point = (wireCell) => ({
+    wireCell,
+    number: wireCell === 37 ? 0 : wireCell,
+  });
+  const area = (from, to, typical) => ({
+    typical: point(typical),
+    corridor: {
+      cells: Array.from({ length: to - from + 1 }, (_, index) => point(from + index)),
+    },
+  });
+
+  assert.deepEqual(displayCells(area(13, 17, 15)).map(({ wireCell }) => wireCell), [13, 14, 15, 16, 17]);
+  assert.deepEqual(displayCells(area(13, 18, 15)).map(({ wireCell }) => wireCell), [13, 14, 15, 16, 17, 18]);
+  assert.deepEqual(displayCells(area(13, 19, 16)).map(({ wireCell }) => wireCell), [14, 15, 16, 17, 18, 19]);
+  assert.deepEqual(displayCells(area(0, 20, 10)).map(({ wireCell }) => wireCell), [8, 9, 10, 11, 12, 13]);
+  assert.deepEqual(displayCells(area(0, 20, 0)).map(({ wireCell }) => wireCell), [0, 1, 2, 3, 4, 5]);
+  assert.deepEqual(displayCells(area(20, 37, 37)).map(({ wireCell }) => wireCell), [32, 33, 34, 35, 36, 37]);
+  assert.deepEqual(displayCells(area(10, 20, 9)), []);
+
+  const frozenInput = area(5, 25, 15);
+  const before = structuredClone(frozenInput);
+  displayCells(frozenInput);
+  assert.deepEqual(frozenInput, before);
 });
 
 test("top-5 horizon block exposes all renderer targets and cumulative horizons", () => {
@@ -163,7 +211,7 @@ test("warm next-round forecast exposes a strict 5-percent walk-forward contract"
   assert.match(html, /id="follower-dynamic-next-title"[^>]*>[^<]*≥5%/);
   assert.match(html, /id="follower-dynamic-next-note"[^>]*>[\s\S]*?5%/);
   assert.match(html, /styles\.css\?v=27/);
-  assert.match(html, /app\.js\?v=29/);
+  assert.match(html, /app\.js\?v=30/);
   assert.match(styles, /\.follower-dynamic-next\s*\{/);
   assert.match(styles, /\.follower-warm-current\s*\{/);
   assert.match(styles, /\.follower-warm-picks\s*\{/);
@@ -384,7 +432,7 @@ test("cycle comparison language is descriptive, responsive, and cache-busted", (
   assert.match(block, /не предсказывает следующее число/);
   assert.doesNotMatch(block, /должн/iu);
   assert.match(html, /href="\/styles\.css\?v=27"/);
-  assert.match(html, /src="\/app\.js\?v=29"/);
+  assert.match(html, /src="\/app\.js\?v=30"/);
   assert.match(styles, /\.cycle-sequence-list\s*\{[\s\S]*?repeat\(auto-fill, minmax\(50px, 1fr\)\)/);
   assert.match(
     styles,

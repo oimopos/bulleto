@@ -8,7 +8,7 @@
     <meta name="description" content="Онлайн-монитор результатов рулетки и циклов исключения чисел от 0 до 36">
     <title>Круг 37 — монитор результатов</title>
     <link rel="stylesheet" href="/styles.css?v=27">
-    <script type="module" src="/app.js?v=29"></script>
+    <script type="module" src="/app.js?v=30"></script>
   </head>
   <body>
     <a class="skip-link" href="#main-content">Перейти к содержимому</a>
@@ -241,7 +241,7 @@
           <p class="preclose-comparison__status" id="trajectory-shadow-shares">Доли похожих завершённых траекторий: вверх — · вниз — · без движения —.</p>
           <p class="preclose-comparison__status trajectory-shadow__range" id="trajectory-shadow-number-area" aria-live="polite" aria-atomic="true">ПРОГНОЗ УЧАСТКА: НЕТ ДАННЫХ</p>
           <p class="preclose-comparison__status" id="trajectory-shadow-sample">Полные сопоставимые раунды: —/30; соседи формы: —/10.</p>
-          <p class="preclose-comparison__note" id="trajectory-shadow-note">Цель — движение цены от последней доступной точки перед forecast lock (возраст точки не более 5 с) до финальной цены результата <code>ed</code>, а не следующий тик. «От» и «до» — взвешенные исторические границы q20/q80 похожих траекторий, а не точные числа. Участок переводится через реальные ценовые полосы текущего раунда: основная шкала идёт от 0 сверху к 36 снизу, а нижняя дублирующая нулевая полоса помечается отдельно. Используются только полные траектории завершённых раундов, известные до текущего lock. Outcome этого prospective shadow пока не валидирован; он не меняет итоговый Top‑3 и виртуальный билет.</p>
+          <p class="preclose-comparison__note" id="trajectory-shadow-note">Цель — движение цены от последней доступной точки перед forecast lock (возраст точки не более 5 с) до финальной цены результата <code>ed</code>, а не следующий тик. Крупная строка показывает не более 6 соседних цифр вокруг типичного q50 внутри полного исторического коридора q20/q80; это сокращение отображения, а не точные числа. Участок переводится через реальные ценовые полосы текущего раунда: основная шкала идёт от 0 сверху к 36 снизу, а нижняя дублирующая нулевая полоса помечается отдельно. Используются только полные траектории завершённых раундов, известные до текущего lock. Outcome этого prospective shadow пока не валидирован; он не меняет итоговый Top‑3 и виртуальный билет.</p>
         </section>
 
         <details class="preclose-hit-history disclosure disclosure--inset" id="preclose-hit-history" data-state="loading" aria-labelledby="preclose-hit-history-title" aria-describedby="preclose-hit-history-status" aria-busy="true">

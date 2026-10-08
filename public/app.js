@@ -17,6 +17,7 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
   const CYCLE_COMPARISON_ALGORITHM_VERSION = "cycle-analogue-prefix-v1";
   const TRAJECTORY_SHADOW_VERSION = "trajectory-shadow-knn-v1";
   const TRAJECTORY_NUMBER_AREA_VERSION = "trajectory-number-area-v1";
+  const TRAJECTORY_NUMBER_AREA_MAX_DISPLAY_CELLS = 6;
   const TRAJECTORY_SHADOW_REQUIRED_HISTORY = 30;
   const TRAJECTORY_SHADOW_REQUIRED_NEIGHBORS = 10;
   const TRAJECTORY_SHADOW_DIRECTION_LABELS = Object.freeze({
@@ -1362,6 +1363,9 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
       || top.wireCell > bottom.wireCell
       || cells.length !== bottom.wireCell - top.wireCell + 1
       || cells.some((cell, index) => cell.wireCell !== top.wireCell + index)
+      || typicalPoint.wireCell < top.wireCell
+      || typicalPoint.wireCell > bottom.wireCell
+      || cells[typicalPoint.wireCell - top.wireCell]?.number !== typicalPoint.number
       || typeof corridor.lowerQuantile !== "number"
       || !Number.isFinite(corridor.lowerQuantile)
       || typeof corridor.upperQuantile !== "number"
@@ -1502,10 +1506,24 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
     return String(point.number);
   }
 
+  function trajectoryNumberAreaDisplayCells(area) {
+    const cells = area?.corridor?.cells;
+    if (!Array.isArray(cells) || cells.length === 0) return [];
+    const typicalIndex = cells.findIndex(
+      (cell) => cell.wireCell === area.typical?.wireCell,
+    );
+    if (typicalIndex < 0) return [];
+    const size = Math.min(TRAJECTORY_NUMBER_AREA_MAX_DISPLAY_CELLS, cells.length);
+    const centeredStart = Math.round(typicalIndex - ((size - 1) / 2));
+    const start = Math.min(Math.max(centeredStart, 0), cells.length - size);
+    return cells.slice(start, start + size);
+  }
+
   function trajectoryNumberAreaText(area) {
-    if (!area) return "ПРОГНОЗ УЧАСТКА: НЕТ ДАННЫХ";
-    const from = trajectoryNumberAreaLabel(area.corridor.top);
-    const to = trajectoryNumberAreaLabel(area.corridor.bottom);
+    const cells = trajectoryNumberAreaDisplayCells(area);
+    if (cells.length === 0) return "ПРОГНОЗ УЧАСТКА: НЕТ ДАННЫХ";
+    const from = trajectoryNumberAreaLabel(cells[0]);
+    const to = trajectoryNumberAreaLabel(cells[cells.length - 1]);
     return `ПРОГНОЗ УЧАСТКА: ОТ ${from} ДО ${to}`;
   }
 
