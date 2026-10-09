@@ -71,43 +71,35 @@ test("combined leader is the first dashboard block and renders exactly one numbe
   const block = html.slice(blockStart, headingStart);
   assert.ok(gapStart >= 0 && blockStart > gapStart && headingStart > blockStart);
   assert.doesNotMatch(block, /\bhidden\b/);
-  assert.match(block, /data-algorithm="predictive-family-index-v4"/);
+  assert.match(block, /data-algorithm="learned-predictive-family-index-v5"/);
   assert.match(block, /id="combined-pick-status" role="status" aria-live="polite" aria-atomic="true"/);
   assert.equal([...block.matchAll(/<output\b/g)].length, 1);
   assert.match(block, /id="combined-pick-number"/);
   assert.doesNotMatch(block, /<(?:ol|ul)\b/);
   assert.match(block, /Актуальные прогнозные сигналы · один итог/);
-  assert.match(block, /эвристический ранговый индекс, не вероятность/);
-  assert.match(block, /Давность, виртуальная цель, невыпавшие числа, survivor и исторический аналог остаются только наблюдением и в единого лидера не входят/);
+  assert.match(block, /Сервер заранее фиксирует полные распределения/);
+  assert.match(block, /Семейные веса начинают с 50\/50 и меняются только по прошлым завершённым общим снимкам/);
+  assert.match(block, /текущий результат в расчёт не попадает/);
+  assert.match(block, /эвристический ранговый индекс, не вероятность и не гарантия преимущества/);
+  assert.match(block, /Давность, виртуальная цель, невыпавшие числа, survivor и исторический аналог остаются только наблюдением/);
   assert.match(block, /1 из 37 \(≈2,7%\)/);
+  assert.match(html, /<script type="module" src="\/app\.js\?v=38"><\/script>/);
 
   assert.match(app, /from "\.\/combined-number\.js\?v=6"/);
   assert.match(app, /assessCombinedNumberFreshness\(store\.state\)/);
+  assert.match(app, /const LEARNED_LEADER_SCHEMA_VERSION = 1/);
+  assert.match(app, /const LEARNED_LEADER_ALGORITHM_VERSION = "learned-predictive-family-index-v5"/);
+  assert.match(app, /function normalizedPredictiveLeader\(value\)/);
+  assert.match(app, /value\.schemaVersion !== LEARNED_LEADER_SCHEMA_VERSION/);
+  assert.match(app, /value\.algorithmVersion !== LEARNED_LEADER_ALGORITHM_VERSION/);
+  assert.match(app, /value\.ranking\.length !== 37/);
+  assert.match(app, /normalizedLearnedLeaderDistribution/);
+  assert.match(app, /normalizedLearnedLeaderLearning/);
+  assert.match(app, /function normalizedPredictiveLeaderMetrics\(value\)/);
   assert.match(app, /function currentCombinedNumberContext\(\)/);
   assert.match(app, /function renderCombinedPick\(\)/);
-  assert.match(app, /latestForecast\.rankedNumbers/);
-  assert.match(app, /normalizedFrozenTransitionSignalRanking/);
   assert.match(app, /function currentPriceTrajectorySignals\(latestForecast\)/);
   assert.match(app, /combinedTrajectorySignals\(/);
-  assert.match(app, /function currentWarmTransitionSignals\(latestResult\)/);
-  assert.match(app, /function currentFollowerLiveRanking\(latestResult\)/);
-  assert.match(app, /\["ready", "no_signal", "waiting_training"\]\.includes\(signal\.status\)/);
-  assert.match(app, /buildFollowerStats\(store\.pairs, latestNumber\)/);
-  assert.match(app, /signal\.candidates\.map/);
-  assert.match(app, /signal\.picks\.map/);
-  assert.match(app, /signal\.anchorResultId !== latestResultId/);
-  assert.match(app, /signal\.sourceNumber !== latestNumber/);
-  assert.match(app, /lastAttempt\?\.resultId === latestResultId/);
-  assert.match(app, /lastAttempt\?\.resultNumber === latestNumber/);
-  assert.match(app, /session\.continuityEpoch !== latestEpoch/);
-  assert.match(app, /historyMaxResultId !== latestResultId/);
-  assert.match(app, /historyCutoffAt\.getTime\(\) !== lockedAt\.getTime\(\)/);
-  assert.match(app, /family: "price"/);
-  assert.match(app, /family: "conditional-history"/);
-  assert.doesNotMatch(app, /result\.status === "no_consensus"/);
-  assert.doesNotMatch(app, /result\.status === "insufficient_families"/);
-  assert.doesNotMatch(app, /result\.status === "ambiguous"/);
-  assert.match(app, /latestForecast\.settlement === null/);
   assert.match(server, /pipelinePending: resultPipeline\.getPendingCounts\(\)/);
   assert.ok(
     [...app.matchAll(/renderCombinedPick\(\)/g)].length >= 3,
@@ -118,31 +110,39 @@ test("combined leader is the first dashboard block and renders exactly one numbe
   const contextEnd = app.indexOf("function renderCombinedPick", contextStart);
   const contextBlock = app.slice(contextStart, contextEnd);
   assert.ok(contextStart >= 0 && contextEnd > contextStart);
+  assert.match(contextBlock, /stateHasIntegrityGap\(store\.state\)/);
+  assert.match(contextBlock, /assessCombinedNumberFreshness\(store\.state\)/);
+  assert.match(contextBlock, /sameEntityId\(latestForecast\.roundId, currentRoundId\)/);
+  assert.match(contextBlock, /latestForecast\.settlement !== null/);
+  assert.match(contextBlock, /latestForecast\.predictiveLeader/);
+  assert.match(contextBlock, /normalizedPredictiveLeader\(latestForecast\.predictiveLeader\)/);
+  assert.match(contextBlock, /sameTimestamp\(leader\.lockedAt, latestForecast\.lockedAt\)/);
+  assert.match(contextBlock, /leader\.status !== "ready"/);
+  assert.match(contextBlock, /predictiveLeaderMetrics/);
+  assert.doesNotMatch(contextBlock, /combineNumberRankings|combinedTripleFollowerRanking/);
+  assert.doesNotMatch(contextBlock, /rankedNumbers|trajectoryShadow|pairHistory|followerTop5Tracker|tripleFollowerSignal/);
   assert.doesNotMatch(contextBlock, /currentOverdueRanking|currentVirtualRecencySignals/);
   assert.doesNotMatch(contextBlock, /currentActiveCycleRemaining|currentCompletedCycleSurvivor/);
   assert.doesNotMatch(contextBlock, /currentCycleAnalogueRanking/);
   assert.doesNotMatch(contextBlock, /recency-overdue-top3|recency-virtual-held/);
   assert.doesNotMatch(contextBlock, /cycle-remaining|cycle-completed-survivor|cycle-analogue-next/);
   assert.doesNotMatch(contextBlock, /family: "absence"|family: "cycle-analogue"/);
-  assert.match(contextBlock, /currentTripleFollowerRanking/);
   assert.doesNotMatch(contextBlock, /historicalAccount|actualNumber/);
-  assert.match(contextBlock, /currentPriceTrajectorySignals/);
-  assert.match(contextBlock, /id: "price-trajectory-rank37"/);
-  assert.match(contextBlock, /numbers: trajectory\.ranking/);
-  assert.match(contextBlock, /weights: trajectory\.weights/);
-  assert.doesNotMatch(contextBlock, /id: "price-start"/);
-  assert.doesNotMatch(
-    contextBlock,
-    /family: "price",\s*\n\s*numbers: modelNumbers/,
-  );
-  assert.doesNotMatch(contextBlock, /start-price-v2/);
-  assert.match(app, /прогнозные источники учтены/);
-  assert.doesNotMatch(app, /числовые блоки учтены/);
-  assert.match(contextBlock, /currentFollowerLiveRanking/);
-  assert.match(contextBlock, /tieSeed: `\$\{latestResultId\}:\$\{currentRoundId\}`/);
-  assert.match(contextBlock, /mode: "set"/);
-  assert.match(contextBlock, /forecastIsCurrent && modelNumbers\.length === 3/);
-  assert.doesNotMatch(contextBlock, /!forecastIsCurrent[^}]+return \{ state: "waiting"/s);
+
+  const renderStart = app.indexOf("function renderCombinedPick()");
+  const renderEnd = app.indexOf("function renderPrecloseComparison", renderStart);
+  const renderBlock = app.slice(renderStart, renderEnd);
+  assert.ok(renderStart >= 0 && renderEnd > renderStart);
+  assert.match(renderBlock, /const \{ leader, metrics \} = context/);
+  assert.match(renderBlock, /leader\.number/);
+  assert.match(renderBlock, /зафиксировано сервером до результата/);
+  assert.match(renderBlock, /обучение \$\{leader\.learning\.trainingCount\}/);
+  assert.match(renderBlock, /вес цены/);
+  assert.match(renderBlock, /истории/);
+  assert.match(renderBlock, /Top‑1/);
+  assert.match(renderBlock, /улучшение не гарантируется/);
+  assert.doesNotMatch(renderBlock, /combineNumberRankings|leaderMass|score|вероятност/);
+  assert.doesNotMatch(app, /\bcombineNumberRankings\b|\bcombinedTripleFollowerRanking\b/);
   assert.match(styles, /\.combined-pick\s*\{/);
   assert.match(styles, /\.combined-pick__result \.combined-pick__number\s*\{/);
   assert.match(
@@ -744,7 +744,7 @@ test("warm next-round forecast exposes a strict 5-percent walk-forward contract"
   assert.match(html, /id="follower-dynamic-next-title"[^>]*>[^<]*≥5%/);
   assert.match(html, /id="follower-dynamic-next-note"[^>]*>[\s\S]*?5%/);
   assert.match(html, /styles\.css\?v=28/);
-  assert.match(html, /app\.js\?v=37/);
+  assert.match(html, /app\.js\?v=38/);
   assert.match(styles, /\.follower-dynamic-next\s*\{/);
   assert.match(styles, /\.follower-warm-current\s*\{/);
   assert.match(styles, /\.follower-warm-picks\s*\{/);
@@ -966,7 +966,7 @@ test("cycle comparison language is descriptive, responsive, and cache-busted", (
   assert.match(block, /не предсказывает следующее число/);
   assert.doesNotMatch(block, /должн/iu);
   assert.match(html, /href="\/styles\.css\?v=28"/);
-  assert.match(html, /src="\/app\.js\?v=37"/);
+  assert.match(html, /src="\/app\.js\?v=38"/);
   assert.match(styles, /\.cycle-sequence-list\s*\{[\s\S]*?repeat\(auto-fill, minmax\(50px, 1fr\)\)/);
   assert.match(
     styles,

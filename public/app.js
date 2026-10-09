@@ -5,9 +5,7 @@ import {
   TRAJECTORY_RANK37_BASIS,
   TRAJECTORY_RANK37_VERSION,
   assessCombinedNumberFreshness,
-  combinedTripleFollowerRanking,
   combinedTrajectorySignals,
-  combineNumberRankings,
 } from "./combined-number.js?v=6";
 
 (() => {
@@ -31,6 +29,12 @@ import {
   const TRAJECTORY_NUMBER_AREA_MAX_DISPLAY_CELLS = 6;
   const TRAJECTORY_SHADOW_REQUIRED_HISTORY = 30;
   const TRAJECTORY_SHADOW_REQUIRED_NEIGHBORS = 10;
+  const LEARNED_LEADER_SCHEMA_VERSION = 1;
+  const LEARNED_LEADER_ALGORITHM_VERSION = "learned-predictive-family-index-v5";
+  const LEARNED_LEADER_LEARNING_VERSION = "family-brier-logodds-v1";
+  const LEARNED_LEADER_FAMILIES = ["price", "conditional-history"];
+  const LEARNED_LEADER_MINIMUM_ADAPTIVE_COUNT = 30;
+  const LEARNED_LEADER_SUM_TOLERANCE = 1e-9;
   const TRAJECTORY_SHADOW_DIRECTION_LABELS = Object.freeze({
     up: "вверх",
     down: "вниз",
@@ -2027,160 +2031,399 @@ import {
     return Boolean(integrityHasGap || warningHasGap);
   }
 
-  function normalizedFrozenTransitionSignalRanking(
-    value,
-    latestResult,
-    modelNumbers,
-    forecastLockedAt,
-  ) {
-    const latestResultId = asOptionalNonNegativeInteger(latestResult?.id);
-    const latestNumber = asRouletteNumber(latestResult?.number);
-    const latestEpoch = asOptionalNonNegativeInteger(
-      latestResult?.continuityEpoch,
-    );
-    const historyMaxResultId = asOptionalNonNegativeInteger(
-      value?.historyMaxResultId,
-    );
-    const anchorEpoch = asOptionalNonNegativeInteger(
-      value?.anchor?.continuityEpoch,
-    );
-    const latestSettledAt = parseDate(latestResult?.settledAt);
-    const anchorSettledAt = parseDate(value?.anchor?.settledAt);
-    const historyCutoffAt = parseDate(value?.historyCutoffAt);
-    const lockedAt = parseDate(forecastLockedAt);
-    const sampleSize = asOptionalNonNegativeInteger(value?.sampleSize);
-    const observedFollowerCount = asOptionalNonNegativeInteger(
-      value?.observedFollowerCount,
-    );
-    if (
-      !value
-      || typeof value !== "object"
-      || Array.isArray(value)
-      || value.schemaVersion !== 1
-      || value.status !== "ready"
-      || value.definition !== "adjacent-within-continuity-epoch"
-      || value.tieBreak !== "count-desc,last-seen-desc,number-asc"
-      || latestResultId === null
-      || latestResultId < 1
-      || latestNumber === null
-      || latestEpoch === null
-      || historyMaxResultId !== latestResultId
-      || anchorEpoch !== latestEpoch
-      || !latestSettledAt
-      || !anchorSettledAt
-      || latestSettledAt.getTime() !== anchorSettledAt.getTime()
-      || !historyCutoffAt
-      || !lockedAt
-      || historyCutoffAt.getTime() !== lockedAt.getTime()
-      || sampleSize === null
-      || sampleSize < 1
-      || observedFollowerCount === null
-      || observedFollowerCount < 5
-      || observedFollowerCount > sampleSize
-      || !sameEntityId(value.anchor?.resultId, latestResultId)
-      || asRouletteNumber(value.anchor?.number) !== latestNumber
-      || !Array.isArray(value.top3)
-      || value.top3.length < 1
-      || value.top3.length > 3
-      || modelNumbers.length !== 3
-    ) {
-      return [];
-    }
-
-    const entries = [];
-    const numbers = [];
-    const seen = new Set();
-    for (let index = 0; index < value.top3.length; index += 1) {
-      const item = value.top3[index];
-      const number = asRouletteNumber(item?.number);
-      const occurrenceCount = asOptionalNonNegativeInteger(item?.occurrenceCount);
-      const share = asOptionalFiniteNumber(item?.share);
-      if (
-        item?.rank !== index + 1
-        || number === null
-        || seen.has(number)
-        || occurrenceCount === null
-        || occurrenceCount < 1
-        || occurrenceCount > sampleSize
-        || share === null
-        || Math.abs(share - (occurrenceCount / sampleSize)) > 1e-12
-      ) {
-        return [];
-      }
-      seen.add(number);
-      numbers.push(number);
-      entries.push({ number, occurrenceCount });
-    }
-
-    const comparisonModel = normalizedForecastTop3(value.comparison?.modelTop3);
-    const comparisonPair = uniqueComparisonNumbers(value.comparison?.pairTop3);
-    if (
-      comparisonModel.length !== 3
-      || comparisonModel.some((number, index) => number !== modelNumbers[index])
-      || comparisonPair.length !== numbers.length
-      || comparisonPair.some((number, index) => number !== numbers[index])
-      || observedFollowerCount < numbers.length
-      || entries.reduce((total, { occurrenceCount }) => (
-        total + occurrenceCount
-      ), 0) > sampleSize
-    ) {
-      return [];
-    }
-    return entries.map(({ number }) => number);
+  function isPlainRecord(value) {
+    return Boolean(value) && typeof value === "object" && !Array.isArray(value);
   }
 
-  function currentWarmTransitionSignals(latestResult) {
-    if (!store.pairsLoaded || store.pairsError) return [];
-    const warm = normalizedFollowerWarmNextRound();
-    const signal = warm?.currentSignal;
-    const latestResultId = asOptionalNonNegativeInteger(latestResult?.id);
-    const latestNumber = asRouletteNumber(latestResult?.number);
-    if (
-      !signal
-      || !["ready", "no_signal", "waiting_training"].includes(signal.status)
-      || latestResultId === null
-      || latestResultId < 1
-      || latestNumber === null
-      || signal.anchorResultId !== latestResultId
-      || signal.sourceNumber !== latestNumber
-      || !sameTimestamp(signal.anchoredAt, latestResult?.settledAt)
-    ) {
-      return [];
+  function normalizedLearnedLeaderDistribution(value, { allowEmpty = false } = {}) {
+    if (!Array.isArray(value) || (allowEmpty && value.length === 0)) {
+      return allowEmpty && Array.isArray(value) && value.length === 0 ? [] : null;
     }
+    if (value.length !== 37) return null;
+    const distribution = [];
+    let total = 0;
+    for (const mass of value) {
+      if (typeof mass !== "number" || !Number.isFinite(mass) || mass < 0 || mass > 1) {
+        return null;
+      }
+      distribution.push(mass);
+      total += mass;
+    }
+    return Math.abs(total - 1) <= LEARNED_LEADER_SUM_TOLERANCE
+      ? distribution
+      : null;
+  }
 
-    const stats = buildFollowerStats(store.pairs, latestNumber);
-    if (
-      stats.sampleSize !== signal.sampleSize
-      || stats.observedFollowerCount !== signal.observedFollowerCount
-    ) {
-      return [];
-    }
-    const observedNumbers = stats.items
-      .filter(({ occurrenceCount }) => occurrenceCount > 0)
-      .map(({ number }) => number);
-    const sources = observedNumbers.length > 0
-      ? [{
-          id: "history-after-last-all",
-          family: "conditional-history",
-          numbers: observedNumbers,
-        }]
-      : [];
-    if (["ready", "no_signal"].includes(signal.status)) {
-      if (signal.candidates.length !== 5) return [];
+  function normalizedLearnedLeaderSourceManifest(value) {
+    if (!Array.isArray(value)) return null;
+    const ids = new Set();
+    const sources = [];
+    for (const source of value) {
+      if (
+        !isPlainRecord(source)
+        || typeof source.id !== "string"
+        || source.id.trim() === ""
+        || ids.has(source.id)
+        || !LEARNED_LEADER_FAMILIES.includes(source.family)
+        || !["ranking", "set"].includes(source.mode)
+        || !Array.isArray(source.numbers)
+        || source.numbers.length < 1
+        || source.numbers.length > 37
+      ) {
+        return null;
+      }
+      const numbers = source.numbers.map(asRouletteNumber);
+      if (numbers.some((number) => number === null) || new Set(numbers).size !== numbers.length) {
+        return null;
+      }
+      let weights = null;
+      if (source.weights !== null) {
+        if (
+          source.mode !== "ranking"
+          || !Array.isArray(source.weights)
+          || source.weights.length !== numbers.length
+          || source.weights.some((weight) => (
+            typeof weight !== "number"
+            || !Number.isFinite(weight)
+            || weight < 0
+            || weight > 1
+          ))
+          || Math.abs(
+            source.weights.reduce((sum, weight) => sum + weight, 0) - 1
+          ) > LEARNED_LEADER_SUM_TOLERANCE
+        ) {
+          return null;
+        }
+        weights = [...source.weights];
+      }
+      ids.add(source.id);
       sources.push({
-        id: "history-after-last-top5",
-        family: "conditional-history",
-        numbers: signal.candidates.map(({ number }) => number),
-      });
-    }
-    if (signal.picks.length > 0) {
-      sources.push({
-        id: "history-after-last-threshold",
-        family: "conditional-history",
-        numbers: signal.picks.map(({ number }) => number),
+        id: source.id,
+        family: source.family,
+        mode: source.mode,
+        numbers,
+        weights,
       });
     }
     return sources;
+  }
+
+  function normalizedLearnedLeaderLearning(value, lockedAt) {
+    if (
+      !isPlainRecord(value)
+      || value.version !== LEARNED_LEADER_LEARNING_VERSION
+      || !["cold_start", "adaptive"].includes(value.status)
+      || !sameTimestamp(value.learningCutoffAt, lockedAt)
+      || !isPlainRecord(value.familyWeights)
+    ) {
+      return null;
+    }
+    const trainingCount = asOptionalNonNegativeInteger(value.trainingCount);
+    const eligibleRowCount = asOptionalNonNegativeInteger(value.eligibleRowCount);
+    const priceWeight = value.familyWeights.price;
+    const historyWeight = value.familyWeights["conditional-history"];
+    if (
+      trainingCount === null
+      || eligibleRowCount === null
+      || eligibleRowCount < trainingCount
+      || value.status !== (
+        trainingCount < LEARNED_LEADER_MINIMUM_ADAPTIVE_COUNT
+          ? "cold_start"
+          : "adaptive"
+      )
+      || typeof priceWeight !== "number"
+      || typeof historyWeight !== "number"
+      || !Number.isFinite(priceWeight)
+      || !Number.isFinite(historyWeight)
+      || priceWeight < 0
+      || priceWeight > 1
+      || historyWeight < 0
+      || historyWeight > 1
+      || Math.abs(priceWeight + historyWeight - 1) > LEARNED_LEADER_SUM_TOLERANCE
+    ) {
+      return null;
+    }
+    return {
+      status: value.status,
+      trainingCount,
+      eligibleRowCount,
+      familyWeights: {
+        price: priceWeight,
+        "conditional-history": historyWeight,
+      },
+    };
+  }
+
+  function normalizedPredictiveLeader(value) {
+    if (
+      !isPlainRecord(value)
+      || value.schemaVersion !== LEARNED_LEADER_SCHEMA_VERSION
+      || value.algorithmVersion !== LEARNED_LEADER_ALGORITHM_VERSION
+      || !["ready", "unavailable"].includes(value.status)
+      || !parseDate(value.lockedAt)
+      || typeof value.tieSeed !== "string"
+      || value.tieSeed.trim() === ""
+      || (value.evaluation !== null && value.evaluation !== undefined)
+    ) {
+      return null;
+    }
+
+    const sourceManifest = normalizedLearnedLeaderSourceManifest(value.sourceManifest);
+    const sourceCount = asOptionalNonNegativeInteger(value.sourceCount);
+    const familyCount = asOptionalNonNegativeInteger(value.familyCount);
+    const learning = normalizedLearnedLeaderLearning(value.learning, value.lockedAt);
+    if (
+      sourceManifest === null
+      || sourceCount === null
+      || sourceCount !== sourceManifest.length
+      || familyCount === null
+      || familyCount > LEARNED_LEADER_FAMILIES.length
+      || learning === null
+      || !isPlainRecord(value.familyDistributions)
+      || !isPlainRecord(value.familyWeights)
+    ) {
+      return null;
+    }
+
+    const familyIds = Object.keys(value.familyDistributions);
+    const sourceFamilyIds = [...new Set(
+      sourceManifest.map((source) => source.family),
+    )].sort();
+    if (
+      familyIds.length !== familyCount
+      || familyIds.some((family) => !LEARNED_LEADER_FAMILIES.includes(family))
+      || Object.keys(value.familyWeights).some((family) => !familyIds.includes(family))
+      || sourceFamilyIds.length !== familyIds.length
+      || sourceFamilyIds.some((family) => !familyIds.includes(family))
+    ) {
+      return null;
+    }
+    const familyDistributions = {};
+    for (const family of familyIds) {
+      const distribution = normalizedLearnedLeaderDistribution(
+        value.familyDistributions[family],
+      );
+      if (distribution === null) return null;
+      familyDistributions[family] = distribution;
+    }
+
+    if (value.status === "unavailable") {
+      if (
+        value.reason !== "no_valid_family"
+        || sourceCount !== 0
+        || familyCount !== 0
+        || Object.keys(value.familyWeights).length !== 0
+        || normalizedLearnedLeaderDistribution(
+          value.combinedDistribution,
+          { allowEmpty: true },
+        )?.length !== 0
+        || !Array.isArray(value.ranking)
+        || value.ranking.length !== 0
+        || value.leaderNumber !== null
+      ) {
+        return null;
+      }
+      return {
+        status: "unavailable",
+        lockedAt: value.lockedAt,
+        sourceCount,
+        familyCount,
+        learning,
+      };
+    }
+
+    if (
+      familyCount < 1
+      || value.reason !== learning.status
+      || Object.keys(value.familyWeights).length !== familyCount
+    ) {
+      return null;
+    }
+    const familyWeights = {};
+    let familyWeightTotal = 0;
+    for (const family of familyIds) {
+      const weight = value.familyWeights[family];
+      if (
+        typeof weight !== "number"
+        || !Number.isFinite(weight)
+        || weight < 0
+        || weight > 1
+      ) {
+        return null;
+      }
+      familyWeights[family] = weight;
+      familyWeightTotal += weight;
+    }
+    if (Math.abs(familyWeightTotal - 1) > LEARNED_LEADER_SUM_TOLERANCE) {
+      return null;
+    }
+    const learnedAvailableTotal = familyIds.reduce(
+      (total, family) => total + learning.familyWeights[family],
+      0,
+    );
+    if (
+      !(learnedAvailableTotal > 0)
+      || familyIds.some((family) => Math.abs(
+        familyWeights[family]
+          - learning.familyWeights[family] / learnedAvailableTotal,
+      ) > LEARNED_LEADER_SUM_TOLERANCE)
+    ) {
+      return null;
+    }
+
+    const combinedDistribution = normalizedLearnedLeaderDistribution(
+      value.combinedDistribution,
+    );
+    if (!combinedDistribution || !Array.isArray(value.ranking) || value.ranking.length !== 37) {
+      return null;
+    }
+    for (let number = 0; number < 37; number += 1) {
+      const rebuiltMass = familyIds.reduce((total, family) => (
+        total + familyWeights[family] * familyDistributions[family][number]
+      ), 0);
+      if (Math.abs(rebuiltMass - combinedDistribution[number]) > LEARNED_LEADER_SUM_TOLERANCE) {
+        return null;
+      }
+    }
+
+    const ranking = [];
+    const seenNumbers = new Set();
+    let previousMass = Infinity;
+    for (let index = 0; index < value.ranking.length; index += 1) {
+      const candidate = value.ranking[index];
+      const number = asRouletteNumber(candidate?.number);
+      const mass = candidate?.mass;
+      const familySupportCount = asOptionalNonNegativeInteger(
+        candidate?.familySupportCount,
+      );
+      if (
+        !isPlainRecord(candidate)
+        || candidate.rank !== index + 1
+        || number === null
+        || seenNumbers.has(number)
+        || typeof mass !== "number"
+        || !Number.isFinite(mass)
+        || Math.abs(mass - combinedDistribution[number]) > LEARNED_LEADER_SUM_TOLERANCE
+        || mass > previousMass + LEARNED_LEADER_SUM_TOLERANCE
+        || familySupportCount === null
+        || familySupportCount > familyCount
+      ) {
+        return null;
+      }
+      seenNumbers.add(number);
+      ranking.push({ number, mass, familySupportCount });
+      previousMass = mass;
+    }
+
+    const leaderNumber = asRouletteNumber(value.leaderNumber);
+    const leaderMass = value.leaderMass;
+    const runnerUpMass = value.runnerUpMass;
+    const margin = value.margin;
+    const tieCount = asOptionalNonNegativeInteger(value.tieCount);
+    if (
+      seenNumbers.size !== 37
+      || leaderNumber === null
+      || leaderNumber !== ranking[0].number
+      || typeof leaderMass !== "number"
+      || typeof runnerUpMass !== "number"
+      || typeof margin !== "number"
+      || !Number.isFinite(leaderMass)
+      || !Number.isFinite(runnerUpMass)
+      || !Number.isFinite(margin)
+      || Math.abs(leaderMass - ranking[0].mass) > LEARNED_LEADER_SUM_TOLERANCE
+      || Math.abs(runnerUpMass - ranking[1].mass) > LEARNED_LEADER_SUM_TOLERANCE
+      || Math.abs(margin - (leaderMass - runnerUpMass)) > LEARNED_LEADER_SUM_TOLERANCE
+      || tieCount === null
+      || tieCount < 1
+      || tieCount > 37
+      || typeof value.tieBreakApplied !== "boolean"
+      || value.tieBreakApplied !== (tieCount > 1)
+    ) {
+      return null;
+    }
+
+    return {
+      status: "ready",
+      lockedAt: value.lockedAt,
+      number: leaderNumber,
+      sourceCount,
+      familyCount,
+      familyWeights,
+      learning,
+      tieBreakApplied: value.tieBreakApplied,
+    };
+  }
+
+  function normalizedPredictiveLeaderMetrics(value) {
+    if (
+      !isPlainRecord(value)
+      || value.algorithmVersion !== LEARNED_LEADER_ALGORITHM_VERSION
+    ) {
+      return null;
+    }
+    const readyCount = asOptionalNonNegativeInteger(value.readyCount);
+    const settledCount = asOptionalNonNegativeInteger(value.settledCount);
+    const pendingCount = asOptionalNonNegativeInteger(value.pendingCount);
+    const top1Hits = asOptionalNonNegativeInteger(value.top1Hits);
+    const top3Hits = asOptionalNonNegativeInteger(value.top3Hits);
+    if (
+      readyCount === null
+      || settledCount === null
+      || pendingCount === null
+      || top1Hits === null
+      || top3Hits === null
+      || settledCount > readyCount
+      || pendingCount !== readyCount - settledCount
+      || top1Hits > settledCount
+      || top3Hits > settledCount
+      || top1Hits > top3Hits
+    ) {
+      return null;
+    }
+    const top1Rate = value.top1Rate;
+    const top3Rate = value.top3Rate;
+    if (
+      (settledCount === 0 && (top1Rate !== null || top3Rate !== null))
+      || (settledCount > 0 && (
+        typeof top1Rate !== "number"
+        || typeof top3Rate !== "number"
+        || !Number.isFinite(top1Rate)
+        || !Number.isFinite(top3Rate)
+        || Math.abs(top1Rate - top1Hits / settledCount) > LEARNED_LEADER_SUM_TOLERANCE
+        || Math.abs(top3Rate - top3Hits / settledCount) > LEARNED_LEADER_SUM_TOLERANCE
+      ))
+    ) {
+      return null;
+    }
+    const meanBrierLoss = value.meanBrierLoss;
+    const uniformBrierLoss = value.uniformBrierLoss;
+    const beatsUniform = value.beatsUniform;
+    if (
+      typeof uniformBrierLoss !== "number"
+      || !Number.isFinite(uniformBrierLoss)
+      || Math.abs(uniformBrierLoss - 18 / 37) > LEARNED_LEADER_SUM_TOLERANCE
+      || (settledCount === 0 && (
+        meanBrierLoss !== null || beatsUniform !== null
+      ))
+      || (settledCount > 0 && (
+        typeof meanBrierLoss !== "number"
+        || !Number.isFinite(meanBrierLoss)
+        || meanBrierLoss < 0
+        || meanBrierLoss > 1
+        || typeof beatsUniform !== "boolean"
+        || beatsUniform !== (meanBrierLoss < uniformBrierLoss)
+      ))
+    ) {
+      return null;
+    }
+    return {
+      settledCount,
+      top1Hits,
+      top1Rate,
+      meanBrierLoss,
+      uniformBrierLoss,
+      beatsUniform,
+    };
   }
 
   function currentPriceTrajectorySignals(latestForecast) {
@@ -2188,146 +2431,48 @@ import {
     return combinedTrajectorySignals(shadow);
   }
 
-  function currentFollowerLiveRanking(latestResult) {
-    const tracker = normalizedFollowerTop5Tracker(
-      store.state?.followerTop5Tracker,
-    );
-    const session = tracker?.currentSession;
-    const latestResultId = asOptionalNonNegativeInteger(latestResult?.id);
-    const latestEpoch = asOptionalNonNegativeInteger(
-      latestResult?.continuityEpoch,
-    );
-    const latestNumber = asRouletteNumber(latestResult?.number);
-    if (
-      !session
-      || latestResultId === null
-      || latestResultId < 1
-      || latestEpoch === null
-      || latestNumber === null
-      || session.continuityEpoch !== latestEpoch
-    ) {
-      return [];
-    }
-
-    if (tracker.status === "armed") {
-      return session.attemptCount === 0
-        && session.anchor.resultId === latestResultId
-        && session.anchor.number === latestNumber
-        ? session.fixedNumbers
-        : [];
-    }
-    if (tracker.status !== "active") return [];
-
-    const lastAttempt = session.attempts.at(-1);
-    return lastAttempt?.resultId === latestResultId
-      && lastAttempt?.resultNumber === latestNumber
-      ? session.fixedNumbers
-      : [];
-  }
-
-  function currentTripleFollowerRanking(latestResult) {
-    return combinedTripleFollowerRanking(
-      store.state?.tripleFollowerSignal,
-      latestResult,
-    );
-  }
-
   function currentCombinedNumberContext() {
-    if (!store.stateLoaded) return { state: "loading", sources: [] };
-    if (store.stateError || !store.state) return { state: "error", sources: [] };
-    if (stateHasIntegrityGap(store.state)) return { state: "paused", sources: [] };
+    if (!store.stateLoaded) return { state: "loading" };
+    if (store.stateError || !store.state) return { state: "error" };
+    if (stateHasIntegrityGap(store.state)) return { state: "paused" };
 
     const freshness = assessCombinedNumberFreshness(store.state);
     if (freshness.status !== "ready") {
-      return { state: freshness.status, sources: [] };
+      return { state: freshness.status };
     }
 
     const currentRoundId = freshness.currentRoundId;
-    const latestResult = store.state.latestResult;
-    const latestResultId = asOptionalNonNegativeInteger(latestResult?.id);
-    const latestNumber = asRouletteNumber(latestResult?.number);
     if (
       currentRoundId === null
       || currentRoundId === undefined
       || currentRoundId === ""
-      || latestResultId === null
-      || latestResultId < 1
-      || latestNumber === null
     ) {
-      return { state: "waiting", sources: [] };
+      return { state: "waiting" };
     }
 
     const latestForecast = store.state.precloseForecast?.latest;
-    const forecastIsCurrent = latestForecast
-      && sameEntityId(latestForecast.roundId, currentRoundId)
-      && (latestForecast.settlement === null || latestForecast.settlement === undefined);
-    const modelNumbers = forecastIsCurrent
-      ? normalizedForecastTop3(latestForecast.rankedNumbers)
-      : [];
-    const sources = [];
-
-    const trajectory = forecastIsCurrent
-      ? currentPriceTrajectorySignals(latestForecast)
-      : { ranking: [], weights: [], range: [] };
-    if (trajectory.ranking.length > 0) {
-      sources.push({
-        id: "price-trajectory-rank37",
-        family: "price",
-        numbers: trajectory.ranking,
-        weights: trajectory.weights,
-      });
+    if (
+      !isPlainRecord(latestForecast)
+      || !sameEntityId(latestForecast.roundId, currentRoundId)
+      || latestForecast.settlement !== null
+      || !parseDate(latestForecast.lockedAt)
+    ) {
+      return { state: "waiting" };
     }
-    if (trajectory.range.length > 0) {
-      sources.push({
-        id: "price-trajectory-range",
-        family: "price",
-        mode: "set",
-        numbers: trajectory.range,
-      });
+    if (latestForecast.predictiveLeader === null || latestForecast.predictiveLeader === undefined) {
+      return { state: "waiting" };
     }
-
-    const transitionNumbers = forecastIsCurrent && modelNumbers.length === 3
-      ? normalizedFrozenTransitionSignalRanking(
-        latestForecast.pairHistory,
-        latestResult,
-        modelNumbers,
-        latestForecast.lockedAt,
-      )
-      : [];
-    if (transitionNumbers.length > 0) {
-      sources.push({
-        id: "history-frozen-pair",
-        family: "conditional-history",
-        numbers: transitionNumbers,
-      });
+    const leader = normalizedPredictiveLeader(latestForecast.predictiveLeader);
+    if (!leader || !sameTimestamp(leader.lockedAt, latestForecast.lockedAt)) {
+      return { state: "paused" };
     }
-    sources.push(...currentWarmTransitionSignals(latestResult));
-
-    const followerLiveNumbers = currentFollowerLiveRanking(latestResult);
-    if (followerLiveNumbers.length > 0) {
-      sources.push({
-        id: "history-live-fixed",
-        family: "conditional-history",
-        numbers: followerLiveNumbers,
-      });
-    }
-
-    const tripleNumbers = currentTripleFollowerRanking(latestResult);
-    if (tripleNumbers === null) {
-      return { state: "paused", sources: [] };
-    }
-    if (tripleNumbers.length > 0) {
-      sources.push({
-        id: "history-last-two-triple",
-        family: "conditional-history",
-        numbers: tripleNumbers,
-      });
-    }
-
+    if (leader.status !== "ready") return { state: "waiting" };
     return {
-      state: sources.length > 0 ? "ready" : "waiting",
-      sources,
-      tieSeed: `${latestResultId}:${currentRoundId}`,
+      state: "ready",
+      leader,
+      metrics: normalizedPredictiveLeaderMetrics(
+        store.state.precloseForecast?.predictiveLeaderMetrics,
+      ),
     };
   }
 
@@ -2344,63 +2489,52 @@ import {
 
     if (context.state !== "ready") {
       const messages = {
-        loading: "Загружаем актуальные рейтинги текущего раунда.",
-        error: "Свежие данные недоступны — сводное число скрыто.",
-        paused: "Актуальность синхронного среза не подтверждена — число скрыто.",
-        waiting: "Пока нет актуального рейтинга для текущего раунда.",
+        loading: "Загружаем зафиксированное решение текущего раунда.",
+        error: "Свежие данные недоступны — число скрыто.",
+        paused: "Целостность зафиксированного решения не подтверждена — число скрыто.",
+        waiting: "Ждём серверную фиксацию решения до результата.",
       };
       elements.combinedPick.dataset.state = context.state;
       elements.combinedPick.setAttribute("aria-busy", String(context.state === "loading"));
-      setTextIfChanged(elements.combinedPickStatus, messages[context.state]);
-      setTextIfChanged(
-        elements.combinedPickSources,
-        context.state === "loading" ? "Собираем данные" : "Нет актуального числа",
-      );
-      resetNumber();
-      return;
-    }
-
-    const result = combineNumberRankings(context.sources, {
-      tieSeed: context.tieSeed,
-    });
-    if (
-      result.status === "unavailable"
-      || !isValidRouletteNumber(result.number)
-    ) {
-      elements.combinedPick.dataset.state = "waiting";
-      elements.combinedPick.setAttribute("aria-busy", "false");
       setTextIfChanged(
         elements.combinedPickStatus,
-        "Доступные числовые сигналы не прошли проверку — итог пока не показан.",
+        messages[context.state] || messages.waiting,
       );
       setTextIfChanged(
         elements.combinedPickSources,
-        result.sourceCount > 0
-          ? `${result.sourceCount} ${pluralForm(result.sourceCount, "метод", "метода", "методов")} · ${result.familyCount} ${pluralForm(result.familyCount, "семейство", "семейства", "семейств")}`
-          : "Нет актуального числа",
+        context.state === "loading" ? "Загружаем снимок" : "Актуального числа пока нет",
       );
       resetNumber();
       return;
     }
 
+    const { leader, metrics } = context;
     elements.combinedPick.dataset.state = "ready";
     elements.combinedPick.setAttribute("aria-busy", "false");
-    elements.combinedPickNumber.className = `result-ball combined-pick__number ${rouletteColorClass(result.number)}`;
-    elements.combinedPickNumber.textContent = String(result.number);
+    elements.combinedPickNumber.className = `result-ball combined-pick__number ${rouletteColorClass(leader.number)}`;
+    elements.combinedPickNumber.textContent = String(leader.number);
     elements.combinedPickNumber.setAttribute(
       "aria-label",
-      `Единый лидер: число ${result.number}, ${rouletteColorLabel(result.number)}`,
+      `Единый лидер: число ${leader.number}, ${rouletteColorLabel(leader.number)}`,
     );
 
     setTextIfChanged(
       elements.combinedPickStatus,
-      result.tieBreakApplied
-        ? `Все доступные и прошедшие проверку прогнозные источники учтены. Равный максимальный индекс разрешён неизменным правилом текущего раунда; показано одно число.`
-        : `Все доступные и прошедшие проверку прогнозные источники учтены; показано одно число с максимальным сводным рангом.`,
+      leader.learning.status === "cold_start"
+        ? "Число зафиксировано сервером до результата. Холодный старт: веса ещё стянуты к 50/50; улучшение не гарантируется."
+        : "Число зафиксировано сервером до результата. Веса рассчитаны только по прошлым завершённым общим снимкам; улучшение не гарантируется.",
     );
+    const priceWeight = leader.learning.familyWeights.price;
+    const historyWeight = leader.learning.familyWeights["conditional-history"];
+    const currentFamilyText = leader.familyCount === 1
+      ? ` · в этом lock доступна только ${leader.familyWeights.price === 1 ? "цена" : "условная история"}`
+      : "";
+    const metricText = metrics?.settledCount > 0
+      ? ` · Top‑1 ${metrics.top1Hits}/${metrics.settledCount} (${trajectoryShadowShareFormatter.format(metrics.top1Rate)})`
+      : "";
     setTextIfChanged(
       elements.combinedPickSources,
-      `${result.sourceCount} ${pluralForm(result.sourceCount, "источник", "источника", "источников")} · ${result.familyCount} ${pluralForm(result.familyCount, "группа", "группы", "групп")} · поддержка ${result.familySupportCount}/${result.familyCount}`,
+      `${leader.sourceCount} ${pluralForm(leader.sourceCount, "источник", "источника", "источников")} · ${leader.familyCount} ${pluralForm(leader.familyCount, "семья", "семьи", "семей")} · обучение ${leader.learning.trainingCount} · обучаемый вес цены ${trajectoryShadowShareFormatter.format(priceWeight)} · истории ${trajectoryShadowShareFormatter.format(historyWeight)}${currentFamilyText}${metricText}`,
     );
   }
 
