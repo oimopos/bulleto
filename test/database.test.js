@@ -803,9 +803,20 @@ test("pre-close forecast freezes an insufficient trajectory shadow instead of us
       displayRangeHits: 0,
       q50ExactHits: 0,
       fullCorridorHits: 0,
+      rank37Version: "trajectory-rank37-v1",
+      rank37Basis: "adaptive-weighted-neighbor-delta-to-current-bands",
+      rank37ReadyCount: 0,
+      rank37SettledCount: 0,
+      rank37PendingCount: 0,
+      rank37EvaluatedCount: 0,
+      rank37UngradableCount: 0,
+      rank37Top1Hits: 0,
+      rank37Top3Hits: 0,
       displayRangeRate: null,
       q50ExactRate: null,
       fullCorridorRate: null,
+      rank37Top1Rate: null,
+      rank37Top3Rate: null,
       coverageRate: null,
     });
   } finally {
@@ -1100,6 +1111,8 @@ test("trajectory shadow freezes a correction-aware past-only READY prediction an
     });
     assert.deepEqual(shadow.integration.displayRange, shadow.displayRange);
     assert.deepEqual(shadow.integration.adaptive, shadow.adaptive);
+    assert.equal(shadow.numberRanking, null);
+    assert.deepEqual(shadow.integration.numberRanking, shadow.numberRanking);
     assert.equal(shadow.evaluation, null);
 
     const frozenShadow = {
@@ -1183,6 +1196,7 @@ test("trajectory shadow freezes a correction-aware past-only READY prediction an
     assert.equal(latest.latest.trajectoryShadow.evaluation.rawCell, null);
     assert.equal(latest.latest.trajectoryShadow.evaluation.displayRangeHit, null);
     assert.equal(latest.trajectoryMetrics.ungradableCount, 1);
+    assert.equal(latest.trajectoryMetrics.rank37UngradableCount, 0);
 
     setCurrentZero.run(37, currentResultId);
     database.sqlite
@@ -1198,6 +1212,8 @@ test("trajectory shadow freezes a correction-aware past-only READY prediction an
     assert.equal(latest.latest.trajectoryShadow.evaluation.fullCorridorHit, null);
     assert.equal(latest.trajectoryMetrics.evaluatedCount, 0);
     assert.equal(latest.trajectoryMetrics.ungradableCount, 1);
+    assert.equal(latest.trajectoryMetrics.rank37EvaluatedCount, 0);
+    assert.equal(latest.trajectoryMetrics.rank37UngradableCount, 0);
 
     database.sqlite
       .prepare("UPDATE round_results SET result_number = 23, raw_cell = 23 WHERE id = ?")
@@ -1217,9 +1233,20 @@ test("trajectory shadow freezes a correction-aware past-only READY prediction an
       displayRangeHits: 1,
       q50ExactHits: 1,
       fullCorridorHits: 1,
+      rank37Version: "trajectory-rank37-v1",
+      rank37Basis: "adaptive-weighted-neighbor-delta-to-current-bands",
+      rank37ReadyCount: 0,
+      rank37SettledCount: 0,
+      rank37PendingCount: 0,
+      rank37EvaluatedCount: 0,
+      rank37UngradableCount: 0,
+      rank37Top1Hits: 0,
+      rank37Top3Hits: 0,
       displayRangeRate: 1,
       q50ExactRate: 1,
       fullCorridorRate: 1,
+      rank37Top1Rate: null,
+      rank37Top3Rate: null,
       coverageRate: 1,
     });
     markResultsCreatedAtObservation(database, "trajectory-current-result");
@@ -1559,6 +1586,9 @@ test("trajectory shadow freezes a correction-aware past-only READY prediction an
     assert.equal(nextState.trajectoryMetrics.readyCount, 2);
     assert.equal(nextState.trajectoryMetrics.settledCount, 1);
     assert.equal(nextState.trajectoryMetrics.pendingCount, 1);
+    assert.equal(nextState.trajectoryMetrics.rank37ReadyCount, 0);
+    assert.equal(nextState.trajectoryMetrics.rank37SettledCount, 0);
+    assert.equal(nextState.trajectoryMetrics.rank37PendingCount, 0);
 
     const nextForecastId = nextState.latest.id;
     const fullCorridorCells = new Set(
@@ -1603,9 +1633,20 @@ test("trajectory shadow freezes a correction-aware past-only READY prediction an
       displayRangeHits: 1,
       q50ExactHits: 1,
       fullCorridorHits: 1,
+      rank37Version: "trajectory-rank37-v1",
+      rank37Basis: "adaptive-weighted-neighbor-delta-to-current-bands",
+      rank37ReadyCount: 0,
+      rank37SettledCount: 0,
+      rank37PendingCount: 0,
+      rank37EvaluatedCount: 0,
+      rank37UngradableCount: 0,
+      rank37Top1Hits: 0,
+      rank37Top3Hits: 0,
       displayRangeRate: 0.5,
       q50ExactRate: 0.5,
       fullCorridorRate: 0.5,
+      rank37Top1Rate: null,
+      rank37Top3Rate: null,
       coverageRate: 1,
     });
 
@@ -1685,6 +1726,37 @@ test("trajectory shadow freezes a correction-aware past-only READY prediction an
     assert.equal(finalIntegration.usableLearningRowCount, 500);
     assert.equal(finalIntegration.adaptive.trainingCount, 500);
     assert.equal(finalIntegration.adaptive.eligibleLearningRowCount, 500);
+    assert.equal(finalIntegration.numberRanking.version, "trajectory-rank37-v1");
+    assert.equal(
+      finalIntegration.numberRanking.basis,
+      "adaptive-weighted-neighbor-delta-to-current-bands",
+    );
+    assert.equal(finalIntegration.numberRanking.candidateCount, 37);
+    assert.equal(
+      finalIntegration.numberRanking.evidenceCandidateCount,
+      2,
+      "a low-diversity fixture must stay stored but remain ineligible for Top-3 metrics",
+    );
+    assert.equal(finalIntegration.numberRanking.ranking.length, 37);
+    assert.equal(
+      new Set(
+        finalIntegration.numberRanking.ranking.map((candidate) => candidate.number),
+      ).size,
+      37,
+    );
+    assert.equal(finalIntegration.numberRanking.tieSeed, iso(finalLockedMs));
+    const finalState = database.getPrecloseForecastState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    assert.deepEqual(
+      finalState.latest.trajectoryShadow.numberRanking,
+      finalIntegration.numberRanking,
+    );
+    assert.equal(finalState.trajectoryMetrics.rank37ReadyCount, 0);
+    assert.equal(finalState.trajectoryMetrics.rank37SettledCount, 0);
+    assert.equal(finalState.trajectoryMetrics.rank37PendingCount, 0);
+    assert.equal(finalState.trajectoryMetrics.rank37EvaluatedCount, 0);
     assert.equal(
       finalIntegration.adaptive.lastTrainingCompletedAt,
       iso(finalLockedMs - 1_000),

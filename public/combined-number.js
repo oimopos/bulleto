@@ -1,6 +1,13 @@
-export const COMBINED_NUMBER_ALGORITHM_VERSION = "all-signal-family-index-v1";
+export const COMBINED_NUMBER_ALGORITHM_VERSION = "all-signal-family-index-v3";
+export const TRAJECTORY_RANK37_VERSION = "trajectory-rank37-v1";
+export const TRAJECTORY_RANK37_BASIS =
+  "adaptive-weighted-neighbor-delta-to-current-bands";
+export const TRAJECTORY_RANK37_MIN_TRAINING_COUNT = 30;
+export const TRAJECTORY_RANK37_MIN_EVIDENCE_CANDIDATES = 3;
 
 const SCORE_EPSILON = 1e-12;
+export const TRAJECTORY_RANK37_EVIDENCE_MASS_THRESHOLD =
+  SCORE_EPSILON / 0.95;
 
 function safeNonNegativeInteger(value) {
   if (value === null || value === undefined || value === "") return null;
@@ -107,8 +114,11 @@ export function assessCombinedNumberFreshness(state) {
   return freshnessResult("ready", "fresh", cursor);
 }
 
-export function combinedTrajectorySignals(value, minimumTrainingCount = 30) {
-  const unavailable = { ranking: [], range: [] };
+export function combinedTrajectorySignals(
+  value,
+  minimumTrainingCount = TRAJECTORY_RANK37_MIN_TRAINING_COUNT,
+) {
+  const unavailable = { ranking: [], weights: [], range: [] };
   if (
     !value
     || typeof value !== "object"
@@ -139,6 +149,92 @@ export function combinedTrajectorySignals(value, minimumTrainingCount = 30) {
     return unavailable;
   }
 
+  const numberRanking = value.numberRanking;
+  if (
+    !numberRanking
+    || typeof numberRanking !== "object"
+    || Array.isArray(numberRanking)
+    || numberRanking.version !== TRAJECTORY_RANK37_VERSION
+    || numberRanking.basis !== TRAJECTORY_RANK37_BASIS
+    || numberRanking.candidateCount !== 37
+    || !Number.isSafeInteger(numberRanking.evidenceCandidateCount)
+    || numberRanking.evidenceCandidateCount < TRAJECTORY_RANK37_MIN_EVIDENCE_CANDIDATES
+    || numberRanking.evidenceCandidateCount > 37
+    || !Number.isFinite(numberRanking.evidenceMassThreshold)
+    || Math.abs(
+      numberRanking.evidenceMassThreshold
+      - TRAJECTORY_RANK37_EVIDENCE_MASS_THRESHOLD
+    ) > 1e-18
+    || typeof numberRanking.tieSeed !== "string"
+    || numberRanking.tieSeed.trim() === ""
+    || numberRanking.smoothing?.version !== "uniform-mixture-v1"
+    || !Number.isFinite(numberRanking.smoothing?.weight)
+    || Math.abs(numberRanking.smoothing?.weight - 0.05) > 1e-12
+    || !Number.isFinite(numberRanking.smoothing?.baselineMass)
+    || Math.abs(numberRanking.smoothing?.baselineMass - (1 / 37)) > 1e-12
+    || !Array.isArray(numberRanking.ranking)
+    || numberRanking.ranking.length !== 37
+  ) {
+    return unavailable;
+  }
+  const ranking = [];
+  const seenRankingNumbers = new Set();
+  let totalMass = 0;
+  let totalRawMass = 0;
+  let evidenceCandidateCount = 0;
+  let previousMass = Infinity;
+  for (let index = 0; index < numberRanking.ranking.length; index += 1) {
+    const candidate = numberRanking.ranking[index];
+    const number = safeRouletteNumber(candidate?.number);
+    const mass = candidate?.mass;
+    const rawMass = candidate?.rawMass;
+    if (
+      candidate?.rank !== index + 1
+      || number === null
+      || candidate.number !== number
+      || seenRankingNumbers.has(number)
+      || !Number.isFinite(mass)
+      || mass < 0
+      || mass > 1
+      || !Number.isFinite(rawMass)
+      || rawMass < 0
+      || rawMass > 1
+      || Math.abs(mass - (0.95 * rawMass + 0.05 / 37)) > 1e-12
+      || mass > previousMass + SCORE_EPSILON
+    ) {
+      return unavailable;
+    }
+    if (
+      index > 0
+      && Math.abs(mass - previousMass) <= SCORE_EPSILON
+      && tiePosition(
+        ranking[index - 1],
+        `${TRAJECTORY_RANK37_VERSION}:${numberRanking.tieSeed}`,
+      ) > tiePosition(
+        number,
+        `${TRAJECTORY_RANK37_VERSION}:${numberRanking.tieSeed}`,
+      )
+    ) {
+      return unavailable;
+    }
+    seenRankingNumbers.add(number);
+    ranking.push(number);
+    totalMass += mass;
+    totalRawMass += rawMass;
+    if (rawMass > TRAJECTORY_RANK37_EVIDENCE_MASS_THRESHOLD) {
+      evidenceCandidateCount += 1;
+    }
+    previousMass = mass;
+  }
+  if (
+    seenRankingNumbers.size !== 37
+    || evidenceCandidateCount !== numberRanking.evidenceCandidateCount
+    || Math.abs(totalMass - 1) > 1e-9
+    || Math.abs(totalRawMass - 1) > 1e-9
+  ) {
+    return unavailable;
+  }
+
   const range = value.displayRange.cells.map((cell) => {
     if (
       !Number.isInteger(cell?.wireCell)
@@ -160,8 +256,13 @@ export function combinedTrajectorySignals(value, minimumTrainingCount = 30) {
     return unavailable;
   }
 
+  const evidenceRawMass = numberRanking.ranking.map(({ rawMass }) => (
+    rawMass > TRAJECTORY_RANK37_EVIDENCE_MASS_THRESHOLD ? rawMass : 0
+  ));
+  const evidenceTotal = evidenceRawMass.reduce((total, mass) => total + mass, 0);
   return {
-    ranking: [value.numberArea.typical.number],
+    ranking,
+    weights: evidenceRawMass.map((mass) => mass / evidenceTotal),
     range,
   };
 }
@@ -216,39 +317,6 @@ export function combinedVirtualRecencySources(value, latestResult) {
   }
 
   const sources = [];
-  const rawLongest = Array.isArray(value.longestCandidates)
-    ? value.longestCandidates
-    : null;
-  const longest = rawLongest?.map((candidate) => ({
-    number: safeRouletteNumber(candidate?.number),
-    continuityEpoch: safeNonNegativeInteger(candidate?.continuityEpoch),
-    roundsSinceLast: safeNonNegativeInteger(candidate?.roundsSinceLast),
-  })) ?? null;
-  const firstLongest = longest?.[0] ?? null;
-  const longestNumbers = longest?.map(({ number }) => number) ?? [];
-  if (
-    longest
-    && longest.length > 0
-    && longest.length <= 37
-    && longestNumbers.every((number) => number !== null)
-    && new Set(longestNumbers).size === longestNumbers.length
-    && longest.every((candidate) => (
-      candidate.continuityEpoch === latestEpoch
-      && candidate.roundsSinceLast === firstLongest.roundsSinceLast
-    ))
-    && safeRouletteNumber(value.longestCandidate?.number) === firstLongest.number
-    && safeNonNegativeInteger(value.longestCandidate?.continuityEpoch) === latestEpoch
-    && safeNonNegativeInteger(value.longestCandidate?.roundsSinceLast)
-      === firstLongest.roundsSinceLast
-  ) {
-    sources.push({
-      id: "recency-virtual-longest-set",
-      family: "recency",
-      mode: "set",
-      numbers: longestNumbers,
-    });
-  }
-
   const session = value.activeSession;
   const status = String(value.status || "").toLowerCase();
   const sessionStatus = String(session?.status || "").toLowerCase();
@@ -272,7 +340,7 @@ export function combinedVirtualRecencySources(value, latestResult) {
   ) {
     sources.push({
       id: "recency-virtual-held",
-      family: "recency",
+      family: "absence",
       numbers: [targetNumber],
     });
   }
@@ -562,6 +630,7 @@ function normalizeSource(value) {
   const id = typeof value.id === "string" ? value.id.trim() : "";
   const family = typeof value.family === "string" ? value.family.trim() : "";
   const mode = value.mode === undefined ? "ranking" : value.mode;
+  const hasWeights = value.weights !== undefined;
   if (
     id === ""
     || family === ""
@@ -569,6 +638,9 @@ function normalizeSource(value) {
     || !Array.isArray(value.numbers)
     || value.numbers.length < 1
     || value.numbers.length > 37
+    || (hasWeights && mode !== "ranking")
+    || (hasWeights && !Array.isArray(value.weights))
+    || (hasWeights && value.weights.length !== value.numbers.length)
   ) {
     return null;
   }
@@ -583,7 +655,24 @@ function normalizeSource(value) {
     return null;
   }
 
-  return { id, family, mode, numbers };
+  let weights = null;
+  if (hasWeights) {
+    weights = [...value.weights];
+    if (
+      weights.some((weight) => (
+        typeof weight !== "number"
+        || !Number.isFinite(weight)
+        || weight < 0
+        || weight > 1
+      ))
+    ) {
+      return null;
+    }
+    const totalWeight = weights.reduce((total, weight) => total + weight, 0);
+    if (Math.abs(totalWeight - 1) > 1e-9) return null;
+  }
+
+  return { id, family, mode, numbers, weights };
 }
 
 function emptyResult(status, sources = [], families = []) {
@@ -637,7 +726,10 @@ export function combineNumberRankings(value, { tieSeed = "" } = {}) {
   for (const source of normalizedSources
     .filter(({ id }) => sourceIdCounts.get(id) === 1)
     .sort((left, right) => left.id.localeCompare(right.id))) {
-    const familyRankingKey = `${source.family}\u0000${source.mode}\u0000${source.numbers.join(",")}`;
+    const weightKey = source.weights === null
+      ? "default"
+      : source.weights.map((weight) => weight.toPrecision(17)).join(",");
+    const familyRankingKey = `${source.family}\u0000${source.mode}\u0000${source.numbers.join(",")}\u0000${weightKey}`;
     if (seenFamilyRankings.has(familyRankingKey)) continue;
     seenFamilyRankings.add(familyRankingKey);
     sources.push(source);
@@ -659,13 +751,17 @@ export function combineNumberRankings(value, { tieSeed = "" } = {}) {
     for (const source of members) {
       const size = source.numbers.length;
       source.numbers.forEach((number, index) => {
+        const contribution = source.weights !== null
+          ? source.weights[index]
+          : source.mode === "set"
+            ? 1 / size
+            : (2 * (size - index)) / (size * (size + 1));
+        if (!(contribution > SCORE_EPSILON)) return;
         const candidate = familyCandidates.get(number) ?? {
           scoreTotal: 0,
           supportCount: 0,
         };
-        candidate.scoreTotal += source.mode === "set"
-          ? 1 / size
-          : (2 * (size - index)) / (size * (size + 1));
+        candidate.scoreTotal += contribution;
         candidate.supportCount += 1;
         familyCandidates.set(number, candidate);
       });

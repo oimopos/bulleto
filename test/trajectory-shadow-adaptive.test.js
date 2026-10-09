@@ -107,6 +107,10 @@ function predictiveFields(result) {
     ensembleWeights: result.adaptive.ensembleWeights,
     trainingCount: result.adaptive.trainingCount,
     lastTrainingCompletedAt: result.adaptive.lastTrainingCompletedAt,
+    neighborDistributions: result.adaptive.experts.map((expert) => ({
+      id: expert.id,
+      neighborDistribution: expert.neighborDistribution,
+    })),
   };
 }
 
@@ -151,6 +155,25 @@ test("starts from frozen experts with an equal prior", () => {
     );
     assert.ok(
       Math.abs(result.adaptive.currentWeights[expert.id] - 1 / 3) < 1e-12,
+    );
+  }
+  for (const expert of result.adaptive.experts) {
+    assert.equal(expert.status, "ready");
+    assert.equal(
+      expert.neighborDistribution.length,
+      expert.sample.neighborCount,
+    );
+    assert.deepEqual(
+      expert.neighborDistribution.map((neighbor) => neighbor.id),
+      expert.nearestIds,
+    );
+    assert.ok(
+      Math.abs(
+        expert.neighborDistribution.reduce(
+          (sum, neighbor) => sum + neighbor.weight,
+          0,
+        ) - 1,
+      ) < 1e-12,
     );
   }
 });
@@ -272,6 +295,11 @@ test("returns a v1-compatible unavailable result when no expert is ready", () =>
   assert.equal(result.sample.eligibleCount, 29);
   assert.equal(result.parameters.flatThresholdCellWidths, 0.5);
   assert.equal(result.adaptive.experts.length, 3);
+  assert.ok(
+    result.adaptive.experts.every(
+      (expert) => expert.neighborDistribution.length === 0,
+    ),
+  );
 });
 
 test("is ready when at least one current expert is ready", () => {
@@ -295,6 +323,12 @@ test("is ready when at least one current expert is ready", () => {
   assert.equal(result.adaptive.ensembleWeights[local.id], 0);
   assert.equal(result.adaptive.ensembleWeights[balanced.id], 0);
   assert.equal(result.adaptive.ensembleWeights[broad.id], 1);
+  assert.deepEqual(expertsById[local.id].neighborDistribution, []);
+  assert.deepEqual(expertsById[balanced.id].neighborDistribution, []);
+  assert.equal(
+    expertsById[broad.id].neighborDistribution.length,
+    expertsById[broad.id].sample.neighborCount,
+  );
   assert.deepEqual(result.probabilities, expertsById[broad.id].probabilities);
 });
 

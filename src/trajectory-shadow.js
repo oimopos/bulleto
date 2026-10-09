@@ -271,6 +271,7 @@ function unavailable(status, sample, options) {
     deltaRangeCellWidths: null,
     sample,
     nearestIds: [],
+    neighborDistribution: [],
     parameters: { ...options },
   };
 }
@@ -459,6 +460,11 @@ export function predictTrajectoryShadow({ current, history, options } = {}) {
     flat: weightedDirections.flat / totalWeight,
   };
   const expectedDeltaCellWidths = weightedDelta / totalWeight;
+  const neighborDistribution = nearest.map((neighbor) => ({
+    id: neighbor.id,
+    deltaCellWidths: neighbor.delta,
+    weight: neighborWeight(neighbor) / totalWeight,
+  }));
   const deltaRangeCellWidths = {
     lowerQuantile: DELTA_RANGE_LOWER_QUANTILE,
     upperQuantile: DELTA_RANGE_UPPER_QUANTILE,
@@ -476,6 +482,7 @@ export function predictTrajectoryShadow({ current, history, options } = {}) {
     deltaRangeCellWidths,
     sample: { ...sample, neighborCount: nearest.length },
     nearestIds: nearest.map((neighbor) => neighbor.id),
+    neighborDistribution,
     parameters: { ...settings },
   };
 }

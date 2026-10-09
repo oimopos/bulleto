@@ -448,6 +448,9 @@ function currentExpertPredictions(current, history) {
       deltaRangeCellWidths: result.deltaRangeCellWidths,
       sample: result.sample,
       nearestIds: [...result.nearestIds],
+      neighborDistribution: result.neighborDistribution.map((neighbor) => ({
+        ...neighbor,
+      })),
     };
   });
 }

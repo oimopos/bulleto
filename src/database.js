@@ -32,6 +32,13 @@ import {
   predictAdaptiveTrajectoryShadow,
 } from "./trajectory-shadow-adaptive.js";
 import {
+  TRAJECTORY_RANK37_BASIS,
+  TRAJECTORY_RANK37_MIN_EVIDENCE_CANDIDATES,
+  TRAJECTORY_RANK37_MIN_TRAINING_COUNT,
+  TRAJECTORY_RANK37_VERSION,
+  buildTrajectoryRank37,
+} from "./trajectory-rank37.js";
+import {
   CYCLE_ANALOGUE_ALGORITHM_VERSION,
   CYCLE_ANALOGUE_ANCHOR_DRAW_COUNT,
   selectCycleAnalogue,
@@ -2398,6 +2405,51 @@ function validTrajectoryNearestIds(nearestIds, expectedCount) {
   );
 }
 
+function normalizedTrajectoryNeighborDistribution(
+  value,
+  nearestIds,
+  expectedCount,
+) {
+  if (value === undefined) return { present: false, value: [] };
+  if (
+    !Array.isArray(nearestIds)
+    || !Number.isSafeInteger(expectedCount)
+    || expectedCount < 0
+    || !Array.isArray(value)
+    || value.length !== expectedCount
+  ) return null;
+  const normalized = [];
+  let totalWeight = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const neighbor = value[index];
+    if (
+      !neighbor
+      || typeof neighbor !== "object"
+      || Array.isArray(neighbor)
+      || Object.keys(neighbor).sort().join(",") !== "deltaCellWidths,id,weight"
+      || neighbor.id !== nearestIds[index]
+      || !Number.isFinite(neighbor.deltaCellWidths)
+      || Math.abs(neighbor.deltaCellWidths) >
+        TRAJECTORY_SHADOW_ADAPTIVE_DEFAULTS.maxAbsDeltaCellWidths
+      || !Number.isFinite(neighbor.weight)
+      || !(neighbor.weight > 0)
+      || neighbor.weight > 1
+    ) {
+      return null;
+    }
+    totalWeight += neighbor.weight;
+    normalized.push({
+      id: neighbor.id,
+      deltaCellWidths: neighbor.deltaCellWidths,
+      weight: neighbor.weight,
+    });
+  }
+  if (expectedCount > 0 && !trajectoryNumbersEqual(totalWeight, 1)) {
+    return null;
+  }
+  return { present: true, value: normalized };
+}
+
 function normalizeTrajectoryAdaptive(
   value,
   {
@@ -2550,9 +2602,15 @@ function normalizeTrajectoryAdaptive(
     ) {
       return null;
     }
+    let neighborDistribution;
     if (ready) {
       const expertProbabilities = expert.probabilities;
       const range = expert.deltaRangeCellWidths;
+      neighborDistribution = normalizedTrajectoryNeighborDistribution(
+        expert.neighborDistribution,
+        expert.nearestIds,
+        expert.sample?.neighborCount,
+      );
       if (
         !TRAJECTORY_DIRECTIONS.includes(expert.direction) ||
         !expertProbabilities ||
@@ -2597,20 +2655,34 @@ function normalizeTrajectoryAdaptive(
         !validTrajectoryNearestIds(
           expert.nearestIds,
           expert.sample.neighborCount,
-        )
+        ) || !neighborDistribution
       ) {
         return null;
       }
-    } else if (
-      expert.direction !== null ||
-      expert.probabilities !== null ||
-      expert.expectedDeltaCellWidths !== null ||
-      expert.deltaRangeCellWidths !== null ||
-      !validTrajectoryNearestIds(expert.nearestIds, 0)
-    ) {
-      return null;
+    } else {
+      neighborDistribution = normalizedTrajectoryNeighborDistribution(
+        expert.neighborDistribution,
+        expert.nearestIds,
+        0,
+      );
+      if (
+        expert.direction !== null ||
+        expert.probabilities !== null ||
+        expert.expectedDeltaCellWidths !== null ||
+        expert.deltaRangeCellWidths !== null ||
+        !validTrajectoryNearestIds(expert.nearestIds, 0) ||
+        !neighborDistribution
+      ) {
+        return null;
+      }
     }
-    normalizedExperts.push({ ...expert, options: { ...options } });
+    const normalizedExpert = { ...expert, options: { ...options } };
+    if (neighborDistribution.present) {
+      normalizedExpert.neighborDistribution = neighborDistribution.value;
+    } else {
+      delete normalizedExpert.neighborDistribution;
+    }
+    normalizedExperts.push(normalizedExpert);
   }
 
   const readyExperts = normalizedExperts.filter(
@@ -2744,6 +2816,35 @@ function normalizeTrajectoryAdaptive(
   };
 }
 
+function expectedTrajectoryNumberRanking({
+  adaptive,
+  cells,
+  lockPrice,
+  medianCellWidth,
+  cutoffAt,
+} = {}) {
+  if (!adaptive || !Array.isArray(adaptive.experts)) return null;
+  if (adaptive.trainingCount < TRAJECTORY_RANK37_MIN_TRAINING_COUNT) return null;
+  const readyExperts = adaptive.experts.filter(
+    (expert) => expert.status === "ready",
+  );
+  if (readyExperts.length === 0) return null;
+  const distributionCount = readyExperts.filter(
+    (expert) => Array.isArray(expert.neighborDistribution),
+  ).length;
+  if (distributionCount === 0) return null;
+  if (distributionCount !== readyExperts.length) {
+    throw new TypeError("adaptive neighbor distributions must be all present or all absent");
+  }
+  return buildTrajectoryRank37({
+    bands: trajectoryBandsFromForecastCells(cells),
+    lockPrice,
+    medianCellWidth,
+    adaptive,
+    tieSeed: cutoffAt,
+  });
+}
+
 function validAdaptiveTrajectorySnapshotSql(
   status,
   cutoffAt,
@@ -2788,7 +2889,7 @@ function validAdaptiveTrajectorySnapshotSql(
       integration?.displayRange,
       numberArea,
     );
-    return normalizeTrajectoryAdaptive(integration?.adaptive, {
+    const adaptive = normalizeTrajectoryAdaptive(integration?.adaptive, {
       status,
       cutoffAt,
       snapshotLockedAt,
@@ -2807,9 +2908,26 @@ function validAdaptiveTrajectorySnapshotSql(
       displayRange,
       storedNumberArea: integration?.numberArea ?? null,
       storedDisplayRange: integration?.displayRange ?? null,
-    }) === null
-      ? 0
-      : 1;
+    });
+    if (adaptive === null) return 0;
+    const expectedNumberRanking = status === "ready"
+      ? expectedTrajectoryNumberRanking({
+          adaptive,
+          cells,
+          lockPrice: numericLockPrice,
+          medianCellWidth: numericMedianCellWidth,
+          cutoffAt,
+        })
+      : null;
+    const storedNumberRanking = integration?.numberRanking ?? null;
+    if (
+      expectedNumberRanking === null
+        ? storedNumberRanking !== null
+        : !sameTrajectoryValue(storedNumberRanking, expectedNumberRanking)
+    ) {
+      return 0;
+    }
+    return 1;
   } catch {
     return 0;
   }
@@ -2935,6 +3053,28 @@ function mapForecastTrajectoryShadow(row) {
         storedDisplayRange: integration?.displayRange ?? null,
       })
     : null;
+  let numberRanking = null;
+  try {
+    numberRanking = status === "ready" && adaptive !== null
+      ? expectedTrajectoryNumberRanking({
+          adaptive,
+          cells,
+          lockPrice,
+          medianCellWidth,
+          cutoffAt: row.trajectory_shadow_cutoff_at,
+        })
+      : null;
+  } catch {
+    return null;
+  }
+  const storedNumberRanking = integration?.numberRanking ?? null;
+  if (
+    numberRanking === null
+      ? storedNumberRanking !== null
+      : !sameTrajectoryValue(storedNumberRanking, numberRanking)
+  ) {
+    return null;
+  }
   const readyProbabilitiesValid =
     probabilities !== null &&
     typeof probabilities === "object" &&
@@ -3058,10 +3198,12 @@ function mapForecastTrajectoryShadow(row) {
       adaptive,
       numberArea: status === "ready" ? numberArea : null,
       displayRange: status === "ready" ? displayRange : null,
+      numberRanking,
     },
     adaptive,
     numberArea: status === "ready" ? numberArea : null,
     displayRange: status === "ready" ? displayRange : null,
+    numberRanking,
     evaluation,
     createdAt: row.trajectory_shadow_created_at,
   };
@@ -3074,6 +3216,11 @@ function mapTrajectoryMetrics(row) {
   const displayRangeHits = Number(row?.display_range_hits ?? 0);
   const q50ExactHits = Number(row?.q50_exact_hits ?? 0);
   const fullCorridorHits = Number(row?.full_corridor_hits ?? 0);
+  const rank37ReadyCount = Number(row?.rank37_ready_count ?? 0);
+  const rank37SettledCount = Number(row?.rank37_settled_count ?? 0);
+  const rank37EvaluatedCount = Number(row?.rank37_evaluated_count ?? 0);
+  const rank37Top1Hits = Number(row?.rank37_top1_hits ?? 0);
+  const rank37Top3Hits = Number(row?.rank37_top3_hits ?? 0);
   return {
     modelVersion: TRAJECTORY_SHADOW_ADAPTIVE_VERSION,
     displayRangeVersion: TRAJECTORY_DISPLAY_RANGE_VERSION,
@@ -3085,11 +3232,31 @@ function mapTrajectoryMetrics(row) {
     displayRangeHits,
     q50ExactHits,
     fullCorridorHits,
+    rank37Version: TRAJECTORY_RANK37_VERSION,
+    rank37Basis: TRAJECTORY_RANK37_BASIS,
+    rank37ReadyCount,
+    rank37SettledCount,
+    rank37PendingCount: Math.max(0, rank37ReadyCount - rank37SettledCount),
+    rank37EvaluatedCount,
+    rank37UngradableCount: Math.max(
+      0,
+      rank37SettledCount - rank37EvaluatedCount,
+    ),
+    rank37Top1Hits,
+    rank37Top3Hits,
     displayRangeRate:
       evaluatedCount > 0 ? displayRangeHits / evaluatedCount : null,
     q50ExactRate: evaluatedCount > 0 ? q50ExactHits / evaluatedCount : null,
     fullCorridorRate:
       evaluatedCount > 0 ? fullCorridorHits / evaluatedCount : null,
+    rank37Top1Rate:
+      rank37EvaluatedCount > 0
+        ? rank37Top1Hits / rank37EvaluatedCount
+        : null,
+    rank37Top3Rate:
+      rank37EvaluatedCount > 0
+        ? rank37Top3Hits / rank37EvaluatedCount
+        : null,
     coverageRate: settledCount > 0 ? evaluatedCount / settledCount : null,
   };
 }
@@ -7566,6 +7733,7 @@ export class RouletteDatabase {
       adaptive: null,
       numberArea: null,
       displayRange: null,
+      numberRanking: null,
     };
     const unavailableCurrent = (
       reason,
@@ -7872,6 +8040,16 @@ export class RouletteDatabase {
     const displayRange = numberArea === null
       ? null
       : buildTrajectoryDisplayRange(numberArea);
+    const numberRanking = result.status === "ready"
+      && result.adaptive.trainingCount >= TRAJECTORY_RANK37_MIN_TRAINING_COUNT
+      ? buildTrajectoryRank37({
+          bands,
+          lockPrice: currentPrefix.lockPrice,
+          medianCellWidth,
+          adaptive: result.adaptive,
+          tieSeed: lockedAt,
+        })
+      : null;
     return {
       modelVersion: result.version,
       trajectoryId,
@@ -7902,6 +8080,7 @@ export class RouletteDatabase {
         adaptive: result.adaptive,
         numberArea,
         displayRange,
+        numberRanking,
       },
     };
   }
@@ -8849,7 +9028,15 @@ export class RouletteDatabase {
               json_extract(
                 trajectory_shadows.integration_json,
                 '$.numberArea.typical.wireCell'
-              ) AS q50_wire_cell
+              ) AS q50_wire_cell,
+              json_extract(
+                trajectory_shadows.integration_json,
+                '$.numberRanking.version'
+              ) = ?
+              AND json_extract(
+                trajectory_shadows.integration_json,
+                '$.numberRanking.evidenceCandidateCount'
+              ) >= ? AS has_rank37
             FROM forecast_trajectory_shadows AS trajectory_shadows
             JOIN round_forecasts AS forecasts
               ON forecasts.id = trajectory_shadows.forecast_id
@@ -8916,10 +9103,34 @@ export class RouletteDatabase {
                 ) AS corridor
                 WHERE json_extract(corridor.value, '$.wireCell') = graded.raw_cell
               )
-            ), 0) AS full_corridor_hits
+            ), 0) AS full_corridor_hits,
+            COALESCE(SUM(has_rank37), 0) AS rank37_ready_count,
+            COALESCE(SUM(has_rank37 AND round_result_id IS NOT NULL), 0)
+              AS rank37_settled_count,
+            COALESCE(SUM(has_rank37 AND is_gradable), 0)
+              AS rank37_evaluated_count,
+            COALESCE(SUM(
+                has_rank37 AND is_gradable AND actual_number = json_extract(
+                  integration_json,
+                  '$.numberRanking.ranking[0].number'
+                )
+              ), 0) AS rank37_top1_hits,
+            COALESCE(SUM(
+                has_rank37 AND is_gradable AND EXISTS (
+                  SELECT 1
+                  FROM json_each(
+                    graded.integration_json,
+                    '$.numberRanking.ranking'
+                  ) AS ranked_number
+                  WHERE json_extract(ranked_number.value, '$.rank') <= 3
+                    AND json_extract(ranked_number.value, '$.number') = graded.actual_number
+                )
+              ), 0) AS rank37_top3_hits
           FROM graded
         `)
         .get(
+          TRAJECTORY_RANK37_VERSION,
+          TRAJECTORY_RANK37_MIN_EVIDENCE_CANDIDATES,
           safeSource,
           safeInstrument,
           TRAJECTORY_SHADOW_ADAPTIVE_VERSION,

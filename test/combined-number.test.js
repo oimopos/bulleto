@@ -12,7 +12,41 @@ import {
   combinedTrajectorySignals,
   combinedVirtualRecencySources,
   combineNumberRankings,
+  TRAJECTORY_RANK37_BASIS,
+  TRAJECTORY_RANK37_EVIDENCE_MASS_THRESHOLD,
+  TRAJECTORY_RANK37_VERSION,
 } from "../public/combined-number.js";
+
+function trajectoryRank37(firstNumber = 32) {
+  const order = [
+    firstNumber,
+    ...Array.from({ length: 37 }, (_, number) => number)
+      .filter((number) => number !== firstNumber),
+  ];
+  const rawMassTotal = 37 * 38 / 2;
+  return {
+    version: TRAJECTORY_RANK37_VERSION,
+    basis: TRAJECTORY_RANK37_BASIS,
+    candidateCount: 37,
+    evidenceCandidateCount: 37,
+    evidenceMassThreshold: TRAJECTORY_RANK37_EVIDENCE_MASS_THRESHOLD,
+    tieSeed: "forecast-4103913",
+    smoothing: {
+      version: "uniform-mixture-v1",
+      weight: 0.05,
+      baselineMass: 1 / 37,
+    },
+    ranking: order.map((number, index) => {
+      const rawMass = (37 - index) / rawMassTotal;
+      return {
+        rank: index + 1,
+        number,
+        rawMass,
+        mass: 0.95 * rawMass + 0.05 / 37,
+      };
+    }),
+  };
+}
 
 const FRESH_STATE = Object.freeze({
   collector: Object.freeze({
@@ -101,12 +135,16 @@ test("combined freshness pauses when database and collector cursors diverge", ()
   ));
 });
 
-test("trajectory exposes the evaluated q50 ranking and its validated range", () => {
+test("trajectory exposes a validated full Rank-37 and its correlated range", () => {
+  const numberRanking = trajectoryRank37(32);
+  const expectedRanking = numberRanking.ranking.map(({ number }) => number);
+  const expectedWeights = numberRanking.ranking.map(({ rawMass }) => rawMass);
   const shadow = {
     isAdaptive: true,
     status: "ready",
     adaptive: { trainingCount: 30 },
     numberArea: { typical: { wireCell: 32, number: 32 } },
+    numberRanking,
     displayRange: {
       cells: [30, 31, 32, 33].map((number) => ({
         wireCell: number,
@@ -116,22 +154,32 @@ test("trajectory exposes the evaluated q50 ranking and its validated range", () 
   };
 
   assert.deepEqual(combinedTrajectorySignals(shadow), {
-    ranking: [32],
+    ranking: expectedRanking,
+    weights: expectedWeights,
     range: [30, 31, 32, 33],
   });
-  assert.deepEqual(combinedTrajectoryRanking(shadow), [32]);
+  assert.equal(COMBINED_NUMBER_ALGORITHM_VERSION, "all-signal-family-index-v3");
+  assert.equal(TRAJECTORY_RANK37_VERSION, "trajectory-rank37-v1");
+  assert.equal(
+    TRAJECTORY_RANK37_BASIS,
+    "adaptive-weighted-neighbor-delta-to-current-bands",
+  );
+  assert.equal(expectedRanking.length, 37);
+  assert.equal(new Set(expectedRanking).size, 37);
+  assert.deepEqual(combinedTrajectoryRanking(shadow), expectedRanking);
   assert.deepEqual(combinedTrajectorySignals({
     ...shadow,
     adaptive: { trainingCount: 29 },
-  }), { ranking: [], range: [] });
+  }), { ranking: [], weights: [], range: [] });
   assert.deepEqual(combinedTrajectorySignals({
     ...shadow,
     displayRange: { cells: [{ wireCell: 37, number: 37 }] },
-  }), { ranking: [], range: [] });
+  }), { ranking: [], weights: [], range: [] });
 
   const zeroAlias = {
     ...shadow,
     numberArea: { typical: { wireCell: 37, number: 0 } },
+    numberRanking: trajectoryRank37(0),
     displayRange: {
       cells: [
         { wireCell: 36, number: 36 },
@@ -140,12 +188,76 @@ test("trajectory exposes the evaluated q50 ranking and its validated range", () 
     },
   };
   assert.deepEqual(combinedTrajectorySignals(zeroAlias), {
-    ranking: [0],
+    ranking: zeroAlias.numberRanking.ranking.map(({ number }) => number),
+    weights: zeroAlias.numberRanking.ranking.map(({ rawMass }) => rawMass),
     range: [36, 0],
   });
 });
 
-test("recency adapters preserve equal longest candidates and current held target zero", () => {
+test("trajectory Rank-37 fails closed when its frozen full order is malformed", () => {
+  const numberRanking = trajectoryRank37();
+  const shadow = {
+    isAdaptive: true,
+    status: "ready",
+    adaptive: { trainingCount: 30 },
+    numberArea: { typical: { wireCell: 32, number: 32 } },
+    numberRanking,
+    displayRange: {
+      cells: [31, 32, 33].map((number) => ({ wireCell: number, number })),
+    },
+  };
+  const malformed = [
+    {
+      ...numberRanking,
+      ranking: numberRanking.ranking.slice(0, -1),
+    },
+    {
+      ...numberRanking,
+      ranking: numberRanking.ranking.map((candidate, index) => (
+        index === 1
+          ? { ...candidate, number: numberRanking.ranking[0].number }
+          : candidate
+      )),
+    },
+    {
+      ...numberRanking,
+      ranking: numberRanking.ranking.map((candidate, index) => (
+        index === 0 ? { ...candidate, mass: candidate.mass + 0.01 } : candidate
+      )),
+    },
+  ];
+
+  for (const invalidRanking of malformed) {
+    assert.deepEqual(combinedTrajectorySignals({
+      ...shadow,
+      numberRanking: invalidRanking,
+    }), { ranking: [], weights: [], range: [] });
+  }
+});
+
+test("zero-mass Rank-37 tail cannot steer the combined leader", () => {
+  const firstOrder = [17, 5, 9, ...Array.from({ length: 37 }, (_, number) => number)
+    .filter((number) => ![17, 5, 9].includes(number))];
+  const secondOrder = [17, 9, 5, ...firstOrder.slice(3).reverse()];
+  const run = (numbers) => combineNumberRankings([
+    {
+      id: "price-rank37",
+      family: "price",
+      numbers,
+      weights: numbers.map((number) => number === 17 ? 1 : 0),
+    },
+    { id: "recency", family: "recency", numbers: [5] },
+    { id: "cycle", family: "cycle", numbers: [9] },
+  ], { tieSeed: "same-current-round" });
+
+  const first = run(firstOrder);
+  const second = run(secondOrder);
+  assert.equal(first.number, second.number);
+  assert.equal(first.score, second.score);
+  assert.equal(first.familySupportCount, second.familySupportCount);
+});
+
+test("virtual recency abstains until it has a current held target", () => {
   const latestResult = { id: 41, continuityEpoch: 3 };
   const base = {
     mode: "simulation",
@@ -164,12 +276,7 @@ test("recency adapters preserve equal longest candidates and current held target
     activeSession: null,
   };
 
-  assert.deepEqual(combinedVirtualRecencySources(base, latestResult), [{
-    id: "recency-virtual-longest-set",
-    family: "recency",
-    mode: "set",
-    numbers: [0, 1, 2],
-  }]);
+  assert.deepEqual(combinedVirtualRecencySources(base, latestResult), []);
 
   const armed = {
     ...base,
@@ -185,12 +292,12 @@ test("recency adapters preserve equal longest candidates and current held target
   };
   assert.deepEqual(
     combinedVirtualRecencySources(armed, latestResult).at(-1),
-    { id: "recency-virtual-held", family: "recency", numbers: [0] },
+    { id: "recency-virtual-held", family: "absence", numbers: [0] },
   );
   assert.equal(combinedVirtualRecencySources({
     ...armed,
     activeSession: { ...armed.activeSession, activatedAfterResultId: 40 },
-  }, latestResult).length, 1);
+  }, latestResult).length, 0);
   assert.equal(combinedVirtualRecencySources({
     ...base,
     longestCandidates: [
@@ -465,6 +572,25 @@ test("correlated sources are averaged inside their family before families are av
   assert.equal(result.supportCount, 3);
   assert.equal(result.familySupportCount, 2);
   assert.equal(result.tieBreakApplied, false);
+});
+
+test("overdue, held virtual, and cycle remainder share one absence-family vote", () => {
+  const result = combineNumberRankings([
+    { id: "price", family: "price", numbers: [21] },
+    { id: "overdue", family: "absence", numbers: [3, 12, 11] },
+    { id: "virtual-held", family: "absence", numbers: [3] },
+    {
+      id: "cycle-remaining",
+      family: "absence",
+      mode: "set",
+      numbers: [3, 11, 12, 14],
+    },
+  ], { tieSeed: "current-round" });
+
+  assert.equal(result.number, 21);
+  assert.equal(result.familyCount, 2);
+  assert.deepEqual(result.familyIds, ["absence", "price"]);
+  assert.equal(result.familySupportCount, 1);
 });
 
 test("seeded tie resolution is deterministic and independent of source order", () => {

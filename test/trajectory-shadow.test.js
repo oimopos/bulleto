@@ -72,6 +72,7 @@ function predictiveFields(result) {
     expectedDeltaCellWidths: result.expectedDeltaCellWidths,
     deltaRangeCellWidths: result.deltaRangeCellWidths,
     nearestIds: result.nearestIds,
+    neighborDistribution: result.neighborDistribution,
   };
 }
 
@@ -112,6 +113,11 @@ test("normalizes offsets and cell scale before deterministic weighted kNN", () =
     "recent-down",
     "middle-up",
     "old-up",
+  ]);
+  assert.deepEqual(result.neighborDistribution, [
+    { id: "recent-down", deltaCellWidths: -1, weight: 1 / 3 },
+    { id: "middle-up", deltaCellWidths: 2, weight: 1 / 3 },
+    { id: "old-up", deltaCellWidths: 1, weight: 1 / 3 },
   ]);
   assert.ok(Math.abs(result.probabilities.up - 2 / 3) < 1e-12);
   assert.ok(Math.abs(result.probabilities.down - 1 / 3) < 1e-12);
@@ -184,6 +190,7 @@ test("fails closed until the minimum past history exists", () => {
   assert.equal(result.expectedDeltaCellWidths, null);
   assert.equal(result.deltaRangeCellWidths, null);
   assert.deepEqual(result.nearestIds, []);
+  assert.deepEqual(result.neighborDistribution, []);
   assert.equal(result.sample.eligibleCount, 2);
   assert.equal(result.sample.neighborCount, 0);
 });
@@ -214,6 +221,22 @@ test("bounds shape distance and gives a closer neighbor more weight", () => {
 
   assert.equal(result.status, "ready");
   assert.deepEqual(result.nearestIds, ["exact-up", "near-down"]);
+  assert.deepEqual(
+    result.neighborDistribution.map((neighbor) => neighbor.id),
+    result.nearestIds,
+  );
+  assert.ok(
+    Math.abs(
+      result.neighborDistribution.reduce(
+        (sum, neighbor) => sum + neighbor.weight,
+        0,
+      ) - 1,
+    ) < 1e-12,
+  );
+  assert.ok(
+    result.neighborDistribution[0].weight
+      > result.neighborDistribution[1].weight,
+  );
   assert.equal(result.sample.eligibleCount, 3);
   assert.equal(result.sample.withinDistanceCount, 2);
   assert.ok(result.probabilities.up > result.probabilities.down);
@@ -310,6 +333,7 @@ test("fails closed when too few candidates are inside the distance bound", () =>
   assert.equal(result.sample.neighborCount, 0);
   assert.equal(result.probabilities, null);
   assert.deepEqual(result.nearestIds, []);
+  assert.deepEqual(result.neighborDistribution, []);
 });
 
 test("is immutable and invariant to history input order", () => {

@@ -2,6 +2,8 @@ import { BET_RISK_MODEL, calculateBetRisk } from "./risk-calculator.js?v=2";
 import { buildFollowerStats } from "./pair-followers.js?v=1";
 import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
 import {
+  TRAJECTORY_RANK37_BASIS,
+  TRAJECTORY_RANK37_VERSION,
   assessCombinedNumberFreshness,
   combinedCycleAnalogueRanking,
   combinedCycleNumberSignals,
@@ -10,7 +12,7 @@ import {
   combinedTrajectorySignals,
   combinedVirtualRecencySources,
   combineNumberRankings,
-} from "./combined-number.js?v=3";
+} from "./combined-number.js?v=5";
 
 (() => {
   "use strict";
@@ -1404,6 +1406,8 @@ import {
       current,
       typical: {
         ...typicalPoint,
+        price: value.typical.price,
+        deltaCellWidths: value.typical.deltaCellWidths,
         direction: value.typical.direction,
         agreesWithDirection: value.typical.agreesWithDirection
       },
@@ -1539,6 +1543,8 @@ import {
       || Array.isArray(value)
       || value.modelVersion !== TRAJECTORY_SHADOW_ADAPTIVE_VERSION
       || value.displayRangeVersion !== TRAJECTORY_DISPLAY_RANGE_VERSION
+      || value.rank37Version !== TRAJECTORY_RANK37_VERSION
+      || value.rank37Basis !== TRAJECTORY_RANK37_BASIS
     ) {
       return null;
     }
@@ -1550,7 +1556,14 @@ import {
       "ungradableCount",
       "displayRangeHits",
       "q50ExactHits",
-      "fullCorridorHits"
+      "fullCorridorHits",
+      "rank37ReadyCount",
+      "rank37SettledCount",
+      "rank37PendingCount",
+      "rank37EvaluatedCount",
+      "rank37UngradableCount",
+      "rank37Top1Hits",
+      "rank37Top3Hits"
     ];
     if (countKeys.some(
       (key) => !Number.isSafeInteger(value[key]) || value[key] < 0,
@@ -1571,6 +1584,13 @@ import {
       || value.q50ExactHits > value.displayRangeHits
       || value.displayRangeHits > value.fullCorridorHits
       || value.fullCorridorHits > value.evaluatedCount
+      || value.rank37ReadyCount !== value.rank37SettledCount + value.rank37PendingCount
+      || value.rank37SettledCount !== value.rank37EvaluatedCount + value.rank37UngradableCount
+      || value.rank37ReadyCount > value.readyCount
+      || value.rank37SettledCount > value.settledCount
+      || value.rank37EvaluatedCount > value.evaluatedCount
+      || value.rank37Top1Hits > value.rank37Top3Hits
+      || value.rank37Top3Hits > value.rank37EvaluatedCount
       || !rateMatches(
         value.displayRangeRate,
         value.displayRangeHits,
@@ -1582,15 +1602,29 @@ import {
         value.fullCorridorHits,
         value.evaluatedCount,
       )
+      || !rateMatches(
+        value.rank37Top1Rate,
+        value.rank37Top1Hits,
+        value.rank37EvaluatedCount,
+      )
+      || !rateMatches(
+        value.rank37Top3Rate,
+        value.rank37Top3Hits,
+        value.rank37EvaluatedCount,
+      )
       || !rateMatches(value.coverageRate, value.evaluatedCount, value.settledCount)
     ) {
       return null;
     }
     return Object.fromEntries([
+      ["rank37Version", value.rank37Version],
+      ["rank37Basis", value.rank37Basis],
       ...countKeys.map((key) => [key, value[key]]),
       ["displayRangeRate", value.displayRangeRate],
       ["q50ExactRate", value.q50ExactRate],
       ["fullCorridorRate", value.fullCorridorRate],
+      ["rank37Top1Rate", value.rank37Top1Rate],
+      ["rank37Top3Rate", value.rank37Top3Rate],
       ["coverageRate", value.coverageRate]
     ]);
   }
@@ -1651,6 +1685,7 @@ import {
         sample: null,
         numberArea: null,
         displayRange: null,
+        numberRanking: null,
         evaluation: null
       };
     }
@@ -1698,6 +1733,7 @@ import {
         sample,
         numberArea: null,
         displayRange: null,
+        numberRanking: null,
         evaluation: null
       };
     }
@@ -1721,6 +1757,7 @@ import {
         sample,
         numberArea: null,
         displayRange: null,
+        numberRanking: null,
         evaluation: null
       };
     }
@@ -1772,6 +1809,7 @@ import {
       sample,
       numberArea,
       displayRange,
+      numberRanking: value.numberRanking ?? null,
       evaluation
     };
   }
@@ -1837,13 +1875,16 @@ import {
 
     if (metrics) {
       const { displayRangeHits, evaluatedCount, displayRangeRate } = metrics;
+      const rankText = metrics.rank37EvaluatedCount === 0
+        ? "Rank‑37: новая серия, 0 проверок"
+        : `Rank‑37: Top‑1 ${metrics.rank37Top1Hits}/${metrics.rank37EvaluatedCount} (${trajectoryShadowShareFormatter.format(metrics.rank37Top1Rate)}) · Top‑3 ${metrics.rank37Top3Hits}/${metrics.rank37EvaluatedCount} (${trajectoryShadowShareFormatter.format(metrics.rank37Top3Rate)})`;
       setTextIfChanged(
         elements.trajectoryShadowRangeMetrics,
         evaluatedCount === 0
-          ? "Участок: 0 из 0 (нет оценённых исходов) · Adaptive v2, проспективное наблюдение."
-          : `Участок: ${displayRangeHits} из ${evaluatedCount} (${trajectoryShadowShareFormatter.format(displayRangeRate)}) · Adaptive v2, проспективное наблюдение.`,
+          ? `Участок: 0 из 0 · ${rankText}.`
+          : `Участок: ${displayRangeHits} из ${evaluatedCount} (${trajectoryShadowShareFormatter.format(displayRangeRate)}) · ${rankText}.`,
       );
-      elements.trajectoryShadowRangeMetrics.title = `Adaptive v2: готово ${metrics.readyCount}; завершено ${metrics.settledCount}; ждут результата ${metrics.pendingCount}; оценено ${metrics.evaluatedCount}; неопределимо ${metrics.ungradableCount}.`;
+      elements.trajectoryShadowRangeMetrics.title = `Adaptive v2: готово ${metrics.readyCount}; завершено ${metrics.settledCount}; Rank‑37 готово ${metrics.rank37ReadyCount}; ждут результата ${metrics.rank37PendingCount}; оценено ${metrics.rank37EvaluatedCount}.`;
     } else {
       setTextIfChanged(
         elements.trajectoryShadowRangeMetrics,
@@ -1856,7 +1897,7 @@ import {
       elements.trajectoryShadowBadge.textContent = "Снимка нет";
       setTextIfChanged(
         elements.trajectoryShadowStatus,
-        "Adaptive-снимок для текущего раунда ещё не опубликован; это не сигнал и не ошибка основного прогноза.",
+        "Adaptive-снимок для текущего раунда ещё не опубликован; полный рейтинг 37 чисел пока не формируется.",
       );
       setTextIfChanged(
         elements.trajectoryShadowShares,
@@ -1890,7 +1931,7 @@ import {
       );
       setTextIfChanged(
         elements.trajectoryShadowSample,
-        "Система дождётся следующего полного непрерывного раунда; основной Top-3 продолжает работать независимо.",
+        "Система дождётся следующего полного непрерывного раунда; статичный start-price-v2 вместо анализа не подставляется.",
       );
       return;
     }
@@ -1957,48 +1998,6 @@ import {
       elements.trajectoryShadowSample,
       `Полные сопоставимые раунды: ${sample.eligibleCount}/${sample.requiredHistory}; использовано соседей формы: ${sample.neighborCount} (минимум ${sample.requiredNeighbors}).`,
     );
-  }
-
-  function resolveFinalForecast(latest) {
-    const consensus = latest?.consensus;
-    const hasConsensus = consensus !== null
-      && typeof consensus === "object"
-      && !Array.isArray(consensus);
-
-    if (hasConsensus) {
-      const status = String(consensus.status || "");
-      const reason = String(consensus.reason || "");
-      const numbers = normalizedForecastTop3(consensus.top3);
-      const validStatus = ["combined", "model_fallback", "pair_fallback"].includes(status);
-      if (validStatus && numbers.length === 3) {
-        return {
-          numbers,
-          status,
-          pairSampleSize: asOptionalNonNegativeInteger(consensus.pairSampleSize),
-          derivedFromSnapshotAt: consensus.derivedFromSnapshotAt || null,
-          reason,
-          legacy: false,
-        };
-      }
-      return {
-        numbers: [],
-        status: "unavailable",
-        pairSampleSize: asOptionalNonNegativeInteger(consensus.pairSampleSize),
-        derivedFromSnapshotAt: consensus.derivedFromSnapshotAt || null,
-        reason,
-        legacy: false,
-      };
-    }
-
-    const legacyNumbers = normalizedForecastTop3(latest?.rankedNumbers);
-    return {
-      numbers: legacyNumbers,
-      status: legacyNumbers.length === 3 ? "model_fallback" : "unavailable",
-      pairSampleSize: null,
-      derivedFromSnapshotAt: null,
-      reason: "legacy_without_consensus",
-      legacy: legacyNumbers.length === 3,
-    };
   }
 
   function sameEntityId(left, right) {
@@ -2190,10 +2189,7 @@ import {
 
   function currentPriceTrajectorySignals(latestForecast) {
     const shadow = normalizedTrajectoryShadow(latestForecast?.trajectoryShadow);
-    return combinedTrajectorySignals(
-      shadow,
-      TRAJECTORY_SHADOW_REQUIRED_HISTORY,
-    );
+    return combinedTrajectorySignals(shadow);
   }
 
   function currentFollowerLiveRanking(latestResult) {
@@ -2307,22 +2303,16 @@ import {
       ? normalizedForecastTop3(latestForecast.rankedNumbers)
       : [];
     const sources = [];
-    if (modelNumbers.length === 3) {
-      sources.push({
-        id: "price-start",
-        family: "price",
-        numbers: modelNumbers,
-      });
-    }
 
     const trajectory = forecastIsCurrent
       ? currentPriceTrajectorySignals(latestForecast)
-      : { ranking: [], range: [] };
+      : { ranking: [], weights: [], range: [] };
     if (trajectory.ranking.length > 0) {
       sources.push({
-        id: "price-trajectory-q50",
+        id: "price-trajectory-rank37",
         family: "price",
         numbers: trajectory.ranking,
+        weights: trajectory.weights,
       });
     }
     if (trajectory.range.length > 0) {
@@ -2376,7 +2366,7 @@ import {
     if (overdueNumbers.length > 0) {
       sources.push({
         id: "recency-overdue-top3",
-        family: "recency",
+        family: "absence",
         numbers: overdueNumbers,
       });
     }
@@ -2387,7 +2377,7 @@ import {
     if (remainingNumbers.length > 0) {
       sources.push({
         id: "cycle-remaining",
-        family: "cycle",
+        family: "absence",
         mode: "set",
         numbers: remainingNumbers,
       });
@@ -2396,7 +2386,7 @@ import {
     if (completedSurvivor.length > 0) {
       sources.push({
         id: "cycle-completed-survivor",
-        family: "cycle",
+        family: "absence",
         numbers: completedSurvivor,
       });
     }
@@ -2404,7 +2394,7 @@ import {
     if (analogueNumbers.length > 0) {
       sources.push({
         id: "cycle-analogue-next",
-        family: "cycle",
+        family: "cycle-analogue",
         numbers: analogueNumbers,
       });
     }
@@ -2489,7 +2479,7 @@ import {
     );
   }
 
-  function renderPrecloseComparison(latest, finalForecast = resolveFinalForecast(latest)) {
+  function renderPrecloseComparison(latest, trajectory, shadow) {
     elements.precloseComparison.removeAttribute("title");
     setComparisonWarning([]);
 
@@ -2499,72 +2489,31 @@ import {
       elements.precloseComparisonBadge.textContent = "Ждём прогноз";
       setTextIfChanged(
         elements.precloseComparisonStatus,
-        "Политика итогового списка будет показана после фиксации прогноза.",
+        "Полный рейтинг 37 чисел появится после фиксации непрерывной траектории.",
       );
       return;
     }
 
-    const { status, pairSampleSize, derivedFromSnapshotAt, reason, legacy } = finalForecast;
-    if (status === "unavailable") {
+    if (trajectory.ranking.length !== 37) {
       elements.precloseComparison.dataset.state = "unavailable";
       elements.precloseComparison.setAttribute("aria-busy", "false");
-      elements.precloseComparisonBadge.textContent = "Нет итогового списка";
+      elements.precloseComparisonBadge.textContent = "Ждём Rank‑37";
       setTextIfChanged(
         elements.precloseComparisonStatus,
-        "Сохранённый сводный прогноз недоступен или неполон.",
+        "Адаптивные соседи ещё не дали проверяемый полный рейтинг. Старый start-price-v2 не используется как запасной вариант.",
       );
       return;
     }
 
     elements.precloseComparison.dataset.state = "ready";
     elements.precloseComparison.setAttribute("aria-busy", "false");
-    const warnings = [];
-    if (status === "combined") {
-      elements.precloseComparisonBadge.textContent = "2 источника";
-      const sampleText = pairSampleSize === null
-        ? ""
-        : ` История: ${pairSampleSize} ${pluralForm(pairSampleSize, "переход", "перехода", "переходов")}.`;
-      setTextIfChanged(
-        elements.precloseComparisonStatus,
-        `2 источника сопоставлены: основная модель и история переходов.${sampleText}`,
-      );
-      if (pairSampleSize !== null && pairSampleSize < 30) {
-        warnings.push(`Очень малая историческая выборка: ${pairSampleSize} ${pluralForm(pairSampleSize, "переход", "перехода", "переходов")}.`);
-      } else if (pairSampleSize !== null && pairSampleSize < 100) {
-        warnings.push(`Мало исторических данных: ${pairSampleSize} переходов. Трактуйте итог осторожно.`);
-      }
-    } else if (status === "pair_fallback") {
-      elements.precloseComparisonBadge.textContent = "1 источник";
-      const sampleText = pairSampleSize === null
-        ? ""
-        : ` Выборка: ${pairSampleSize} ${pluralForm(pairSampleSize, "переход", "перехода", "переходов")}.`;
-      setTextIfChanged(
-        elements.precloseComparisonStatus,
-        `Итог сформирован только по истории переходов: основная модель недоступна.${sampleText}`,
-      );
-    } else if (reason === "authoritative_model") {
-      elements.precloseComparisonBadge.textContent = "start-price-v2 primary";
-      const sampleText = pairSampleSize === null || pairSampleSize === 0
-        ? ""
-        : ` (${pairSampleSize} ${pluralForm(pairSampleSize, "переход", "перехода", "переходов")})`;
-      setTextIfChanged(
-        elements.precloseComparisonStatus,
-        `Основной top‑3 start-price-v2 зафиксирован без перестановки. Исторический снимок${sampleText} остаётся справочным, legacy OLS shadow — диагностическим; они не меняют итог.`,
-      );
-    } else {
-      elements.precloseComparisonBadge.textContent = "1 источник";
-      setTextIfChanged(
-        elements.precloseComparisonStatus,
-        legacy
-          ? "Показан основной top‑3 старого прогноза: сводный снимок для него ещё не сохранялся."
-          : "Итог сформирован только основной моделью: исторический снимок недоступен.",
-      );
-    }
-    setComparisonWarning(warnings);
-
-    if (derivedFromSnapshotAt) {
-      elements.precloseComparison.title = `Сводный список рассчитан по снимку от ${formatDateTime(derivedFromSnapshotAt, { alwaysShowDate: true })}`;
-    }
+    elements.precloseComparisonBadge.textContent = "37 из 37";
+    const trainingCount = shadow?.adaptive?.trainingCount ?? 0;
+    setTextIfChanged(
+      elements.precloseComparisonStatus,
+      `Все 37 чисел получили ранг по замороженным распределениям похожих траекторий и весам, обученным на ${trainingCount} завершённых снимках. На экран вынесены только первые три; это ранговая масса, не вероятность.`,
+    );
+    elements.precloseComparison.title = `Rank‑37 зафиксирован по срезу ${formatDateTime(latest.lockedAt, { alwaysShowDate: true })}`;
   }
 
   function normalizeForecastHit(value) {
@@ -2618,7 +2567,7 @@ import {
     const card = createElement("li", "preclose-hit-card");
     const sequence = createElement("div", "preclose-hit-card__sequence");
     const ranking = createElement("ol", "preclose-hit-card__ranking");
-    ranking.setAttribute("aria-label", "Зафиксированный основной top-3");
+    ranking.setAttribute("aria-label", "Зафиксированный архивный top-3 start-price-v2");
     hit.rankedNumbers.forEach((number, index) => {
       ranking.appendChild(forecastHitPick(number, index + 1, hit.actualNumber));
     });
@@ -2696,7 +2645,7 @@ import {
         elements.precloseHitHistoryStatus,
         store.forecastHitsError
           ? "Повторим загрузку автоматически."
-          : "Загружаем сохранённые прогнозы основной модели с подтверждённым результатом; это наблюдение, не реальные ставки.",
+          : "Загружаем архив попаданий прежней модели start-price-v2; эти записи не являются новым Rank‑37.",
       );
       return;
     }
@@ -2715,13 +2664,13 @@ import {
         "empty-state",
         store.forecastHitsError
           ? "Не удалось обновить историю попаданий."
-          : "Подтверждённых попаданий основного top-3 пока нет.",
+          : "Подтверждённых попаданий архивного top-3 start-price-v2 пока нет.",
       ));
       setTextIfChanged(
         elements.precloseHitHistoryStatus,
         store.forecastHitsError
           ? "Повторим загрузку автоматически."
-          : "Первое подтверждённое попадание основной модели появится здесь после проверки результата; это наблюдение, не реальные ставки.",
+          : "Первое подтверждённое попадание архивной модели start-price-v2 появится здесь после проверки результата.",
       );
       return;
     }
@@ -2736,7 +2685,7 @@ import {
       elements.precloseHitHistoryCount.textContent = `${hits.length} · не обновлено`;
       setTextIfChanged(
         elements.precloseHitHistoryStatus,
-        `Показаны последние загруженные ${hits.length} ${hitLabel} основной модели; свежие данные временно недоступны. Это наблюдение, не реальные ставки.`,
+        `Показаны последние загруженные ${hits.length} ${hitLabel} архивной модели start-price-v2; свежие данные временно недоступны.`,
       );
       return;
     }
@@ -2748,15 +2697,14 @@ import {
     setTextIfChanged(
       elements.precloseHitHistoryStatus,
       store.forecastHitsHasMore
-        ? `Показаны ${hits.length} последних ${hitLabel} основной модели; более ранние записи остаются в истории. Это наблюдение, не реальные ставки.`
-        : `Показаны все ${hits.length} ${hitLabel} основной модели на данный момент. Это наблюдение, не реальные ставки.`,
+        ? `Показаны ${hits.length} последних ${hitLabel} архивной модели start-price-v2; более ранние записи остаются в истории.`
+        : `Показаны все ${hits.length} ${hitLabel} архивной модели start-price-v2 на данный момент.`,
     );
   }
 
   function renderPrecloseForecast() {
     const forecastState = store.state?.precloseForecast || null;
     const latest = forecastState?.latest || null;
-    const metrics = forecastState?.metrics || {};
     const currentRound = store.state?.collector?.currentRound || null;
     const currentRoundId = currentRound?.id == null ? null : String(currentRound.id);
     const latestRoundId = latest?.roundId == null ? null : String(latest.roundId);
@@ -2769,21 +2717,29 @@ import {
     const matchesCurrent = latest !== null
       && currentRoundId !== null
       && latestRoundId === currentRoundId;
-    const settledCount = asNonNegativeInteger(metrics.settledCount, 0);
-    const forecastCount = asNonNegativeInteger(metrics.forecastCount, settledCount);
-    const pendingCount = asNonNegativeInteger(metrics.pendingCount, Math.max(0, forecastCount - settledCount));
-    const top3Hits = asNonNegativeInteger(metrics.top3Hits, 0);
-    const top3Rate = Number(metrics.top3Rate);
-    const finalForecast = resolveFinalForecast(matchesCurrent ? latest : null);
+    const shadow = matchesCurrent
+      ? normalizedTrajectoryShadow(latest?.trajectoryShadow)
+      : null;
+    const trajectory = matchesCurrent
+      ? currentPriceTrajectorySignals(latest)
+      : { ranking: [], weights: [], range: [] };
+    const trajectoryMetrics = normalizedTrajectoryMetrics(
+      forecastState?.trajectoryMetrics,
+    );
+    const rankedSettledCount = trajectoryMetrics?.rank37SettledCount ?? 0;
+    const rankedPendingCount = trajectoryMetrics?.rank37PendingCount ?? 0;
+    const rankedEvaluatedCount = trajectoryMetrics?.rank37EvaluatedCount ?? 0;
+    const rankedTop3Hits = trajectoryMetrics?.rank37Top3Hits ?? 0;
+    const rankedTop3Rate = trajectoryMetrics?.rank37Top3Rate ?? null;
 
-    elements.precloseSampleCount.textContent = settledCount < 100
-      ? `${settledCount} из 100`
-      : `${settledCount} проверено`;
-    elements.precloseSampleCount.title = `Основная модель: зафиксировано ${forecastCount}; ожидают результата ${pendingCount}`;
-    elements.precloseTop3Rate.textContent = settledCount >= 100 && Number.isFinite(top3Rate)
-      ? `${top3Hits} из ${settledCount} · ${(top3Rate * 100).toFixed(1).replace(".", ",")}%`
-      : `${top3Hits} из ${settledCount} · мало данных`;
-    renderPrecloseComparison(matchesCurrent ? latest : null, finalForecast);
+    elements.precloseSampleCount.textContent = rankedEvaluatedCount < 100
+      ? `${rankedEvaluatedCount} из 100`
+      : `${rankedEvaluatedCount} проверено`;
+    elements.precloseSampleCount.title = `Rank‑37: завершено ${rankedSettledCount}; ожидают результата ${rankedPendingCount}`;
+    elements.precloseTop3Rate.textContent = rankedEvaluatedCount >= 100 && Number.isFinite(rankedTop3Rate)
+      ? `${rankedTop3Hits} из ${rankedEvaluatedCount} · ${(rankedTop3Rate * 100).toFixed(1).replace(".", ",")}%`
+      : `${rankedTop3Hits} из ${rankedEvaluatedCount} · мало данных`;
+    renderPrecloseComparison(matchesCurrent ? latest : null, trajectory, shadow);
     renderTrajectoryShadow(
       matchesCurrent ? latest?.trajectoryShadow : null,
       forecastState?.trajectoryMetrics,
@@ -2814,7 +2770,7 @@ import {
       } else if (nowMs < closesMs) {
         elements.preclosePanel.dataset.state = "capturing";
         elements.precloseBadge.textContent = `Открыто · ${secondsUntilClose}с`;
-        elements.precloseStatus.textContent = "Фиксируем последний допустимый снимок основной модели…";
+        elements.precloseStatus.textContent = "Фиксируем траекторию и полный рейтинг 37 чисел…";
         elements.precloseTiming.textContent = "Будут использованы только данные, полученные до bcd.";
       } else {
         elements.preclosePanel.dataset.state = "locked";
@@ -2825,10 +2781,8 @@ import {
       return;
     }
 
-    const rankedNumbers = finalForecast.numbers;
-    const rankingLabel = finalForecast.legacy
-      ? "Основной список старого прогноза"
-      : "Итоговый список";
+    const rankedNumbers = trajectory.ranking.slice(0, 3);
+    const rankingLabel = "Первые три места полного рейтинга 37 чисел";
     const ranking = rankedNumbers.map((number, index) => {
       const item = createElement("li", "preclose-pick");
       item.setAttribute(
@@ -2859,15 +2813,13 @@ import {
     elements.precloseRanking.replaceChildren(
       ...(ranking.length
         ? ranking
-        : [createElement("li", "empty-state", "Итоговый top‑3 недоступен.")]),
+        : [createElement("li", "empty-state", "Полный Rank‑37 для этого раунда ещё не готов.")]),
     );
     elements.precloseRanking.setAttribute("aria-busy", "false");
     elements.precloseLivePrice.textContent = Number.isFinite(Number(latest.currentPrice))
       ? Number(latest.currentPrice).toFixed(5)
       : "—";
-    const primaryPrice = latest.modelVersion === "start-price-v2"
-      ? Number(latest.startPrice)
-      : Number(latest.projectedPrice);
+    const primaryPrice = Number(shadow?.numberArea?.typical?.price);
     elements.precloseProjectedPrice.textContent = Number.isFinite(primaryPrice)
       ? primaryPrice.toFixed(5)
       : "—";
@@ -2875,40 +2827,34 @@ import {
     const availableLeadText = Number.isFinite(availableLead)
       ? `${availableLead.toFixed(1).replace(".", ",")} сек.`
       : "неизвестно";
-    const shadowPrice = Number(latest.features?.shadow?.projectedPrice);
-    const shadowText = latest.modelVersion === "start-price-v2" && Number.isFinite(shadowPrice)
-      ? ` Legacy OLS shadow: ${shadowPrice.toFixed(5)}; на итог не влияет.`
-      : "";
-    elements.precloseTiming.textContent = `Снимок получен ${formatDateTime(latest.lockedAt)}, запись сохранена ${formatDateTime(latest.persistedAt)} · за ${availableLeadText} до bcd.${shadowText}`;
+    elements.precloseTiming.textContent = `Траектория и распределения соседей заморожены ${formatDateTime(latest.lockedAt)}, запись сохранена ${formatDateTime(latest.persistedAt)} · за ${availableLeadText} до bcd.`;
+
+    if (rankedNumbers.length !== 3) {
+      elements.preclosePanel.dataset.state = "waiting";
+      elements.precloseBadge.textContent = "Ждём Rank‑37";
+      elements.precloseStatus.textContent = `Раунд ${compactId(latestRoundId)}: полный рейтинг всех 37 чисел не прошёл проверку; старый статичный Top‑3 не показывается.`;
+      return;
+    }
 
     if (latest.settlement) {
       const actual = asRouletteNumber(latest.settlement.actualNumber);
-      if (rankedNumbers.length !== 3) {
-        elements.preclosePanel.dataset.state = "locked";
-        elements.precloseBadge.textContent = "Итог недоступен";
-        elements.precloseStatus.textContent = `Раунд ${compactId(latestRoundId)} проверен: выпало ${actual ?? "—"}. Сопоставить результат с итоговым списком нельзя.`;
-        return;
-      }
       const finalHit = actual !== null && rankedNumbers.includes(actual);
       elements.preclosePanel.dataset.state = finalHit ? "hit" : "miss";
-      elements.precloseBadge.textContent = finalForecast.legacy
-        ? "Старый список · справочно"
-        : finalHit
-          ? "Совпадение · справочно"
-          : "Проверено · справочно";
-      const listLabel = finalForecast.legacy ? "старого основного списка" : "итогового списка";
+      elements.precloseBadge.textContent = finalHit
+        ? "Совпадение · справочно"
+        : "Проверено · справочно";
       const comparisonText = finalHit
-        ? `Совпадение ${listLabel} (справочно).`
-        : `Совпадения с ${listLabel} нет (справочно).`;
+        ? "Есть совпадение с первой тройкой Rank‑37 (справочно)."
+        : "Совпадения с первой тройкой Rank‑37 нет (справочно).";
       elements.precloseStatus.textContent = `Раунд ${compactId(latestRoundId)} проверен: выпало ${actual ?? "—"}. ${comparisonText}`;
     } else if (closesMs !== null && nowMs < closesMs) {
       elements.preclosePanel.dataset.state = "open";
       elements.precloseBadge.textContent = `Открыто · ${secondsUntilClose}с`;
-      elements.precloseStatus.textContent = `Раунд ${compactId(latestRoundId)}: прогноз уже зафиксирован, ставки пока открыты.`;
+      elements.precloseStatus.textContent = `Раунд ${compactId(latestRoundId)}: все 37 чисел отранжированы, показаны три первых; ставки пока открыты.`;
     } else {
       elements.preclosePanel.dataset.state = "locked";
       elements.precloseBadge.textContent = "Ставки закрыты";
-      elements.precloseStatus.textContent = `Раунд ${compactId(latestRoundId)}: прогноз сохранён, но красная линия уже пройдена. Ждём результат.`;
+      elements.precloseStatus.textContent = `Раунд ${compactId(latestRoundId)}: Rank‑37 сохранён, красная линия уже пройдена. Ждём результат.`;
     }
   }
 
