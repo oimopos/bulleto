@@ -1,4 +1,4 @@
-export const COMBINED_NUMBER_ALGORITHM_VERSION = "all-signal-family-index-v3";
+export const COMBINED_NUMBER_ALGORITHM_VERSION = "predictive-family-index-v4";
 export const TRAJECTORY_RANK37_VERSION = "trajectory-rank37-v1";
 export const TRAJECTORY_RANK37_BASIS =
   "adaptive-weighted-neighbor-delta-to-current-bands";

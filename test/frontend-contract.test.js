@@ -71,17 +71,17 @@ test("combined leader is the first dashboard block and renders exactly one numbe
   const block = html.slice(blockStart, headingStart);
   assert.ok(gapStart >= 0 && blockStart > gapStart && headingStart > blockStart);
   assert.doesNotMatch(block, /\bhidden\b/);
-  assert.match(block, /data-algorithm="all-signal-family-index-v3"/);
+  assert.match(block, /data-algorithm="predictive-family-index-v4"/);
   assert.match(block, /id="combined-pick-status" role="status" aria-live="polite" aria-atomic="true"/);
   assert.equal([...block.matchAll(/<output\b/g)].length, 1);
   assert.match(block, /id="combined-pick-number"/);
   assert.doesNotMatch(block, /<(?:ol|ul)\b/);
-  assert.match(block, /Все доступные числовые сигналы · один итог/);
+  assert.match(block, /Актуальные прогнозные сигналы · один итог/);
   assert.match(block, /эвристический ранговый индекс, не вероятность/);
-  assert.match(block, /описательные и симуляционные блоки тоже включены/);
+  assert.match(block, /Давность, виртуальная цель, невыпавшие числа, survivor и исторический аналог остаются только наблюдением и в единого лидера не входят/);
   assert.match(block, /1 из 37 \(≈2,7%\)/);
 
-  assert.match(app, /from "\.\/combined-number\.js\?v=5"/);
+  assert.match(app, /from "\.\/combined-number\.js\?v=6"/);
   assert.match(app, /assessCombinedNumberFreshness\(store\.state\)/);
   assert.match(app, /function currentCombinedNumberContext\(\)/);
   assert.match(app, /function renderCombinedPick\(\)/);
@@ -104,8 +104,6 @@ test("combined leader is the first dashboard block and renders exactly one numbe
   assert.match(app, /historyCutoffAt\.getTime\(\) !== lockedAt\.getTime\(\)/);
   assert.match(app, /family: "price"/);
   assert.match(app, /family: "conditional-history"/);
-  assert.match(app, /family: "absence"/);
-  assert.match(app, /family: "cycle-analogue"/);
   assert.doesNotMatch(app, /result\.status === "no_consensus"/);
   assert.doesNotMatch(app, /result\.status === "insufficient_families"/);
   assert.doesNotMatch(app, /result\.status === "ambiguous"/);
@@ -117,14 +115,15 @@ test("combined leader is the first dashboard block and renders exactly one numbe
   );
 
   const contextStart = app.indexOf("function currentCombinedNumberContext()");
-  const contextEnd = app.indexOf("function renderPrecloseComparison", contextStart);
+  const contextEnd = app.indexOf("function renderCombinedPick", contextStart);
   const contextBlock = app.slice(contextStart, contextEnd);
   assert.ok(contextStart >= 0 && contextEnd > contextStart);
-  assert.match(contextBlock, /currentOverdueRanking/);
-  assert.match(contextBlock, /currentVirtualRecencySignals/);
-  assert.match(contextBlock, /currentActiveCycleRemaining/);
-  assert.match(contextBlock, /currentCompletedCycleSurvivor/);
-  assert.match(contextBlock, /currentCycleAnalogueRanking/);
+  assert.doesNotMatch(contextBlock, /currentOverdueRanking|currentVirtualRecencySignals/);
+  assert.doesNotMatch(contextBlock, /currentActiveCycleRemaining|currentCompletedCycleSurvivor/);
+  assert.doesNotMatch(contextBlock, /currentCycleAnalogueRanking/);
+  assert.doesNotMatch(contextBlock, /recency-overdue-top3|recency-virtual-held/);
+  assert.doesNotMatch(contextBlock, /cycle-remaining|cycle-completed-survivor|cycle-analogue-next/);
+  assert.doesNotMatch(contextBlock, /family: "absence"|family: "cycle-analogue"/);
   assert.match(contextBlock, /currentTripleFollowerRanking/);
   assert.doesNotMatch(contextBlock, /historicalAccount|actualNumber/);
   assert.match(contextBlock, /currentPriceTrajectorySignals/);
@@ -137,6 +136,8 @@ test("combined leader is the first dashboard block and renders exactly one numbe
     /family: "price",\s*\n\s*numbers: modelNumbers/,
   );
   assert.doesNotMatch(contextBlock, /start-price-v2/);
+  assert.match(app, /прогнозные источники учтены/);
+  assert.doesNotMatch(app, /числовые блоки учтены/);
   assert.match(contextBlock, /currentFollowerLiveRanking/);
   assert.match(contextBlock, /tieSeed: `\$\{latestResultId\}:\$\{currentRoundId\}`/);
   assert.match(contextBlock, /mode: "set"/);
@@ -743,7 +744,7 @@ test("warm next-round forecast exposes a strict 5-percent walk-forward contract"
   assert.match(html, /id="follower-dynamic-next-title"[^>]*>[^<]*≥5%/);
   assert.match(html, /id="follower-dynamic-next-note"[^>]*>[\s\S]*?5%/);
   assert.match(html, /styles\.css\?v=28/);
-  assert.match(html, /app\.js\?v=36/);
+  assert.match(html, /app\.js\?v=37/);
   assert.match(styles, /\.follower-dynamic-next\s*\{/);
   assert.match(styles, /\.follower-warm-current\s*\{/);
   assert.match(styles, /\.follower-warm-picks\s*\{/);
@@ -965,7 +966,7 @@ test("cycle comparison language is descriptive, responsive, and cache-busted", (
   assert.match(block, /не предсказывает следующее число/);
   assert.doesNotMatch(block, /должн/iu);
   assert.match(html, /href="\/styles\.css\?v=28"/);
-  assert.match(html, /src="\/app\.js\?v=36"/);
+  assert.match(html, /src="\/app\.js\?v=37"/);
   assert.match(styles, /\.cycle-sequence-list\s*\{[\s\S]*?repeat\(auto-fill, minmax\(50px, 1fr\)\)/);
   assert.match(
     styles,

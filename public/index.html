@@ -8,7 +8,7 @@
     <meta name="description" content="Онлайн-монитор результатов рулетки и циклов исключения чисел от 0 до 36">
     <title>Круг 37 — монитор результатов</title>
     <link rel="stylesheet" href="/styles.css?v=28">
-    <script type="module" src="/app.js?v=36"></script>
+    <script type="module" src="/app.js?v=37"></script>
   </head>
   <body>
     <a class="skip-link" href="#main-content">Перейти к содержимому</a>
@@ -46,12 +46,12 @@
         </div>
       </section>
 
-      <section class="panel combined-pick" id="combined-pick" data-state="loading" data-algorithm="all-signal-family-index-v3" aria-labelledby="combined-pick-title" aria-describedby="combined-pick-status combined-pick-note" aria-busy="true">
+      <section class="panel combined-pick" id="combined-pick" data-state="loading" data-algorithm="predictive-family-index-v4" aria-labelledby="combined-pick-title" aria-describedby="combined-pick-status combined-pick-note" aria-busy="true">
         <div class="combined-pick__copy">
-          <p class="eyebrow">Все доступные числовые сигналы · один итог</p>
-          <p class="combined-pick__title" id="combined-pick-title">Одно число по всем блокам</p>
+          <p class="eyebrow">Актуальные прогнозные сигналы · один итог</p>
+          <p class="combined-pick__title" id="combined-pick-title">Одно число по прогнозным блокам</p>
           <p class="combined-pick__status" id="combined-pick-status" role="status" aria-live="polite" aria-atomic="true">Собираем актуальные числовые сигналы текущего раунда.</p>
-          <p class="combined-pick__note" id="combined-pick-note">Учитываются полный Rank‑37 текущей траектории, её участок, переходы после последних чисел, сохранённый Top‑5, давность, активная виртуальная цель, невыпавшие числа цикла, следующий ход исторического аналога и условные тройки. При этом описательные и симуляционные блоки тоже включены, но давность, виртуальная цель и остаток цикла объединяются в одну группу отсутствия и не дублируют голос одного числа; виртуальный кандидат без активной сессии отдельного веса не получает. Наверху всегда выводится ровно один лидер. Это эвристический ранговый индекс, не вероятность. Базовый шанс отдельного числа — 1 из 37 (≈2,7%).</p>
+          <p class="combined-pick__note" id="combined-pick-note">Учитываются полный Rank‑37 текущей траектории, её участок, переходы после последних чисел, сохранённый Top‑5 и условные тройки. Давность, виртуальная цель, невыпавшие числа, survivor и исторический аналог остаются только наблюдением и в единого лидера не входят. Наверху выводится ровно одно число. Это эвристический ранговый индекс, не вероятность. Базовый шанс отдельного числа — 1 из 37 (≈2,7%).</p>
         </div>
         <div class="combined-pick__result">
           <span class="combined-pick__label">Одно число</span>
@@ -257,7 +257,7 @@
           <p class="preclose-comparison__status" id="trajectory-shadow-training">Обучение: — результатов · adaptive-снимок для этого раунда отсутствует.</p>
           <p class="preclose-comparison__status" id="trajectory-shadow-range-metrics" aria-live="polite" aria-atomic="true">Участок: — из — (нет данных) · Adaptive v2, проспективное наблюдение.</p>
           <p class="preclose-comparison__status" id="trajectory-shadow-sample">Полные сопоставимые раунды: —/30; соседи формы: —/10.</p>
-          <p class="preclose-comparison__note" id="trajectory-shadow-note">Цель — движение цены от последней доступной точки перед forecast lock (возраст точки не более 5 с) до финальной цены результата <code>ed</code>, а не следующий тик. Adaptive v2 фиксирует при lock не более 6 соседних ценовых полос вокруг типичного q50 внутри полного коридора q20/q80; legacy KNN v1 восстанавливает такое же компактное окно только для отображения. Основная шкала идёт от 0 сверху к 36 снизу, а нижняя дублирующая нулевая полоса помечается отдельно. Обучение использует только завершённые снимки, известные строго до lock нового снимка. «Участок» и Rank‑37 проверяются только на проспективно зафиксированных Adaptive v2 снимках; архивные доли попаданий не являются вероятностью следующего раунда. В блок «Одно число по всем блокам» Rank‑37 входит с замороженной исходной массой: числа с нулевой массой данных не получают вес из-за технического порядка. Компактный диапазон усредняется с ним внутри одной ценовой группы и не создаёт второй независимый вес.</p>
+          <p class="preclose-comparison__note" id="trajectory-shadow-note">Цель — движение цены от последней доступной точки перед forecast lock (возраст точки не более 5 с) до финальной цены результата <code>ed</code>, а не следующий тик. Adaptive v2 фиксирует при lock не более 6 соседних ценовых полос вокруг типичного q50 внутри полного коридора q20/q80; legacy KNN v1 восстанавливает такое же компактное окно только для отображения. Основная шкала идёт от 0 сверху к 36 снизу, а нижняя дублирующая нулевая полоса помечается отдельно. Обучение использует только завершённые снимки, известные строго до lock нового снимка. «Участок» и Rank‑37 проверяются только на проспективно зафиксированных Adaptive v2 снимках; архивные доли попаданий не являются вероятностью следующего раунда. В блок «Одно число по прогнозным блокам» Rank‑37 входит с замороженной исходной массой: числа с нулевой массой данных не получают вес из-за технического порядка. Компактный диапазон усредняется с ним внутри одной ценовой группы и не создаёт второй независимый вес.</p>
         </section>
 
         <details class="preclose-hit-history disclosure disclosure--inset" id="preclose-hit-history" data-state="loading" aria-labelledby="preclose-hit-history-title" aria-describedby="preclose-hit-history-status" aria-busy="true">

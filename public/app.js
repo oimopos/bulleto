@@ -5,14 +5,10 @@ import {
   TRAJECTORY_RANK37_BASIS,
   TRAJECTORY_RANK37_VERSION,
   assessCombinedNumberFreshness,
-  combinedCycleAnalogueRanking,
-  combinedCycleNumberSignals,
-  combinedOverdueRanking,
   combinedTripleFollowerRanking,
   combinedTrajectorySignals,
-  combinedVirtualRecencySources,
   combineNumberRankings,
-} from "./combined-number.js?v=5";
+} from "./combined-number.js?v=6";
 
 (() => {
   "use strict";
@@ -2236,40 +2232,6 @@ import {
     );
   }
 
-  function currentOverdueRanking() {
-    return combinedOverdueRanking(store.state?.numberStats);
-  }
-
-  function currentVirtualRecencySignals(latestResult) {
-    return combinedVirtualRecencySources(
-      store.state?.virtualBettor,
-      latestResult,
-    );
-  }
-
-  function currentActiveCycleRemaining(latestResult) {
-    return combinedCycleNumberSignals(
-      store.state?.activeCycle,
-      latestResult,
-    ).remaining;
-  }
-
-  function currentCompletedCycleSurvivor(latestResult) {
-    return combinedCycleNumberSignals(
-      store.state?.activeCycle,
-      latestResult,
-    ).survivor;
-  }
-
-  function currentCycleAnalogueRanking(latestResult, activeCycle) {
-    if (!store.cycleComparisonLoaded || store.cycleComparisonError) return [];
-    return combinedCycleAnalogueRanking(
-      store.cycleComparison,
-      activeCycle,
-      latestResult,
-    );
-  }
-
   function currentCombinedNumberContext() {
     if (!store.stateLoaded) return { state: "loading", sources: [] };
     if (store.stateError || !store.state) return { state: "error", sources: [] };
@@ -2362,43 +2324,6 @@ import {
       });
     }
 
-    const overdueNumbers = currentOverdueRanking();
-    if (overdueNumbers.length > 0) {
-      sources.push({
-        id: "recency-overdue-top3",
-        family: "absence",
-        numbers: overdueNumbers,
-      });
-    }
-    sources.push(...currentVirtualRecencySignals(latestResult));
-
-    const activeCycle = store.state.activeCycle;
-    const remainingNumbers = currentActiveCycleRemaining(latestResult);
-    if (remainingNumbers.length > 0) {
-      sources.push({
-        id: "cycle-remaining",
-        family: "absence",
-        mode: "set",
-        numbers: remainingNumbers,
-      });
-    }
-    const completedSurvivor = currentCompletedCycleSurvivor(latestResult);
-    if (completedSurvivor.length > 0) {
-      sources.push({
-        id: "cycle-completed-survivor",
-        family: "absence",
-        numbers: completedSurvivor,
-      });
-    }
-    const analogueNumbers = currentCycleAnalogueRanking(latestResult, activeCycle);
-    if (analogueNumbers.length > 0) {
-      sources.push({
-        id: "cycle-analogue-next",
-        family: "cycle-analogue",
-        numbers: analogueNumbers,
-      });
-    }
-
     return {
       state: sources.length > 0 ? "ready" : "waiting",
       sources,
@@ -2470,8 +2395,8 @@ import {
     setTextIfChanged(
       elements.combinedPickStatus,
       result.tieBreakApplied
-        ? `Все доступные и прошедшие проверку числовые блоки учтены. Равный максимальный индекс разрешён неизменным правилом текущего раунда; показано одно число.`
-        : `Все доступные и прошедшие проверку числовые блоки учтены; показано одно число с максимальным сводным рангом.`,
+        ? `Все доступные и прошедшие проверку прогнозные источники учтены. Равный максимальный индекс разрешён неизменным правилом текущего раунда; показано одно число.`
+        : `Все доступные и прошедшие проверку прогнозные источники учтены; показано одно число с максимальным сводным рангом.`,
     );
     setTextIfChanged(
       elements.combinedPickSources,

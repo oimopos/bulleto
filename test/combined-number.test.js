@@ -158,7 +158,7 @@ test("trajectory exposes a validated full Rank-37 and its correlated range", () 
     weights: expectedWeights,
     range: [30, 31, 32, 33],
   });
-  assert.equal(COMBINED_NUMBER_ALGORITHM_VERSION, "all-signal-family-index-v3");
+  assert.equal(COMBINED_NUMBER_ALGORITHM_VERSION, "predictive-family-index-v4");
   assert.equal(TRAJECTORY_RANK37_VERSION, "trajectory-rank37-v1");
   assert.equal(
     TRAJECTORY_RANK37_BASIS,
@@ -574,25 +574,6 @@ test("correlated sources are averaged inside their family before families are av
   assert.equal(result.tieBreakApplied, false);
 });
 
-test("overdue, held virtual, and cycle remainder share one absence-family vote", () => {
-  const result = combineNumberRankings([
-    { id: "price", family: "price", numbers: [21] },
-    { id: "overdue", family: "absence", numbers: [3, 12, 11] },
-    { id: "virtual-held", family: "absence", numbers: [3] },
-    {
-      id: "cycle-remaining",
-      family: "absence",
-      mode: "set",
-      numbers: [3, 11, 12, 14],
-    },
-  ], { tieSeed: "current-round" });
-
-  assert.equal(result.number, 21);
-  assert.equal(result.familyCount, 2);
-  assert.deepEqual(result.familyIds, ["absence", "price"]);
-  assert.equal(result.familySupportCount, 1);
-});
-
 test("seeded tie resolution is deterministic and independent of source order", () => {
   const sources = [
     { id: "transition", family: "transition", numbers: [36, 0] },
@@ -652,7 +633,7 @@ test("invalid and duplicate sources add no weight while modes dedupe separately"
   assert.deepEqual(forward.familyIds, ["cycle", "price"]);
 });
 
-test("empty input fails closed with the complete v3 result shape", () => {
+test("empty input fails closed with the complete v4 result shape", () => {
   assert.deepEqual(combineNumberRankings([]), {
     version: COMBINED_NUMBER_ALGORITHM_VERSION,
     status: "unavailable",
