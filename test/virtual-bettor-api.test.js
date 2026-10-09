@@ -107,7 +107,7 @@ async function stopChild(child) {
 }
 
 test(
-  "GET /api/virtual-bettor returns the persisted balance and longest current series",
+  "server exposes the current triple follower and persisted virtual state",
   { timeout: 25_000 },
   async () => {
     const directory = mkdtempSync(join(tmpdir(), "roulette-virtual-api-"));
@@ -115,6 +115,7 @@ test(
     let child = null;
     let stdout = "";
     let stderr = "";
+    let expectedTripleFollowerSignal = null;
 
     try {
       const database = createDatabase({
@@ -124,6 +125,10 @@ test(
       });
       try {
         database.ingestBatch([resultEvent(0), resultEvent(1), resultEvent(2)]);
+        expectedTripleFollowerSignal = database.getCurrentTripleFollowerSignal(
+          SOURCE,
+          INSTRUMENT,
+        );
       } finally {
         database.close();
       }
@@ -156,6 +161,33 @@ test(
       const baseUrl = `http://127.0.0.1:${port}`;
       const logs = () => `stdout:\n${stdout}\nstderr:\n${stderr}`;
       await waitUntilReady(baseUrl, child, logs);
+
+      const stateResponse = await fetch(`${baseUrl}/api/state`);
+      assert.equal(stateResponse.status, 200, logs());
+      assert.match(
+        stateResponse.headers.get("content-type") ?? "",
+        /^application\/json\b/,
+      );
+      assert.equal(stateResponse.headers.get("cache-control"), "no-store");
+      const dashboardState = await stateResponse.json();
+      assert.deepEqual(
+        dashboardState.tripleFollowerSignal,
+        expectedTripleFollowerSignal,
+      );
+      assert.equal(
+        dashboardState.tripleFollowerSignal.historyThrough,
+        dashboardState.latestResult.settledAt,
+      );
+      assert.equal(
+        dashboardState.tripleFollowerSignal.anchor.current.resultId,
+        dashboardState.latestResult.id,
+      );
+      assert.ok(Array.isArray(dashboardState.virtualBettor.longestCandidates));
+      assert.ok(dashboardState.virtualBettor.longestCandidates.length >= 1);
+      assert.deepEqual(
+        dashboardState.virtualBettor.longestCandidate,
+        dashboardState.virtualBettor.longestCandidates[0],
+      );
 
       const response = await fetch(`${baseUrl}/api/virtual-bettor`);
       assert.equal(response.status, 200, logs());

@@ -70,6 +70,12 @@ const FOLLOWER_TOP5_GATE_THRESHOLD_PERCENT = 80;
 const FOLLOWER_TOP5_GATE_MAXIMUM_ATTEMPT = 20;
 const FOLLOWER_TOP5_GATE_ACCOUNT_ALGORITHM_VERSION =
   "follower-top5-cumulative80-ladder-v1";
+const TRIPLE_FOLLOWER_SCHEMA_VERSION = 1;
+const TRIPLE_FOLLOWER_ALGORITHM_VERSION = "triple-follower-current-v1";
+const TRIPLE_FOLLOWER_DEFINITION =
+  "next-result-after-ordered-pair-within-continuity-epoch";
+const TRIPLE_FOLLOWER_TIE_BREAK =
+  "occurrence-count-desc,last-occurred-at-desc,number-asc";
 
 function emptyFollowerHitBucket() {
   return {
@@ -4937,13 +4943,13 @@ export class RouletteDatabase {
       );
   }
 
-  #longestVirtualCandidate(
+  #longestVirtualCandidates(
     source,
     instrument,
     continuityEpoch,
     excludeResultId = null,
   ) {
-    const row = this.sqlite
+    const rows = this.sqlite
       .prepare(`
         WITH numbers(result_number) AS (
           VALUES ${ROULETTE_NUMBERS.map((number) => `(${number})`).join(", ")}
@@ -4993,9 +4999,8 @@ export class RouletteDatabase {
           CASE WHEN last_seen.last_position IS NULL THEN 0 ELSE 1 END,
           last_seen.last_position,
           numbers.result_number
-        LIMIT 1
       `)
-      .get(
+      .all(
         source,
         instrument,
         continuityEpoch,
@@ -5003,20 +5008,40 @@ export class RouletteDatabase {
         excludeResultId,
       );
 
-    if (!row) return null;
-    const roundsSinceLast = Number(row.rounds_since_last);
-    return {
-      number: Number(row.result_number),
-      roundsSinceLast,
-      occurrenceCount: Number(row.occurrence_count),
-      lastSeenAt: row.last_seen_at,
-      lastResultId:
-        row.last_result_id === null ? null : Number(row.last_result_id),
-      lastPosition:
-        row.last_position === null ? null : Number(row.last_position),
+    if (rows.length === 0) return [];
+    const candidates = rows.map((row) => {
+      const roundsSinceLast = Number(row.rounds_since_last);
+      return {
+        number: Number(row.result_number),
+        roundsSinceLast,
+        occurrenceCount: Number(row.occurrence_count),
+        lastSeenAt: row.last_seen_at,
+        lastResultId:
+          row.last_result_id === null ? null : Number(row.last_result_id),
+        lastPosition:
+          row.last_position === null ? null : Number(row.last_position),
+        continuityEpoch,
+        eligible: roundsSinceLast >= VIRTUAL_BET_MODEL.triggerThreshold,
+      };
+    });
+    const longestRounds = candidates[0].roundsSinceLast;
+    return candidates.filter(({ roundsSinceLast }) => (
+      roundsSinceLast === longestRounds
+    ));
+  }
+
+  #longestVirtualCandidate(
+    source,
+    instrument,
+    continuityEpoch,
+    excludeResultId = null,
+  ) {
+    return this.#longestVirtualCandidates(
+      source,
+      instrument,
       continuityEpoch,
-      eligible: roundsSinceLast >= VIRTUAL_BET_MODEL.triggerThreshold,
-    };
+      excludeResultId,
+    )[0] ?? null;
   }
 
   #armVirtualBettorInTransaction(
@@ -7001,6 +7026,11 @@ export class RouletteDatabase {
         : VIRTUAL_BET_MODEL.initialStake;
     const initialBalance = Number(bankroll.initial_balance);
     const currentBalance = Number(bankroll.current_balance);
+    const longestCandidates = this.#longestVirtualCandidates(
+      safeSource,
+      safeInstrument,
+      continuityEpoch,
+    );
 
     return {
       mode: "simulation",
@@ -7023,11 +7053,8 @@ export class RouletteDatabase {
         exhaustedAt: bankroll.exhausted_at ?? null,
         dataComplete: invalidGapSessions === 0,
       },
-      longestCandidate: this.#longestVirtualCandidate(
-        safeSource,
-        safeInstrument,
-        continuityEpoch,
-      ),
+      longestCandidate: longestCandidates[0] ?? null,
+      longestCandidates,
       activeSession: mapVirtualBetSession(liveRow),
       latestOutcome: mapVirtualBetOutcome(latestOutcomeRow),
       recentSessions: recentRows.map(mapVirtualBetSession),
@@ -7099,6 +7126,129 @@ export class RouletteDatabase {
         firstOccurredAt: row.first_occurred_at,
         lastOccurredAt: row.last_occurred_at,
       }));
+  }
+
+  getCurrentTripleFollowerSignal(
+    source = "buleto",
+    instrument = "default",
+  ) {
+    this.#assertOpen();
+    const safeSource = asNonEmptyText(source, undefined, "source");
+    const safeInstrument = asNonEmptyText(instrument, undefined, "instrument");
+    const latestRows = this.sqlite
+      .prepare(`
+        SELECT id, result_number, settled_at, continuity_epoch
+        FROM round_results
+        WHERE source = ? AND instrument = ?
+        ORDER BY settled_at DESC, id DESC
+        LIMIT 2
+      `)
+      .all(safeSource, safeInstrument);
+    const currentRow = latestRows[0] ?? null;
+    const responseBase = {
+      schemaVersion: TRIPLE_FOLLOWER_SCHEMA_VERSION,
+      algorithmVersion: TRIPLE_FOLLOWER_ALGORITHM_VERSION,
+      definition: TRIPLE_FOLLOWER_DEFINITION,
+      tieBreak: TRIPLE_FOLLOWER_TIE_BREAK,
+      historyThroughResultId: currentRow === null ? null : Number(currentRow.id),
+      historyThrough: currentRow?.settled_at ?? null,
+      anchor: null,
+      sampleSize: 0,
+      observedFollowerCount: 0,
+      candidates: [],
+    };
+
+    if (currentRow === null) {
+      return { ...responseBase, status: "empty" };
+    }
+
+    const previousRow = latestRows[1] ?? null;
+    if (
+      previousRow === null ||
+      Number(previousRow.continuity_epoch) !== Number(currentRow.continuity_epoch)
+    ) {
+      return { ...responseBase, status: "waiting_anchor" };
+    }
+
+    const anchor = {
+      continuityEpoch: Number(currentRow.continuity_epoch),
+      previous: {
+        resultId: Number(previousRow.id),
+        number: Number(previousRow.result_number),
+        settledAt: previousRow.settled_at,
+      },
+      current: {
+        resultId: Number(currentRow.id),
+        number: Number(currentRow.result_number),
+        settledAt: currentRow.settled_at,
+      },
+    };
+    const rows = this.sqlite
+      .prepare(`
+        WITH bounded AS (
+          SELECT id, result_number, settled_at, continuity_epoch
+          FROM round_results
+          WHERE source = ?
+            AND instrument = ?
+            AND (
+              settled_at < ?
+              OR (settled_at = ? AND id <= ?)
+            )
+        ), ordered AS (
+          SELECT
+            result_number AS first_number,
+            LEAD(result_number, 1) OVER stream_order AS second_number,
+            LEAD(result_number, 2) OVER stream_order AS follower_number,
+            LEAD(settled_at, 2) OVER stream_order AS follower_occurred_at
+          FROM bounded
+          WINDOW stream_order AS (
+            PARTITION BY continuity_epoch
+            ORDER BY settled_at, id
+          )
+        )
+        SELECT
+          follower_number,
+          COUNT(*) AS occurrence_count,
+          MAX(follower_occurred_at) AS last_occurred_at
+        FROM ordered
+        WHERE first_number = ?
+          AND second_number = ?
+          AND follower_number IS NOT NULL
+        GROUP BY follower_number
+        ORDER BY
+          occurrence_count DESC,
+          last_occurred_at DESC,
+          follower_number
+      `)
+      .all(
+        safeSource,
+        safeInstrument,
+        currentRow.settled_at,
+        currentRow.settled_at,
+        Number(currentRow.id),
+        Number(previousRow.result_number),
+        Number(currentRow.result_number),
+      );
+    const sampleSize = rows.reduce(
+      (total, row) => total + Number(row.occurrence_count),
+      0,
+    );
+    const candidates = rows.map((row, index) => ({
+      rank: index + 1,
+      number: Number(row.follower_number),
+      occurrenceCount: Number(row.occurrence_count),
+      share: Number(row.occurrence_count) / sampleSize,
+      lastOccurredAt: row.last_occurred_at,
+    }));
+
+    return {
+      ...responseBase,
+      status: sampleSize > 0 ? "ready" : "no_samples",
+      anchor,
+      sampleSize,
+      observedFollowerCount: candidates.length,
+      candidates,
+    };
   }
 
   getPairStats(source = "buleto", instrument = "default") {

@@ -3,9 +3,14 @@ import { buildFollowerStats } from "./pair-followers.js?v=1";
 import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
 import {
   assessCombinedNumberFreshness,
-  combinedTrajectoryRanking,
+  combinedCycleAnalogueRanking,
+  combinedCycleNumberSignals,
+  combinedOverdueRanking,
+  combinedTripleFollowerRanking,
+  combinedTrajectorySignals,
+  combinedVirtualRecencySources,
   combineNumberRankings,
-} from "./combined-number.js?v=2";
+} from "./combined-number.js?v=3";
 
 (() => {
   "use strict";
@@ -2003,6 +2008,16 @@ import {
     return String(left) === String(right);
   }
 
+  function sameTimestamp(left, right) {
+    const leftDate = parseDate(left);
+    const rightDate = parseDate(right);
+    return Boolean(
+      leftDate
+      && rightDate
+      && leftDate.getTime() === rightDate.getTime()
+    );
+  }
+
   function stateHasIntegrityGap(state) {
     const warnings = Array.isArray(state?.warnings) ? state.warnings : [];
     const integrity = String(state?.activeCycle?.integrityStatus || "").toLowerCase();
@@ -2116,14 +2131,10 @@ import {
     ) {
       return [];
     }
-    return entries
-      .filter(({ occurrenceCount }) => (
-        occurrenceCount * 100 >= sampleSize * 5
-      ))
-      .map(({ number }) => number);
+    return entries.map(({ number }) => number);
   }
 
-  function currentWarmTransitionSignalRanking(latestResult) {
+  function currentWarmTransitionSignals(latestResult) {
     if (!store.pairsLoaded || store.pairsError) return [];
     const warm = normalizedFollowerWarmNextRound();
     const signal = warm?.currentSignal;
@@ -2131,27 +2142,55 @@ import {
     const latestNumber = asRouletteNumber(latestResult?.number);
     if (
       !signal
-      || signal.status !== "ready"
+      || !["ready", "no_signal", "waiting_training"].includes(signal.status)
       || latestResultId === null
       || latestResultId < 1
       || latestNumber === null
       || signal.anchorResultId !== latestResultId
       || signal.sourceNumber !== latestNumber
-      || signal.candidates.length !== 5
-      || signal.picks.length < 1
+      || !sameTimestamp(signal.anchoredAt, latestResult?.settledAt)
     ) {
       return [];
     }
-    return signal.picks.map(({ number }) => number);
+
+    const stats = buildFollowerStats(store.pairs, latestNumber);
+    if (
+      stats.sampleSize !== signal.sampleSize
+      || stats.observedFollowerCount !== signal.observedFollowerCount
+    ) {
+      return [];
+    }
+    const observedNumbers = stats.items
+      .filter(({ occurrenceCount }) => occurrenceCount > 0)
+      .map(({ number }) => number);
+    const sources = observedNumbers.length > 0
+      ? [{
+          id: "history-after-last-all",
+          family: "conditional-history",
+          numbers: observedNumbers,
+        }]
+      : [];
+    if (["ready", "no_signal"].includes(signal.status)) {
+      if (signal.candidates.length !== 5) return [];
+      sources.push({
+        id: "history-after-last-top5",
+        family: "conditional-history",
+        numbers: signal.candidates.map(({ number }) => number),
+      });
+    }
+    if (signal.picks.length > 0) {
+      sources.push({
+        id: "history-after-last-threshold",
+        family: "conditional-history",
+        numbers: signal.picks.map(({ number }) => number),
+      });
+    }
+    return sources;
   }
 
-  function currentTrajectoryRanking(latestForecast) {
+  function currentPriceTrajectorySignals(latestForecast) {
     const shadow = normalizedTrajectoryShadow(latestForecast?.trajectoryShadow);
-    // The displayed range is ordered by physical wire position, not by
-    // likelihood. Only its prospectively evaluated q50 point is an exact
-    // scalar candidate; inventing ranks for the surrounding cells would make
-    // the combined result look more precise than the source contract allows.
-    return combinedTrajectoryRanking(
+    return combinedTrajectorySignals(
       shadow,
       TRAJECTORY_SHADOW_REQUIRED_HISTORY,
     );
@@ -2194,6 +2233,47 @@ import {
       : [];
   }
 
+  function currentTripleFollowerRanking(latestResult) {
+    return combinedTripleFollowerRanking(
+      store.state?.tripleFollowerSignal,
+      latestResult,
+    );
+  }
+
+  function currentOverdueRanking() {
+    return combinedOverdueRanking(store.state?.numberStats);
+  }
+
+  function currentVirtualRecencySignals(latestResult) {
+    return combinedVirtualRecencySources(
+      store.state?.virtualBettor,
+      latestResult,
+    );
+  }
+
+  function currentActiveCycleRemaining(latestResult) {
+    return combinedCycleNumberSignals(
+      store.state?.activeCycle,
+      latestResult,
+    ).remaining;
+  }
+
+  function currentCompletedCycleSurvivor(latestResult) {
+    return combinedCycleNumberSignals(
+      store.state?.activeCycle,
+      latestResult,
+    ).survivor;
+  }
+
+  function currentCycleAnalogueRanking(latestResult, activeCycle) {
+    if (!store.cycleComparisonLoaded || store.cycleComparisonError) return [];
+    return combinedCycleAnalogueRanking(
+      store.cycleComparison,
+      activeCycle,
+      latestResult,
+    );
+  }
+
   function currentCombinedNumberContext() {
     if (!store.stateLoaded) return { state: "loading", sources: [] };
     if (store.stateError || !store.state) return { state: "error", sources: [] };
@@ -2219,7 +2299,6 @@ import {
       return { state: "waiting", sources: [] };
     }
 
-    const sources = [];
     const latestForecast = store.state.precloseForecast?.latest;
     const forecastIsCurrent = latestForecast
       && sameEntityId(latestForecast.roundId, currentRoundId)
@@ -2227,6 +2306,7 @@ import {
     const modelNumbers = forecastIsCurrent
       ? normalizedForecastTop3(latestForecast.rankedNumbers)
       : [];
+    const sources = [];
     if (modelNumbers.length === 3) {
       sources.push({
         id: "price-start",
@@ -2235,43 +2315,105 @@ import {
       });
     }
 
-    const trajectoryNumbers = forecastIsCurrent
-      ? currentTrajectoryRanking(latestForecast)
-      : [];
-    if (trajectoryNumbers.length > 0) {
+    const trajectory = forecastIsCurrent
+      ? currentPriceTrajectorySignals(latestForecast)
+      : { ranking: [], range: [] };
+    if (trajectory.ranking.length > 0) {
       sources.push({
         id: "price-trajectory-q50",
         family: "price",
-        numbers: trajectoryNumbers,
+        numbers: trajectory.ranking,
+      });
+    }
+    if (trajectory.range.length > 0) {
+      sources.push({
+        id: "price-trajectory-range",
+        family: "price",
+        mode: "set",
+        numbers: trajectory.range,
       });
     }
 
-    const transitionNumbers = forecastIsCurrent
+    const transitionNumbers = forecastIsCurrent && modelNumbers.length === 3
       ? normalizedFrozenTransitionSignalRanking(
         latestForecast.pairHistory,
         latestResult,
         modelNumbers,
         latestForecast.lockedAt,
       )
-      : currentWarmTransitionSignalRanking(latestResult);
+      : [];
     if (transitionNumbers.length > 0) {
       sources.push({
-        id: "transition-current",
-        family: "transition",
+        id: "history-frozen-pair",
+        family: "conditional-history",
         numbers: transitionNumbers,
       });
     }
+    sources.push(...currentWarmTransitionSignals(latestResult));
 
     const followerLiveNumbers = currentFollowerLiveRanking(latestResult);
     if (followerLiveNumbers.length > 0) {
       sources.push({
-        id: "transition-live-fixed",
-        family: "transition",
+        id: "history-live-fixed",
+        family: "conditional-history",
         numbers: followerLiveNumbers,
       });
     }
 
-    return { state: sources.length > 0 ? "ready" : "waiting", sources };
+    const tripleNumbers = currentTripleFollowerRanking(latestResult);
+    if (tripleNumbers === null) {
+      return { state: "paused", sources: [] };
+    }
+    if (tripleNumbers.length > 0) {
+      sources.push({
+        id: "history-last-two-triple",
+        family: "conditional-history",
+        numbers: tripleNumbers,
+      });
+    }
+
+    const overdueNumbers = currentOverdueRanking();
+    if (overdueNumbers.length > 0) {
+      sources.push({
+        id: "recency-overdue-top3",
+        family: "recency",
+        numbers: overdueNumbers,
+      });
+    }
+    sources.push(...currentVirtualRecencySignals(latestResult));
+
+    const activeCycle = store.state.activeCycle;
+    const remainingNumbers = currentActiveCycleRemaining(latestResult);
+    if (remainingNumbers.length > 0) {
+      sources.push({
+        id: "cycle-remaining",
+        family: "cycle",
+        mode: "set",
+        numbers: remainingNumbers,
+      });
+    }
+    const completedSurvivor = currentCompletedCycleSurvivor(latestResult);
+    if (completedSurvivor.length > 0) {
+      sources.push({
+        id: "cycle-completed-survivor",
+        family: "cycle",
+        numbers: completedSurvivor,
+      });
+    }
+    const analogueNumbers = currentCycleAnalogueRanking(latestResult, activeCycle);
+    if (analogueNumbers.length > 0) {
+      sources.push({
+        id: "cycle-analogue-next",
+        family: "cycle",
+        numbers: analogueNumbers,
+      });
+    }
+
+    return {
+      state: sources.length > 0 ? "ready" : "waiting",
+      sources,
+      tieSeed: `${latestResultId}:${currentRoundId}`,
+    };
   }
 
   function renderCombinedPick() {
@@ -2303,25 +2445,18 @@ import {
       return;
     }
 
-    const result = combineNumberRankings(context.sources);
+    const result = combineNumberRankings(context.sources, {
+      tieSeed: context.tieSeed,
+    });
     if (
       result.status === "unavailable"
-      || result.status === "insufficient_families"
-      || result.status === "no_consensus"
-      || result.status === "ambiguous"
       || !isValidRouletteNumber(result.number)
     ) {
       elements.combinedPick.dataset.state = "waiting";
       elements.combinedPick.setAttribute("aria-busy", "false");
       setTextIfChanged(
         elements.combinedPickStatus,
-        result.status === "no_consensus"
-          ? "Все актуальные прогнозные блоки, прошедшие проверку, учтены, но разные семейства методов не подтвердили одно число."
-          : result.status === "ambiguous"
-            ? "Несколько согласованных кандидатов получили одинаковый итоговый ранг — система не назначает число произвольно."
-          : result.status === "insufficient_families"
-            ? "Доступно только одно семейство прогнозов — для честного лидера требуется согласие минимум двух."
-            : "Доступные рейтинги не прошли проверку — сводное число не показано.",
+        "Доступные числовые сигналы не прошли проверку — итог пока не показан.",
       );
       setTextIfChanged(
         elements.combinedPickSources,
@@ -2344,11 +2479,13 @@ import {
 
     setTextIfChanged(
       elements.combinedPickStatus,
-      `Число подтверждено ${result.familySupportCount} из ${result.familyCount} разных семейств методов; родственные расчёты не получают отдельных независимых голосов.`,
+      result.tieBreakApplied
+        ? `Все доступные и прошедшие проверку числовые блоки учтены. Равный максимальный индекс разрешён неизменным правилом текущего раунда; показано одно число.`
+        : `Все доступные и прошедшие проверку числовые блоки учтены; показано одно число с максимальным сводным рангом.`,
     );
     setTextIfChanged(
       elements.combinedPickSources,
-      `${result.sourceCount} ${pluralForm(result.sourceCount, "метод", "метода", "методов")} · поддержка ${result.familySupportCount}/${result.familyCount}`,
+      `${result.sourceCount} ${pluralForm(result.sourceCount, "источник", "источника", "источников")} · ${result.familyCount} ${pluralForm(result.familyCount, "группа", "группы", "групп")} · поддержка ${result.familySupportCount}/${result.familyCount}`,
     );
   }
 

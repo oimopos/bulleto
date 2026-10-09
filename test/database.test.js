@@ -4176,6 +4176,171 @@ test("fixed top-5 paper tracker follows a reconciled anchor epoch across restart
   }
 });
 
+test("current triple follower ranks every observed continuation of the latest pair", () => {
+  const database = createDatabase({ path: ":memory:" });
+  try {
+    const numbers = [4, 5, 7, 8, 4, 5, 7, 9, 4, 5, 8, 4, 5];
+    database.ingestBatch(
+      numbers.map((number, index) =>
+        event(number, `current-triple-${index}`, index),
+      ),
+    );
+    database.ingestBatch([
+      event(4, "current-triple-other-instrument", 100, {
+        instrument: "OTHER/INSTRUMENT",
+      }),
+    ]);
+
+    assert.deepEqual(
+      database.getCurrentTripleFollowerSignal(
+        "buleto",
+        "PRIMECOIN(XPM)/RUB",
+      ),
+      {
+        schemaVersion: 1,
+        algorithmVersion: "triple-follower-current-v1",
+        definition:
+          "next-result-after-ordered-pair-within-continuity-epoch",
+        tieBreak:
+          "occurrence-count-desc,last-occurred-at-desc,number-asc",
+        status: "ready",
+        historyThroughResultId: 13,
+        historyThrough: "2026-09-21T00:00:12.000Z",
+        anchor: {
+          continuityEpoch: 0,
+          previous: {
+            resultId: 12,
+            number: 4,
+            settledAt: "2026-09-21T00:00:11.000Z",
+          },
+          current: {
+            resultId: 13,
+            number: 5,
+            settledAt: "2026-09-21T00:00:12.000Z",
+          },
+        },
+        sampleSize: 3,
+        observedFollowerCount: 2,
+        candidates: [
+          {
+            rank: 1,
+            number: 7,
+            occurrenceCount: 2,
+            share: 2 / 3,
+            lastOccurredAt: "2026-09-21T00:00:06.000Z",
+          },
+          {
+            rank: 2,
+            number: 8,
+            occurrenceCount: 1,
+            share: 1 / 3,
+            lastOccurredAt: "2026-09-21T00:00:10.000Z",
+          },
+        ],
+      },
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test("current triple follower waits across a gap and trains across intact epochs", () => {
+  const database = createDatabase({ path: ":memory:" });
+  try {
+    const firstEpoch = [4, 5, 7, 4, 5, 8, 4];
+    database.ingestBatch(
+      firstEpoch.map((number, index) =>
+        event(number, `current-triple-gap-left-${index}`, index),
+      ),
+    );
+    database.ingestBatchAfterGap(
+      {
+        source: "buleto",
+        instrument: "PRIMECOIN(XPM)/RUB",
+        incidentKey: "current-triple-gap",
+        detectedAt: "2026-09-21T00:00:07.000Z",
+        message: "known missing result",
+      },
+      [event(5, "current-triple-gap-right-0", 7)],
+    );
+
+    const waiting = database.getCurrentTripleFollowerSignal(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    assert.equal(waiting.status, "waiting_anchor");
+    assert.equal(waiting.historyThroughResultId, 8);
+    assert.equal(waiting.historyThrough, "2026-09-21T00:00:07.000Z");
+    assert.equal(waiting.anchor, null);
+    assert.equal(waiting.sampleSize, 0);
+    assert.deepEqual(waiting.candidates, []);
+
+    database.ingestBatch([
+      event(4, "current-triple-gap-right-1", 8),
+      event(5, "current-triple-gap-right-2", 9),
+    ]);
+    const ready = database.getCurrentTripleFollowerSignal(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    assert.equal(ready.status, "ready");
+    assert.equal(ready.anchor.continuityEpoch, 1);
+    assert.deepEqual(
+      ready.candidates.map(({ number, occurrenceCount }) => ({
+        number,
+        occurrenceCount,
+      })),
+      [
+        { number: 8, occurrenceCount: 1 },
+        { number: 7, occurrenceCount: 1 },
+      ],
+    );
+    assert.equal(ready.sampleSize, 2);
+  } finally {
+    database.close();
+  }
+});
+
+test("current triple follower has stable empty and one-result states", () => {
+  const database = createDatabase({ path: ":memory:" });
+  try {
+    const empty = database.getCurrentTripleFollowerSignal(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    assert.equal(empty.status, "empty");
+    assert.equal(empty.historyThroughResultId, null);
+    assert.equal(empty.historyThrough, null);
+    assert.equal(empty.anchor, null);
+    assert.deepEqual(empty.candidates, []);
+
+    database.ingestBatch([event(6, "current-triple-single", 0)]);
+    const waiting = database.getCurrentTripleFollowerSignal(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    assert.equal(waiting.status, "waiting_anchor");
+    assert.equal(waiting.historyThroughResultId, 1);
+    assert.equal(waiting.historyThrough, "2026-09-21T00:00:00.000Z");
+    assert.equal(waiting.anchor, null);
+    assert.deepEqual(waiting.candidates, []);
+
+    database.ingestBatch([event(7, "current-triple-no-samples", 1)]);
+    const noSamples = database.getCurrentTripleFollowerSignal(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    assert.equal(noSamples.status, "no_samples");
+    assert.equal(noSamples.anchor.previous.number, 6);
+    assert.equal(noSamples.anchor.current.number, 7);
+    assert.equal(noSamples.sampleSize, 0);
+    assert.equal(noSamples.observedFollowerCount, 0);
+    assert.deepEqual(noSamples.candidates, []);
+  } finally {
+    database.close();
+  }
+});
+
 test("repeated triples preserve order and count overlapping appearances", () => {
   const database = createDatabase({ path: ":memory:" });
   try {
@@ -4582,6 +4747,28 @@ test("gap invalidation and its first result commit atomically", () => {
     assert.equal(state.totals.invalidCycles, 1);
     assert.equal(state.activeCycle.id, 2);
     assert.equal(state.latestResult.fingerprint, "atomic-after");
+  } finally {
+    database.close();
+  }
+});
+
+test("virtual bettor exposes every equally longest candidate without low-number singleton bias", () => {
+  const database = createDatabase({ path: ":memory:" });
+  try {
+    database.ingestBatch([event(5, "virtual-equal-longest", 0)]);
+    const state = database.getVirtualBettorState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+
+    assert.equal(state.status, "waiting");
+    assert.equal(state.longestCandidate.number, 0);
+    assert.equal(state.longestCandidates.length, 36);
+    assert.deepEqual(
+      state.longestCandidates.map(({ number }) => number),
+      Array.from({ length: 37 }, (_, number) => number).filter((number) => number !== 5),
+    );
+    assert.ok(state.longestCandidates.every(({ roundsSinceLast }) => roundsSinceLast === 1));
   } finally {
     database.close();
   }

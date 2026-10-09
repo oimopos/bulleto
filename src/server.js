@@ -215,6 +215,10 @@ function databaseStateForApi() {
     latestCompletedCycle,
     latestResult: resultForApi(state.latestResult),
     numberStats: db.getNumberStats('buleto', config.instrument),
+    tripleFollowerSignal: db.getCurrentTripleFollowerSignal(
+      'buleto',
+      config.instrument,
+    ),
     followerTop5Tracker: db.getFollowerTop5TrackerState('buleto', config.instrument),
     virtualBettor: db.getVirtualBettorState('buleto', config.instrument),
     precloseForecast: db.getPrecloseForecastState('buleto', config.instrument),

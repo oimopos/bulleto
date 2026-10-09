@@ -1,12 +1,30 @@
-export const COMBINED_NUMBER_ALGORITHM_VERSION = "combined-family-consensus-v2";
+export const COMBINED_NUMBER_ALGORITHM_VERSION = "all-signal-family-index-v1";
 
-const MINIMUM_FAMILY_SUPPORT = 2;
 const SCORE_EPSILON = 1e-12;
 
 function safeNonNegativeInteger(value) {
   if (value === null || value === undefined || value === "") return null;
   const number = Number(value);
   return Number.isSafeInteger(number) && number >= 0 ? number : null;
+}
+
+function safeRouletteNumber(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const number = Number(value);
+  return Number.isInteger(number) && number >= 0 && number <= 36 ? number : null;
+}
+
+function sameEntityId(left, right) {
+  return left !== null
+    && left !== undefined
+    && right !== null
+    && right !== undefined
+    && String(left) === String(right);
+}
+
+function validInstant(value) {
+  const milliseconds = Date.parse(value);
+  return Number.isFinite(milliseconds) ? milliseconds : null;
 }
 
 function sameInstant(left, right) {
@@ -89,7 +107,8 @@ export function assessCombinedNumberFreshness(state) {
   return freshnessResult("ready", "fresh", cursor);
 }
 
-export function combinedTrajectoryRanking(value, minimumTrainingCount = 30) {
+export function combinedTrajectorySignals(value, minimumTrainingCount = 30) {
+  const unavailable = { ranking: [], range: [] };
   if (
     !value
     || typeof value !== "object"
@@ -117,9 +136,424 @@ export function combinedTrajectoryRanking(value, minimumTrainingCount = 30) {
       && cell?.number === value.numberArea.typical.number
     ))
   ) {
+    return unavailable;
+  }
+
+  const range = value.displayRange.cells.map((cell) => {
+    if (
+      !Number.isInteger(cell?.wireCell)
+      || cell.wireCell < 0
+      || cell.wireCell > 37
+      || !Number.isInteger(cell?.number)
+      || cell.number !== (cell.wireCell === 37 ? 0 : cell.wireCell)
+    ) {
+      return null;
+    }
+    return cell.number;
+  });
+  if (
+    range.length < 1
+    || range.length > 6
+    || range.some((number) => number === null)
+    || new Set(range).size !== range.length
+  ) {
+    return unavailable;
+  }
+
+  return {
+    ranking: [value.numberArea.typical.number],
+    range,
+  };
+}
+
+export function combinedTrajectoryRanking(value, minimumTrainingCount = 30) {
+  return combinedTrajectorySignals(value, minimumTrainingCount).ranking;
+}
+
+export function combinedOverdueRanking(value) {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set();
+  const candidates = [];
+  for (const item of value) {
+    const number = safeRouletteNumber(item?.number);
+    const roundsSinceLast = safeNonNegativeInteger(item?.roundsSinceLast);
+    const lastSeenAt = validInstant(item?.lastSeenAt);
+    if (
+      number === null
+      || seen.has(number)
+      || roundsSinceLast === null
+      || lastSeenAt === null
+    ) {
+      continue;
+    }
+    seen.add(number);
+    candidates.push({ number, roundsSinceLast, lastSeenAt });
+  }
+  return candidates
+    .sort((left, right) => (
+      right.roundsSinceLast - left.roundsSinceLast
+      || left.lastSeenAt - right.lastSeenAt
+      || left.number - right.number
+    ))
+    .slice(0, 3)
+    .map(({ number }) => number);
+}
+
+export function combinedVirtualRecencySources(value, latestResult) {
+  const latestResultId = safeNonNegativeInteger(latestResult?.id);
+  const latestEpoch = safeNonNegativeInteger(latestResult?.continuityEpoch);
+  if (
+    !value
+    || typeof value !== "object"
+    || Array.isArray(value)
+    || value.mode !== "simulation"
+    || value.executionEnabled !== false
+    || latestResultId === null
+    || latestResultId < 1
+    || latestEpoch === null
+  ) {
     return [];
   }
-  return [value.numberArea.typical.number];
+
+  const sources = [];
+  const rawLongest = Array.isArray(value.longestCandidates)
+    ? value.longestCandidates
+    : null;
+  const longest = rawLongest?.map((candidate) => ({
+    number: safeRouletteNumber(candidate?.number),
+    continuityEpoch: safeNonNegativeInteger(candidate?.continuityEpoch),
+    roundsSinceLast: safeNonNegativeInteger(candidate?.roundsSinceLast),
+  })) ?? null;
+  const firstLongest = longest?.[0] ?? null;
+  const longestNumbers = longest?.map(({ number }) => number) ?? [];
+  if (
+    longest
+    && longest.length > 0
+    && longest.length <= 37
+    && longestNumbers.every((number) => number !== null)
+    && new Set(longestNumbers).size === longestNumbers.length
+    && longest.every((candidate) => (
+      candidate.continuityEpoch === latestEpoch
+      && candidate.roundsSinceLast === firstLongest.roundsSinceLast
+    ))
+    && safeRouletteNumber(value.longestCandidate?.number) === firstLongest.number
+    && safeNonNegativeInteger(value.longestCandidate?.continuityEpoch) === latestEpoch
+    && safeNonNegativeInteger(value.longestCandidate?.roundsSinceLast)
+      === firstLongest.roundsSinceLast
+  ) {
+    sources.push({
+      id: "recency-virtual-longest-set",
+      family: "recency",
+      mode: "set",
+      numbers: longestNumbers,
+    });
+  }
+
+  const session = value.activeSession;
+  const status = String(value.status || "").toLowerCase();
+  const sessionStatus = String(session?.status || "").toLowerCase();
+  const targetNumber = safeRouletteNumber(session?.targetNumber);
+  const sessionEpoch = safeNonNegativeInteger(session?.continuityEpoch);
+  const attemptCount = safeNonNegativeInteger(session?.attemptCount);
+  const armedIsCurrent = status === "armed"
+    && sessionStatus === "armed"
+    && attemptCount === 0
+    && sameEntityId(session?.activatedAfterResultId, latestResultId)
+    && (session?.lastBetResultId === null || session?.lastBetResultId === undefined);
+  const activeIsCurrent = status === "active"
+    && sessionStatus === "active"
+    && attemptCount !== null
+    && attemptCount > 0
+    && sameEntityId(session?.lastBetResultId, latestResultId);
+  if (
+    targetNumber !== null
+    && sessionEpoch === latestEpoch
+    && (armedIsCurrent || activeIsCurrent)
+  ) {
+    sources.push({
+      id: "recency-virtual-held",
+      family: "recency",
+      numbers: [targetNumber],
+    });
+  }
+  return sources;
+}
+
+function normalizedCycleRecords(cycle) {
+  if (!Array.isArray(cycle?.numbers) || cycle.numbers.length !== 37) return null;
+  const records = new Map();
+  for (const record of cycle.numbers) {
+    const number = safeRouletteNumber(record?.number);
+    if (
+      number === null
+      || records.has(number)
+      || typeof record?.eliminated !== "boolean"
+    ) {
+      return null;
+    }
+    records.set(number, record.eliminated);
+  }
+  return records.size === 37 ? records : null;
+}
+
+export function combinedCycleNumberSignals(cycle, latestResult) {
+  const unavailable = { remaining: [], survivor: [] };
+  if (
+    !cycle
+    || typeof cycle !== "object"
+    || Array.isArray(cycle)
+    || String(cycle.integrityStatus || "").toLowerCase() !== "ok"
+    || !sameEntityId(cycle.id, latestResult?.cycleId)
+    || !sameInstant(cycle.lastEventAt, latestResult?.settledAt)
+  ) {
+    return unavailable;
+  }
+  const eventCount = safeNonNegativeInteger(cycle.eventCount);
+  const totalDraws = safeNonNegativeInteger(cycle.totalDraws);
+  const remainingCount = safeNonNegativeInteger(cycle.remainingCount);
+  const eliminatedCount = safeNonNegativeInteger(cycle.eliminatedCount);
+  const uniqueCount = safeNonNegativeInteger(cycle.uniqueCount);
+  const records = normalizedCycleRecords(cycle);
+  const rawRemaining = Array.isArray(cycle.remainingNumbers)
+    ? cycle.remainingNumbers.map(safeRouletteNumber)
+    : null;
+  if (
+    eventCount === null
+    || eventCount < 1
+    || totalDraws !== eventCount
+    || !records
+    || !rawRemaining
+    || rawRemaining.some((number) => number === null)
+    || new Set(rawRemaining).size !== rawRemaining.length
+    || remainingCount !== rawRemaining.length
+    || eliminatedCount !== 37 - rawRemaining.length
+    || uniqueCount !== eliminatedCount
+    || (
+      latestResult?.remainingAfter !== null
+      && latestResult?.remainingAfter !== undefined
+      && safeNonNegativeInteger(latestResult.remainingAfter) !== rawRemaining.length
+    )
+  ) {
+    return unavailable;
+  }
+  const remainingSet = new Set(rawRemaining);
+  if ([...records].some(([number, eliminated]) => (
+    eliminated === remainingSet.has(number)
+  ))) {
+    return unavailable;
+  }
+
+  const status = String(cycle.status || "").toLowerCase();
+  if (status === "active" && rawRemaining.length > 0) {
+    return { remaining: rawRemaining, survivor: [] };
+  }
+  const survivor = safeRouletteNumber(cycle.survivorNumber);
+  if (
+    status === "completed"
+    && survivor !== null
+    && rawRemaining.length === 1
+    && rawRemaining[0] === survivor
+    && eliminatedCount === 36
+    && uniqueCount === 36
+  ) {
+    return { remaining: [], survivor: [survivor] };
+  }
+  return unavailable;
+}
+
+function normalizedCycleEventSequence(value) {
+  if (!Array.isArray(value)) return null;
+  const events = [];
+  for (let index = 0; index < value.length; index += 1) {
+    const item = value[index];
+    const resultId = safeNonNegativeInteger(item?.resultId ?? item?.id);
+    const number = safeRouletteNumber(item?.number);
+    const settledAt = validInstant(item?.settledAt);
+    if (
+      item?.position !== index + 1
+      || resultId === null
+      || resultId < 1
+      || number === null
+      || settledAt === null
+    ) {
+      return null;
+    }
+    events.push({ resultId, number, settledAt });
+  }
+  return events;
+}
+
+export function combinedCycleAnalogueRanking(value, activeCycle, latestResult) {
+  const targetEvents = normalizedCycleEventSequence(value?.target?.events);
+  const analogueEvents = normalizedCycleEventSequence(value?.analogue?.events);
+  const targetDraws = safeNonNegativeInteger(value?.target?.cycle?.totalDraws);
+  const targetEventCount = safeNonNegativeInteger(value?.target?.cycle?.eventCount);
+  const analogueDraws = safeNonNegativeInteger(value?.analogue?.cycle?.totalDraws);
+  const analogueEventCount = safeNonNegativeInteger(value?.analogue?.cycle?.eventCount);
+  const activeDraws = safeNonNegativeInteger(activeCycle?.totalDraws);
+  const activeEventCount = safeNonNegativeInteger(activeCycle?.eventCount);
+  if (
+    !value
+    || value.schemaVersion !== 1
+    || value.algorithmVersion !== "cycle-analogue-prefix-v1"
+    || value.interpretation !== "descriptive-not-predictive"
+    || value.anchorDrawCount !== 20
+    || value.status !== "ready"
+    || value.target?.mode !== "active"
+    || !targetEvents
+    || !analogueEvents
+    || targetEvents.length < 20
+    || String(activeCycle?.status || "").toLowerCase() !== "active"
+    || String(activeCycle?.integrityStatus || "").toLowerCase() !== "ok"
+    || String(value.target?.cycle?.status || "").toLowerCase() !== "active"
+    || String(value.target?.cycle?.integrityStatus || "").toLowerCase() !== "ok"
+    || String(value.analogue?.cycle?.status || "").toLowerCase() !== "completed"
+    || String(value.analogue?.cycle?.integrityStatus || "").toLowerCase() !== "ok"
+    || !sameEntityId(value.target?.cycle?.id, activeCycle?.id)
+    || targetDraws === null
+    || targetEventCount !== targetDraws
+    || targetDraws !== targetEvents.length
+    || activeDraws !== targetDraws
+    || activeEventCount !== activeDraws
+    || analogueDraws === null
+    || analogueEventCount !== analogueDraws
+    || analogueDraws !== analogueEvents.length
+  ) {
+    return [];
+  }
+  const latestResultId = safeNonNegativeInteger(latestResult?.id);
+  const latestNumber = safeRouletteNumber(latestResult?.number);
+  const lastTarget = targetEvents.at(-1);
+  const anchor = targetEvents[19];
+  const nextAnalogue = analogueEvents[targetEvents.length];
+  if (
+    latestResultId === null
+    || latestResultId < 1
+    || latestNumber === null
+    || !lastTarget
+    || !anchor
+    || !nextAnalogue
+    || lastTarget.resultId !== latestResultId
+    || lastTarget.number !== latestNumber
+    || lastTarget.settledAt !== validInstant(latestResult?.settledAt)
+    || !sameEntityId(value.anchorResultId, anchor.resultId)
+  ) {
+    return [];
+  }
+  return [nextAnalogue.number];
+}
+
+export function combinedTripleFollowerRanking(value, latestResult) {
+  const latestResultId = safeNonNegativeInteger(latestResult?.id);
+  const latestNumber = safeRouletteNumber(latestResult?.number);
+  const latestEpoch = safeNonNegativeInteger(latestResult?.continuityEpoch);
+  const historyThroughResultId = safeNonNegativeInteger(value?.historyThroughResultId);
+  if (
+    !value
+    || typeof value !== "object"
+    || Array.isArray(value)
+    || value.schemaVersion !== 1
+    || value.algorithmVersion !== "triple-follower-current-v1"
+    || value.definition !== "next-result-after-ordered-pair-within-continuity-epoch"
+    || value.tieBreak !== "occurrence-count-desc,last-occurred-at-desc,number-asc"
+    || !["waiting_anchor", "no_samples", "ready"].includes(value.status)
+    || latestResultId === null
+    || latestResultId < 1
+    || latestNumber === null
+    || latestEpoch === null
+    || historyThroughResultId !== latestResultId
+    || !sameInstant(value.historyThrough, latestResult?.settledAt)
+    || !Array.isArray(value.candidates)
+  ) {
+    return null;
+  }
+  if (value.status === "waiting_anchor") {
+    return value.anchor === null
+      && value.sampleSize === 0
+      && value.observedFollowerCount === 0
+      && value.candidates.length === 0
+      ? []
+      : null;
+  }
+
+  const anchorEpoch = safeNonNegativeInteger(value.anchor?.continuityEpoch);
+  const previousResultId = safeNonNegativeInteger(value.anchor?.previous?.resultId);
+  const previousNumber = safeRouletteNumber(value.anchor?.previous?.number);
+  const currentResultId = safeNonNegativeInteger(value.anchor?.current?.resultId);
+  const currentNumber = safeRouletteNumber(value.anchor?.current?.number);
+  const sampleSize = safeNonNegativeInteger(value.sampleSize);
+  const observedFollowerCount = safeNonNegativeInteger(value.observedFollowerCount);
+  const previousAt = validInstant(value.anchor?.previous?.settledAt);
+  const currentAt = validInstant(value.anchor?.current?.settledAt);
+  const historyThrough = validInstant(value.historyThrough);
+  if (
+    anchorEpoch !== latestEpoch
+    || previousResultId === null
+    || previousResultId < 1
+    || previousResultId === latestResultId
+    || previousNumber === null
+    || currentResultId !== latestResultId
+    || currentNumber !== latestNumber
+    || currentAt !== validInstant(latestResult?.settledAt)
+    || previousAt === null
+    || previousAt > currentAt
+    || historyThrough === null
+    || sampleSize === null
+    || observedFollowerCount === null
+    || observedFollowerCount !== value.candidates.length
+    || observedFollowerCount > 37
+  ) {
+    return null;
+  }
+  if (value.status === "no_samples") {
+    return sampleSize === 0 && observedFollowerCount === 0 ? [] : null;
+  }
+  if (sampleSize < 1 || observedFollowerCount < 1) return null;
+
+  const numbers = [];
+  const seen = new Set();
+  let countedSamples = 0;
+  let previousCandidate = null;
+  for (let index = 0; index < value.candidates.length; index += 1) {
+    const candidate = value.candidates[index];
+    const number = safeRouletteNumber(candidate?.number);
+    const occurrenceCount = safeNonNegativeInteger(candidate?.occurrenceCount);
+    const share = Number(candidate?.share);
+    const lastOccurredAt = validInstant(candidate?.lastOccurredAt);
+    if (
+      candidate?.rank !== index + 1
+      || number === null
+      || seen.has(number)
+      || occurrenceCount === null
+      || occurrenceCount < 1
+      || !Number.isFinite(share)
+      || Math.abs(share - occurrenceCount / sampleSize) > 1e-12
+      || lastOccurredAt === null
+      || lastOccurredAt > historyThrough
+      || (
+        previousCandidate
+        && (
+          occurrenceCount > previousCandidate.occurrenceCount
+          || (
+            occurrenceCount === previousCandidate.occurrenceCount
+            && lastOccurredAt > previousCandidate.lastOccurredAt
+          )
+          || (
+            occurrenceCount === previousCandidate.occurrenceCount
+            && lastOccurredAt === previousCandidate.lastOccurredAt
+            && number < previousCandidate.number
+          )
+        )
+      )
+    ) {
+      return null;
+    }
+    seen.add(number);
+    numbers.push(number);
+    countedSamples += occurrenceCount;
+    previousCandidate = { number, occurrenceCount, lastOccurredAt };
+  }
+  return countedSamples === sampleSize ? numbers : null;
 }
 
 function normalizeSource(value) {
@@ -127,9 +561,11 @@ function normalizeSource(value) {
 
   const id = typeof value.id === "string" ? value.id.trim() : "";
   const family = typeof value.family === "string" ? value.family.trim() : "";
+  const mode = value.mode === undefined ? "ranking" : value.mode;
   if (
     id === ""
     || family === ""
+    || !["ranking", "set"].includes(mode)
     || !Array.isArray(value.numbers)
     || value.numbers.length < 1
     || value.numbers.length > 37
@@ -137,7 +573,9 @@ function normalizeSource(value) {
     return null;
   }
 
-  const numbers = [...value.numbers];
+  const numbers = mode === "set"
+    ? [...value.numbers].sort((left, right) => left - right)
+    : [...value.numbers];
   if (
     numbers.some((number) => !Number.isInteger(number) || number < 0 || number > 36)
     || new Set(numbers).size !== numbers.length
@@ -145,7 +583,7 @@ function normalizeSource(value) {
     return null;
   }
 
-  return { id, family, numbers };
+  return { id, family, mode, numbers };
 }
 
 function emptyResult(status, sources = [], families = []) {
@@ -158,12 +596,34 @@ function emptyResult(status, sources = [], families = []) {
     familyCount: families.length,
     supportCount: 0,
     familySupportCount: 0,
+    tieCount: 0,
+    tieBreakApplied: false,
     sourceIds: sources.map(({ id }) => id).sort(),
     familyIds: [...families].sort(),
   };
 }
 
-export function combineNumberRankings(value) {
+function hash32(value) {
+  let hash = 0x811c9dc5;
+  for (const character of String(value)) {
+    hash ^= character.codePointAt(0);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return hash >>> 0;
+}
+
+function tiePosition(number, seed) {
+  const offset = hash32(`${seed}:offset`) % 37;
+  const step = (hash32(`${seed}:step`) % 36) + 1;
+  let current = offset;
+  for (let index = 0; index < 37; index += 1) {
+    if (current === number) return index;
+    current = (current + step) % 37;
+  }
+  return 37;
+}
+
+export function combineNumberRankings(value, { tieSeed = "" } = {}) {
   if (!Array.isArray(value)) return emptyResult("unavailable");
 
   const normalizedSources = value.map(normalizeSource).filter(Boolean);
@@ -177,7 +637,7 @@ export function combineNumberRankings(value) {
   for (const source of normalizedSources
     .filter(({ id }) => sourceIdCounts.get(id) === 1)
     .sort((left, right) => left.id.localeCompare(right.id))) {
-    const familyRankingKey = `${source.family}\u0000${source.numbers.join(",")}`;
+    const familyRankingKey = `${source.family}\u0000${source.mode}\u0000${source.numbers.join(",")}`;
     if (seenFamilyRankings.has(familyRankingKey)) continue;
     seenFamilyRankings.add(familyRankingKey);
     sources.push(source);
@@ -192,9 +652,6 @@ export function combineNumberRankings(value) {
     familySources.set(source.family, members);
   }
   const familyIds = [...familySources.keys()];
-  if (familyIds.length < MINIMUM_FAMILY_SUPPORT) {
-    return emptyResult("insufficient_families", sources, familyIds);
-  }
 
   const candidates = new Map();
   for (const members of familySources.values()) {
@@ -206,7 +663,9 @@ export function combineNumberRankings(value) {
           scoreTotal: 0,
           supportCount: 0,
         };
-        candidate.scoreTotal += (2 * (size - index)) / (size * (size + 1));
+        candidate.scoreTotal += source.mode === "set"
+          ? 1 / size
+          : (2 * (size - index)) / (size * (size + 1));
         candidate.supportCount += 1;
         familyCandidates.set(number, candidate);
       });
@@ -226,41 +685,38 @@ export function combineNumberRankings(value) {
     }
   }
 
-  const ranked = [...candidates.values()]
-    .filter((candidate) => (
-      candidate.familySupportCount >= MINIMUM_FAMILY_SUPPORT
-    ))
-    .map((candidate) => ({
-      ...candidate,
-      score: candidate.scoreTotal,
-    }))
-    .sort((left, right) => (
-      right.familySupportCount - left.familySupportCount
-      || right.score - left.score
-    ));
-
-  if (ranked.length === 0) {
-    return emptyResult("no_consensus", sources, familyIds);
-  }
-
-  const winner = ranked[0];
-  const tied = ranked.filter((candidate) => (
-    candidate.familySupportCount === winner.familySupportCount
-    && Math.abs(candidate.score - winner.score) <= SCORE_EPSILON
+  const ranked = [...candidates.values()].map((candidate) => ({
+    ...candidate,
+    score: candidate.scoreTotal / familyIds.length,
+  }));
+  const bestScore = Math.max(...ranked.map(({ score }) => score));
+  const scoreTied = ranked.filter(({ score }) => (
+    Math.abs(score - bestScore) <= SCORE_EPSILON
   ));
-  if (tied.length > 1) {
-    return emptyResult("ambiguous", sources, familyIds);
-  }
+  const bestFamilySupport = Math.max(
+    ...scoreTied.map(({ familySupportCount }) => familySupportCount),
+  );
+  const tied = scoreTied
+    .filter(({ familySupportCount }) => (
+      familySupportCount === bestFamilySupport
+    ))
+    .sort((left, right) => (
+      tiePosition(left.number, `${COMBINED_NUMBER_ALGORITHM_VERSION}:${tieSeed}`)
+      - tiePosition(right.number, `${COMBINED_NUMBER_ALGORITHM_VERSION}:${tieSeed}`)
+    ));
+  const winner = tied[0];
 
   return {
     version: COMBINED_NUMBER_ALGORITHM_VERSION,
-    status: "consensus",
+    status: "ranked",
     number: winner.number,
     score: winner.score,
     sourceCount: sources.length,
     familyCount: familyIds.length,
     supportCount: winner.supportCount,
     familySupportCount: winner.familySupportCount,
+    tieCount: tied.length,
+    tieBreakApplied: tied.length > 1,
     sourceIds: sources.map(({ id }) => id).sort(),
     familyIds: [...familyIds].sort(),
   };
