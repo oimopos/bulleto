@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { BuletoCollector } from './collector.js';
 import { createDatabase } from './database.js';
 import { followerTop5GatedSnapshotForApi } from './follower-top5-gated-api.js';
+import { predictiveLeaderSnapshotForApi } from './predictive-leader-api.js';
 import { ResultPipeline } from './result-pipeline.js';
 import { virtualBettorSnapshotForApi } from './virtual-bettor-api.js';
 
@@ -271,6 +272,15 @@ function followerTop5GatedForApi() {
   });
 }
 
+function predictiveLeaderForApi() {
+  return predictiveLeaderSnapshotForApi({
+    state: dashboardState(),
+    source: 'buleto',
+    instrument: config.instrument,
+    now: new Date(),
+  });
+}
+
 function clampLimit(rawValue, fallback, max) {
   if (rawValue === null || rawValue === '') return fallback;
   const value = Number(rawValue);
@@ -392,6 +402,11 @@ const server = createServer((request, response) => {
         200,
         db.getPrecloseForecastState('buleto', config.instrument),
       );
+      return;
+    }
+
+    if (pathname === '/api/predictive-leader') {
+      sendJson(response, 200, predictiveLeaderForApi());
       return;
     }
 

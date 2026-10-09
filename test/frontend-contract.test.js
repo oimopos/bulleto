@@ -53,6 +53,15 @@ test("dashboard keeps the exact read-only fetch URL list", () => {
   );
 });
 
+test("server exposes a separate read-only predictive leader GET", () => {
+  assert.match(
+    server,
+    /if \(pathname === '\/api\/predictive-leader'\) \{[\s\S]*?sendJson\(response, 200, predictiveLeaderForApi\(\)\)/,
+  );
+  assert.match(server, /predictiveLeaderSnapshotForApi\(\{/);
+  assert.match(server, /state: dashboardState\(\)/);
+});
+
 test("combined leader is the first dashboard block and renders exactly one number", () => {
   const rendererIds = [
     "combined-pick",

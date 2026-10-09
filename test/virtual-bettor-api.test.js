@@ -9,6 +9,8 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { createDatabase } from "../src/database.js";
+import { LEARNED_LEADER_ALGORITHM_VERSION } from "../src/learned-leader.js";
+import { PREDICTIVE_LEADER_API_SCHEMA_VERSION } from "../src/predictive-leader-api.js";
 
 const ROOT_DIR = fileURLToPath(new URL("../", import.meta.url));
 const SOURCE = "buleto";
@@ -188,6 +190,47 @@ test(
         dashboardState.virtualBettor.longestCandidate,
         dashboardState.virtualBettor.longestCandidates[0],
       );
+
+      const leaderResponse = await fetch(`${baseUrl}/api/predictive-leader`);
+      assert.equal(leaderResponse.status, 200, logs());
+      assert.match(
+        leaderResponse.headers.get("content-type") ?? "",
+        /^application\/json\b/,
+      );
+      assert.equal(leaderResponse.headers.get("cache-control"), "no-store");
+      const leaderPayload = await leaderResponse.json();
+      assert.equal(
+        leaderPayload.schemaVersion,
+        PREDICTIVE_LEADER_API_SCHEMA_VERSION,
+      );
+      assert.equal(
+        leaderPayload.algorithmVersion,
+        LEARNED_LEADER_ALGORITHM_VERSION,
+      );
+      assert.ok(["waiting", "paused"].includes(leaderPayload.status));
+      assert.equal(leaderPayload.number, null);
+      assert.doesNotMatch(
+        JSON.stringify(leaderPayload),
+        /ranking|combinedDistribution|familyDistributions|sourceManifest/,
+      );
+
+      const leaderHead = await fetch(`${baseUrl}/api/predictive-leader`, {
+        method: "HEAD",
+      });
+      assert.equal(leaderHead.status, 200, logs());
+      assert.equal(leaderHead.headers.get("cache-control"), "no-store");
+      assert.match(
+        leaderHead.headers.get("content-type") ?? "",
+        /^application\/json\b/,
+      );
+      assert.equal(await leaderHead.text(), "");
+
+      const leaderPost = await fetch(`${baseUrl}/api/predictive-leader`, {
+        method: "POST",
+      });
+      assert.equal(leaderPost.status, 405, logs());
+      assert.equal(leaderPost.headers.get("cache-control"), "no-store");
+      assert.deepEqual(await leaderPost.json(), { error: "Метод не разрешён" });
 
       const response = await fetch(`${baseUrl}/api/virtual-bettor`);
       assert.equal(response.status, 200, logs());
