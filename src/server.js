@@ -236,6 +236,7 @@ function dashboardState() {
   return {
     ...databaseStateForApi(),
     collector: collector.getStatus(),
+    pipelinePending: resultPipeline.getPendingCounts(),
     serverTime: new Date().toISOString(),
   };
 }

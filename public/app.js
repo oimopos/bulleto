@@ -1,7 +1,11 @@
 import { BET_RISK_MODEL, calculateBetRisk } from "./risk-calculator.js?v=2";
 import { buildFollowerStats } from "./pair-followers.js?v=1";
 import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
-import { combineNumberRankings } from "./combined-number.js?v=1";
+import {
+  assessCombinedNumberFreshness,
+  combinedTrajectoryRanking,
+  combineNumberRankings,
+} from "./combined-number.js?v=2";
 
 (() => {
   "use strict";
@@ -2013,9 +2017,27 @@ import { combineNumberRankings } from "./combined-number.js?v=1";
     return Boolean(integrityHasGap || warningHasGap);
   }
 
-  function normalizedFrozenTransitionRanking(value, latestResult, modelNumbers) {
+  function normalizedFrozenTransitionSignalRanking(
+    value,
+    latestResult,
+    modelNumbers,
+    forecastLockedAt,
+  ) {
     const latestResultId = asOptionalNonNegativeInteger(latestResult?.id);
     const latestNumber = asRouletteNumber(latestResult?.number);
+    const latestEpoch = asOptionalNonNegativeInteger(
+      latestResult?.continuityEpoch,
+    );
+    const historyMaxResultId = asOptionalNonNegativeInteger(
+      value?.historyMaxResultId,
+    );
+    const anchorEpoch = asOptionalNonNegativeInteger(
+      value?.anchor?.continuityEpoch,
+    );
+    const latestSettledAt = parseDate(latestResult?.settledAt);
+    const anchorSettledAt = parseDate(value?.anchor?.settledAt);
+    const historyCutoffAt = parseDate(value?.historyCutoffAt);
+    const lockedAt = parseDate(forecastLockedAt);
     const sampleSize = asOptionalNonNegativeInteger(value?.sampleSize);
     const observedFollowerCount = asOptionalNonNegativeInteger(
       value?.observedFollowerCount,
@@ -2031,9 +2053,20 @@ import { combineNumberRankings } from "./combined-number.js?v=1";
       || latestResultId === null
       || latestResultId < 1
       || latestNumber === null
+      || latestEpoch === null
+      || historyMaxResultId !== latestResultId
+      || anchorEpoch !== latestEpoch
+      || !latestSettledAt
+      || !anchorSettledAt
+      || latestSettledAt.getTime() !== anchorSettledAt.getTime()
+      || !historyCutoffAt
+      || !lockedAt
+      || historyCutoffAt.getTime() !== lockedAt.getTime()
       || sampleSize === null
       || sampleSize < 1
       || observedFollowerCount === null
+      || observedFollowerCount < 5
+      || observedFollowerCount > sampleSize
       || !sameEntityId(value.anchor?.resultId, latestResultId)
       || asRouletteNumber(value.anchor?.number) !== latestNumber
       || !Array.isArray(value.top3)
@@ -2044,6 +2077,7 @@ import { combineNumberRankings } from "./combined-number.js?v=1";
       return [];
     }
 
+    const entries = [];
     const numbers = [];
     const seen = new Set();
     for (let index = 0; index < value.top3.length; index += 1) {
@@ -2065,6 +2099,7 @@ import { combineNumberRankings } from "./combined-number.js?v=1";
       }
       seen.add(number);
       numbers.push(number);
+      entries.push({ number, occurrenceCount });
     }
 
     const comparisonModel = normalizedForecastTop3(value.comparison?.modelTop3);
@@ -2075,13 +2110,20 @@ import { combineNumberRankings } from "./combined-number.js?v=1";
       || comparisonPair.length !== numbers.length
       || comparisonPair.some((number, index) => number !== numbers[index])
       || observedFollowerCount < numbers.length
+      || entries.reduce((total, { occurrenceCount }) => (
+        total + occurrenceCount
+      ), 0) > sampleSize
     ) {
       return [];
     }
-    return numbers;
+    return entries
+      .filter(({ occurrenceCount }) => (
+        occurrenceCount * 100 >= sampleSize * 5
+      ))
+      .map(({ number }) => number);
   }
 
-  function currentWarmTransitionRanking(latestResult) {
+  function currentWarmTransitionSignalRanking(latestResult) {
     if (!store.pairsLoaded || store.pairsError) return [];
     const warm = normalizedFollowerWarmNextRound();
     const signal = warm?.currentSignal;
@@ -2089,17 +2131,67 @@ import { combineNumberRankings } from "./combined-number.js?v=1";
     const latestNumber = asRouletteNumber(latestResult?.number);
     if (
       !signal
-      || !["ready", "no_signal"].includes(signal.status)
+      || signal.status !== "ready"
       || latestResultId === null
       || latestResultId < 1
       || latestNumber === null
       || signal.anchorResultId !== latestResultId
       || signal.sourceNumber !== latestNumber
       || signal.candidates.length !== 5
+      || signal.picks.length < 1
     ) {
       return [];
     }
-    return signal.candidates.map(({ number }) => number);
+    return signal.picks.map(({ number }) => number);
+  }
+
+  function currentTrajectoryRanking(latestForecast) {
+    const shadow = normalizedTrajectoryShadow(latestForecast?.trajectoryShadow);
+    // The displayed range is ordered by physical wire position, not by
+    // likelihood. Only its prospectively evaluated q50 point is an exact
+    // scalar candidate; inventing ranks for the surrounding cells would make
+    // the combined result look more precise than the source contract allows.
+    return combinedTrajectoryRanking(
+      shadow,
+      TRAJECTORY_SHADOW_REQUIRED_HISTORY,
+    );
+  }
+
+  function currentFollowerLiveRanking(latestResult) {
+    const tracker = normalizedFollowerTop5Tracker(
+      store.state?.followerTop5Tracker,
+    );
+    const session = tracker?.currentSession;
+    const latestResultId = asOptionalNonNegativeInteger(latestResult?.id);
+    const latestEpoch = asOptionalNonNegativeInteger(
+      latestResult?.continuityEpoch,
+    );
+    const latestNumber = asRouletteNumber(latestResult?.number);
+    if (
+      !session
+      || latestResultId === null
+      || latestResultId < 1
+      || latestEpoch === null
+      || latestNumber === null
+      || session.continuityEpoch !== latestEpoch
+    ) {
+      return [];
+    }
+
+    if (tracker.status === "armed") {
+      return session.attemptCount === 0
+        && session.anchor.resultId === latestResultId
+        && session.anchor.number === latestNumber
+        ? session.fixedNumbers
+        : [];
+    }
+    if (tracker.status !== "active") return [];
+
+    const lastAttempt = session.attempts.at(-1);
+    return lastAttempt?.resultId === latestResultId
+      && lastAttempt?.resultNumber === latestNumber
+      ? session.fixedNumbers
+      : [];
   }
 
   function currentCombinedNumberContext() {
@@ -2107,16 +2199,12 @@ import { combineNumberRankings } from "./combined-number.js?v=1";
     if (store.stateError || !store.state) return { state: "error", sources: [] };
     if (stateHasIntegrityGap(store.state)) return { state: "paused", sources: [] };
 
-    const collector = store.state.collector;
-    const pendingCount = asOptionalNonNegativeInteger(collector?.pendingResultCount);
-    if (
-      collector?.resultConfirmationPending === true
-      || (pendingCount !== null && pendingCount > 0)
-    ) {
-      return { state: "paused", sources: [] };
+    const freshness = assessCombinedNumberFreshness(store.state);
+    if (freshness.status !== "ready") {
+      return { state: freshness.status, sources: [] };
     }
 
-    const currentRoundId = collector?.currentRound?.id;
+    const currentRoundId = freshness.currentRoundId;
     const latestResult = store.state.latestResult;
     const latestResultId = asOptionalNonNegativeInteger(latestResult?.id);
     const latestNumber = asRouletteNumber(latestResult?.number);
@@ -2140,24 +2228,46 @@ import { combineNumberRankings } from "./combined-number.js?v=1";
       ? normalizedForecastTop3(latestForecast.rankedNumbers)
       : [];
     if (modelNumbers.length === 3) {
-      sources.push({ id: "current-model", priority: 0, numbers: modelNumbers });
+      sources.push({
+        id: "price-start",
+        family: "price",
+        numbers: modelNumbers,
+      });
     }
 
-    let transitionNumbers = forecastIsCurrent
-      ? normalizedFrozenTransitionRanking(
-          latestForecast.pairHistory,
-          latestResult,
-          modelNumbers,
-        )
+    const trajectoryNumbers = forecastIsCurrent
+      ? currentTrajectoryRanking(latestForecast)
       : [];
-    if (transitionNumbers.length === 0) {
-      transitionNumbers = currentWarmTransitionRanking(latestResult);
+    if (trajectoryNumbers.length > 0) {
+      sources.push({
+        id: "price-trajectory-q50",
+        family: "price",
+        numbers: trajectoryNumbers,
+      });
     }
+
+    const transitionNumbers = forecastIsCurrent
+      ? normalizedFrozenTransitionSignalRanking(
+        latestForecast.pairHistory,
+        latestResult,
+        modelNumbers,
+        latestForecast.lockedAt,
+      )
+      : currentWarmTransitionSignalRanking(latestResult);
     if (transitionNumbers.length > 0) {
       sources.push({
-        id: "current-transition",
-        priority: 1,
+        id: "transition-current",
+        family: "transition",
         numbers: transitionNumbers,
+      });
+    }
+
+    const followerLiveNumbers = currentFollowerLiveRanking(latestResult);
+    if (followerLiveNumbers.length > 0) {
+      sources.push({
+        id: "transition-live-fixed",
+        family: "transition",
+        numbers: followerLiveNumbers,
       });
     }
 
@@ -2179,7 +2289,7 @@ import { combineNumberRankings } from "./combined-number.js?v=1";
       const messages = {
         loading: "Загружаем актуальные рейтинги текущего раунда.",
         error: "Свежие данные недоступны — сводное число скрыто.",
-        paused: "Расчёт приостановлен до подтверждения непрерывной истории.",
+        paused: "Актуальность синхронного среза не подтверждена — число скрыто.",
         waiting: "Пока нет актуального рейтинга для текущего раунда.",
       };
       elements.combinedPick.dataset.state = context.state;
@@ -2194,21 +2304,36 @@ import { combineNumberRankings } from "./combined-number.js?v=1";
     }
 
     const result = combineNumberRankings(context.sources);
-    if (result.status === "unavailable" || !isValidRouletteNumber(result.number)) {
+    if (
+      result.status === "unavailable"
+      || result.status === "insufficient_families"
+      || result.status === "no_consensus"
+      || result.status === "ambiguous"
+      || !isValidRouletteNumber(result.number)
+    ) {
       elements.combinedPick.dataset.state = "waiting";
       elements.combinedPick.setAttribute("aria-busy", "false");
       setTextIfChanged(
         elements.combinedPickStatus,
-        "Доступные рейтинги не прошли проверку — сводное число не показано.",
+        result.status === "no_consensus"
+          ? "Все актуальные прогнозные блоки, прошедшие проверку, учтены, но разные семейства методов не подтвердили одно число."
+          : result.status === "ambiguous"
+            ? "Несколько согласованных кандидатов получили одинаковый итоговый ранг — система не назначает число произвольно."
+          : result.status === "insufficient_families"
+            ? "Доступно только одно семейство прогнозов — для честного лидера требуется согласие минимум двух."
+            : "Доступные рейтинги не прошли проверку — сводное число не показано.",
       );
-      setTextIfChanged(elements.combinedPickSources, "Нет актуального числа");
+      setTextIfChanged(
+        elements.combinedPickSources,
+        result.sourceCount > 0
+          ? `${result.sourceCount} ${pluralForm(result.sourceCount, "метод", "метода", "методов")} · ${result.familyCount} ${pluralForm(result.familyCount, "семейство", "семейства", "семейств")}`
+          : "Нет актуального числа",
+      );
       resetNumber();
       return;
     }
 
-    elements.combinedPick.dataset.state = result.status === "single_source"
-      ? "single-source"
-      : "ready";
+    elements.combinedPick.dataset.state = "ready";
     elements.combinedPick.setAttribute("aria-busy", "false");
     elements.combinedPickNumber.className = `result-ball combined-pick__number ${rouletteColorClass(result.number)}`;
     elements.combinedPickNumber.textContent = String(result.number);
@@ -2217,27 +2342,13 @@ import { combineNumberRankings } from "./combined-number.js?v=1";
       `Единый лидер: число ${result.number}, ${rouletteColorLabel(result.number)}`,
     );
 
-    if (result.status === "single_source") {
-      setTextIfChanged(
-        elements.combinedPickStatus,
-        "Доступна одна актуальная группа данных: показан её лидер без усиления уверенности.",
-      );
-      setTextIfChanged(elements.combinedPickSources, "1 группа данных");
-      return;
-    }
-
-    const fullAgreement = result.supportCount === result.sourceCount;
     setTextIfChanged(
       elements.combinedPickStatus,
-      fullAgreement
-        ? "Модель текущего раунда и история переходов сопоставлены: это число получило лучший общий ранг."
-        : "Доступные рейтинги сопоставлены: показан один лидер по их среднему нормализованному рангу.",
+      `Число подтверждено ${result.familySupportCount} из ${result.familyCount} разных семейств методов; родственные расчёты не получают отдельных независимых голосов.`,
     );
     setTextIfChanged(
       elements.combinedPickSources,
-      fullAgreement
-        ? `Поддержка ${result.supportCount} из ${result.sourceCount} групп`
-        : `${result.sourceCount} группы данных`,
+      `${result.sourceCount} ${pluralForm(result.sourceCount, "метод", "метода", "методов")} · поддержка ${result.familySupportCount}/${result.familyCount}`,
     );
   }
 

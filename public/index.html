@@ -8,7 +8,7 @@
     <meta name="description" content="Онлайн-монитор результатов рулетки и циклов исключения чисел от 0 до 36">
     <title>Круг 37 — монитор результатов</title>
     <link rel="stylesheet" href="/styles.css?v=28">
-    <script type="module" src="/app.js?v=32"></script>
+    <script type="module" src="/app.js?v=33"></script>
   </head>
   <body>
     <a class="skip-link" href="#main-content">Перейти к содержимому</a>
@@ -46,12 +46,12 @@
         </div>
       </section>
 
-      <section class="panel combined-pick" id="combined-pick" data-state="loading" data-algorithm="combined-rank-v1" aria-labelledby="combined-pick-title" aria-describedby="combined-pick-status combined-pick-note" aria-busy="true">
+      <section class="panel combined-pick" id="combined-pick" data-state="loading" data-algorithm="combined-family-consensus-v2" aria-labelledby="combined-pick-title" aria-describedby="combined-pick-status combined-pick-note" aria-busy="true">
         <div class="combined-pick__copy">
-          <p class="eyebrow">Все сопоставимые показатели · один итог</p>
+          <p class="eyebrow">Все актуальные прогнозные блоки · без двойного учёта</p>
           <p class="combined-pick__title" id="combined-pick-title">Единый лидер</p>
-          <p class="combined-pick__status" id="combined-pick-status" role="status" aria-live="polite" aria-atomic="true">Сопоставляем актуальные рейтинги текущего раунда.</p>
-          <p class="combined-pick__note" id="combined-pick-note">Средний нормализованный ранг, а не вероятность. В независимом раунде базовый шанс любого отдельного числа одинаков: 1 из 37 (≈2,7%).</p>
+          <p class="combined-pick__status" id="combined-pick-status" role="status" aria-live="polite" aria-atomic="true">Проверяем согласие разных семейств прогнозов текущего раунда.</p>
+          <p class="combined-pick__note" id="combined-pick-note">Число показывается только при поддержке минимум двух разных семейств методов: цен текущего раунда и истории переходов. Родственные расчёты объединяются внутри семейства и не дублируют голос. Давность, цикл, аналог и симуляции не считаются прогнозными голосами. Это индекс согласия, а не вероятность; базовый шанс отдельного числа — 1 из 37 (≈2,7%).</p>
         </div>
         <div class="combined-pick__result">
           <span class="combined-pick__label">Одно число</span>
@@ -257,7 +257,7 @@
           <p class="preclose-comparison__status" id="trajectory-shadow-training">Обучение: — результатов · adaptive-снимок для этого раунда отсутствует.</p>
           <p class="preclose-comparison__status" id="trajectory-shadow-range-metrics" aria-live="polite" aria-atomic="true">Участок: — из — (нет данных) · Adaptive v2, проспективное наблюдение.</p>
           <p class="preclose-comparison__status" id="trajectory-shadow-sample">Полные сопоставимые раунды: —/30; соседи формы: —/10.</p>
-          <p class="preclose-comparison__note" id="trajectory-shadow-note">Цель — движение цены от последней доступной точки перед forecast lock (возраст точки не более 5 с) до финальной цены результата <code>ed</code>, а не следующий тик. Adaptive v2 фиксирует при lock не более 6 соседних ценовых полос вокруг типичного q50 внутри полного коридора q20/q80; legacy KNN v1 восстанавливает такое же компактное окно только для отображения. Основная шкала идёт от 0 сверху к 36 снизу, а нижняя дублирующая нулевая полоса помечается отдельно. Обучение использует только завершённые снимки, известные строго до lock нового снимка. «Участок» считает проспективные попадания лишь по завершённым Adaptive v2 снимкам с зафиксированным диапазоном и однозначной исходной полосой; архивная доля попаданий не является вероятностью следующего раунда. Это только наблюдение: shadow не меняет итоговый Top‑3, виртуальный билет и ставки.</p>
+          <p class="preclose-comparison__note" id="trajectory-shadow-note">Цель — движение цены от последней доступной точки перед forecast lock (возраст точки не более 5 с) до финальной цены результата <code>ed</code>, а не следующий тик. Adaptive v2 фиксирует при lock не более 6 соседних ценовых полос вокруг типичного q50 внутри полного коридора q20/q80; legacy KNN v1 восстанавливает такое же компактное окно только для отображения. Основная шкала идёт от 0 сверху к 36 снизу, а нижняя дублирующая нулевая полоса помечается отдельно. Обучение использует только завершённые снимки, известные строго до lock нового снимка. «Участок» считает проспективные попадания лишь по завершённым Adaptive v2 снимкам с зафиксированным диапазоном и однозначной исходной полосой; архивная доля попаданий не является вероятностью следующего раунда. Это только наблюдение: shadow не меняет итоговый Top‑3, виртуальный билет и ставки. Готовая точка q50 учитывается в «Едином лидере» лишь внутри общей ценовой семьи и не получает отдельного независимого голоса.</p>
         </section>
 
         <details class="preclose-hit-history disclosure disclosure--inset" id="preclose-hit-history" data-state="loading" aria-labelledby="preclose-hit-history-title" aria-describedby="preclose-hit-history-status" aria-busy="true">
