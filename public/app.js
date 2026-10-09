@@ -1,6 +1,7 @@
 import { BET_RISK_MODEL, calculateBetRisk } from "./risk-calculator.js?v=2";
 import { buildFollowerStats } from "./pair-followers.js?v=1";
 import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
+import { combineNumberRankings } from "./combined-number.js?v=1";
 
 (() => {
   "use strict";
@@ -43,6 +44,10 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
     collectorStatus: document.getElementById("collector-status"),
     gapAlert: document.getElementById("gap-alert"),
     gapMessage: document.getElementById("gap-message"),
+    combinedPick: document.getElementById("combined-pick"),
+    combinedPickNumber: document.getElementById("combined-pick-number"),
+    combinedPickStatus: document.getElementById("combined-pick-status"),
+    combinedPickSources: document.getElementById("combined-pick-sources"),
     lastNumber: document.getElementById("last-number"),
     lastTime: document.getElementById("last-time"),
     lastPrice: document.getElementById("last-price"),
@@ -1247,6 +1252,7 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
   }
 
   function renderFetchFailure() {
+    renderCombinedPick();
     if (!store.hasCompletedInitialRender) {
       elements.resultsBody.replaceChildren(emptyTableRow("Не удалось загрузить результаты. Повторим попытку автоматически."));
       elements.cyclesList.replaceChildren(createElement("li", "empty-state", "Не удалось загрузить архив циклов."));
@@ -1280,6 +1286,7 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
     const latestResult = store.state?.latestResult || store.results[0] || null;
     renderCollector(store.state?.collector);
     renderGapWarning(store.state);
+    renderCombinedPick();
     renderLatestResult(latestResult);
     renderPrecloseForecast();
     renderForecastHitHistory();
@@ -1983,6 +1990,255 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
       reason: "legacy_without_consensus",
       legacy: legacyNumbers.length === 3,
     };
+  }
+
+  function sameEntityId(left, right) {
+    if (left === null || left === undefined || right === null || right === undefined) {
+      return false;
+    }
+    return String(left) === String(right);
+  }
+
+  function stateHasIntegrityGap(state) {
+    const warnings = Array.isArray(state?.warnings) ? state.warnings : [];
+    const integrity = String(state?.activeCycle?.integrityStatus || "").toLowerCase();
+    const integrityHasGap = integrity
+      && !["ok", "complete", "valid", "verified"].includes(integrity);
+    const hasFreshActiveCycle = String(state?.activeCycle?.status || "").toLowerCase() === "active"
+      && !integrityHasGap;
+    const warningHasGap = !hasFreshActiveCycle && warnings.some((warning) => {
+      const type = String(warning?.type || "").toLowerCase();
+      return type.includes("gap") || type.includes("missing") || type.includes("integrity");
+    });
+    return Boolean(integrityHasGap || warningHasGap);
+  }
+
+  function normalizedFrozenTransitionRanking(value, latestResult, modelNumbers) {
+    const latestResultId = asOptionalNonNegativeInteger(latestResult?.id);
+    const latestNumber = asRouletteNumber(latestResult?.number);
+    const sampleSize = asOptionalNonNegativeInteger(value?.sampleSize);
+    const observedFollowerCount = asOptionalNonNegativeInteger(
+      value?.observedFollowerCount,
+    );
+    if (
+      !value
+      || typeof value !== "object"
+      || Array.isArray(value)
+      || value.schemaVersion !== 1
+      || value.status !== "ready"
+      || value.definition !== "adjacent-within-continuity-epoch"
+      || value.tieBreak !== "count-desc,last-seen-desc,number-asc"
+      || latestResultId === null
+      || latestResultId < 1
+      || latestNumber === null
+      || sampleSize === null
+      || sampleSize < 1
+      || observedFollowerCount === null
+      || !sameEntityId(value.anchor?.resultId, latestResultId)
+      || asRouletteNumber(value.anchor?.number) !== latestNumber
+      || !Array.isArray(value.top3)
+      || value.top3.length < 1
+      || value.top3.length > 3
+      || modelNumbers.length !== 3
+    ) {
+      return [];
+    }
+
+    const numbers = [];
+    const seen = new Set();
+    for (let index = 0; index < value.top3.length; index += 1) {
+      const item = value.top3[index];
+      const number = asRouletteNumber(item?.number);
+      const occurrenceCount = asOptionalNonNegativeInteger(item?.occurrenceCount);
+      const share = asOptionalFiniteNumber(item?.share);
+      if (
+        item?.rank !== index + 1
+        || number === null
+        || seen.has(number)
+        || occurrenceCount === null
+        || occurrenceCount < 1
+        || occurrenceCount > sampleSize
+        || share === null
+        || Math.abs(share - (occurrenceCount / sampleSize)) > 1e-12
+      ) {
+        return [];
+      }
+      seen.add(number);
+      numbers.push(number);
+    }
+
+    const comparisonModel = normalizedForecastTop3(value.comparison?.modelTop3);
+    const comparisonPair = uniqueComparisonNumbers(value.comparison?.pairTop3);
+    if (
+      comparisonModel.length !== 3
+      || comparisonModel.some((number, index) => number !== modelNumbers[index])
+      || comparisonPair.length !== numbers.length
+      || comparisonPair.some((number, index) => number !== numbers[index])
+      || observedFollowerCount < numbers.length
+    ) {
+      return [];
+    }
+    return numbers;
+  }
+
+  function currentWarmTransitionRanking(latestResult) {
+    if (!store.pairsLoaded || store.pairsError) return [];
+    const warm = normalizedFollowerWarmNextRound();
+    const signal = warm?.currentSignal;
+    const latestResultId = asOptionalNonNegativeInteger(latestResult?.id);
+    const latestNumber = asRouletteNumber(latestResult?.number);
+    if (
+      !signal
+      || !["ready", "no_signal"].includes(signal.status)
+      || latestResultId === null
+      || latestResultId < 1
+      || latestNumber === null
+      || signal.anchorResultId !== latestResultId
+      || signal.sourceNumber !== latestNumber
+      || signal.candidates.length !== 5
+    ) {
+      return [];
+    }
+    return signal.candidates.map(({ number }) => number);
+  }
+
+  function currentCombinedNumberContext() {
+    if (!store.stateLoaded) return { state: "loading", sources: [] };
+    if (store.stateError || !store.state) return { state: "error", sources: [] };
+    if (stateHasIntegrityGap(store.state)) return { state: "paused", sources: [] };
+
+    const collector = store.state.collector;
+    const pendingCount = asOptionalNonNegativeInteger(collector?.pendingResultCount);
+    if (
+      collector?.resultConfirmationPending === true
+      || (pendingCount !== null && pendingCount > 0)
+    ) {
+      return { state: "paused", sources: [] };
+    }
+
+    const currentRoundId = collector?.currentRound?.id;
+    const latestResult = store.state.latestResult;
+    const latestResultId = asOptionalNonNegativeInteger(latestResult?.id);
+    const latestNumber = asRouletteNumber(latestResult?.number);
+    if (
+      currentRoundId === null
+      || currentRoundId === undefined
+      || currentRoundId === ""
+      || latestResultId === null
+      || latestResultId < 1
+      || latestNumber === null
+    ) {
+      return { state: "waiting", sources: [] };
+    }
+
+    const sources = [];
+    const latestForecast = store.state.precloseForecast?.latest;
+    const forecastIsCurrent = latestForecast
+      && sameEntityId(latestForecast.roundId, currentRoundId)
+      && (latestForecast.settlement === null || latestForecast.settlement === undefined);
+    const modelNumbers = forecastIsCurrent
+      ? normalizedForecastTop3(latestForecast.rankedNumbers)
+      : [];
+    if (modelNumbers.length === 3) {
+      sources.push({ id: "current-model", priority: 0, numbers: modelNumbers });
+    }
+
+    let transitionNumbers = forecastIsCurrent
+      ? normalizedFrozenTransitionRanking(
+          latestForecast.pairHistory,
+          latestResult,
+          modelNumbers,
+        )
+      : [];
+    if (transitionNumbers.length === 0) {
+      transitionNumbers = currentWarmTransitionRanking(latestResult);
+    }
+    if (transitionNumbers.length > 0) {
+      sources.push({
+        id: "current-transition",
+        priority: 1,
+        numbers: transitionNumbers,
+      });
+    }
+
+    return { state: sources.length > 0 ? "ready" : "waiting", sources };
+  }
+
+  function renderCombinedPick() {
+    const context = currentCombinedNumberContext();
+    const resetNumber = () => {
+      elements.combinedPickNumber.className = "result-ball result-ball--empty combined-pick__number";
+      elements.combinedPickNumber.textContent = "—";
+      elements.combinedPickNumber.setAttribute(
+        "aria-label",
+        "Сводное число пока не рассчитано",
+      );
+    };
+
+    if (context.state !== "ready") {
+      const messages = {
+        loading: "Загружаем актуальные рейтинги текущего раунда.",
+        error: "Свежие данные недоступны — сводное число скрыто.",
+        paused: "Расчёт приостановлен до подтверждения непрерывной истории.",
+        waiting: "Пока нет актуального рейтинга для текущего раунда.",
+      };
+      elements.combinedPick.dataset.state = context.state;
+      elements.combinedPick.setAttribute("aria-busy", String(context.state === "loading"));
+      setTextIfChanged(elements.combinedPickStatus, messages[context.state]);
+      setTextIfChanged(
+        elements.combinedPickSources,
+        context.state === "loading" ? "Собираем данные" : "Нет актуального числа",
+      );
+      resetNumber();
+      return;
+    }
+
+    const result = combineNumberRankings(context.sources);
+    if (result.status === "unavailable" || !isValidRouletteNumber(result.number)) {
+      elements.combinedPick.dataset.state = "waiting";
+      elements.combinedPick.setAttribute("aria-busy", "false");
+      setTextIfChanged(
+        elements.combinedPickStatus,
+        "Доступные рейтинги не прошли проверку — сводное число не показано.",
+      );
+      setTextIfChanged(elements.combinedPickSources, "Нет актуального числа");
+      resetNumber();
+      return;
+    }
+
+    elements.combinedPick.dataset.state = result.status === "single_source"
+      ? "single-source"
+      : "ready";
+    elements.combinedPick.setAttribute("aria-busy", "false");
+    elements.combinedPickNumber.className = `result-ball combined-pick__number ${rouletteColorClass(result.number)}`;
+    elements.combinedPickNumber.textContent = String(result.number);
+    elements.combinedPickNumber.setAttribute(
+      "aria-label",
+      `Единый лидер: число ${result.number}, ${rouletteColorLabel(result.number)}`,
+    );
+
+    if (result.status === "single_source") {
+      setTextIfChanged(
+        elements.combinedPickStatus,
+        "Доступна одна актуальная группа данных: показан её лидер без усиления уверенности.",
+      );
+      setTextIfChanged(elements.combinedPickSources, "1 группа данных");
+      return;
+    }
+
+    const fullAgreement = result.supportCount === result.sourceCount;
+    setTextIfChanged(
+      elements.combinedPickStatus,
+      fullAgreement
+        ? "Модель текущего раунда и история переходов сопоставлены: это число получило лучший общий ранг."
+        : "Доступные рейтинги сопоставлены: показан один лидер по их среднему нормализованному рангу.",
+    );
+    setTextIfChanged(
+      elements.combinedPickSources,
+      fullAgreement
+        ? `Поддержка ${result.supportCount} из ${result.sourceCount} групп`
+        : `${result.sourceCount} группы данных`,
+    );
   }
 
   function renderPrecloseComparison(latest, finalForecast = resolveFinalForecast(latest)) {

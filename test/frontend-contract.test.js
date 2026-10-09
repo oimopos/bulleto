@@ -48,6 +48,64 @@ test("dashboard keeps the exact read-only fetch URL list", () => {
   );
 });
 
+test("combined leader is the first dashboard block and renders exactly one number", () => {
+  const rendererIds = [
+    "combined-pick",
+    "combined-pick-number",
+    "combined-pick-status",
+    "combined-pick-sources",
+  ];
+  for (const id of rendererIds) {
+    assert.match(html, new RegExp(`\\bid="${id}"`));
+    assert.match(app, new RegExp(`getElementById\\("${id}"\\)`));
+  }
+
+  const gapStart = html.indexOf('id="gap-alert"');
+  const blockStart = html.indexOf('id="combined-pick"');
+  const headingStart = html.indexOf('class="page-heading"');
+  const block = html.slice(blockStart, headingStart);
+  assert.ok(gapStart >= 0 && blockStart > gapStart && headingStart > blockStart);
+  assert.doesNotMatch(block, /\bhidden\b/);
+  assert.match(block, /data-algorithm="combined-rank-v1"/);
+  assert.match(block, /id="combined-pick-status" role="status" aria-live="polite" aria-atomic="true"/);
+  assert.equal([...block.matchAll(/<output\b/g)].length, 1);
+  assert.match(block, /id="combined-pick-number"/);
+  assert.doesNotMatch(block, /<(?:ol|ul)\b/);
+  assert.match(block, /Средний нормализованный ранг, а не вероятность/);
+  assert.match(block, /1 из 37 \(≈2,7%\)/);
+
+  assert.match(app, /from "\.\/combined-number\.js\?v=1"/);
+  assert.match(app, /function currentCombinedNumberContext\(\)/);
+  assert.match(app, /function renderCombinedPick\(\)/);
+  assert.match(app, /latestForecast\.rankedNumbers/);
+  assert.match(app, /normalizedFrozenTransitionRanking/);
+  assert.match(app, /currentWarmTransitionRanking/);
+  assert.match(app, /\["ready", "no_signal"\]\.includes\(signal\.status\)/);
+  assert.match(app, /signal\.anchorResultId !== latestResultId/);
+  assert.match(app, /signal\.sourceNumber !== latestNumber/);
+  assert.match(app, /collector\?\.resultConfirmationPending === true/);
+  assert.match(app, /latestForecast\.settlement === null/);
+  assert.ok(
+    [...app.matchAll(/renderCombinedPick\(\)/g)].length >= 3,
+    "combined leader must render on normal and failed refresh paths",
+  );
+
+  const contextStart = app.indexOf("function currentCombinedNumberContext()");
+  const contextEnd = app.indexOf("function renderPrecloseComparison", contextStart);
+  const contextBlock = app.slice(contextStart, contextEnd);
+  assert.ok(contextStart >= 0 && contextEnd > contextStart);
+  assert.doesNotMatch(
+    contextBlock,
+    /trajectoryShadow|numberStats|virtualBettor|historicalAccount|actualNumber/,
+  );
+  assert.match(styles, /\.combined-pick\s*\{/);
+  assert.match(styles, /\.combined-pick__result \.combined-pick__number\s*\{/);
+  assert.match(
+    styles,
+    /@media \(max-width: 430px\)[\s\S]*?\.combined-pick\s*\{[\s\S]*?grid-template-columns: minmax\(0, 1fr\)/,
+  );
+});
+
 test("trajectory shadow is additive, prospective, and observation-only", () => {
   const rendererIds = [
     "trajectory-shadow-panel",
@@ -527,7 +585,7 @@ test("trajectory evaluation distinguishes both zero bands and leaves missing raw
   );
 });
 
-test("top-5 horizon block exposes all renderer targets and cumulative horizons", () => {
+test("top-5 horizon block stays hidden while preserving renderer targets and cumulative horizons", () => {
   for (const id of [
     "follower-horizon",
     "follower-horizon-list",
@@ -536,6 +594,7 @@ test("top-5 horizon block exposes all renderer targets and cumulative horizons",
   ]) {
     assert.match(html, new RegExp(`\\bid="${id}"`));
   }
+  assert.match(html, /id="follower-horizon"[^>]*\bhidden\b/);
   assert.match(app, /const FOLLOWER_HIT_HORIZONS = \[1, 2, 3, 5, 10, 20\]/);
   assert.match(app, /top5HitByHorizon/);
   assert.match(app, /follower-top5-walk-forward-v1/);
@@ -577,8 +636,8 @@ test("warm next-round forecast exposes a strict 5-percent walk-forward contract"
   );
   assert.match(html, /id="follower-dynamic-next-title"[^>]*>[^<]*≥5%/);
   assert.match(html, /id="follower-dynamic-next-note"[^>]*>[\s\S]*?5%/);
-  assert.match(html, /styles\.css\?v=27/);
-  assert.match(html, /app\.js\?v=31/);
+  assert.match(html, /styles\.css\?v=28/);
+  assert.match(html, /app\.js\?v=32/);
   assert.match(styles, /\.follower-dynamic-next\s*\{/);
   assert.match(styles, /\.follower-warm-current\s*\{/);
   assert.match(styles, /\.follower-warm-picks\s*\{/);
@@ -712,7 +771,7 @@ test("live fixed top-5 account gates one shared ticket ladder on cumulative 80 p
   );
 });
 
-test("full-cycle comparison block exposes every renderer target and stays above forecasts", () => {
+test("full-cycle comparison block stays hidden while preserving every renderer target", () => {
   const rendererIds = [
     "cycle-comparison-panel",
     "cycle-comparison-badge",
@@ -748,6 +807,7 @@ test("full-cycle comparison block exposes every renderer target and stays above 
     html,
     /<section class="overview-grid"[\s\S]*?<section class="panel cycle-comparison-panel"[\s\S]*?<section class="panel preclose-panel"/,
   );
+  assert.match(html, /id="cycle-comparison-panel"[^>]*\bhidden\b/);
   assert.match(html, /id="cycle-comparison-status" role="status" aria-live="polite" aria-atomic="true"/);
   assert.match(html, /id="cycle-comparison-panel"[\s\S]*?aria-busy="true"/);
   assert.match(html, /id="cycle-comparison-current-sequence"[\s\S]*?aria-busy="true"/);
@@ -798,8 +858,8 @@ test("cycle comparison language is descriptive, responsive, and cache-busted", (
   assert.match(block, /не прогноз/);
   assert.match(block, /не предсказывает следующее число/);
   assert.doesNotMatch(block, /должн/iu);
-  assert.match(html, /href="\/styles\.css\?v=27"/);
-  assert.match(html, /src="\/app\.js\?v=31"/);
+  assert.match(html, /href="\/styles\.css\?v=28"/);
+  assert.match(html, /src="\/app\.js\?v=32"/);
   assert.match(styles, /\.cycle-sequence-list\s*\{[\s\S]*?repeat\(auto-fill, minmax\(50px, 1fr\)\)/);
   assert.match(
     styles,
