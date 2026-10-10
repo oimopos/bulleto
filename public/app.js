@@ -127,6 +127,7 @@ import {
     followerLiveAccountBalance: document.getElementById("follower-live-account-balance"),
     followerLiveAccountResultCard: document.getElementById("follower-live-account-result-card"),
     followerLiveAccountResult: document.getElementById("follower-live-account-result"),
+    followerLiveAccountStaked: document.getElementById("follower-live-account-staked"),
     followerLiveAccountBets: document.getElementById("follower-live-account-bets"),
     followerLiveAccountRecord: document.getElementById("follower-live-account-record"),
     followerLiveAccountStake: document.getElementById("follower-live-account-stake"),
@@ -5025,6 +5026,7 @@ import {
     const resetValues = () => {
       setTextIfChanged(elements.followerLiveAccountBalance, "—");
       setTextIfChanged(elements.followerLiveAccountResult, "—");
+      setTextIfChanged(elements.followerLiveAccountStaked, "—");
       setTextIfChanged(elements.followerLiveAccountBets, "—");
       setTextIfChanged(elements.followerLiveAccountRecord, "— попаданий · — промахов");
       setTextIfChanged(elements.followerLiveAccountStake, "—");
@@ -5090,6 +5092,10 @@ import {
     } else if (account.netResult < 0) {
       elements.followerLiveAccountResultCard.classList.add("is-loss");
     }
+    setTextIfChanged(
+      elements.followerLiveAccountStaked,
+      formatRiskAmount(account.totalStaked)
+    );
     setTextIfChanged(elements.followerLiveAccountBets, formatRiskAmount(account.betCount));
     setTextIfChanged(
       elements.followerLiveAccountRecord,

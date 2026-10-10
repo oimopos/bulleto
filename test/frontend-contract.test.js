@@ -92,7 +92,7 @@ test("combined leader is the first dashboard block and renders exactly one numbe
   assert.match(block, /эвристический ранговый индекс, не вероятность и не гарантия преимущества/);
   assert.match(block, /Давность, виртуальная цель, невыпавшие числа, survivor и исторический аналог остаются только наблюдением/);
   assert.match(block, /1 из 37 \(≈2,7%\)/);
-  assert.match(html, /<script type="module" src="\/app\.js\?v=39"><\/script>/);
+  assert.match(html, /<script type="module" src="\/app\.js\?v=40"><\/script>/);
 
   assert.match(app, /from "\.\/combined-number\.js\?v=6"/);
   assert.match(app, /assessCombinedNumberFreshness\(store\.state\)/);
@@ -863,8 +863,8 @@ test("warm next-round forecast exposes a strict 5-percent walk-forward contract"
   );
   assert.match(html, /id="follower-dynamic-next-title"[^>]*>[^<]*≥5%/);
   assert.match(html, /id="follower-dynamic-next-note"[^>]*>[\s\S]*?5%/);
-  assert.match(html, /styles\.css\?v=29/);
-  assert.match(html, /app\.js\?v=39/);
+  assert.match(html, /styles\.css\?v=30/);
+  assert.match(html, /app\.js\?v=40/);
   assert.match(styles, /\.follower-dynamic-next\s*\{/);
   assert.match(styles, /\.follower-warm-current\s*\{/);
   assert.match(styles, /\.follower-warm-picks\s*\{/);
@@ -949,6 +949,7 @@ test("live fixed top-5 account gates one shared ticket ladder on cumulative 80 p
     "follower-live-account-balance",
     "follower-live-account-result-card",
     "follower-live-account-result",
+    "follower-live-account-staked",
     "follower-live-account-bets",
     "follower-live-account-record",
     "follower-live-account-stake",
@@ -977,8 +978,11 @@ test("live fixed top-5 account gates one shared ticket ladder on cumulative 80 p
   assert.match(app, /startEvidence\.rate < strategy\.threshold/);
   assert.match(app, /function renderFollowerLiveGatedAccount\(account,/);
   assert.match(app, /renderFollowerLiveGatedAccount\(tracker\.gatedAccount, \{ stale \}\)/);
+  assert.match(app, /followerLiveAccountStaked,[\s\S]*?formatRiskAmount\(account\.totalStaked\)/);
   assert.match(app, /liveGatePercentFormatter/);
   assert.match(html, /Счёт с накопительным порогом 80%/);
+  assert.match(html, /Всего поставлено/);
+  assert.match(html, /с начала счёта 80%/);
   assert.match(html, /Порог 80% — накопительная архивная доля/);
   assert.match(html, /а не вероятность следующего раунда/);
   assert.match(html, /Независимый шанс попадания пяти чисел[^<]*5 из 37/);
@@ -1085,8 +1089,8 @@ test("cycle comparison language is descriptive, responsive, and cache-busted", (
   assert.match(block, /не прогноз/);
   assert.match(block, /не предсказывает следующее число/);
   assert.doesNotMatch(block, /должн/iu);
-  assert.match(html, /href="\/styles\.css\?v=29"/);
-  assert.match(html, /src="\/app\.js\?v=39"/);
+  assert.match(html, /href="\/styles\.css\?v=30"/);
+  assert.match(html, /src="\/app\.js\?v=40"/);
   assert.match(styles, /\.cycle-sequence-list\s*\{[\s\S]*?repeat\(auto-fill, minmax\(50px, 1fr\)\)/);
   assert.match(
     styles,
