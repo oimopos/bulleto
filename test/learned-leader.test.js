@@ -198,6 +198,64 @@ test("decision freezes all 37 masses and exactly one deterministic leader", () =
   assert.deepEqual(normalizeLearnedLeaderDecision(decision), decision);
 });
 
+test("unweighted ranking and set sources survive the stored decision round trip", () => {
+  for (const source of [
+    {
+      id: "conditional-ranking",
+      family: "conditional-history",
+      numbers: [7, 11, 19],
+    },
+    {
+      id: "price-range",
+      family: "price",
+      mode: "set",
+      numbers: [7, 8, 9],
+    },
+  ]) {
+    const decision = buildLearnedLeaderDecision({
+      sources: [{
+        ...source,
+        cursor: { cutoffAt: iso(20) },
+      }],
+      learningRows: [],
+      lockedAt: iso(20),
+      tieSeed: `round-trip-${source.id}`,
+    });
+
+    assert.equal(decision.status, "ready");
+    assert.equal(decision.sourceManifest[0].weights, null);
+    assert.deepEqual(normalizeLearnedLeaderDecision(decision), decision);
+  }
+});
+
+test("weighted Rank-37 and its unweighted display range round trip together", () => {
+  const decision = buildLearnedLeaderDecision({
+    sources: [
+      {
+        id: "price-trajectory-rank37",
+        family: "price",
+        numbers: [25, 13, 5],
+        weights: [0.5, 0.3, 0.2],
+        cursor: { forecastId: 41, cutoffAt: iso(20) },
+      },
+      {
+        id: "price-trajectory-range",
+        family: "price",
+        mode: "set",
+        numbers: [19, 20, 21],
+        cursor: { forecastId: 41, cutoffAt: iso(20) },
+      },
+    ],
+    learningRows: [],
+    lockedAt: iso(20),
+    tieSeed: "production-shaped-price-family",
+  });
+
+  assert.equal(decision.status, "ready");
+  assert.equal(decision.sourceManifest.length, 2);
+  assert.deepEqual(normalizeLearnedLeaderDecision(decision), decision);
+});
+
 test("settlement evaluates the immutable decision with proper Brier and hit metrics", () => {
   const decision = buildLearnedLeaderDecision({
     sources: currentSources,

@@ -7,8 +7,8 @@
     <meta name="color-scheme" content="dark">
     <meta name="description" content="Онлайн-монитор результатов рулетки и циклов исключения чисел от 0 до 36">
     <title>Круг 37 — монитор результатов</title>
-    <link rel="stylesheet" href="/styles.css?v=28">
-    <script type="module" src="/app.js?v=38"></script>
+    <link rel="stylesheet" href="/styles.css?v=29">
+    <script type="module" src="/app.js?v=39"></script>
   </head>
   <body>
     <a class="skip-link" href="#main-content">Перейти к содержимому</a>
@@ -58,6 +58,38 @@
           <output class="result-ball result-ball--empty combined-pick__number" id="combined-pick-number" aria-label="Сводное число пока не рассчитано">—</output>
           <span class="combined-pick__sources" id="combined-pick-sources">Ожидаем данные</span>
         </div>
+        <section class="combined-pick-account" id="combined-pick-account" data-state="loading" aria-labelledby="combined-pick-account-title" aria-describedby="combined-pick-account-note" aria-busy="true">
+          <div class="combined-pick-account__header">
+            <div>
+              <p class="eyebrow">Проспективная симуляция · один лидер</p>
+              <h3 id="combined-pick-account-title">Виртуальный счёт лестницы</h3>
+            </div>
+            <span class="combined-pick-account__status" id="combined-pick-account-status" role="status" aria-live="polite" aria-atomic="true">Загрузка…</span>
+          </div>
+          <dl class="combined-pick-account__metrics" aria-label="Показатели виртуального счёта единого лидера">
+            <div class="combined-pick-account__metric" id="combined-pick-account-balance-card">
+              <dt>Текущий счёт</dt>
+              <dd id="combined-pick-account-balance">—</dd>
+              <small id="combined-pick-account-profit">старт 1 000 · результат —</small>
+            </div>
+            <div class="combined-pick-account__metric">
+              <dt>Попадания / промахи</dt>
+              <dd id="combined-pick-account-record">— / —</dd>
+              <small id="combined-pick-account-settled">завершено —</small>
+            </div>
+            <div class="combined-pick-account__metric">
+              <dt>Наблюдаемая частота попаданий</dt>
+              <dd id="combined-pick-account-rate">—</dd>
+              <small id="combined-pick-account-rate-detail">по завершённым · не вероятность; база 1/37 ≈2,7%</small>
+            </div>
+            <div class="combined-pick-account__metric">
+              <dt id="combined-pick-account-stake-label">Следующая ставка</dt>
+              <dd id="combined-pick-account-stake">—</dd>
+              <small id="combined-pick-account-ladder">ступень — · серия —</small>
+            </div>
+          </dl>
+          <p class="combined-pick-account__note" id="combined-pick-account-note">На каждое заранее сохранённое число фиксируется только условная ставка. Старт 1 000, ставка и шаг 10, максимум 2 500; выплата ×36 включает возврат. Попадание сбрасывает лестницу. Частота — прошлое наблюдение, не вероятность следующего результата. Это виртуальная («бумажная») симуляция; реальных ставок и действий нет.</p>
+        </section>
       </section>
 
       <div class="page-heading">

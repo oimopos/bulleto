@@ -112,6 +112,7 @@ const resultPipeline = new ResultPipeline({
 // no credentials, browser automation, payment access, or Buleto write calls.
 db.initializeVirtualBettor('buleto', config.instrument);
 db.settlePrecloseForecasts('buleto', config.instrument);
+db.settlePredictiveLeaderAccount('buleto', config.instrument);
 
 const sseClients = new Set();
 
@@ -630,6 +631,18 @@ function publishPipelineOutcome(outcome) {
     if (forecastOutcome.settled > 0) broadcastUpdate('forecast-settled');
   } catch (error) {
     console.error('[forecast] settlement failed; it will be retried', error);
+  }
+  try {
+    const accountOutcome = db.settlePredictiveLeaderAccount(
+      'buleto',
+      config.instrument,
+    );
+    if (accountOutcome.settled > 0) broadcastUpdate('predictive-leader-account');
+  } catch (error) {
+    console.error(
+      '[predictive-leader] account settlement failed; it will be retried',
+      error,
+    );
   }
 }
 

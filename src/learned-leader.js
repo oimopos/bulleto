@@ -148,7 +148,7 @@ function normalizedSource(value, index) {
   if (mode === "set") numbers.sort((left, right) => left - right);
 
   let weights = null;
-  if (value.weights !== undefined) {
+  if (value.weights !== undefined && value.weights !== null) {
     if (
       mode !== "ranking"
       || !Array.isArray(value.weights)

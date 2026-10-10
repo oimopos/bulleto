@@ -50,6 +50,14 @@ import {
   normalizeLearnedLeaderDecision,
 } from "./learned-leader.js";
 import {
+  PREDICTIVE_LEADER_ACCOUNT_MODEL,
+  PREDICTIVE_LEADER_ACCOUNT_SCHEMA_VERSION,
+  PREDICTIVE_LEADER_ACCOUNT_STARTING_BALANCE,
+  PREDICTIVE_LEADER_ACCOUNT_STRATEGY_VERSION,
+  nextPredictiveLeaderStake,
+  settlePredictiveLeaderBet,
+} from "./predictive-leader-account.js";
+import {
   CYCLE_ANALOGUE_ALGORITHM_VERSION,
   CYCLE_ANALOGUE_ANCHOR_DRAW_COUNT,
   selectCycleAnalogue,
@@ -4020,6 +4028,7 @@ export class RouletteDatabase {
     this.#migrateForecastConsensusPolicyV14();
     this.#migrateRoundTrajectoriesV15();
     this.#migratePredictiveLeaderSnapshotsV16();
+    this.#migratePredictiveLeaderAccountV17();
   }
 
   #migratePrecloseForecastsV10() {
@@ -4658,6 +4667,152 @@ export class RouletteDatabase {
         );
 
       PRAGMA user_version = 16;
+      COMMIT;
+    `);
+  }
+
+  #migratePredictiveLeaderAccountV17() {
+    this.sqlite.exec(`
+      BEGIN IMMEDIATE;
+
+      CREATE TABLE IF NOT EXISTS predictive_leader_accounts (
+        source TEXT NOT NULL,
+        instrument TEXT NOT NULL,
+        schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+        strategy_version TEXT NOT NULL CHECK (length(trim(strategy_version)) > 0),
+        leader_algorithm_version TEXT NOT NULL CHECK (
+          length(trim(leader_algorithm_version)) > 0
+        ),
+        status TEXT NOT NULL CHECK (status IN ('running', 'exhausted')),
+        initial_balance INTEGER NOT NULL CHECK (initial_balance = 1000),
+        current_balance INTEGER NOT NULL CHECK (current_balance >= 0),
+        initial_stake INTEGER NOT NULL CHECK (initial_stake = 10),
+        stake_step INTEGER NOT NULL CHECK (stake_step = 10),
+        max_stake INTEGER NOT NULL CHECK (max_stake = 2500),
+        gross_payout_multiplier INTEGER NOT NULL CHECK (
+          gross_payout_multiplier = 36
+        ),
+        payout_includes_stake INTEGER NOT NULL CHECK (
+          payout_includes_stake IN (0, 1)
+        ),
+        next_stake INTEGER NOT NULL CHECK (
+          next_stake > 0 AND next_stake <= max_stake
+          AND next_stake % stake_step = 0
+        ),
+        ladder_miss_count INTEGER NOT NULL CHECK (ladder_miss_count >= 0),
+        ladder_total_loss INTEGER NOT NULL CHECK (
+          ladder_total_loss >= 0 AND ladder_total_loss % stake_step = 0
+        ),
+        last_continuity_epoch INTEGER CHECK (
+          last_continuity_epoch IS NULL OR last_continuity_epoch >= 0
+        ),
+        continuity_gap_count INTEGER NOT NULL CHECK (continuity_gap_count >= 0),
+        pending_forecast_id INTEGER UNIQUE REFERENCES
+          forecast_predictive_leader_snapshots(forecast_id),
+        started_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        exhausted_at TEXT,
+        PRIMARY KEY (source, instrument),
+        CHECK ((ladder_miss_count = 0) = (ladder_total_loss = 0)),
+        CHECK (
+          (status = 'running' AND exhausted_at IS NULL)
+          OR
+          (status = 'exhausted' AND exhausted_at IS NOT NULL
+            AND pending_forecast_id IS NULL AND next_stake > current_balance)
+        )
+      );
+
+      CREATE TABLE IF NOT EXISTS predictive_leader_account_bets (
+        forecast_id INTEGER PRIMARY KEY REFERENCES
+          forecast_predictive_leader_snapshots(forecast_id),
+        source TEXT NOT NULL,
+        instrument TEXT NOT NULL,
+        schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+        strategy_version TEXT NOT NULL CHECK (length(trim(strategy_version)) > 0),
+        leader_algorithm_version TEXT NOT NULL CHECK (
+          length(trim(leader_algorithm_version)) > 0
+        ),
+        continuity_epoch INTEGER CHECK (
+          continuity_epoch IS NULL OR continuity_epoch >= 0
+        ),
+        target_number INTEGER NOT NULL CHECK (target_number BETWEEN 0 AND 36),
+        stake INTEGER NOT NULL CHECK (
+          stake > 0 AND stake <= 2500 AND stake % 10 = 0
+        ),
+        balance_before INTEGER NOT NULL CHECK (balance_before >= stake),
+        ladder_loss_before INTEGER NOT NULL CHECK (
+          ladder_loss_before >= 0 AND ladder_loss_before % 10 = 0
+        ),
+        ladder_miss_count_before INTEGER NOT NULL CHECK (
+          ladder_miss_count_before >= 0
+        ),
+        status TEXT NOT NULL CHECK (status IN ('pending', 'settled')),
+        round_result_id INTEGER UNIQUE REFERENCES round_results(id),
+        result_number INTEGER CHECK (
+          result_number IS NULL OR result_number BETWEEN 0 AND 36
+        ),
+        outcome TEXT CHECK (outcome IS NULL OR outcome IN ('hit', 'miss')),
+        gross_payout INTEGER CHECK (gross_payout IS NULL OR gross_payout >= 0),
+        balance_after INTEGER CHECK (balance_after IS NULL OR balance_after >= 0),
+        ladder_loss_after INTEGER CHECK (
+          ladder_loss_after IS NULL OR ladder_loss_after >= 0
+        ),
+        ladder_miss_count_after INTEGER CHECK (
+          ladder_miss_count_after IS NULL OR ladder_miss_count_after >= 0
+        ),
+        next_stake_after INTEGER CHECK (
+          next_stake_after IS NULL
+          OR (next_stake_after > 0 AND next_stake_after <= 2500
+            AND next_stake_after % 10 = 0)
+        ),
+        recovery_possible INTEGER CHECK (
+          recovery_possible IS NULL OR recovery_possible IN (0, 1)
+        ),
+        placed_at TEXT NOT NULL,
+        occurred_at TEXT,
+        settled_at TEXT,
+        updated_at TEXT NOT NULL,
+        CHECK (
+          (status = 'pending' AND round_result_id IS NULL
+            AND result_number IS NULL AND outcome IS NULL
+            AND gross_payout IS NULL AND balance_after IS NULL
+            AND ladder_loss_after IS NULL AND ladder_miss_count_after IS NULL
+            AND next_stake_after IS NULL AND recovery_possible IS NULL
+            AND occurred_at IS NULL AND settled_at IS NULL)
+          OR
+          (status = 'settled' AND round_result_id IS NOT NULL
+            AND result_number IS NOT NULL AND outcome IS NOT NULL
+            AND gross_payout IS NOT NULL AND balance_after IS NOT NULL
+            AND ladder_loss_after IS NOT NULL
+            AND ladder_miss_count_after IS NOT NULL
+            AND next_stake_after IS NOT NULL
+            AND recovery_possible IS NOT NULL
+            AND occurred_at IS NOT NULL AND settled_at IS NOT NULL
+            AND placed_at <= occurred_at AND occurred_at <= settled_at)
+        ),
+        CHECK (
+          status = 'pending'
+          OR balance_after = balance_before - stake + gross_payout
+        ),
+        CHECK (
+          status = 'pending'
+          OR (outcome = 'hit' AND result_number = target_number
+            AND gross_payout = stake * 36
+            AND ladder_loss_after = 0 AND ladder_miss_count_after = 0)
+          OR (outcome = 'miss' AND result_number != target_number
+            AND gross_payout = 0
+            AND ladder_loss_after = ladder_loss_before + stake
+            AND ladder_miss_count_after = ladder_miss_count_before + 1)
+        )
+      );
+
+      CREATE INDEX IF NOT EXISTS predictive_leader_account_bets_stream_idx
+        ON predictive_leader_account_bets(source, instrument, forecast_id);
+      CREATE UNIQUE INDEX IF NOT EXISTS predictive_leader_account_pending_idx
+        ON predictive_leader_account_bets(source, instrument)
+        WHERE status = 'pending';
+
+      PRAGMA user_version = 17;
       COMMIT;
     `);
   }
@@ -8848,6 +9003,184 @@ export class RouletteDatabase {
     return { learningRows, resultIdByForecastId };
   }
 
+  #placePredictiveLeaderAccountBetInTransaction({
+    forecastId,
+    source,
+    instrument,
+    decision,
+    historyMaxResultId,
+    placedAt,
+  }) {
+    if (decision.status !== "ready") return { placed: false, reason: "unavailable" };
+    this.sqlite
+      .prepare(`
+        INSERT INTO predictive_leader_accounts (
+          source, instrument, schema_version, strategy_version,
+          leader_algorithm_version, status, initial_balance, current_balance,
+          initial_stake, stake_step, max_stake, gross_payout_multiplier,
+          payout_includes_stake, next_stake, ladder_miss_count,
+          ladder_total_loss, last_continuity_epoch, continuity_gap_count,
+          pending_forecast_id, started_at, updated_at, exhausted_at
+        ) VALUES (?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, 0, 0,
+          NULL, 0, NULL, ?, ?, NULL)
+        ON CONFLICT(source, instrument) DO NOTHING
+      `)
+      .run(
+        source,
+        instrument,
+        PREDICTIVE_LEADER_ACCOUNT_SCHEMA_VERSION,
+        PREDICTIVE_LEADER_ACCOUNT_STRATEGY_VERSION,
+        LEARNED_LEADER_ALGORITHM_VERSION,
+        PREDICTIVE_LEADER_ACCOUNT_STARTING_BALANCE,
+        PREDICTIVE_LEADER_ACCOUNT_STARTING_BALANCE,
+        PREDICTIVE_LEADER_ACCOUNT_MODEL.initialStake,
+        PREDICTIVE_LEADER_ACCOUNT_MODEL.stakeStep,
+        PREDICTIVE_LEADER_ACCOUNT_MODEL.maxStake,
+        PREDICTIVE_LEADER_ACCOUNT_MODEL.grossPayoutMultiplier,
+        PREDICTIVE_LEADER_ACCOUNT_MODEL.payoutIncludesStake ? 1 : 0,
+        nextPredictiveLeaderStake(0),
+        placedAt,
+        placedAt,
+      );
+    const account = this.sqlite
+      .prepare(`
+        SELECT *
+        FROM predictive_leader_accounts
+        WHERE source = ? AND instrument = ?
+      `)
+      .get(source, instrument);
+    if (
+      !account
+      || Number(account.schema_version) !== PREDICTIVE_LEADER_ACCOUNT_SCHEMA_VERSION
+      || account.strategy_version !== PREDICTIVE_LEADER_ACCOUNT_STRATEGY_VERSION
+      || account.leader_algorithm_version !== LEARNED_LEADER_ALGORITHM_VERSION
+      || Number(account.initial_balance) !== PREDICTIVE_LEADER_ACCOUNT_STARTING_BALANCE
+      || Number(account.initial_stake) !== PREDICTIVE_LEADER_ACCOUNT_MODEL.initialStake
+      || Number(account.stake_step) !== PREDICTIVE_LEADER_ACCOUNT_MODEL.stakeStep
+      || Number(account.max_stake) !== PREDICTIVE_LEADER_ACCOUNT_MODEL.maxStake
+      || Number(account.gross_payout_multiplier)
+        !== PREDICTIVE_LEADER_ACCOUNT_MODEL.grossPayoutMultiplier
+      || Boolean(account.payout_includes_stake)
+        !== PREDICTIVE_LEADER_ACCOUNT_MODEL.payoutIncludesStake
+    ) {
+      throw new Error("predictive leader account model is invalid");
+    }
+    if (account.status === "exhausted") {
+      return { placed: false, reason: "bankroll_exhausted" };
+    }
+    if (account.pending_forecast_id !== null) {
+      return { placed: false, reason: "prior_pending" };
+    }
+
+    const historyRow = historyMaxResultId === null
+      ? null
+      : this.sqlite
+          .prepare(`
+            SELECT continuity_epoch
+            FROM round_results
+            WHERE id = ? AND source = ? AND instrument = ?
+          `)
+          .get(historyMaxResultId, source, instrument);
+    if (historyMaxResultId !== null && !historyRow) {
+      throw new Error("predictive leader account history cursor is invalid");
+    }
+    const continuityEpoch = historyRow ? Number(historyRow.continuity_epoch) : null;
+    let ladderMissCount = Number(account.ladder_miss_count);
+    let ladderTotalLoss = Number(account.ladder_total_loss);
+    let nextStake = Number(account.next_stake);
+    let continuityGapCount = Number(account.continuity_gap_count);
+    const lastContinuityEpoch = account.last_continuity_epoch === null
+      ? null
+      : Number(account.last_continuity_epoch);
+    if (
+      lastContinuityEpoch !== null
+      && continuityEpoch !== null
+      && continuityEpoch !== lastContinuityEpoch
+    ) {
+      ladderMissCount = 0;
+      ladderTotalLoss = 0;
+      nextStake = nextPredictiveLeaderStake(0);
+      continuityGapCount += 1;
+    }
+    if (nextStake !== nextPredictiveLeaderStake(ladderTotalLoss)) {
+      throw new Error("predictive leader account ladder cursor is invalid");
+    }
+    const currentBalance = Number(account.current_balance);
+    if (nextStake > currentBalance) {
+      this.sqlite
+        .prepare(`
+          UPDATE predictive_leader_accounts
+          SET status = 'exhausted', next_stake = ?, pending_forecast_id = NULL,
+            last_continuity_epoch = ?, continuity_gap_count = ?,
+            ladder_miss_count = ?, ladder_total_loss = ?, updated_at = ?,
+            exhausted_at = ?
+          WHERE source = ? AND instrument = ? AND status = 'running'
+        `)
+        .run(
+          nextStake,
+          continuityEpoch,
+          continuityGapCount,
+          ladderMissCount,
+          ladderTotalLoss,
+          placedAt,
+          placedAt,
+          source,
+          instrument,
+        );
+      return { placed: false, reason: "bankroll_exhausted" };
+    }
+
+    this.sqlite
+      .prepare(`
+        INSERT INTO predictive_leader_account_bets (
+          forecast_id, source, instrument, schema_version, strategy_version,
+          leader_algorithm_version, continuity_epoch, target_number, stake,
+          balance_before, ladder_loss_before, ladder_miss_count_before,
+          status, placed_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+      `)
+      .run(
+        forecastId,
+        source,
+        instrument,
+        PREDICTIVE_LEADER_ACCOUNT_SCHEMA_VERSION,
+        PREDICTIVE_LEADER_ACCOUNT_STRATEGY_VERSION,
+        LEARNED_LEADER_ALGORITHM_VERSION,
+        continuityEpoch,
+        decision.leaderNumber,
+        nextStake,
+        currentBalance,
+        ladderTotalLoss,
+        ladderMissCount,
+        placedAt,
+        placedAt,
+      );
+    const update = this.sqlite
+      .prepare(`
+        UPDATE predictive_leader_accounts
+        SET pending_forecast_id = ?, next_stake = ?, ladder_miss_count = ?,
+          ladder_total_loss = ?, last_continuity_epoch = ?,
+          continuity_gap_count = ?, updated_at = ?
+        WHERE source = ? AND instrument = ? AND status = 'running'
+          AND pending_forecast_id IS NULL
+      `)
+      .run(
+        forecastId,
+        nextStake,
+        ladderMissCount,
+        ladderTotalLoss,
+        continuityEpoch,
+        continuityGapCount,
+        placedAt,
+        source,
+        instrument,
+      );
+    if (Number(update.changes) !== 1) {
+      throw new Error("predictive leader account could not freeze its pending bet");
+    }
+    return { placed: true, reason: "pending" };
+  }
+
   #recordPredictiveLeaderSnapshot(forecastId, trajectoryShadow) {
     return this.#transaction(() => {
       const existing = this.sqlite
@@ -8974,6 +9307,26 @@ export class RouletteDatabase {
           JSON.stringify(decision),
           createdAt,
         );
+      this.#placePredictiveLeaderAccountBetInTransaction({
+        forecastId,
+        source: parent.source,
+        instrument: parent.instrument,
+        decision,
+        historyMaxResultId: conditional.historyMaxResultId,
+        placedAt: createdAt,
+      });
+      const commitCheckedAt = asTimestamp(
+        this.clock(),
+        undefined,
+        "predictive leader commitCheckedAt",
+      );
+      if (
+        Date.parse(parent.betting_closes_at) - Date.parse(commitCheckedAt) < 5_000
+      ) {
+        throw new RangeError(
+          "predictive leader transaction must finish at least five seconds before betting closes",
+        );
+      }
       return { inserted: true };
     });
   }
@@ -9541,7 +9894,26 @@ export class RouletteDatabase {
         );
 
       if (Number(insertion.changes) === 0) {
-        return { inserted: false, roundId: externalRoundId };
+        const raced = this.sqlite
+          .prepare(`
+            SELECT forecasts.id AS forecast_id
+            FROM forecast_snapshots AS snapshots
+            JOIN round_forecasts AS forecasts ON forecasts.snapshot_id = snapshots.id
+            WHERE snapshots.source = ?
+              AND snapshots.instrument = ?
+              AND snapshots.external_round_id = ?
+              AND snapshots.horizon_seconds = ?
+            LIMIT 1
+          `)
+          .get(source, instrument, externalRoundId, horizonSeconds);
+        if (!raced) {
+          throw new Error("conflicting forecast was stored without its forecast row");
+        }
+        return {
+          inserted: false,
+          roundId: externalRoundId,
+          forecastId: Number(raced.forecast_id),
+        };
       }
 
       const snapshotId = Number(insertion.lastInsertRowid);
@@ -9645,6 +10017,151 @@ export class RouletteDatabase {
     }
 
     return { inserted: primaryOutcome.inserted, roundId: externalRoundId };
+  }
+
+  settlePredictiveLeaderAccount(source = "buleto", instrument = "default") {
+    this.#assertOpen();
+    const safeSource = asNonEmptyText(source, undefined, "source");
+    const safeInstrument = asNonEmptyText(instrument, undefined, "instrument");
+    const now = asTimestamp(this.clock(), undefined, "predictive leader account settledAt");
+    return this.#transaction(() => {
+      const account = this.sqlite
+        .prepare(`
+          SELECT *
+          FROM predictive_leader_accounts
+          WHERE source = ? AND instrument = ?
+        `)
+        .get(safeSource, safeInstrument);
+      if (!account || account.pending_forecast_id === null) return { settled: 0 };
+      if (account.status !== "running") {
+        throw new Error("exhausted predictive leader account cannot have a pending bet");
+      }
+      const bet = this.sqlite
+        .prepare(`
+          SELECT
+            bets.*,
+            leaders.status AS leader_status,
+            leaders.algorithm_version AS stored_leader_algorithm_version,
+            leaders.predicted_number AS stored_leader_number,
+            snapshots.source AS forecast_source,
+            snapshots.instrument AS forecast_instrument,
+            settlements.round_result_id AS settlement_result_id,
+            settlements.actual_number AS settlement_actual_number,
+            settlements.settled_at AS settlement_occurred_at,
+            results.result_number AS stored_result_number,
+            results.settled_at AS result_occurred_at
+          FROM predictive_leader_account_bets AS bets
+          JOIN forecast_predictive_leader_snapshots AS leaders
+            ON leaders.forecast_id = bets.forecast_id
+          JOIN round_forecasts AS forecasts ON forecasts.id = bets.forecast_id
+          JOIN forecast_snapshots AS snapshots ON snapshots.id = forecasts.snapshot_id
+          LEFT JOIN forecast_settlements AS settlements
+            ON settlements.forecast_id = bets.forecast_id
+          LEFT JOIN round_results AS results
+            ON results.id = settlements.round_result_id
+          WHERE bets.forecast_id = ? AND bets.status = 'pending'
+        `)
+        .get(Number(account.pending_forecast_id));
+      if (!bet) {
+        throw new Error("predictive leader account pending pointer is invalid");
+      }
+      if (bet.settlement_result_id === null) return { settled: 0 };
+      const resultNumber = Number(bet.settlement_actual_number);
+      if (
+        Number(bet.schema_version) !== PREDICTIVE_LEADER_ACCOUNT_SCHEMA_VERSION
+        || bet.strategy_version !== PREDICTIVE_LEADER_ACCOUNT_STRATEGY_VERSION
+        || bet.leader_algorithm_version !== LEARNED_LEADER_ALGORITHM_VERSION
+        || bet.stored_leader_algorithm_version !== LEARNED_LEADER_ALGORITHM_VERSION
+        || bet.leader_status !== "ready"
+        || Number(bet.target_number) !== Number(bet.stored_leader_number)
+        || bet.source !== safeSource
+        || bet.instrument !== safeInstrument
+        || bet.forecast_source !== safeSource
+        || bet.forecast_instrument !== safeInstrument
+        || Number(bet.round_result_id ?? bet.settlement_result_id)
+          !== Number(bet.settlement_result_id)
+        || resultNumber !== Number(bet.stored_result_number)
+        || bet.settlement_occurred_at !== bet.result_occurred_at
+        || Number(bet.balance_before) !== Number(account.current_balance)
+        || Number(bet.ladder_loss_before) !== Number(account.ladder_total_loss)
+        || Number(bet.ladder_miss_count_before) !== Number(account.ladder_miss_count)
+        || Number(bet.stake) !== Number(account.next_stake)
+      ) {
+        throw new Error("predictive leader account settlement cursor is invalid");
+      }
+      const settlement = settlePredictiveLeaderBet({
+        targetNumber: Number(bet.target_number),
+        resultNumber,
+        stake: Number(bet.stake),
+        balanceBefore: Number(account.current_balance),
+        ladderLossBefore: Number(account.ladder_total_loss),
+        model: {
+          initialStake: Number(account.initial_stake),
+          stakeStep: Number(account.stake_step),
+          maxStake: Number(account.max_stake),
+          grossPayoutMultiplier: Number(account.gross_payout_multiplier),
+          payoutIncludesStake: Boolean(account.payout_includes_stake),
+        },
+      });
+      const ladderMissCountAfter = settlement.outcome === "hit"
+        ? 0
+        : Number(account.ladder_miss_count) + settlement.ladderMissCountDelta;
+      const exhausted = settlement.outcome === "miss"
+        && settlement.nextStakeAfter > settlement.balanceAfter;
+      const betUpdate = this.sqlite
+        .prepare(`
+          UPDATE predictive_leader_account_bets
+          SET status = 'settled', round_result_id = ?, result_number = ?,
+            outcome = ?, gross_payout = ?, balance_after = ?,
+            ladder_loss_after = ?, ladder_miss_count_after = ?,
+            next_stake_after = ?, recovery_possible = ?, occurred_at = ?,
+            settled_at = ?, updated_at = ?
+          WHERE forecast_id = ? AND status = 'pending'
+        `)
+        .run(
+          Number(bet.settlement_result_id),
+          resultNumber,
+          settlement.outcome,
+          settlement.grossPayout,
+          settlement.balanceAfter,
+          settlement.ladderLossAfter,
+          ladderMissCountAfter,
+          settlement.nextStakeAfter,
+          settlement.recoveryPossible ? 1 : 0,
+          bet.result_occurred_at,
+          now,
+          now,
+          Number(bet.forecast_id),
+        );
+      if (Number(betUpdate.changes) !== 1) {
+        throw new Error("predictive leader account bet was not settled exactly once");
+      }
+      const accountUpdate = this.sqlite
+        .prepare(`
+          UPDATE predictive_leader_accounts
+          SET status = ?, current_balance = ?, next_stake = ?,
+            ladder_miss_count = ?, ladder_total_loss = ?,
+            pending_forecast_id = NULL, updated_at = ?, exhausted_at = ?
+          WHERE source = ? AND instrument = ? AND status = 'running'
+            AND pending_forecast_id = ?
+        `)
+        .run(
+          exhausted ? "exhausted" : "running",
+          settlement.balanceAfter,
+          settlement.nextStakeAfter,
+          ladderMissCountAfter,
+          settlement.ladderLossAfter,
+          now,
+          exhausted ? bet.result_occurred_at : null,
+          safeSource,
+          safeInstrument,
+          Number(bet.forecast_id),
+        );
+      if (Number(accountUpdate.changes) !== 1) {
+        throw new Error("predictive leader account was not updated exactly once");
+      }
+      return { settled: 1 };
+    });
   }
 
   settlePrecloseForecasts(source = "buleto", instrument = "default") {
@@ -9760,6 +10277,258 @@ export class RouletteDatabase {
       }
       return { settled: inserted };
     });
+  }
+
+  #predictiveLeaderAccountState(source, instrument) {
+    const base = {
+      schemaVersion: PREDICTIVE_LEADER_ACCOUNT_SCHEMA_VERSION,
+      strategyVersion: PREDICTIVE_LEADER_ACCOUNT_STRATEGY_VERSION,
+      leaderAlgorithmVersion: LEARNED_LEADER_ALGORITHM_VERSION,
+      mode: "prospective-simulation",
+      executionEnabled: false,
+      advisoryOnly: true,
+      status: "waiting",
+      reason: "waiting_first_frozen_leader",
+      initialBalance: PREDICTIVE_LEADER_ACCOUNT_STARTING_BALANCE,
+      currentBalance: PREDICTIVE_LEADER_ACCOUNT_STARTING_BALANCE,
+      profit: 0,
+      model: {
+        ...PREDICTIVE_LEADER_ACCOUNT_MODEL,
+        netHitMultiplier: PREDICTIVE_LEADER_ACCOUNT_MODEL.grossPayoutMultiplier
+          - Number(PREDICTIVE_LEADER_ACCOUNT_MODEL.payoutIncludesStake),
+      },
+      nextStake: nextPredictiveLeaderStake(0),
+      canAffordNext: true,
+      shortfall: 0,
+      betCount: 0,
+      settledCount: 0,
+      pendingCount: 0,
+      hitCount: 0,
+      missCount: 0,
+      hitRate: null,
+      totalStaked: 0,
+      totalGrossPayout: 0,
+      peakBalance: PREDICTIVE_LEADER_ACCOUNT_STARTING_BALANCE,
+      minimumBalance: PREDICTIVE_LEADER_ACCOUNT_STARTING_BALANCE,
+      maximumDrawdown: 0,
+      continuityGapCount: 0,
+      ladder: { missCount: 0, totalLoss: 0 },
+      pendingBet: null,
+      latestOutcome: null,
+      startedAt: null,
+      updatedAt: null,
+      exhaustedAt: null,
+    };
+    const account = this.sqlite
+      .prepare(`
+        SELECT *
+        FROM predictive_leader_accounts
+        WHERE source = ? AND instrument = ?
+      `)
+      .get(source, instrument);
+    if (!account) return base;
+    if (
+      Number(account.schema_version) !== PREDICTIVE_LEADER_ACCOUNT_SCHEMA_VERSION
+      || account.strategy_version !== PREDICTIVE_LEADER_ACCOUNT_STRATEGY_VERSION
+      || account.leader_algorithm_version !== LEARNED_LEADER_ALGORITHM_VERSION
+      || Number(account.initial_balance) !== PREDICTIVE_LEADER_ACCOUNT_STARTING_BALANCE
+      || Number(account.initial_stake) !== PREDICTIVE_LEADER_ACCOUNT_MODEL.initialStake
+      || Number(account.stake_step) !== PREDICTIVE_LEADER_ACCOUNT_MODEL.stakeStep
+      || Number(account.max_stake) !== PREDICTIVE_LEADER_ACCOUNT_MODEL.maxStake
+      || Number(account.gross_payout_multiplier)
+        !== PREDICTIVE_LEADER_ACCOUNT_MODEL.grossPayoutMultiplier
+      || Boolean(account.payout_includes_stake)
+        !== PREDICTIVE_LEADER_ACCOUNT_MODEL.payoutIncludesStake
+      || !["running", "exhausted"].includes(account.status)
+    ) {
+      return null;
+    }
+    const rows = this.sqlite
+      .prepare(`
+        SELECT *
+        FROM predictive_leader_account_bets
+        WHERE source = ? AND instrument = ?
+        ORDER BY forecast_id
+      `)
+      .all(source, instrument);
+    let balance = PREDICTIVE_LEADER_ACCOUNT_STARTING_BALANCE;
+    let peakBalance = balance;
+    let minimumBalance = balance;
+    let maximumDrawdown = 0;
+    let totalStaked = 0;
+    let totalGrossPayout = 0;
+    let hitCount = 0;
+    let missCount = 0;
+    let ladderMissCount = 0;
+    let ladderTotalLoss = 0;
+    let lastContinuityEpoch = null;
+    let continuityGapCount = 0;
+    let pendingBet = null;
+    let latestOutcome = null;
+    for (const row of rows) {
+      const stake = Number(row.stake);
+      const continuityEpoch = row.continuity_epoch === null
+        ? null
+        : Number(row.continuity_epoch);
+      if (
+        continuityEpoch !== null
+        && (!Number.isSafeInteger(continuityEpoch) || continuityEpoch < 0)
+      ) {
+        return null;
+      }
+      if (
+        lastContinuityEpoch !== null
+        && continuityEpoch !== null
+        && continuityEpoch !== lastContinuityEpoch
+      ) {
+        ladderMissCount = 0;
+        ladderTotalLoss = 0;
+        continuityGapCount += 1;
+      }
+      if (
+        Number(row.schema_version) !== PREDICTIVE_LEADER_ACCOUNT_SCHEMA_VERSION
+        || row.strategy_version !== PREDICTIVE_LEADER_ACCOUNT_STRATEGY_VERSION
+        || row.leader_algorithm_version !== LEARNED_LEADER_ALGORITHM_VERSION
+        || !Number.isSafeInteger(stake)
+        || stake < PREDICTIVE_LEADER_ACCOUNT_MODEL.initialStake
+        || stake > PREDICTIVE_LEADER_ACCOUNT_MODEL.maxStake
+        || stake % PREDICTIVE_LEADER_ACCOUNT_MODEL.stakeStep !== 0
+        || Number(row.balance_before) !== balance
+        || Number(row.ladder_loss_before) !== ladderTotalLoss
+        || Number(row.ladder_miss_count_before) !== ladderMissCount
+        || stake !== nextPredictiveLeaderStake(ladderTotalLoss)
+      ) {
+        return null;
+      }
+      lastContinuityEpoch = continuityEpoch;
+      if (row.status === "pending") {
+        if (pendingBet || row.round_result_id !== null) return null;
+        pendingBet = {
+          forecastId: Number(row.forecast_id),
+          targetNumber: Number(row.target_number),
+          stake,
+          balanceBefore: balance,
+          placedAt: row.placed_at,
+        };
+        continue;
+      }
+      if (row.status !== "settled" || pendingBet) return null;
+      const expectedHit = Number(row.target_number) === Number(row.result_number);
+      let expectedSettlement;
+      try {
+        expectedSettlement = settlePredictiveLeaderBet({
+          targetNumber: Number(row.target_number),
+          resultNumber: Number(row.result_number),
+          stake,
+          balanceBefore: balance,
+          ladderLossBefore: ladderTotalLoss,
+          model: PREDICTIVE_LEADER_ACCOUNT_MODEL,
+        });
+      } catch {
+        return null;
+      }
+      const grossPayout = Number(row.gross_payout);
+      const balanceAfter = Number(row.balance_after);
+      const expectedLadderMissCount = expectedHit ? 0 : ladderMissCount + 1;
+      if (
+        !["hit", "miss"].includes(row.outcome)
+        || (row.outcome === "hit") !== expectedHit
+        || grossPayout !== expectedSettlement.grossPayout
+        || balanceAfter !== expectedSettlement.balanceAfter
+        || Number(row.ladder_loss_after) !== expectedSettlement.ladderLossAfter
+        || Number(row.ladder_miss_count_after) !== expectedLadderMissCount
+        || Number(row.next_stake_after) !== expectedSettlement.nextStakeAfter
+        || Boolean(row.recovery_possible) !== expectedSettlement.recoveryPossible
+      ) {
+        return null;
+      }
+      totalStaked += stake;
+      totalGrossPayout += grossPayout;
+      balance = balanceAfter;
+      ladderTotalLoss = expectedSettlement.ladderLossAfter;
+      ladderMissCount = expectedLadderMissCount;
+      hitCount += Number(expectedHit);
+      missCount += Number(!expectedHit);
+      peakBalance = Math.max(peakBalance, balance);
+      minimumBalance = Math.min(minimumBalance, balance);
+      maximumDrawdown = Math.max(maximumDrawdown, peakBalance - balance);
+      latestOutcome = {
+        forecastId: Number(row.forecast_id),
+        resultId: Number(row.round_result_id),
+        targetNumber: Number(row.target_number),
+        resultNumber: Number(row.result_number),
+        stake,
+        outcome: row.outcome,
+        grossPayout,
+        balanceAfter,
+        occurredAt: row.occurred_at,
+      };
+    }
+    const pendingId = account.pending_forecast_id === null
+      ? null
+      : Number(account.pending_forecast_id);
+    const settledCount = hitCount + missCount;
+    const nextStake = Number(account.next_stake);
+    const currentBalance = Number(account.current_balance);
+    const accountContinuityEpoch = account.last_continuity_epoch === null
+      ? null
+      : Number(account.last_continuity_epoch);
+    if (
+      currentBalance !== balance
+      || currentBalance
+        !== PREDICTIVE_LEADER_ACCOUNT_STARTING_BALANCE
+          - totalStaked + totalGrossPayout
+      || pendingId !== (pendingBet?.forecastId ?? null)
+      || rows.length !== settledCount + Number(pendingBet !== null)
+      || !Number.isSafeInteger(nextStake)
+      || Number(account.ladder_total_loss) !== ladderTotalLoss
+      || Number(account.ladder_miss_count) !== ladderMissCount
+      || nextStake !== nextPredictiveLeaderStake(ladderTotalLoss)
+      || accountContinuityEpoch !== lastContinuityEpoch
+      || Number(account.continuity_gap_count) !== continuityGapCount
+      || (account.status === "exhausted") !== (nextStake > currentBalance)
+    ) {
+      return null;
+    }
+    return {
+      ...base,
+      status: account.status === "exhausted"
+        ? "exhausted"
+        : pendingBet
+          ? "pending"
+          : "waiting",
+      reason: account.status === "exhausted"
+        ? "bankroll_exhausted"
+        : pendingBet
+          ? "bet_frozen"
+          : "waiting_next_frozen_leader",
+      currentBalance,
+      profit: currentBalance - PREDICTIVE_LEADER_ACCOUNT_STARTING_BALANCE,
+      nextStake,
+      canAffordNext: nextStake <= currentBalance,
+      shortfall: Math.max(0, nextStake - currentBalance),
+      betCount: rows.length,
+      settledCount,
+      pendingCount: Number(pendingBet !== null),
+      hitCount,
+      missCount,
+      hitRate: settledCount > 0 ? hitCount / settledCount : null,
+      totalStaked,
+      totalGrossPayout,
+      peakBalance,
+      minimumBalance,
+      maximumDrawdown,
+      continuityGapCount: Number(account.continuity_gap_count),
+      ladder: {
+        missCount: Number(account.ladder_miss_count),
+        totalLoss: Number(account.ladder_total_loss),
+      },
+      pendingBet,
+      latestOutcome,
+      startedAt: account.started_at,
+      updatedAt: account.updated_at,
+      exhaustedAt: account.exhausted_at,
+    };
   }
 
   getPrecloseForecastState(source = "buleto", instrument = "default") {
@@ -10100,6 +10869,10 @@ export class RouletteDatabase {
     const predictiveLeaderMetrics = mapPredictiveLeaderMetrics(
       predictiveLeaderRows,
     );
+    const predictiveLeaderAccount = this.#predictiveLeaderAccountState(
+      safeSource,
+      safeInstrument,
+    );
     return {
       mode: "observation",
       executionEnabled: false,
@@ -10108,6 +10881,7 @@ export class RouletteDatabase {
       latest,
       trajectoryMetrics,
       predictiveLeaderMetrics,
+      predictiveLeaderAccount,
       metrics: {
         forecastCount,
         settledCount,

@@ -401,7 +401,8 @@ h2 {
   overflow: hidden;
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
-  gap: clamp(24px, 5vw, 72px);
+  column-gap: clamp(24px, 5vw, 72px);
+  row-gap: 20px;
   background:
     radial-gradient(circle at 88% 50%, rgba(228, 189, 115, 0.12), transparent 22rem),
     linear-gradient(120deg, rgba(43, 196, 141, 0.045), transparent 48%),
@@ -482,6 +483,125 @@ h2 {
   font-size: 11px;
   font-weight: 650;
   text-align: center;
+}
+
+.combined-pick-account {
+  min-width: 0;
+  padding-top: 17px;
+  grid-column: 1 / -1;
+  border-top: 1px solid var(--border-soft);
+}
+
+.combined-pick-account__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.combined-pick-account__header .eyebrow {
+  margin: 0 0 3px;
+}
+
+.combined-pick-account__header h3 {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.35;
+}
+
+.combined-pick-account__status {
+  display: inline-flex;
+  min-height: 25px;
+  max-width: min(100%, 470px);
+  padding: 5px 9px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border-soft);
+  border-radius: 99px;
+  color: var(--muted-strong);
+  background: rgba(255, 255, 255, 0.025);
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 750;
+  line-height: 1.35;
+  text-align: center;
+}
+
+.combined-pick-account__metrics {
+  display: grid;
+  margin: 10px 0 0;
+  padding: 0;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 7px;
+}
+
+.combined-pick-account__metric {
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: 9px;
+  background: rgba(255, 255, 255, 0.018);
+}
+
+.combined-pick-account__metrics dt {
+  color: var(--muted);
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: 0.045em;
+  line-height: 1.35;
+  text-transform: uppercase;
+}
+
+.combined-pick-account__metrics dd {
+  margin: 5px 0 0;
+  color: var(--text);
+  font-size: clamp(16px, 1.8vw, 21px);
+  font-variant-numeric: tabular-nums;
+  font-weight: 800;
+  line-height: 1.1;
+}
+
+.combined-pick-account__metrics small {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 8px;
+  line-height: 1.4;
+}
+
+.combined-pick-account__metric.is-positive dd {
+  color: #7adbb8;
+}
+
+.combined-pick-account__metric.is-loss dd {
+  color: #df8b92;
+}
+
+.combined-pick-account__note {
+  margin: 9px 0 0;
+  color: #737d83;
+  font-size: 9px;
+  line-height: 1.5;
+}
+
+.combined-pick-account[data-state="pending"] .combined-pick-account__status {
+  border-color: rgba(43, 196, 141, 0.28);
+  color: #a4e7cd;
+  background: rgba(43, 196, 141, 0.08);
+}
+
+.combined-pick-account[data-state="waiting"] .combined-pick-account__status {
+  border-color: rgba(239, 173, 84, 0.24);
+  color: #e3c797;
+  background: rgba(239, 173, 84, 0.06);
+}
+
+.combined-pick-account[data-state="exhausted"] .combined-pick-account__status,
+.combined-pick-account[data-state="error"] .combined-pick-account__status,
+.combined-pick-account[data-state="unavailable"] .combined-pick-account__status {
+  border-color: rgba(232, 102, 102, 0.3);
+  color: #f2b0b0;
+  background: rgba(232, 102, 102, 0.08);
 }
 
 .panel__topline {
@@ -4409,6 +4529,10 @@ tbody tr:first-child {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
+  .combined-pick-account__metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .follower-warm-picks {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -4592,7 +4716,8 @@ tbody tr:first-child {
   .follower-dynamic-next__header,
   .follower-warm-current__heading,
   .follower-warm-account__header,
-  .follower-live-account__header {
+  .follower-live-account__header,
+  .combined-pick-account__header {
     flex-direction: column;
     gap: 7px;
   }
@@ -4792,6 +4917,10 @@ tbody tr:first-child {
   .follower-live-account__metrics {
     grid-template-columns: minmax(0, 1fr);
   }
+
+  .combined-pick-account__metrics {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -4831,7 +4960,8 @@ tbody tr:first-child {
   .follower-warm-pick,
   .follower-warm-account,
   .follower-warm-account__metrics > div,
-  .follower-dynamic-next__metrics > div {
+  .follower-dynamic-next__metrics > div,
+  .combined-pick-account__metric {
     border-color: var(--border);
   }
 }

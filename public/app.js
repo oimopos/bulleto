@@ -35,6 +35,17 @@ import {
   const LEARNED_LEADER_FAMILIES = ["price", "conditional-history"];
   const LEARNED_LEADER_MINIMUM_ADAPTIVE_COUNT = 30;
   const LEARNED_LEADER_SUM_TOLERANCE = 1e-9;
+  const PREDICTIVE_LEADER_ACCOUNT_SCHEMA_VERSION = 1;
+  const PREDICTIVE_LEADER_ACCOUNT_STRATEGY_VERSION = "predictive-leader-single-ladder-v1";
+  const PREDICTIVE_LEADER_ACCOUNT_STARTING_BALANCE = 1_000;
+  const PREDICTIVE_LEADER_ACCOUNT_MODEL = Object.freeze({
+    initialStake: 10,
+    stakeStep: 10,
+    maxStake: 2_500,
+    grossPayoutMultiplier: 36,
+    payoutIncludesStake: true,
+    netHitMultiplier: 35,
+  });
   const TRAJECTORY_SHADOW_DIRECTION_LABELS = Object.freeze({
     up: "вверх",
     down: "вниз",
@@ -59,6 +70,18 @@ import {
     combinedPickNumber: document.getElementById("combined-pick-number"),
     combinedPickStatus: document.getElementById("combined-pick-status"),
     combinedPickSources: document.getElementById("combined-pick-sources"),
+    combinedPickAccount: document.getElementById("combined-pick-account"),
+    combinedPickAccountStatus: document.getElementById("combined-pick-account-status"),
+    combinedPickAccountBalanceCard: document.getElementById("combined-pick-account-balance-card"),
+    combinedPickAccountBalance: document.getElementById("combined-pick-account-balance"),
+    combinedPickAccountProfit: document.getElementById("combined-pick-account-profit"),
+    combinedPickAccountRecord: document.getElementById("combined-pick-account-record"),
+    combinedPickAccountSettled: document.getElementById("combined-pick-account-settled"),
+    combinedPickAccountRate: document.getElementById("combined-pick-account-rate"),
+    combinedPickAccountRateDetail: document.getElementById("combined-pick-account-rate-detail"),
+    combinedPickAccountStakeLabel: document.getElementById("combined-pick-account-stake-label"),
+    combinedPickAccountStake: document.getElementById("combined-pick-account-stake"),
+    combinedPickAccountLadder: document.getElementById("combined-pick-account-ladder"),
     lastNumber: document.getElementById("last-number"),
     lastTime: document.getElementById("last-time"),
     lastPrice: document.getElementById("last-price"),
@@ -1264,6 +1287,7 @@ import {
 
   function renderFetchFailure() {
     renderCombinedPick();
+    renderPredictiveLeaderAccount();
     if (!store.hasCompletedInitialRender) {
       elements.resultsBody.replaceChildren(emptyTableRow("Не удалось загрузить результаты. Повторим попытку автоматически."));
       elements.cyclesList.replaceChildren(createElement("li", "empty-state", "Не удалось загрузить архив циклов."));
@@ -1298,6 +1322,7 @@ import {
     renderCollector(store.state?.collector);
     renderGapWarning(store.state);
     renderCombinedPick();
+    renderPredictiveLeaderAccount();
     renderLatestResult(latestResult);
     renderPrecloseForecast();
     renderForecastHitHistory();
@@ -2424,6 +2449,374 @@ import {
       uniformBrierLoss,
       beatsUniform,
     };
+  }
+
+  function isStrictSafeNonNegativeInteger(value) {
+    return Number.isSafeInteger(value) && value >= 0;
+  }
+
+  function isStrictRouletteNumber(value) {
+    return Number.isInteger(value) && value >= 0 && value <= 36;
+  }
+
+  function strictTimestamp(value) {
+    return typeof value === "string" && value.trim() !== "" ? parseDate(value) : null;
+  }
+
+  function normalizedPredictiveLeaderAccount(value) {
+    if (
+      !isPlainRecord(value)
+      || value.schemaVersion !== PREDICTIVE_LEADER_ACCOUNT_SCHEMA_VERSION
+      || value.strategyVersion !== PREDICTIVE_LEADER_ACCOUNT_STRATEGY_VERSION
+      || value.leaderAlgorithmVersion !== LEARNED_LEADER_ALGORITHM_VERSION
+      || value.mode !== "prospective-simulation"
+      || value.executionEnabled !== false
+      || value.advisoryOnly !== true
+      || value.initialBalance !== PREDICTIVE_LEADER_ACCOUNT_STARTING_BALANCE
+      || !isPlainRecord(value.model)
+      || value.model.initialStake !== PREDICTIVE_LEADER_ACCOUNT_MODEL.initialStake
+      || value.model.stakeStep !== PREDICTIVE_LEADER_ACCOUNT_MODEL.stakeStep
+      || value.model.maxStake !== PREDICTIVE_LEADER_ACCOUNT_MODEL.maxStake
+      || value.model.grossPayoutMultiplier
+        !== PREDICTIVE_LEADER_ACCOUNT_MODEL.grossPayoutMultiplier
+      || value.model.payoutIncludesStake
+        !== PREDICTIVE_LEADER_ACCOUNT_MODEL.payoutIncludesStake
+      || value.model.netHitMultiplier !== PREDICTIVE_LEADER_ACCOUNT_MODEL.netHitMultiplier
+      || !["waiting", "pending", "exhausted"].includes(value.status)
+    ) {
+      return null;
+    }
+
+    const expectedReason = {
+      waiting: ["waiting_first_frozen_leader", "waiting_next_frozen_leader"],
+      pending: ["bet_frozen"],
+      exhausted: ["bankroll_exhausted"],
+    }[value.status];
+    if (!expectedReason.includes(value.reason)) return null;
+
+    const nonNegativeIntegerFields = [
+      "currentBalance",
+      "nextStake",
+      "shortfall",
+      "betCount",
+      "settledCount",
+      "pendingCount",
+      "hitCount",
+      "missCount",
+      "totalStaked",
+      "totalGrossPayout",
+      "peakBalance",
+      "minimumBalance",
+      "maximumDrawdown",
+      "continuityGapCount",
+    ];
+    if (
+      nonNegativeIntegerFields.some((field) => !isStrictSafeNonNegativeInteger(value[field]))
+      || !Number.isSafeInteger(value.profit)
+      || typeof value.canAffordNext !== "boolean"
+      || value.nextStake < PREDICTIVE_LEADER_ACCOUNT_MODEL.initialStake
+      || value.nextStake > PREDICTIVE_LEADER_ACCOUNT_MODEL.maxStake
+      || value.nextStake % PREDICTIVE_LEADER_ACCOUNT_MODEL.stakeStep !== 0
+      || value.totalStaked % PREDICTIVE_LEADER_ACCOUNT_MODEL.stakeStep !== 0
+      || value.totalGrossPayout
+        % (PREDICTIVE_LEADER_ACCOUNT_MODEL.stakeStep
+          * PREDICTIVE_LEADER_ACCOUNT_MODEL.grossPayoutMultiplier) !== 0
+      || value.pendingCount > 1
+      || value.betCount !== value.settledCount + value.pendingCount
+      || value.settledCount !== value.hitCount + value.missCount
+    ) {
+      return null;
+    }
+
+    const computedBalance = value.initialBalance - value.totalStaked + value.totalGrossPayout;
+    if (
+      !Number.isSafeInteger(computedBalance)
+      || value.currentBalance !== computedBalance
+      || value.profit !== value.currentBalance - value.initialBalance
+      || value.canAffordNext !== (value.nextStake <= value.currentBalance)
+      || value.shortfall !== Math.max(0, value.nextStake - value.currentBalance)
+      || (value.status === "exhausted") !== !value.canAffordNext
+      || value.peakBalance < Math.max(value.initialBalance, value.currentBalance)
+      || value.minimumBalance > Math.min(value.initialBalance, value.currentBalance)
+      || value.maximumDrawdown < value.peakBalance - value.currentBalance
+      || value.maximumDrawdown > value.peakBalance - value.minimumBalance
+    ) {
+      return null;
+    }
+
+    if (
+      (value.settledCount === 0 && value.hitRate !== null)
+      || (value.settledCount > 0 && (
+        typeof value.hitRate !== "number"
+        || !Number.isFinite(value.hitRate)
+        || value.hitRate < 0
+        || value.hitRate > 1
+        || Math.abs(value.hitRate - value.hitCount / value.settledCount)
+          > LEARNED_LEADER_SUM_TOLERANCE
+      ))
+    ) {
+      return null;
+    }
+
+    if (
+      !isPlainRecord(value.ladder)
+      || !isStrictSafeNonNegativeInteger(value.ladder.missCount)
+      || !isStrictSafeNonNegativeInteger(value.ladder.totalLoss)
+      || value.ladder.totalLoss % PREDICTIVE_LEADER_ACCOUNT_MODEL.stakeStep !== 0
+      || (value.ladder.missCount === 0) !== (value.ladder.totalLoss === 0)
+      || value.ladder.missCount > value.missCount
+      || value.ladder.totalLoss > value.totalStaked
+      || value.ladder.totalLoss
+        < value.ladder.missCount * PREDICTIVE_LEADER_ACCOUNT_MODEL.initialStake
+    ) {
+      return null;
+    }
+
+    const requiredSteps = Math.max(
+      1,
+      Math.ceil(
+        value.ladder.totalLoss
+          / (PREDICTIVE_LEADER_ACCOUNT_MODEL.netHitMultiplier
+            * PREDICTIVE_LEADER_ACCOUNT_MODEL.stakeStep),
+      ),
+    );
+    const expectedNextStake = Math.min(
+      PREDICTIVE_LEADER_ACCOUNT_MODEL.maxStake,
+      Math.max(
+        PREDICTIVE_LEADER_ACCOUNT_MODEL.initialStake,
+        PREDICTIVE_LEADER_ACCOUNT_MODEL.stakeStep * requiredSteps,
+      ),
+    );
+    if (value.nextStake !== expectedNextStake) return null;
+
+    let pendingBet = null;
+    if (value.pendingBet !== null) {
+      const pendingPlacedAt = strictTimestamp(value.pendingBet?.placedAt);
+      if (
+        !isPlainRecord(value.pendingBet)
+        || !Number.isSafeInteger(value.pendingBet.forecastId)
+        || value.pendingBet.forecastId <= 0
+        || !isStrictRouletteNumber(value.pendingBet.targetNumber)
+        || !isStrictSafeNonNegativeInteger(value.pendingBet.stake)
+        || value.pendingBet.stake !== value.nextStake
+        || value.pendingBet.stake > value.currentBalance
+        || value.pendingBet.balanceBefore !== value.currentBalance
+        || !pendingPlacedAt
+      ) {
+        return null;
+      }
+      pendingBet = {
+        forecastId: value.pendingBet.forecastId,
+        targetNumber: value.pendingBet.targetNumber,
+        stake: value.pendingBet.stake,
+        balanceBefore: value.pendingBet.balanceBefore,
+        placedAt: value.pendingBet.placedAt,
+      };
+    }
+    if (
+      (value.status === "pending") !== (pendingBet !== null)
+      || value.pendingCount !== Number(pendingBet !== null)
+    ) {
+      return null;
+    }
+
+    let latestOutcome = null;
+    if (value.latestOutcome !== null) {
+      const occurredAt = strictTimestamp(value.latestOutcome?.occurredAt);
+      if (
+        !isPlainRecord(value.latestOutcome)
+        || !Number.isSafeInteger(value.latestOutcome.forecastId)
+        || value.latestOutcome.forecastId <= 0
+        || !Number.isSafeInteger(value.latestOutcome.resultId)
+        || value.latestOutcome.resultId <= 0
+        || !isStrictRouletteNumber(value.latestOutcome.targetNumber)
+        || !isStrictRouletteNumber(value.latestOutcome.resultNumber)
+        || !isStrictSafeNonNegativeInteger(value.latestOutcome.stake)
+        || value.latestOutcome.stake < PREDICTIVE_LEADER_ACCOUNT_MODEL.initialStake
+        || value.latestOutcome.stake > PREDICTIVE_LEADER_ACCOUNT_MODEL.maxStake
+        || value.latestOutcome.stake % PREDICTIVE_LEADER_ACCOUNT_MODEL.stakeStep !== 0
+        || !["hit", "miss"].includes(value.latestOutcome.outcome)
+        || (value.latestOutcome.outcome === "hit")
+          !== (value.latestOutcome.targetNumber === value.latestOutcome.resultNumber)
+        || value.latestOutcome.grossPayout !== (value.latestOutcome.outcome === "hit"
+          ? value.latestOutcome.stake * PREDICTIVE_LEADER_ACCOUNT_MODEL.grossPayoutMultiplier
+          : 0)
+        || value.latestOutcome.balanceAfter !== value.currentBalance
+        || !occurredAt
+      ) {
+        return null;
+      }
+      latestOutcome = { ...value.latestOutcome };
+    }
+    if ((value.settledCount > 0) !== (latestOutcome !== null)) return null;
+
+    const startedAt = strictTimestamp(value.startedAt);
+    const updatedAt = strictTimestamp(value.updatedAt);
+    const exhaustedAt = strictTimestamp(value.exhaustedAt);
+    const isWaitingForFirst = value.reason === "waiting_first_frozen_leader";
+    if (isWaitingForFirst) {
+      if (
+        value.betCount !== 0
+        || value.currentBalance !== value.initialBalance
+        || value.totalStaked !== 0
+        || value.totalGrossPayout !== 0
+        || value.peakBalance !== value.initialBalance
+        || value.minimumBalance !== value.initialBalance
+        || value.maximumDrawdown !== 0
+        || value.continuityGapCount !== 0
+        || value.startedAt !== null
+        || value.updatedAt !== null
+        || value.exhaustedAt !== null
+      ) {
+        return null;
+      }
+    } else if (
+      !startedAt
+      || !updatedAt
+      || startedAt.getTime() > updatedAt.getTime()
+      || (value.status === "exhausted") !== Boolean(exhaustedAt)
+      || (exhaustedAt && (
+        exhaustedAt.getTime() < startedAt.getTime()
+        || exhaustedAt.getTime() > updatedAt.getTime()
+      ))
+      || (pendingBet && (
+        strictTimestamp(pendingBet.placedAt).getTime() < startedAt.getTime()
+        || strictTimestamp(pendingBet.placedAt).getTime() > updatedAt.getTime()
+      ))
+      || (latestOutcome && (
+        strictTimestamp(latestOutcome.occurredAt).getTime() < startedAt.getTime()
+        || strictTimestamp(latestOutcome.occurredAt).getTime() > updatedAt.getTime()
+      ))
+    ) {
+      return null;
+    }
+    if (value.status !== "exhausted" && value.exhaustedAt !== null) return null;
+
+    return {
+      status: value.status,
+      reason: value.reason,
+      initialBalance: value.initialBalance,
+      currentBalance: value.currentBalance,
+      profit: value.profit,
+      model: { ...PREDICTIVE_LEADER_ACCOUNT_MODEL },
+      nextStake: value.nextStake,
+      canAffordNext: value.canAffordNext,
+      shortfall: value.shortfall,
+      betCount: value.betCount,
+      settledCount: value.settledCount,
+      pendingCount: value.pendingCount,
+      hitCount: value.hitCount,
+      missCount: value.missCount,
+      hitRate: value.hitRate,
+      totalStaked: value.totalStaked,
+      totalGrossPayout: value.totalGrossPayout,
+      maximumDrawdown: value.maximumDrawdown,
+      continuityGapCount: value.continuityGapCount,
+      ladder: {
+        missCount: value.ladder.missCount,
+        totalLoss: value.ladder.totalLoss,
+      },
+      pendingBet,
+      latestOutcome,
+    };
+  }
+
+  function currentPredictiveLeaderAccountContext() {
+    if (!store.stateLoaded) return { state: "loading" };
+    if (store.stateError || !store.state) return { state: "error" };
+    const account = normalizedPredictiveLeaderAccount(
+      store.state.precloseForecast?.predictiveLeaderAccount,
+    );
+    return account ? { state: "ready", account } : { state: "unavailable" };
+  }
+
+  function renderPredictiveLeaderAccount() {
+    const context = currentPredictiveLeaderAccountContext();
+    elements.combinedPickAccountBalanceCard.classList.remove("is-positive", "is-loss");
+
+    if (context.state !== "ready") {
+      const messages = {
+        loading: "Загрузка…",
+        error: "Свежий снимок счёта недоступен",
+        unavailable: "Контракт счёта не подтверждён",
+      };
+      elements.combinedPickAccount.dataset.state = context.state;
+      elements.combinedPickAccount.setAttribute("aria-busy", String(context.state === "loading"));
+      setTextIfChanged(
+        elements.combinedPickAccountStatus,
+        messages[context.state] || messages.unavailable,
+      );
+      setTextIfChanged(elements.combinedPickAccountBalance, "—");
+      setTextIfChanged(elements.combinedPickAccountProfit, "старт 1 000 · результат —");
+      setTextIfChanged(elements.combinedPickAccountRecord, "— / —");
+      setTextIfChanged(elements.combinedPickAccountSettled, "завершено —");
+      setTextIfChanged(elements.combinedPickAccountRate, "—");
+      setTextIfChanged(
+        elements.combinedPickAccountRateDetail,
+        "по завершённым · не вероятность; база 1/37 ≈2,7%",
+      );
+      setTextIfChanged(elements.combinedPickAccountStakeLabel, "Следующая ставка");
+      setTextIfChanged(elements.combinedPickAccountStake, "—");
+      setTextIfChanged(elements.combinedPickAccountLadder, "ступень — · серия —");
+      return;
+    }
+
+    const { account } = context;
+    elements.combinedPickAccount.dataset.state = account.status;
+    elements.combinedPickAccount.setAttribute("aria-busy", "false");
+    const statusText = account.status === "pending"
+      ? `Условная ставка ${formatRiskAmount(account.pendingBet.stake)} на число ${account.pendingBet.targetNumber} зафиксирована до результата`
+      : account.status === "exhausted"
+        ? `Стоп · не хватает ${formatRiskAmount(account.shortfall)}`
+        : account.reason === "waiting_first_frozen_leader"
+          ? "Пока без завершённых прогнозов"
+          : "Рассчитан · ждём следующий зафиксированный лидер";
+    setTextIfChanged(elements.combinedPickAccountStatus, statusText);
+    setTextIfChanged(
+      elements.combinedPickAccountBalance,
+      formatRiskAmount(account.currentBalance),
+    );
+    setTextIfChanged(
+      elements.combinedPickAccountProfit,
+      `старт ${formatRiskAmount(account.initialBalance)} · результат ${formatSignedRiskAmount(account.profit)}`,
+    );
+    if (account.profit > 0) elements.combinedPickAccountBalanceCard.classList.add("is-positive");
+    if (account.profit < 0) elements.combinedPickAccountBalanceCard.classList.add("is-loss");
+
+    setTextIfChanged(
+      elements.combinedPickAccountRecord,
+      `${formatRiskAmount(account.hitCount)} / ${formatRiskAmount(account.missCount)}`,
+    );
+    const pendingText = account.pendingCount === 1 ? " · 1 ждёт результата" : "";
+    setTextIfChanged(
+      elements.combinedPickAccountSettled,
+      `${formatRiskAmount(account.settledCount)} ${pluralForm(account.settledCount, "завершён", "завершено", "завершено")}${pendingText}`,
+    );
+    setTextIfChanged(
+      elements.combinedPickAccountRate,
+      account.hitRate === null ? "—" : trajectoryShadowShareFormatter.format(account.hitRate),
+    );
+    setTextIfChanged(
+      elements.combinedPickAccountRateDetail,
+      account.settledCount > 0
+        ? `${formatRiskAmount(account.hitCount)} из ${formatRiskAmount(account.settledCount)} · не вероятность; база 1/37 ≈2,7%`
+        : "нет завершённых · не вероятность; база 1/37 ≈2,7%",
+    );
+
+    setTextIfChanged(
+      elements.combinedPickAccountStakeLabel,
+      account.status === "pending"
+        ? "Текущая ставка"
+        : account.status === "exhausted"
+          ? "Требуемая ставка"
+          : "Следующая ставка",
+    );
+    setTextIfChanged(elements.combinedPickAccountStake, formatRiskAmount(account.nextStake));
+    const ladderLevel = account.nextStake / account.model.stakeStep;
+    setTextIfChanged(
+      elements.combinedPickAccountLadder,
+      `ступень №${formatRiskAmount(ladderLevel)} · серия ${formatRiskAmount(account.ladder.missCount)} ${pluralForm(account.ladder.missCount, "промах", "промаха", "промахов")} · накоплено ${formatRiskAmount(account.ladder.totalLoss)}`,
+    );
   }
 
   function currentPriceTrajectorySignals(latestForecast) {
