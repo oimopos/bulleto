@@ -4029,6 +4029,7 @@ export class RouletteDatabase {
     this.#migrateRoundTrajectoriesV15();
     this.#migratePredictiveLeaderSnapshotsV16();
     this.#migratePredictiveLeaderAccountV17();
+    this.#migratePredictiveLeaderAccountVoidV18();
   }
 
   #migratePrecloseForecastsV10() {
@@ -4746,7 +4747,7 @@ export class RouletteDatabase {
         ladder_miss_count_before INTEGER NOT NULL CHECK (
           ladder_miss_count_before >= 0
         ),
-        status TEXT NOT NULL CHECK (status IN ('pending', 'settled')),
+        status TEXT NOT NULL CHECK (status IN ('pending', 'settled', 'void')),
         round_result_id INTEGER UNIQUE REFERENCES round_results(id),
         result_number INTEGER CHECK (
           result_number IS NULL OR result_number BETWEEN 0 AND 36
@@ -4771,6 +4772,14 @@ export class RouletteDatabase {
         placed_at TEXT NOT NULL,
         occurred_at TEXT,
         settled_at TEXT,
+        void_reason TEXT CHECK (
+          void_reason IS NULL OR void_reason = 'integrity_gap'
+        ),
+        void_incident_id INTEGER UNIQUE REFERENCES incidents(id),
+        void_continuity_epoch INTEGER CHECK (
+          void_continuity_epoch IS NULL OR void_continuity_epoch >= 0
+        ),
+        voided_at TEXT,
         updated_at TEXT NOT NULL,
         CHECK (
           (status = 'pending' AND round_result_id IS NULL
@@ -4778,7 +4787,9 @@ export class RouletteDatabase {
             AND gross_payout IS NULL AND balance_after IS NULL
             AND ladder_loss_after IS NULL AND ladder_miss_count_after IS NULL
             AND next_stake_after IS NULL AND recovery_possible IS NULL
-            AND occurred_at IS NULL AND settled_at IS NULL)
+            AND occurred_at IS NULL AND settled_at IS NULL
+            AND void_reason IS NULL AND void_incident_id IS NULL
+            AND void_continuity_epoch IS NULL AND voided_at IS NULL)
           OR
           (status = 'settled' AND round_result_id IS NOT NULL
             AND result_number IS NOT NULL AND outcome IS NOT NULL
@@ -4788,14 +4799,26 @@ export class RouletteDatabase {
             AND next_stake_after IS NOT NULL
             AND recovery_possible IS NOT NULL
             AND occurred_at IS NOT NULL AND settled_at IS NOT NULL
+            AND void_reason IS NULL AND void_incident_id IS NULL
+            AND void_continuity_epoch IS NULL AND voided_at IS NULL
             AND placed_at <= occurred_at AND occurred_at <= settled_at)
+          OR
+          (status = 'void' AND round_result_id IS NULL
+            AND result_number IS NULL AND outcome IS NULL
+            AND gross_payout IS NULL AND balance_after IS NULL
+            AND ladder_loss_after IS NULL AND ladder_miss_count_after IS NULL
+            AND next_stake_after IS NULL AND recovery_possible IS NULL
+            AND occurred_at IS NULL AND settled_at IS NULL
+            AND void_reason = 'integrity_gap' AND void_incident_id IS NOT NULL
+            AND void_continuity_epoch IS NOT NULL AND voided_at IS NOT NULL
+            AND placed_at <= voided_at)
         ),
         CHECK (
-          status = 'pending'
+          status <> 'settled'
           OR balance_after = balance_before - stake + gross_payout
         ),
         CHECK (
-          status = 'pending'
+          status <> 'settled'
           OR (outcome = 'hit' AND result_number = target_number
             AND gross_payout = stake * 36
             AND ladder_loss_after = 0 AND ladder_miss_count_after = 0)
@@ -4815,6 +4838,176 @@ export class RouletteDatabase {
       PRAGMA user_version = 17;
       COMMIT;
     `);
+  }
+
+  #migratePredictiveLeaderAccountVoidV18() {
+    const columns = this.sqlite
+      .prepare("PRAGMA table_info(predictive_leader_account_bets)")
+      .all();
+    if (columns.some((column) => column.name === "void_incident_id")) {
+      this.sqlite.exec("PRAGMA user_version = 18");
+      return;
+    }
+
+    const priorCount = Number(
+      this.sqlite
+        .prepare("SELECT COUNT(*) AS count FROM predictive_leader_account_bets")
+        .get().count,
+    );
+    this.sqlite.exec("BEGIN IMMEDIATE");
+    try {
+      this.sqlite.exec(`
+        DROP TABLE IF EXISTS predictive_leader_account_bets_v18;
+        CREATE TABLE predictive_leader_account_bets_v18 (
+          forecast_id INTEGER PRIMARY KEY REFERENCES
+            forecast_predictive_leader_snapshots(forecast_id),
+          source TEXT NOT NULL,
+          instrument TEXT NOT NULL,
+          schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+          strategy_version TEXT NOT NULL CHECK (length(trim(strategy_version)) > 0),
+          leader_algorithm_version TEXT NOT NULL CHECK (
+            length(trim(leader_algorithm_version)) > 0
+          ),
+          continuity_epoch INTEGER CHECK (
+            continuity_epoch IS NULL OR continuity_epoch >= 0
+          ),
+          target_number INTEGER NOT NULL CHECK (target_number BETWEEN 0 AND 36),
+          stake INTEGER NOT NULL CHECK (
+            stake > 0 AND stake <= 2500 AND stake % 10 = 0
+          ),
+          balance_before INTEGER NOT NULL CHECK (balance_before >= stake),
+          ladder_loss_before INTEGER NOT NULL CHECK (
+            ladder_loss_before >= 0 AND ladder_loss_before % 10 = 0
+          ),
+          ladder_miss_count_before INTEGER NOT NULL CHECK (
+            ladder_miss_count_before >= 0
+          ),
+          status TEXT NOT NULL CHECK (status IN ('pending', 'settled', 'void')),
+          round_result_id INTEGER UNIQUE REFERENCES round_results(id),
+          result_number INTEGER CHECK (
+            result_number IS NULL OR result_number BETWEEN 0 AND 36
+          ),
+          outcome TEXT CHECK (outcome IS NULL OR outcome IN ('hit', 'miss')),
+          gross_payout INTEGER CHECK (gross_payout IS NULL OR gross_payout >= 0),
+          balance_after INTEGER CHECK (balance_after IS NULL OR balance_after >= 0),
+          ladder_loss_after INTEGER CHECK (
+            ladder_loss_after IS NULL OR ladder_loss_after >= 0
+          ),
+          ladder_miss_count_after INTEGER CHECK (
+            ladder_miss_count_after IS NULL OR ladder_miss_count_after >= 0
+          ),
+          next_stake_after INTEGER CHECK (
+            next_stake_after IS NULL
+            OR (next_stake_after > 0 AND next_stake_after <= 2500
+              AND next_stake_after % 10 = 0)
+          ),
+          recovery_possible INTEGER CHECK (
+            recovery_possible IS NULL OR recovery_possible IN (0, 1)
+          ),
+          placed_at TEXT NOT NULL,
+          occurred_at TEXT,
+          settled_at TEXT,
+          void_reason TEXT CHECK (
+            void_reason IS NULL OR void_reason = 'integrity_gap'
+          ),
+          void_incident_id INTEGER UNIQUE REFERENCES incidents(id),
+          void_continuity_epoch INTEGER CHECK (
+            void_continuity_epoch IS NULL OR void_continuity_epoch >= 0
+          ),
+          voided_at TEXT,
+          updated_at TEXT NOT NULL,
+          CHECK (
+            (status = 'pending' AND round_result_id IS NULL
+              AND result_number IS NULL AND outcome IS NULL
+              AND gross_payout IS NULL AND balance_after IS NULL
+              AND ladder_loss_after IS NULL AND ladder_miss_count_after IS NULL
+              AND next_stake_after IS NULL AND recovery_possible IS NULL
+              AND occurred_at IS NULL AND settled_at IS NULL
+              AND void_reason IS NULL AND void_incident_id IS NULL
+              AND void_continuity_epoch IS NULL AND voided_at IS NULL)
+            OR
+            (status = 'settled' AND round_result_id IS NOT NULL
+              AND result_number IS NOT NULL AND outcome IS NOT NULL
+              AND gross_payout IS NOT NULL AND balance_after IS NOT NULL
+              AND ladder_loss_after IS NOT NULL
+              AND ladder_miss_count_after IS NOT NULL
+              AND next_stake_after IS NOT NULL
+              AND recovery_possible IS NOT NULL
+              AND occurred_at IS NOT NULL AND settled_at IS NOT NULL
+              AND void_reason IS NULL AND void_incident_id IS NULL
+              AND void_continuity_epoch IS NULL AND voided_at IS NULL
+              AND placed_at <= occurred_at AND occurred_at <= settled_at)
+            OR
+            (status = 'void' AND round_result_id IS NULL
+              AND result_number IS NULL AND outcome IS NULL
+              AND gross_payout IS NULL AND balance_after IS NULL
+              AND ladder_loss_after IS NULL AND ladder_miss_count_after IS NULL
+              AND next_stake_after IS NULL AND recovery_possible IS NULL
+              AND occurred_at IS NULL AND settled_at IS NULL
+              AND void_reason = 'integrity_gap' AND void_incident_id IS NOT NULL
+              AND void_continuity_epoch IS NOT NULL AND voided_at IS NOT NULL
+              AND placed_at <= voided_at)
+          ),
+          CHECK (
+            status <> 'settled'
+            OR balance_after = balance_before - stake + gross_payout
+          ),
+          CHECK (
+            status <> 'settled'
+            OR (outcome = 'hit' AND result_number = target_number
+              AND gross_payout = stake * 36
+              AND ladder_loss_after = 0 AND ladder_miss_count_after = 0)
+            OR (outcome = 'miss' AND result_number != target_number
+              AND gross_payout = 0
+              AND ladder_loss_after = ladder_loss_before + stake
+              AND ladder_miss_count_after = ladder_miss_count_before + 1)
+          )
+        );
+      `);
+      const copy = this.sqlite.prepare(`
+        INSERT INTO predictive_leader_account_bets_v18 (
+          forecast_id, source, instrument, schema_version, strategy_version,
+          leader_algorithm_version, continuity_epoch, target_number, stake,
+          balance_before, ladder_loss_before, ladder_miss_count_before,
+          status, round_result_id, result_number, outcome, gross_payout,
+          balance_after, ladder_loss_after, ladder_miss_count_after,
+          next_stake_after, recovery_possible, placed_at, occurred_at,
+          settled_at, void_reason, void_incident_id, void_continuity_epoch,
+          voided_at, updated_at
+        )
+        SELECT
+          forecast_id, source, instrument, schema_version, strategy_version,
+          leader_algorithm_version, continuity_epoch, target_number, stake,
+          balance_before, ladder_loss_before, ladder_miss_count_before,
+          status, round_result_id, result_number, outcome, gross_payout,
+          balance_after, ladder_loss_after, ladder_miss_count_after,
+          next_stake_after, recovery_possible, placed_at, occurred_at,
+          settled_at, NULL, NULL, NULL, NULL, updated_at
+        FROM predictive_leader_account_bets
+      `).run();
+      if (Number(copy.changes) !== priorCount) {
+        throw new Error("predictive leader account v18 migration lost bet rows");
+      }
+      this.sqlite.exec(`
+        DROP TABLE predictive_leader_account_bets;
+        ALTER TABLE predictive_leader_account_bets_v18
+          RENAME TO predictive_leader_account_bets;
+        CREATE INDEX predictive_leader_account_bets_stream_idx
+          ON predictive_leader_account_bets(source, instrument, forecast_id);
+        CREATE UNIQUE INDEX predictive_leader_account_pending_idx
+          ON predictive_leader_account_bets(source, instrument)
+          WHERE status = 'pending';
+        PRAGMA user_version = 18;
+        COMMIT;
+      `);
+    } catch (error) {
+      try {
+        this.sqlite.exec("ROLLBACK");
+      } catch {
+        // Preserve the migration error.
+      }
+      throw error;
+    }
   }
 
   #migrateContinuityReconciliationV9() {
@@ -6653,7 +6846,11 @@ export class RouletteDatabase {
     };
   }
 
-  #markGapInTransaction(incident, now) {
+  #markGapInTransaction(
+    incident,
+    now,
+    { deferPredictiveLeaderVoid = false } = {},
+  ) {
     if (incident.incidentKey !== null) {
       const existing = this.sqlite
         .prepare(`
@@ -6663,10 +6860,24 @@ export class RouletteDatabase {
         `)
         .get(incident.source, incident.instrument, incident.incidentKey);
       if (existing) {
+        const continuityEpoch = this.#continuityEpoch(
+          incident.source,
+          incident.instrument,
+        );
         return {
           row: existing,
           cycleId: existing.cycle_id == null ? null : Number(existing.cycle_id),
           duplicate: true,
+          continuityEpoch,
+          predictiveLeaderVoid: deferPredictiveLeaderVoid
+            ? null
+            : this.#voidPredictiveLeaderPendingBetForGapInTransaction({
+                source: incident.source,
+                instrument: incident.instrument,
+                incidentId: Number(existing.id),
+                continuityEpoch,
+                voidedAt: now,
+              }),
         };
       }
     }
@@ -6725,13 +6936,23 @@ export class RouletteDatabase {
       incident.source,
       incident.instrument,
     );
+    const incidentId = Number(insertion.lastInsertRowid);
     return {
       row: this.sqlite
         .prepare("SELECT * FROM incidents WHERE id = ?")
-        .get(Number(insertion.lastInsertRowid)),
+        .get(incidentId),
       cycleId,
       duplicate: false,
       continuityEpoch,
+      predictiveLeaderVoid: deferPredictiveLeaderVoid
+        ? null
+        : this.#voidPredictiveLeaderPendingBetForGapInTransaction({
+            source: incident.source,
+            instrument: incident.instrument,
+            incidentId,
+            continuityEpoch,
+            voidedAt: now,
+          }),
     };
   }
 
@@ -6796,11 +7017,15 @@ export class RouletteDatabase {
         );
         const gapOutcomes = [];
         if (normalizedGap !== null) {
-          gapOutcomes.push(this.#markGapInTransaction(normalizedGap, now));
+          gapOutcomes.push(this.#markGapInTransaction(normalizedGap, now, {
+            deferPredictiveLeaderVoid: true,
+          }));
         } else {
           for (const group of historicalOutcome.missingGroups.values()) {
             gapOutcomes.push(
-              this.#markGapInTransaction(this.#lateHistoricalGap(group, now), now),
+              this.#markGapInTransaction(this.#lateHistoricalGap(group, now), now, {
+                deferPredictiveLeaderVoid: true,
+              }),
             );
           }
         }
@@ -7003,6 +7228,17 @@ export class RouletteDatabase {
         }
 
         this.#processFollowerTop5TrackerBatch(insertedResultRows, now);
+
+        for (const outcome of gapOutcomes) {
+          outcome.predictiveLeaderVoid =
+            this.#voidPredictiveLeaderPendingBetForGapInTransaction({
+              source: outcome.row.source,
+              instrument: outcome.row.instrument,
+              incidentId: Number(outcome.row.id),
+              continuityEpoch: outcome.continuityEpoch,
+              voidedAt: now,
+            });
+        }
 
         return {
           received: events.length,
@@ -9003,6 +9239,219 @@ export class RouletteDatabase {
     return { learningRows, resultIdByForecastId };
   }
 
+  #predictiveLeaderPendingResultIsResolvable(
+    forecastId,
+    source,
+    instrument,
+  ) {
+    const forecast = this.sqlite
+      .prepare(`
+        SELECT
+          snapshots.external_round_id,
+          snapshots.round_ends_at,
+          settlements.forecast_id AS settlement_forecast_id
+        FROM round_forecasts AS forecasts
+        JOIN forecast_snapshots AS snapshots ON snapshots.id = forecasts.snapshot_id
+        LEFT JOIN forecast_settlements AS settlements
+          ON settlements.forecast_id = forecasts.id
+        WHERE forecasts.id = ?
+          AND snapshots.source = ?
+          AND snapshots.instrument = ?
+      `)
+      .get(forecastId, source, instrument);
+    if (!forecast) {
+      throw new Error("predictive leader pending forecast cursor is invalid");
+    }
+    if (forecast.settlement_forecast_id !== null) return true;
+
+    const exact = this.sqlite
+      .prepare(`
+        SELECT id
+        FROM round_results
+        WHERE source = ? AND instrument = ? AND external_round_id = ?
+        LIMIT 1
+      `)
+      .get(source, instrument, forecast.external_round_id);
+    if (exact) return true;
+
+    const expectedEndMs = Date.parse(forecast.round_ends_at);
+    if (!Number.isFinite(expectedEndMs)) return false;
+    const anonymous = this.sqlite
+      .prepare(`
+        SELECT id
+        FROM round_results
+        WHERE source = ?
+          AND instrument = ?
+          AND external_round_id IS NULL
+          AND settled_at >= ?
+          AND settled_at <= ?
+          AND NOT EXISTS (
+            SELECT 1
+            FROM forecast_settlements
+            WHERE forecast_settlements.round_result_id = round_results.id
+          )
+        ORDER BY settled_at, id
+        LIMIT 2
+      `)
+      .all(
+        source,
+        instrument,
+        new Date(expectedEndMs - 3_000).toISOString(),
+        new Date(expectedEndMs + 1_000).toISOString(),
+      );
+    if (anonymous.length !== 1) return false;
+    const unsettledAtEnd = Number(
+      this.sqlite
+        .prepare(`
+          SELECT COUNT(*) AS count
+          FROM round_forecasts AS forecasts
+          JOIN forecast_snapshots AS snapshots ON snapshots.id = forecasts.snapshot_id
+          LEFT JOIN forecast_settlements AS settlements
+            ON settlements.forecast_id = forecasts.id
+          WHERE snapshots.source = ?
+            AND snapshots.instrument = ?
+            AND snapshots.round_ends_at = ?
+            AND settlements.forecast_id IS NULL
+        `)
+        .get(source, instrument, forecast.round_ends_at).count,
+    );
+    return unsettledAtEnd === 1;
+  }
+
+  #voidPredictiveLeaderPendingBetForGapInTransaction({
+    source,
+    instrument,
+    incidentId,
+    continuityEpoch,
+    voidedAt,
+  }) {
+    const account = this.sqlite
+      .prepare(`
+        SELECT *
+        FROM predictive_leader_accounts
+        WHERE source = ? AND instrument = ?
+      `)
+      .get(source, instrument);
+    if (!account || account.pending_forecast_id === null) {
+      return { voided: 0, reason: "no_pending_bet" };
+    }
+    if (account.status !== "running") {
+      throw new Error("exhausted predictive leader account cannot have a pending bet");
+    }
+
+    const incident = this.sqlite
+      .prepare(`
+        SELECT *
+        FROM incidents
+        WHERE id = ? AND source = ? AND instrument = ? AND kind = 'gap'
+      `)
+      .get(incidentId, source, instrument);
+    if (!incident) {
+      throw new Error("predictive leader void incident cursor is invalid");
+    }
+    const nextEpoch = Number(continuityEpoch);
+    if (!Number.isSafeInteger(nextEpoch) || nextEpoch < 1) {
+      throw new Error("predictive leader void continuity cursor is invalid");
+    }
+
+    const bet = this.sqlite
+      .prepare(`
+        SELECT *
+        FROM predictive_leader_account_bets
+        WHERE forecast_id = ? AND source = ? AND instrument = ?
+          AND status = 'pending'
+      `)
+      .get(Number(account.pending_forecast_id), source, instrument);
+    if (!bet) {
+      throw new Error("predictive leader account pending pointer is invalid");
+    }
+    const betEpoch = bet.continuity_epoch === null
+      ? null
+      : Number(bet.continuity_epoch);
+    const incidentCreatedMs = Date.parse(incident.created_at);
+    const placedMs = Date.parse(bet.placed_at);
+    const staleAcrossGap = betEpoch === null
+      ? Number.isFinite(incidentCreatedMs)
+        && Number.isFinite(placedMs)
+        && placedMs <= incidentCreatedMs
+      : betEpoch < nextEpoch;
+    if (!staleAcrossGap) {
+      if (betEpoch !== null && betEpoch > nextEpoch) {
+        throw new Error("predictive leader pending bet is ahead of continuity");
+      }
+      return { voided: 0, reason: "pending_bet_after_gap" };
+    }
+    if (
+      this.#predictiveLeaderPendingResultIsResolvable(
+        Number(bet.forecast_id),
+        source,
+        instrument,
+      )
+    ) {
+      return { voided: 0, reason: "result_resolvable" };
+    }
+    if (
+      Number(bet.balance_before) !== Number(account.current_balance)
+      || Number(bet.ladder_loss_before) !== Number(account.ladder_total_loss)
+      || Number(bet.ladder_miss_count_before) !== Number(account.ladder_miss_count)
+      || Number(bet.stake) !== Number(account.next_stake)
+    ) {
+      throw new Error("predictive leader void ledger cursor is invalid");
+    }
+
+    const safeVoidedAt = asTimestamp(
+      voidedAt,
+      undefined,
+      "predictive leader account voidedAt",
+    );
+    if (Date.parse(safeVoidedAt) < placedMs) {
+      throw new Error("predictive leader bet cannot be voided before placement");
+    }
+    const betUpdate = this.sqlite
+      .prepare(`
+        UPDATE predictive_leader_account_bets
+        SET status = 'void', void_reason = 'integrity_gap',
+          void_incident_id = ?, void_continuity_epoch = ?, voided_at = ?,
+          updated_at = ?
+        WHERE forecast_id = ? AND status = 'pending'
+      `)
+      .run(
+        Number(incident.id),
+        nextEpoch,
+        safeVoidedAt,
+        safeVoidedAt,
+        Number(bet.forecast_id),
+      );
+    if (Number(betUpdate.changes) !== 1) {
+      throw new Error("predictive leader account bet was not voided exactly once");
+    }
+    const accountUpdate = this.sqlite
+      .prepare(`
+        UPDATE predictive_leader_accounts
+        SET pending_forecast_id = NULL, next_stake = ?, ladder_miss_count = 0,
+          ladder_total_loss = 0, last_continuity_epoch = ?,
+          continuity_gap_count = continuity_gap_count + 1, updated_at = ?
+        WHERE source = ? AND instrument = ? AND status = 'running'
+          AND pending_forecast_id = ?
+      `)
+      .run(
+        nextPredictiveLeaderStake(0),
+        nextEpoch,
+        safeVoidedAt,
+        source,
+        instrument,
+        Number(bet.forecast_id),
+      );
+    if (Number(accountUpdate.changes) !== 1) {
+      throw new Error("predictive leader account was not released after void");
+    }
+    return {
+      voided: 1,
+      reason: "integrity_gap",
+      forecastId: Number(bet.forecast_id),
+    };
+  }
+
   #placePredictiveLeaderAccountBetInTransaction({
     forecastId,
     source,
@@ -9084,7 +9533,7 @@ export class RouletteDatabase {
     if (historyMaxResultId !== null && !historyRow) {
       throw new Error("predictive leader account history cursor is invalid");
     }
-    const continuityEpoch = historyRow ? Number(historyRow.continuity_epoch) : null;
+    const continuityEpoch = this.#continuityEpoch(source, instrument);
     let ladderMissCount = Number(account.ladder_miss_count);
     let ladderTotalLoss = Number(account.ladder_total_loss);
     let nextStake = Number(account.next_stake);
@@ -10164,6 +10613,171 @@ export class RouletteDatabase {
     });
   }
 
+  reconcilePredictiveLeaderAccount(source = "buleto", instrument = "default") {
+    this.#assertOpen();
+    const safeSource = asNonEmptyText(source, undefined, "source");
+    const safeInstrument = asNonEmptyText(instrument, undefined, "instrument");
+    const now = asTimestamp(
+      this.clock(),
+      undefined,
+      "predictive leader account reconciledAt",
+    );
+    return this.#transaction(() => {
+      const account = this.sqlite
+        .prepare(`
+          SELECT *
+          FROM predictive_leader_accounts
+          WHERE source = ? AND instrument = ?
+        `)
+        .get(safeSource, safeInstrument);
+      let voidOutcome = { voided: 0, reason: "no_pending_bet" };
+      if (account?.pending_forecast_id !== null && account?.pending_forecast_id !== undefined) {
+        const currentEpoch = this.#continuityEpoch(safeSource, safeInstrument);
+        const bet = this.sqlite
+          .prepare(`
+            SELECT continuity_epoch
+            FROM predictive_leader_account_bets
+            WHERE forecast_id = ? AND status = 'pending'
+          `)
+          .get(Number(account.pending_forecast_id));
+        if (!bet) {
+          throw new Error("predictive leader account pending pointer is invalid");
+        }
+        const betEpoch = bet.continuity_epoch === null
+          ? null
+          : Number(bet.continuity_epoch);
+        if (betEpoch === null || betEpoch < currentEpoch) {
+          const incident = this.sqlite
+            .prepare(`
+              SELECT id
+              FROM incidents
+              WHERE source = ? AND instrument = ? AND kind = 'gap'
+              ORDER BY id DESC
+              LIMIT 1
+            `)
+            .get(safeSource, safeInstrument);
+          if (incident) {
+            voidOutcome = this.#voidPredictiveLeaderPendingBetForGapInTransaction({
+              source: safeSource,
+              instrument: safeInstrument,
+              incidentId: Number(incident.id),
+              continuityEpoch: currentEpoch,
+              voidedAt: now,
+            });
+          }
+        } else if (betEpoch > currentEpoch) {
+          throw new Error("predictive leader pending bet is ahead of continuity");
+        }
+      }
+
+      const refreshedAccount = this.sqlite
+        .prepare(`
+          SELECT pending_forecast_id
+          FROM predictive_leader_accounts
+          WHERE source = ? AND instrument = ?
+        `)
+        .get(safeSource, safeInstrument);
+      if (refreshedAccount?.pending_forecast_id !== null
+        && refreshedAccount?.pending_forecast_id !== undefined) {
+        return {
+          placed: 0,
+          reason: voidOutcome.reason === "result_resolvable"
+            ? "result_resolvable"
+            : "prior_pending",
+          voided: voidOutcome.voided,
+        };
+      }
+
+      const candidate = this.sqlite
+        .prepare(`
+          SELECT
+            leaders.*,
+            snapshots.source,
+            snapshots.instrument,
+            snapshots.external_round_id,
+            snapshots.betting_closes_at,
+            snapshots.locked_at AS forecast_locked_at,
+            settlements.forecast_id AS settlement_forecast_id,
+            bets.forecast_id AS account_bet_forecast_id
+          FROM forecast_predictive_leader_snapshots AS leaders
+          JOIN round_forecasts AS forecasts ON forecasts.id = leaders.forecast_id
+          JOIN forecast_snapshots AS snapshots ON snapshots.id = forecasts.snapshot_id
+          LEFT JOIN forecast_settlements AS settlements
+            ON settlements.forecast_id = leaders.forecast_id
+          LEFT JOIN predictive_leader_account_bets AS bets
+            ON bets.forecast_id = leaders.forecast_id
+          WHERE snapshots.source = ?
+            AND snapshots.instrument = ?
+            AND leaders.algorithm_version = ?
+          ORDER BY leaders.forecast_id DESC
+          LIMIT 1
+        `)
+        .get(
+          safeSource,
+          safeInstrument,
+          LEARNED_LEADER_ALGORITHM_VERSION,
+        );
+      if (!candidate) {
+        return { placed: 0, reason: "no_eligible_leader", voided: voidOutcome.voided };
+      }
+      if (
+        candidate.status !== "ready"
+        || candidate.settlement_forecast_id !== null
+        || candidate.account_bet_forecast_id !== null
+      ) {
+        return { placed: 0, reason: "no_eligible_leader", voided: voidOutcome.voided };
+      }
+      if (
+        Date.parse(now) < Date.parse(candidate.forecast_locked_at)
+        || Date.parse(candidate.betting_closes_at) - Date.parse(now) < 5_000
+      ) {
+        return { placed: 0, reason: "outside_safe_window", voided: voidOutcome.voided };
+      }
+      const knownTarget = this.sqlite
+        .prepare(`
+          SELECT id
+          FROM round_results
+          WHERE source = ? AND instrument = ? AND external_round_id = ?
+          LIMIT 1
+        `)
+        .get(safeSource, safeInstrument, candidate.external_round_id);
+      if (knownTarget) {
+        return { placed: 0, reason: "target_known", voided: voidOutcome.voided };
+      }
+      const decision = normalizeLearnedLeaderDecision(
+        deserializeJson(candidate.snapshot_json),
+      );
+      if (
+        !decision
+        || !validLearnedLeaderAudit(decision)
+        || decision.status !== "ready"
+        || decision.algorithmVersion !== LEARNED_LEADER_ALGORITHM_VERSION
+        || decision.lockedAt !== candidate.locked_at
+        || decision.lockedAt !== candidate.forecast_locked_at
+        || Number(decision.leaderNumber) !== Number(candidate.predicted_number)
+        || Math.abs(Number(decision.leaderMass) - Number(candidate.score)) > 1e-12
+      ) {
+        throw new Error("predictive leader reconciliation snapshot is invalid");
+      }
+      const placement = this.#placePredictiveLeaderAccountBetInTransaction({
+        forecastId: Number(candidate.forecast_id),
+        source: safeSource,
+        instrument: safeInstrument,
+        decision,
+        historyMaxResultId: candidate.history_max_result_id === null
+          ? null
+          : Number(candidate.history_max_result_id),
+        placedAt: now,
+      });
+      return {
+        placed: Number(placement.placed),
+        reason: placement.reason,
+        forecastId: Number(candidate.forecast_id),
+        voided: voidOutcome.voided,
+      };
+    });
+  }
+
   settlePrecloseForecasts(source = "buleto", instrument = "default") {
     this.#assertOpen();
     const safeSource = asNonEmptyText(source, undefined, "source");
@@ -10303,6 +10917,7 @@ export class RouletteDatabase {
       betCount: 0,
       settledCount: 0,
       pendingCount: 0,
+      voidCount: 0,
       hitCount: 0,
       missCount: 0,
       hitRate: null,
@@ -10314,6 +10929,7 @@ export class RouletteDatabase {
       continuityGapCount: 0,
       ladder: { missCount: 0, totalLoss: 0 },
       pendingBet: null,
+      latestVoid: null,
       latestOutcome: null,
       startedAt: null,
       updatedAt: null,
@@ -10345,10 +10961,15 @@ export class RouletteDatabase {
     }
     const rows = this.sqlite
       .prepare(`
-        SELECT *
-        FROM predictive_leader_account_bets
-        WHERE source = ? AND instrument = ?
-        ORDER BY forecast_id
+        SELECT
+          bets.*,
+          incidents.kind AS void_incident_kind,
+          incidents.source AS void_incident_source,
+          incidents.instrument AS void_incident_instrument
+        FROM predictive_leader_account_bets AS bets
+        LEFT JOIN incidents ON incidents.id = bets.void_incident_id
+        WHERE bets.source = ? AND bets.instrument = ?
+        ORDER BY bets.forecast_id
       `)
       .all(source, instrument);
     let balance = PREDICTIVE_LEADER_ACCOUNT_STARTING_BALANCE;
@@ -10363,7 +10984,9 @@ export class RouletteDatabase {
     let ladderTotalLoss = 0;
     let lastContinuityEpoch = null;
     let continuityGapCount = 0;
+    let voidCount = 0;
     let pendingBet = null;
+    let latestVoid = null;
     let latestOutcome = null;
     for (const row of rows) {
       const stake = Number(row.stake);
@@ -10402,13 +11025,59 @@ export class RouletteDatabase {
       }
       lastContinuityEpoch = continuityEpoch;
       if (row.status === "pending") {
-        if (pendingBet || row.round_result_id !== null) return null;
+        if (
+          pendingBet
+          || row.round_result_id !== null
+          || row.void_incident_id !== null
+          || row.void_continuity_epoch !== null
+          || row.voided_at !== null
+        ) {
+          return null;
+        }
         pendingBet = {
           forecastId: Number(row.forecast_id),
           targetNumber: Number(row.target_number),
           stake,
           balanceBefore: balance,
           placedAt: row.placed_at,
+        };
+        continue;
+      }
+      if (row.status === "void") {
+        const voidContinuityEpoch = Number(row.void_continuity_epoch);
+        const voidedAtMs = Date.parse(row.voided_at);
+        if (
+          pendingBet
+          || row.void_reason !== "integrity_gap"
+          || !Number.isSafeInteger(Number(row.void_incident_id))
+          || Number(row.void_incident_id) < 1
+          || !Number.isSafeInteger(voidContinuityEpoch)
+          || voidContinuityEpoch < 1
+          || (continuityEpoch !== null && voidContinuityEpoch <= continuityEpoch)
+          || row.void_incident_kind !== "gap"
+          || row.void_incident_source !== source
+          || row.void_incident_instrument !== instrument
+          || !Number.isFinite(voidedAtMs)
+          || voidedAtMs < Date.parse(row.placed_at)
+          || row.round_result_id !== null
+          || row.result_number !== null
+          || row.outcome !== null
+          || row.gross_payout !== null
+          || row.balance_after !== null
+        ) {
+          return null;
+        }
+        voidCount += 1;
+        ladderMissCount = 0;
+        ladderTotalLoss = 0;
+        continuityGapCount += 1;
+        lastContinuityEpoch = voidContinuityEpoch;
+        latestVoid = {
+          forecastId: Number(row.forecast_id),
+          targetNumber: Number(row.target_number),
+          stake,
+          reason: row.void_reason,
+          voidedAt: row.voided_at,
         };
         continue;
       }
@@ -10479,7 +11148,7 @@ export class RouletteDatabase {
         !== PREDICTIVE_LEADER_ACCOUNT_STARTING_BALANCE
           - totalStaked + totalGrossPayout
       || pendingId !== (pendingBet?.forecastId ?? null)
-      || rows.length !== settledCount + Number(pendingBet !== null)
+      || rows.length !== settledCount + voidCount + Number(pendingBet !== null)
       || !Number.isSafeInteger(nextStake)
       || Number(account.ladder_total_loss) !== ladderTotalLoss
       || Number(account.ladder_miss_count) !== ladderMissCount
@@ -10510,6 +11179,7 @@ export class RouletteDatabase {
       betCount: rows.length,
       settledCount,
       pendingCount: Number(pendingBet !== null),
+      voidCount,
       hitCount,
       missCount,
       hitRate: settledCount > 0 ? hitCount / settledCount : null,
@@ -10524,6 +11194,7 @@ export class RouletteDatabase {
         totalLoss: Number(account.ladder_total_loss),
       },
       pendingBet,
+      latestVoid,
       latestOutcome,
       startedAt: account.started_at,
       updatedAt: account.updated_at,

@@ -4,10 +4,397 @@ export const TRAJECTORY_RANK37_BASIS =
   "adaptive-weighted-neighbor-delta-to-current-bands";
 export const TRAJECTORY_RANK37_MIN_TRAINING_COUNT = 30;
 export const TRAJECTORY_RANK37_MIN_EVIDENCE_CANDIDATES = 3;
+export const PREDICTIVE_LEADER_API_SCHEMA_VERSION = 1;
+export const PREDICTIVE_LEADER_API_ALGORITHM_VERSION =
+  "learned-predictive-family-index-v5";
+export const PREDICTIVE_LEADER_API_LEARNING_VERSION =
+  "family-brier-logodds-v1";
 
 const SCORE_EPSILON = 1e-12;
+const PREDICTIVE_LEADER_SUM_TOLERANCE = 1e-9;
+const PREDICTIVE_LEADER_MINIMUM_ADAPTIVE_COUNT = 30;
+const PREDICTIVE_LEADER_FAMILIES = ["price", "conditional-history"];
+const PREDICTIVE_LEADER_REASONS = Object.freeze({
+  ready: new Set(["ready"]),
+  waiting: new Set([
+    "state_unavailable",
+    "cursor_unavailable",
+    "forecast_unavailable",
+    "forecast_settled",
+    "leader_not_frozen",
+    "no_valid_family",
+  ]),
+  paused: new Set([
+    "integrity_gap",
+    "cursor_invalid",
+    "collector_unavailable",
+    "collector_pending",
+    "persistence_pending",
+    "result_cursor_mismatch",
+    "round_cursor_mismatch",
+    "forecast_invalid",
+    "forecast_round_mismatch",
+    "leader_invalid",
+  ]),
+});
+const PREDICTIVE_LEADER_REASONS_WITH_FORECAST = new Set([
+  "ready",
+  "forecast_round_mismatch",
+  "forecast_settled",
+  "leader_not_frozen",
+  "no_valid_family",
+  "leader_invalid",
+]);
 export const TRAJECTORY_RANK37_EVIDENCE_MASS_THRESHOLD =
   SCORE_EPSILON / 0.95;
+
+function isPlainRecord(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function strictNonNegativeInteger(value, minimum = 0) {
+  return Number.isSafeInteger(value) && value >= minimum ? value : null;
+}
+
+function nullableStrictNonNegativeInteger(value, minimum = 0) {
+  return value === null ? null : strictNonNegativeInteger(value, minimum);
+}
+
+function nullableInstant(value) {
+  if (value === null) return null;
+  return typeof value === "string" && Number.isFinite(Date.parse(value))
+    ? value
+    : undefined;
+}
+
+function normalizedPredictiveLeaderForecast(value) {
+  if (!isPlainRecord(value)) return null;
+  const id = strictNonNegativeInteger(value.id, 1);
+  const roundId = safeNonNegativeInteger(value.roundId);
+  const lockedAt = nullableInstant(value.lockedAt);
+  const bettingClosesAt = nullableInstant(value.bettingClosesAt);
+  const roundEndsAt = nullableInstant(value.roundEndsAt);
+  if (
+    id === null
+    || roundId === null
+    || lockedAt === null
+    || lockedAt === undefined
+    || bettingClosesAt === null
+    || bettingClosesAt === undefined
+    || roundEndsAt === null
+    || roundEndsAt === undefined
+  ) {
+    return null;
+  }
+  return {
+    id,
+    roundId: value.roundId,
+    lockedAt,
+    bettingClosesAt,
+    roundEndsAt,
+  };
+}
+
+function normalizedPredictiveLeaderFreshness(value) {
+  if (!isPlainRecord(value)) return null;
+  const currentRoundId = nullableStrictNonNegativeInteger(value.currentRoundId);
+  const latestPersistedResultId = nullableStrictNonNegativeInteger(
+    value.latestPersistedResultId,
+    1,
+  );
+  const latestPersistedRoundId = nullableStrictNonNegativeInteger(
+    value.latestPersistedRoundId,
+  );
+  const latestPersistedAt = nullableInstant(value.latestPersistedAt);
+  const collectorLastResultAt = nullableInstant(value.collectorLastResultAt);
+  const resultConfirmationPending = value.resultConfirmationPending;
+  const pendingResultCount = nullableStrictNonNegativeInteger(value.pendingResultCount);
+  const persistencePendingResults = nullableStrictNonNegativeInteger(
+    value.persistencePendingResults,
+  );
+  const persistencePendingGaps = nullableStrictNonNegativeInteger(
+    value.persistencePendingGaps,
+  );
+  if (
+    currentRoundId === null && value.currentRoundId !== null
+    || latestPersistedResultId === null && value.latestPersistedResultId !== null
+    || latestPersistedRoundId === null && value.latestPersistedRoundId !== null
+    || latestPersistedAt === undefined
+    || collectorLastResultAt === undefined
+    || ![true, false].includes(value.resultCursorMatches)
+    || ![true, false].includes(value.roundCursorMatches)
+    || ![true, false].includes(value.forecastRoundMatches)
+    || ![true, false, null].includes(resultConfirmationPending)
+    || pendingResultCount === null && value.pendingResultCount !== null
+    || persistencePendingResults === null && value.persistencePendingResults !== null
+    || persistencePendingGaps === null && value.persistencePendingGaps !== null
+    || typeof value.integrityOk !== "boolean"
+  ) {
+    return null;
+  }
+  return {
+    currentRoundId,
+    latestPersistedResultId,
+    latestPersistedRoundId,
+    latestPersistedAt,
+    collectorLastResultAt,
+    resultCursorMatches: value.resultCursorMatches,
+    roundCursorMatches: value.roundCursorMatches,
+    forecastRoundMatches: value.forecastRoundMatches,
+    resultConfirmationPending,
+    pendingResultCount,
+    persistencePendingResults,
+    persistencePendingGaps,
+    integrityOk: value.integrityOk,
+  };
+}
+
+function normalizedPredictiveLeaderApiMetrics(value) {
+  if (value === null) return null;
+  if (!isPlainRecord(value)) return undefined;
+  const readyCount = strictNonNegativeInteger(value.readyCount);
+  const settledCount = strictNonNegativeInteger(value.settledCount);
+  const pendingCount = strictNonNegativeInteger(value.pendingCount);
+  const top1Hits = strictNonNegativeInteger(value.top1Hits);
+  if (
+    readyCount === null
+    || settledCount === null
+    || pendingCount === null
+    || top1Hits === null
+    || settledCount > readyCount
+    || pendingCount !== readyCount - settledCount
+    || top1Hits > settledCount
+  ) {
+    return undefined;
+  }
+  const { top1Rate, meanBrierLoss, uniformBrierLoss, beatsUniform } = value;
+  if (
+    typeof uniformBrierLoss !== "number"
+    || !Number.isFinite(uniformBrierLoss)
+    || Math.abs(uniformBrierLoss - 18 / 37) > PREDICTIVE_LEADER_SUM_TOLERANCE
+    || (settledCount === 0 && (
+      top1Rate !== null || meanBrierLoss !== null || beatsUniform !== null
+    ))
+    || (settledCount > 0 && (
+      typeof top1Rate !== "number"
+      || !Number.isFinite(top1Rate)
+      || Math.abs(top1Rate - top1Hits / settledCount)
+        > PREDICTIVE_LEADER_SUM_TOLERANCE
+      || typeof meanBrierLoss !== "number"
+      || !Number.isFinite(meanBrierLoss)
+      || meanBrierLoss < 0
+      || meanBrierLoss > 1
+      || typeof beatsUniform !== "boolean"
+      || beatsUniform !== (meanBrierLoss < uniformBrierLoss)
+    ))
+  ) {
+    return undefined;
+  }
+  return {
+    readyCount,
+    settledCount,
+    pendingCount,
+    top1Hits,
+    top1Rate,
+    meanBrierLoss,
+    uniformBrierLoss,
+    beatsUniform,
+  };
+}
+
+function normalizedFamilyWeights(value, families) {
+  if (!isPlainRecord(value)) return null;
+  const keys = Object.keys(value);
+  if (
+    keys.length !== families.length
+    || keys.some((family) => !families.includes(family))
+  ) {
+    return null;
+  }
+  let total = 0;
+  const weights = {};
+  for (const family of families) {
+    const weight = value[family];
+    if (
+      typeof weight !== "number"
+      || !Number.isFinite(weight)
+      || weight < 0
+      || weight > 1
+    ) {
+      return null;
+    }
+    weights[family] = weight;
+    total += weight;
+  }
+  return Math.abs(total - 1) <= PREDICTIVE_LEADER_SUM_TOLERANCE
+    ? weights
+    : null;
+}
+
+function normalizedPredictiveLeaderModel(value) {
+  if (!isPlainRecord(value)) return null;
+  const sourceCount = strictNonNegativeInteger(value.sourceCount, 1);
+  const familyCount = strictNonNegativeInteger(value.familyCount, 1);
+  const trainingCount = strictNonNegativeInteger(value.trainingCount);
+  if (
+    sourceCount === null
+    || familyCount === null
+    || familyCount > PREDICTIVE_LEADER_FAMILIES.length
+    || sourceCount < familyCount
+    || !Array.isArray(value.activeFamilies)
+    || value.activeFamilies.length !== familyCount
+    || new Set(value.activeFamilies).size !== familyCount
+    || value.activeFamilies.some((family) => !PREDICTIVE_LEADER_FAMILIES.includes(family))
+    || value.learningVersion !== PREDICTIVE_LEADER_API_LEARNING_VERSION
+    || !["cold_start", "adaptive"].includes(value.learningStatus)
+    || trainingCount === null
+    || value.learningStatus !== (
+      trainingCount < PREDICTIVE_LEADER_MINIMUM_ADAPTIVE_COUNT
+        ? "cold_start"
+        : "adaptive"
+    )
+    || typeof value.tieBreakApplied !== "boolean"
+  ) {
+    return null;
+  }
+  const activeFamilyWeights = normalizedFamilyWeights(
+    value.activeFamilyWeights,
+    value.activeFamilies,
+  );
+  const learnedFamilyWeights = normalizedFamilyWeights(
+    value.learnedFamilyWeights,
+    PREDICTIVE_LEADER_FAMILIES,
+  );
+  if (!activeFamilyWeights || !learnedFamilyWeights) return null;
+  return {
+    sourceCount,
+    familyCount,
+    activeFamilies: [...value.activeFamilies],
+    activeFamilyWeights,
+    learningVersion: value.learningVersion,
+    learningStatus: value.learningStatus,
+    trainingCount,
+    learnedFamilyWeights,
+    tieBreakApplied: value.tieBreakApplied,
+  };
+}
+
+export function normalizePredictiveLeaderApiSnapshot(value) {
+  if (
+    !isPlainRecord(value)
+    || value.schemaVersion !== PREDICTIVE_LEADER_API_SCHEMA_VERSION
+    || value.algorithmVersion !== PREDICTIVE_LEADER_API_ALGORITHM_VERSION
+    || value.mode !== "observation"
+    || value.executionEnabled !== false
+    || value.advisoryOnly !== true
+    || typeof value.source !== "string"
+    || value.source.trim() === ""
+    || value.source !== value.source.trim()
+    || typeof value.instrument !== "string"
+    || value.instrument.trim() === ""
+    || value.instrument !== value.instrument.trim()
+    || nullableInstant(value.serverTime) === null
+    || nullableInstant(value.serverTime) === undefined
+    || !PREDICTIVE_LEADER_REASONS[value.status]?.has(value.reason)
+    || (value.account !== null && !isPlainRecord(value.account))
+  ) {
+    return null;
+  }
+
+  const freshness = normalizedPredictiveLeaderFreshness(value.freshness);
+  const metrics = normalizedPredictiveLeaderApiMetrics(value.metrics);
+  const forecast = value.forecast === null
+    ? null
+    : normalizedPredictiveLeaderForecast(value.forecast);
+  const shouldHaveForecast = PREDICTIVE_LEADER_REASONS_WITH_FORECAST.has(value.reason);
+  if (
+    !freshness
+    || metrics === undefined
+    || (value.forecast !== null && !forecast)
+    || shouldHaveForecast !== (forecast !== null)
+  ) {
+    return null;
+  }
+
+  if (value.status !== "ready") {
+    if (value.number !== null || value.model !== null) return null;
+    return {
+      schemaVersion: value.schemaVersion,
+      algorithmVersion: value.algorithmVersion,
+      mode: value.mode,
+      executionEnabled: value.executionEnabled,
+      advisoryOnly: value.advisoryOnly,
+      source: value.source,
+      instrument: value.instrument,
+      serverTime: value.serverTime,
+      status: value.status,
+      reason: value.reason,
+      number: null,
+      forecast,
+      model: null,
+      account: value.account,
+      metrics,
+      freshness,
+    };
+  }
+
+  const number = strictNonNegativeInteger(value.number);
+  const model = normalizedPredictiveLeaderModel(value.model);
+  if (
+    number === null
+    || number > 36
+    || !model
+    || freshness.currentRoundId === null
+    || !freshness.resultCursorMatches
+    || !freshness.roundCursorMatches
+    || !freshness.forecastRoundMatches
+    || freshness.resultConfirmationPending !== false
+    || freshness.pendingResultCount !== 0
+    || freshness.persistencePendingResults !== 0
+    || freshness.persistencePendingGaps !== 0
+    || freshness.integrityOk !== true
+    || !sameEntityId(forecast.roundId, freshness.currentRoundId)
+  ) {
+    return null;
+  }
+  return {
+    schemaVersion: value.schemaVersion,
+    algorithmVersion: value.algorithmVersion,
+    mode: value.mode,
+    executionEnabled: value.executionEnabled,
+    advisoryOnly: value.advisoryOnly,
+    source: value.source,
+    instrument: value.instrument,
+    serverTime: value.serverTime,
+    status: value.status,
+    reason: value.reason,
+    number,
+    forecast,
+    model,
+    account: value.account,
+    metrics,
+    freshness,
+  };
+}
+
+export function predictiveLeaderNumberContext({
+  loaded = false,
+  error = false,
+  requiresFreshSnapshot = false,
+  snapshot = null,
+} = {}) {
+  if (error) return { state: "error" };
+  if (!loaded) return { state: "loading" };
+  if (requiresFreshSnapshot) {
+    return { state: "paused", reason: "event_stream_disconnected" };
+  }
+  if (!snapshot || !["ready", "waiting", "paused"].includes(snapshot.status)) {
+    return { state: "error" };
+  }
+  return snapshot.status === "ready"
+    ? { state: "ready", snapshot }
+    : { state: snapshot.status, reason: snapshot.reason };
+}
 
 function safeNonNegativeInteger(value) {
   if (value === null || value === undefined || value === "") return null;

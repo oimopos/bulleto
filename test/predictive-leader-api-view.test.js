@@ -48,6 +48,7 @@ function pristineAccount() {
     betCount: 0,
     settledCount: 0,
     pendingCount: 0,
+    voidCount: 0,
     hitCount: 0,
     missCount: 0,
     hitRate: null,
@@ -59,6 +60,7 @@ function pristineAccount() {
     continuityGapCount: 0,
     ladder: { missCount: 0, totalLoss: 0 },
     pendingBet: null,
+    latestVoid: null,
     latestOutcome: null,
     startedAt: null,
     updatedAt: null,
@@ -89,6 +91,7 @@ function pendingAccount() {
     betCount: 1,
     settledCount: 0,
     pendingCount: 1,
+    voidCount: 0,
     hitCount: 0,
     missCount: 0,
     hitRate: null,
@@ -106,6 +109,7 @@ function pendingAccount() {
       balanceBefore: 1000,
       placedAt: ACCOUNT_STARTED_AT,
     },
+    latestVoid: null,
     latestOutcome: null,
     startedAt: ACCOUNT_STARTED_AT,
     updatedAt: ACCOUNT_STARTED_AT,
@@ -143,6 +147,29 @@ function waitingAccount() {
     },
     startedAt: '2026-10-10T09:59:20.000Z',
     updatedAt: LATEST_SETTLED_AT,
+  };
+}
+
+function voidedAccount() {
+  return {
+    ...pendingAccount(),
+    status: 'waiting',
+    reason: 'waiting_next_frozen_leader',
+    betCount: 1,
+    settledCount: 0,
+    pendingCount: 0,
+    voidCount: 1,
+    continuityGapCount: 1,
+    pendingBet: null,
+    latestVoid: {
+      forecastId: 77,
+      targetNumber: 7,
+      stake: 10,
+      reason: 'integrity_gap',
+      voidedAt: SERVER_TIME,
+    },
+    latestOutcome: null,
+    updatedAt: SERVER_TIME,
   };
 }
 
@@ -473,6 +500,7 @@ test('predictive leader GET view exposes persisted account states without mutati
     pristineAccount(),
     pendingAccount(),
     waitingAccount(),
+    voidedAccount(),
     exhaustedAccount(),
   ]) {
     const state = freshState();
@@ -487,6 +515,24 @@ test('predictive leader GET view exposes persisted account states without mutati
     assert.notStrictEqual(payload.account, account);
     assert.notStrictEqual(payload.account.model, account.model);
     assert.deepEqual(state, before, `${account.status} input state must stay untouched`);
+  }
+});
+
+test('predictive leader GET view validates auditable void account fields', () => {
+  const valid = freshState();
+  valid.precloseForecast.predictiveLeaderAccount = voidedAccount();
+  assert.deepEqual(snapshot(valid).account, voidedAccount());
+
+  for (const mutate of [
+    (account) => { account.voidCount = 0; },
+    (account) => { account.latestVoid.reason = 'miss'; },
+    (account) => { account.latestVoid.voidedAt = '2026-10-10T10:00:22Z'; },
+    (account) => { account.latestVoid.stake = 11; },
+  ]) {
+    const state = freshState();
+    state.precloseForecast.predictiveLeaderAccount = voidedAccount();
+    mutate(state.precloseForecast.predictiveLeaderAccount);
+    assert.equal(snapshot(state).account, null);
   }
 });
 

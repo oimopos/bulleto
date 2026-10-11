@@ -284,6 +284,8 @@ export class BuletoCollector extends EventEmitter {
     this.connectionTimer = null;
     this.initialSnapshotTimer = null;
     this.resultSnapshotTimer = null;
+    this.precloseForecastTimer = null;
+    this.precloseForecastTimerRoundKey = null;
     this.initialSnapshotReceived = false;
     this.pendingRoundResults = [];
     this.deferredSnapshotResults = new Map();
@@ -328,6 +330,7 @@ export class BuletoCollector extends EventEmitter {
     this.forecastRound = null;
     this.latestFactors = [];
     this.forecastErrorRoundId = null;
+    this.#clearPrecloseForecastTimer();
     this.#resetRoundTrajectory();
     this.generation += 1;
     this.#connect(this.generation);
@@ -360,6 +363,7 @@ export class BuletoCollector extends EventEmitter {
     clearTimeout(this.connectionTimer);
     clearTimeout(this.initialSnapshotTimer);
     clearTimeout(this.resultSnapshotTimer);
+    this.#clearPrecloseForecastTimer();
     clearInterval(this.watchdogTimer);
     this.reconnectTimer = null;
     this.connectionTimer = null;
@@ -390,6 +394,7 @@ export class BuletoCollector extends EventEmitter {
     this.forecastRound = null;
     this.latestFactors = [];
     this.forecastErrorRoundId = null;
+    this.#clearPrecloseForecastTimer();
     this.#resetRoundTrajectory();
 
     this.#setState({
@@ -476,6 +481,8 @@ export class BuletoCollector extends EventEmitter {
       this.initialSnapshotTimer = null;
       clearTimeout(this.resultSnapshotTimer);
       this.resultSnapshotTimer = null;
+      this.#clearPrecloseForecastTimer();
+      this.forecastRound = null;
       if (!this.initialSnapshotReceived) this.#recordSnapshotFailure();
       if (this.stopped) return;
 
@@ -564,6 +571,7 @@ export class BuletoCollector extends EventEmitter {
           .sort((a, b) => a.settledAt.localeCompare(b.settledAt));
         this.deferredSnapshotResults.clear();
         this.#emitResults(chronological);
+        this.#tryEmitPrecloseForecast(receivedAt);
       } catch (error) {
         this.emit('collector-error', error);
       }
@@ -609,6 +617,7 @@ export class BuletoCollector extends EventEmitter {
         this.#resetRoundTrajectory();
       }
 
+      this.#schedulePrecloseForecastAttempt();
       this.#tryEmitPrecloseForecast(receivedAt);
 
       // В финальном сообщении round поле rr содержит тот же результат, что
@@ -680,7 +689,13 @@ export class BuletoCollector extends EventEmitter {
   }
 
   #tryEmitPrecloseForecast(receivedAt) {
-    if (!this.forecastRound || this.latestFactors.length === 0) return;
+    if (
+      !this.initialSnapshotReceived ||
+      !this.forecastRound ||
+      this.latestFactors.length === 0
+    ) {
+      return;
+    }
     const closesAtMs = Date.parse(this.forecastRound.bcd);
     const receivedAtMs = receivedAt.getTime();
     const leadTimeMs = closesAtMs - receivedAtMs;
@@ -713,6 +728,65 @@ export class BuletoCollector extends EventEmitter {
         new Error(`Не удалось зафиксировать прогноз раунда ${roundId}`, { cause: error }),
       );
     }
+  }
+
+  #precloseForecastRoundKey(round = this.forecastRound) {
+    if (!round) return null;
+    const closesAtMs = Date.parse(round.bcd);
+    if (!Number.isFinite(closesAtMs)) return null;
+    return `${String(round.id ?? 'unknown')}\u0000${closesAtMs}`;
+  }
+
+  #clearPrecloseForecastTimer() {
+    clearTimeout(this.precloseForecastTimer);
+    this.precloseForecastTimer = null;
+    this.precloseForecastTimerRoundKey = null;
+  }
+
+  #schedulePrecloseForecastAttempt() {
+    const roundKey = this.#precloseForecastRoundKey();
+    if (!roundKey) {
+      this.#clearPrecloseForecastTimer();
+      return;
+    }
+    if (
+      this.precloseForecastTimer &&
+      this.precloseForecastTimerRoundKey === roundKey
+    ) {
+      return;
+    }
+
+    this.#clearPrecloseForecastTimer();
+    const closesAtMs = Date.parse(this.forecastRound.bcd);
+    const delayMs = closesAtMs - PRECLOSE_FORECAST_MAX_LEAD_MS - Date.now();
+    if (delayMs <= 0) return;
+    const scheduledDelayMs = Math.min(delayMs, 2_147_483_647);
+
+    const generation = this.generation;
+    const socket = this.socket;
+    this.precloseForecastTimerRoundKey = roundKey;
+    this.precloseForecastTimer = setTimeout(() => {
+      this.precloseForecastTimer = null;
+      this.precloseForecastTimerRoundKey = null;
+      if (
+        this.stopped ||
+        generation !== this.generation ||
+        socket !== this.socket ||
+        roundKey !== this.#precloseForecastRoundKey()
+      ) {
+        return;
+      }
+
+      const receivedAt = new Date();
+      if (closesAtMs - receivedAt.getTime() > PRECLOSE_FORECAST_MAX_LEAD_MS) {
+        // A backwards clock adjustment or an early timer callback must not
+        // escape the inclusive 8-10 second lock window.
+        this.#schedulePrecloseForecastAttempt();
+        return;
+      }
+      this.#tryEmitPrecloseForecast(receivedAt);
+    }, scheduledDelayMs);
+    this.precloseForecastTimer.unref?.();
   }
 
   #emitResults(results) {

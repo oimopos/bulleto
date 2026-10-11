@@ -113,6 +113,7 @@ const resultPipeline = new ResultPipeline({
 db.initializeVirtualBettor('buleto', config.instrument);
 db.settlePrecloseForecasts('buleto', config.instrument);
 db.settlePredictiveLeaderAccount('buleto', config.instrument);
+db.reconcilePredictiveLeaderAccount('buleto', config.instrument);
 
 const sseClients = new Set();
 
@@ -620,17 +621,19 @@ function enqueueRoundTrajectory(trajectory) {
 }
 
 function publishPipelineOutcome(outcome) {
-  if (!outcome) return;
+  if (!outcome) return true;
   if (outcome.inserted > 0) {
     console.info(`[collector] saved ${outcome.inserted} new result(s)`);
   }
   if (outcome.gaps > 0) broadcastUpdate('gap');
   if (outcome.changed) broadcastUpdate('results');
+  let retryError = null;
   try {
     const forecastOutcome = db.settlePrecloseForecasts('buleto', config.instrument);
     if (forecastOutcome.settled > 0) broadcastUpdate('forecast-settled');
   } catch (error) {
     console.error('[forecast] settlement failed; it will be retried', error);
+    retryError ??= error;
   }
   try {
     const accountOutcome = db.settlePredictiveLeaderAccount(
@@ -643,11 +646,30 @@ function publishPipelineOutcome(outcome) {
       '[predictive-leader] account settlement failed; it will be retried',
       error,
     );
+    retryError ??= error;
   }
+  try {
+    const reconciliation = db.reconcilePredictiveLeaderAccount(
+      'buleto',
+      config.instrument,
+    );
+    if (reconciliation.placed > 0 || reconciliation.voided > 0) {
+      broadcastUpdate('predictive-leader-account');
+    }
+  } catch (error) {
+    console.error(
+      '[predictive-leader] account reconciliation failed; it will be retried',
+      error,
+    );
+    retryError ??= error;
+  }
+  if (retryError) schedulePipelineRetry(retryError);
+  else pipelineRetryAttempt = 0;
+  return retryError === null;
 }
 
 function schedulePipelineRetry(error) {
-  console.error('[collector] persistence failed; data retained for retry', error);
+  console.error('[collector] persistence/reconciliation failed; retry scheduled', error);
   if (pipelineRetryTimer || shuttingDown) return;
   pipelineRetryAttempt += 1;
   const delay = Math.min(30_000, 1_000 * 2 ** Math.min(pipelineRetryAttempt - 1, 5));
@@ -655,7 +677,6 @@ function schedulePipelineRetry(error) {
     pipelineRetryTimer = null;
     try {
       const outcome = resultPipeline.drain();
-      pipelineRetryAttempt = 0;
       publishPipelineOutcome(outcome);
     } catch (retryError) {
       schedulePipelineRetry(retryError);
@@ -670,7 +691,6 @@ function schedulePipelineFlush() {
     pipelineFlushTimer = null;
     try {
       const outcome = resultPipeline.drain();
-      pipelineRetryAttempt = 0;
       publishPipelineOutcome(outcome);
     } catch (error) {
       schedulePipelineRetry(error);
@@ -684,7 +704,6 @@ collector.on('results', (results) => {
   pipelineFlushTimer = null;
   try {
     const outcome = resultPipeline.ingest(results);
-    pipelineRetryAttempt = 0;
     publishPipelineOutcome(outcome);
   } catch (error) {
     schedulePipelineRetry(error);

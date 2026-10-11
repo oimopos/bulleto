@@ -190,6 +190,7 @@ function accountForApi(value) {
   const betCount = strictInteger(value.betCount);
   const settledCount = strictInteger(value.settledCount);
   const pendingCount = strictInteger(value.pendingCount);
+  const voidCount = strictInteger(value.voidCount);
   const hitCount = strictInteger(value.hitCount);
   const missCount = strictInteger(value.missCount);
   const totalStaked = strictInteger(value.totalStaked);
@@ -207,6 +208,7 @@ function accountForApi(value) {
       betCount,
       settledCount,
       pendingCount,
+      voidCount,
       hitCount,
       missCount,
       totalStaked,
@@ -235,7 +237,7 @@ function accountForApi(value) {
   const expectedBalance = value.initialBalance - totalStaked + totalGrossPayout;
   const expectedProfit = currentBalance - value.initialBalance;
   const expectedSettledCount = hitCount + missCount;
-  const expectedBetCount = settledCount + pendingCount;
+  const expectedBetCount = settledCount + pendingCount + voidCount;
   const expectedCanAfford = nextStake <= currentBalance;
   const expectedShortfall = Math.max(0, nextStake - currentBalance);
   const minimumLadderLoss = ladderMissCount * model.initialStake;
@@ -299,6 +301,35 @@ function accountForApi(value) {
   }
   if (pendingCount !== Number(pendingBet !== null)) return null;
 
+  let latestVoid = null;
+  if (value.latestVoid !== null) {
+    if (!isPlainObject(value.latestVoid)) return null;
+    const forecastId = strictInteger(value.latestVoid.forecastId, { minimum: 1 });
+    const targetNumber = strictInteger(value.latestVoid.targetNumber);
+    const stake = strictInteger(value.latestVoid.stake, { minimum: model.initialStake });
+    const voidedAt = canonicalInstant(value.latestVoid.voidedAt);
+    if (
+      forecastId === null
+      || targetNumber === null
+      || targetNumber > 36
+      || stake === null
+      || stake > model.maxStake
+      || stake % model.stakeStep !== 0
+      || value.latestVoid.reason !== 'integrity_gap'
+      || voidedAt === null
+    ) {
+      return null;
+    }
+    latestVoid = {
+      forecastId,
+      targetNumber,
+      stake,
+      reason: value.latestVoid.reason,
+      voidedAt,
+    };
+  }
+  if ((voidCount === 0) !== (latestVoid === null)) return null;
+
   let latestOutcome = null;
   if (value.latestOutcome !== null) {
     if (!isPlainObject(value.latestOutcome)) return null;
@@ -361,6 +392,7 @@ function accountForApi(value) {
       || betCount !== 0
       || settledCount !== 0
       || pendingCount !== 0
+      || voidCount !== 0
       || hitCount !== 0
       || missCount !== 0
       || totalStaked !== 0
@@ -372,6 +404,7 @@ function accountForApi(value) {
       || ladderMissCount !== 0
       || ladderTotalLoss !== 0
       || pendingBet !== null
+      || latestVoid !== null
       || latestOutcome !== null
     ) {
       return null;
@@ -400,6 +433,15 @@ function accountForApi(value) {
       && (
         Date.parse(latestOutcome.occurredAt) < Date.parse(startedAt)
         || Date.parse(latestOutcome.occurredAt) > Date.parse(updatedAt)
+      )
+    ) {
+      return null;
+    }
+    if (
+      latestVoid
+      && (
+        Date.parse(latestVoid.voidedAt) < Date.parse(startedAt)
+        || Date.parse(latestVoid.voidedAt) > Date.parse(updatedAt)
       )
     ) {
       return null;
@@ -448,6 +490,7 @@ function accountForApi(value) {
     betCount,
     settledCount,
     pendingCount,
+    voidCount,
     hitCount,
     missCount,
     hitRate: value.hitRate,
@@ -462,6 +505,7 @@ function accountForApi(value) {
       totalLoss: ladderTotalLoss,
     },
     pendingBet,
+    latestVoid,
     latestOutcome,
     startedAt,
     updatedAt,

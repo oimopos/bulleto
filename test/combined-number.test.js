@@ -12,6 +12,10 @@ import {
   combinedTrajectorySignals,
   combinedVirtualRecencySources,
   combineNumberRankings,
+  normalizePredictiveLeaderApiSnapshot,
+  PREDICTIVE_LEADER_API_ALGORITHM_VERSION,
+  PREDICTIVE_LEADER_API_SCHEMA_VERSION,
+  predictiveLeaderNumberContext,
   TRAJECTORY_RANK37_BASIS,
   TRAJECTORY_RANK37_EVIDENCE_MASS_THRESHOLD,
   TRAJECTORY_RANK37_VERSION,
@@ -66,6 +70,72 @@ const FRESH_STATE = Object.freeze({
   pipelinePending: Object.freeze({ results: 0, gaps: 0 }),
 });
 
+function predictiveLeaderApiSnapshot() {
+  return {
+    schemaVersion: PREDICTIVE_LEADER_API_SCHEMA_VERSION,
+    algorithmVersion: PREDICTIVE_LEADER_API_ALGORITHM_VERSION,
+    mode: "observation",
+    executionEnabled: false,
+    advisoryOnly: true,
+    source: "buleto",
+    instrument: "default",
+    serverTime: "2026-10-10T10:00:22.000Z",
+    status: "ready",
+    reason: "ready",
+    number: 7,
+    forecast: {
+      id: 77,
+      roundId: "101",
+      lockedAt: "2026-10-10T10:00:20.000Z",
+      bettingClosesAt: "2026-10-10T10:00:25.000Z",
+      roundEndsAt: "2026-10-10T10:01:00.000Z",
+    },
+    model: {
+      sourceCount: 2,
+      familyCount: 2,
+      activeFamilies: ["price", "conditional-history"],
+      activeFamilyWeights: {
+        price: 0.5,
+        "conditional-history": 0.5,
+      },
+      learningVersion: "family-brier-logodds-v1",
+      learningStatus: "cold_start",
+      trainingCount: 0,
+      learnedFamilyWeights: {
+        price: 0.5,
+        "conditional-history": 0.5,
+      },
+      tieBreakApplied: false,
+    },
+    account: null,
+    metrics: {
+      readyCount: 1,
+      settledCount: 0,
+      pendingCount: 1,
+      top1Hits: 0,
+      top1Rate: null,
+      meanBrierLoss: null,
+      uniformBrierLoss: 18 / 37,
+      beatsUniform: null,
+    },
+    freshness: {
+      currentRoundId: 101,
+      latestPersistedResultId: 10,
+      latestPersistedRoundId: 100,
+      latestPersistedAt: "2026-10-10T10:00:00.000Z",
+      collectorLastResultAt: "2026-10-10T10:00:00.000Z",
+      resultCursorMatches: true,
+      roundCursorMatches: true,
+      forecastRoundMatches: true,
+      resultConfirmationPending: false,
+      pendingResultCount: 0,
+      persistencePendingResults: 0,
+      persistencePendingGaps: 0,
+      integrityOk: true,
+    },
+  };
+}
+
 test("combined freshness accepts one fully synchronized state snapshot", () => {
   assert.deepEqual(assessCombinedNumberFreshness(FRESH_STATE), {
     status: "ready",
@@ -74,6 +144,78 @@ test("combined freshness accepts one fully synchronized state snapshot", () => {
     latestRoundId: 4_103_912,
     latestResultId: 1_113,
   });
+});
+
+test("predictive leader API snapshot exposes only a strict ready number", () => {
+  const payload = predictiveLeaderApiSnapshot();
+  const normalized = normalizePredictiveLeaderApiSnapshot(payload);
+
+  assert.deepEqual(normalized, payload);
+  assert.deepEqual(predictiveLeaderNumberContext({
+    loaded: true,
+    snapshot: normalized,
+  }), {
+    state: "ready",
+    snapshot: normalized,
+  });
+});
+
+test("predictive leader API rejects malformed ready payloads", () => {
+  for (const mutate of [
+    (value) => { value.number = 37; },
+    (value) => { value.model.learnedFamilyWeights.price = 0.6; },
+    (value) => { value.freshness.persistencePendingResults = 1; },
+    (value) => { value.forecast.roundId = "102"; },
+  ]) {
+    const malformed = predictiveLeaderApiSnapshot();
+    mutate(malformed);
+    assert.equal(normalizePredictiveLeaderApiSnapshot(malformed), null);
+  }
+});
+
+test("predictive leader API waiting and paused responses hide the number", () => {
+  const waiting = predictiveLeaderApiSnapshot();
+  waiting.status = "waiting";
+  waiting.reason = "forecast_settled";
+  waiting.number = null;
+  waiting.model = null;
+  const normalizedWaiting = normalizePredictiveLeaderApiSnapshot(waiting);
+  assert.equal(normalizedWaiting?.status, "waiting");
+  assert.deepEqual(predictiveLeaderNumberContext({
+    loaded: true,
+    snapshot: normalizedWaiting,
+  }), { state: "waiting", reason: "forecast_settled" });
+
+  const paused = predictiveLeaderApiSnapshot();
+  paused.status = "paused";
+  paused.reason = "collector_unavailable";
+  paused.number = null;
+  paused.forecast = null;
+  paused.model = null;
+  const normalizedPaused = normalizePredictiveLeaderApiSnapshot(paused);
+  assert.equal(normalizedPaused?.status, "paused");
+  assert.deepEqual(predictiveLeaderNumberContext({
+    loaded: true,
+    snapshot: normalizedPaused,
+  }), { state: "paused", reason: "collector_unavailable" });
+});
+
+test("predictive leader first-fetch error cannot remain stuck on loading", () => {
+  const ready = normalizePredictiveLeaderApiSnapshot(predictiveLeaderApiSnapshot());
+  assert.deepEqual(predictiveLeaderNumberContext({
+    loaded: false,
+    error: true,
+    snapshot: ready,
+  }), { state: "error" });
+});
+
+test("predictive leader SSE stale flag immediately hides a cached number", () => {
+  const ready = normalizePredictiveLeaderApiSnapshot(predictiveLeaderApiSnapshot());
+  assert.deepEqual(predictiveLeaderNumberContext({
+    loaded: true,
+    requiresFreshSnapshot: true,
+    snapshot: ready,
+  }), { state: "paused", reason: "event_stream_disconnected" });
 });
 
 test("combined freshness pauses on collector or persistence backlog", () => {

@@ -119,6 +119,10 @@ function startFakeCollector(t) {
   return { collector, socket };
 }
 
+function syncInitialSnapshot(socket) {
+  socket.message({ type: 'last-results', data: [] });
+}
+
 test('Buleto wire cell 37 maps to roulette zero', () => {
   assert.equal(canonicalRouletteNumber(37), 0);
   assert.equal(canonicalRouletteNumber(0), 0);
@@ -349,6 +353,7 @@ test('round trajectory emits only new exact observations and never leaks across 
 
 test('same-message trajectory always precedes pre-close forecast for both wire orders', (t) => {
   const { collector, socket } = startFakeCollector(t);
+  syncInitialSnapshot(socket);
   const order = [];
   collector.on('round-trajectory', (trajectory) => {
     order.push({ type: 'trajectory', roundId: trajectory.round.externalRoundId });
@@ -395,6 +400,7 @@ test('same-message trajectory always precedes pre-close forecast for both wire o
 
 test('collector emits a pre-close forecast in the safe window and ignores future factors', (t) => {
   const { collector, socket } = startFakeCollector(t);
+  syncInitialSnapshot(socket);
   const forecasts = [];
   const errors = [];
   collector.on('preclose-forecast', (forecast) => forecasts.push(forecast));
@@ -443,6 +449,7 @@ test('collector emits a pre-close forecast in the safe window and ignores future
 
 test('collector does not emit a forecast after betting is closed', (t) => {
   const { collector, socket } = startFakeCollector(t);
+  syncInitialSnapshot(socket);
   const forecasts = [];
   collector.on('preclose-forecast', (forecast) => forecasts.push(forecast));
 
@@ -465,6 +472,7 @@ test('collector does not emit a forecast after betting is closed', (t) => {
 
 test('collector does not emit a forecast when upstream status is closed', (t) => {
   const { collector, socket } = startFakeCollector(t);
+  syncInitialSnapshot(socket);
   const forecasts = [];
   collector.on('preclose-forecast', (forecast) => forecasts.push(forecast));
 
@@ -489,6 +497,7 @@ test('collector does not emit a forecast when upstream status is closed', (t) =>
 
 test('collector never derives a forecast from a final round carrying rr', (t) => {
   const { collector, socket } = startFakeCollector(t);
+  syncInitialSnapshot(socket);
   const forecasts = [];
   collector.on('preclose-forecast', (forecast) => forecasts.push(forecast));
 
@@ -510,6 +519,107 @@ test('collector never derives a forecast from a final round carrying rr', (t) =>
     ],
   });
 
+  assert.equal(forecasts.length, 0);
+});
+
+test('collector captures a pre-close forecast on schedule when the websocket is quiet', async (t) => {
+  const { collector, socket } = startFakeCollector(t);
+  syncInitialSnapshot(socket);
+  const forecasts = [];
+  collector.on('preclose-forecast', (forecast) => forecasts.push(forecast));
+
+  const factorBaseMs = Date.now();
+  socket.message({
+    type: 'factors',
+    data: [
+      { dt: iso(factorBaseMs - 4_000), v: 19.6 },
+      { dt: iso(factorBaseMs - 2_000), v: 19.8 },
+      { dt: iso(factorBaseMs), v: 20 },
+    ],
+  });
+  socket.message({
+    type: 'round',
+    data: forecastRound({ id: 505, bettingClosesAtMs: factorBaseMs + 10_300 }),
+  });
+
+  assert.equal(forecasts.length, 0, 'round arrives before the safe lock window');
+  await new Promise((resolve) => setTimeout(resolve, 600));
+
+  assert.equal(forecasts.length, 1);
+  assert.equal(forecasts[0].round.externalRoundId, '505');
+  assert.ok(forecasts[0].features.leadTimeMs >= 8_000);
+  assert.ok(forecasts[0].features.leadTimeMs <= 10_000);
+
+  socket.message({
+    type: 'factors',
+    data: [
+      { dt: iso(Date.now() - 2_000), v: 20 },
+      { dt: iso(Date.now() - 1_000), v: 20.1 },
+      { dt: iso(Date.now()), v: 20.2 },
+    ],
+  });
+  assert.equal(forecasts.length, 2, 'later frames retry delivery while the lock window is open');
+});
+
+test('collector skips scheduled and immediate forecasts before initial history sync', async (t) => {
+  const { collector, socket } = startFakeCollector(t);
+  const forecasts = [];
+  collector.on('preclose-forecast', (forecast) => forecasts.push(forecast));
+
+  const factorBaseMs = Date.now();
+  socket.message({
+    type: 'factors',
+    data: [
+      { dt: iso(factorBaseMs - 4_000), v: 19.6 },
+      { dt: iso(factorBaseMs - 2_000), v: 19.8 },
+      { dt: iso(factorBaseMs), v: 20 },
+    ],
+  });
+  socket.message({
+    type: 'round',
+    data: forecastRound({ id: 506, bettingClosesAtMs: factorBaseMs + 10_250 }),
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  assert.equal(forecasts.length, 0);
+
+  const retryBaseMs = Date.now();
+  socket.message({
+    type: 'factors',
+    data: [
+      { dt: iso(retryBaseMs - 2_000), v: 20 },
+      { dt: iso(retryBaseMs - 1_000), v: 20.1 },
+      { dt: iso(retryBaseMs), v: 20.2 },
+    ],
+  });
+  assert.equal(forecasts.length, 0, 'an immediate attempt is guarded too');
+});
+
+test('collector cancels the scheduled pre-close attempt when the round closes', async (t) => {
+  const { collector, socket } = startFakeCollector(t);
+  syncInitialSnapshot(socket);
+  const forecasts = [];
+  collector.on('preclose-forecast', (forecast) => forecasts.push(forecast));
+
+  const factorBaseMs = Date.now();
+  socket.message({
+    type: 'factors',
+    data: [
+      { dt: iso(factorBaseMs - 4_000), v: 19.6 },
+      { dt: iso(factorBaseMs - 2_000), v: 19.8 },
+      { dt: iso(factorBaseMs), v: 20 },
+    ],
+  });
+  socket.message({
+    type: 'round',
+    data: forecastRound({ id: 507, bettingClosesAtMs: factorBaseMs + 10_250 }),
+  });
+  socket.message({
+    type: 'round',
+    data: forecastRound({ id: 507, bettingClosesAtMs: factorBaseMs + 10_250, result: null }),
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 500));
   assert.equal(forecasts.length, 0);
 });
 

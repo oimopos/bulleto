@@ -45,6 +45,7 @@ test("dashboard keeps the exact read-only fetch URL list", () => {
     "/api/pairs",
     "/api/forecasts/hits?limit=20",
     "/api/cycle-comparison",
+    "/api/predictive-leader",
   ]);
   assert.equal(
     [...app.matchAll(/\bfetchJson\(/g)].length,
@@ -60,6 +61,26 @@ test("server exposes a separate read-only predictive leader GET", () => {
   );
   assert.match(server, /predictiveLeaderSnapshotForApi\(\{/);
   assert.match(server, /state: dashboardState\(\)/);
+});
+
+test("dashboard wires predictive leader loading and SSE invalidation fail-closed", () => {
+  const refreshStart = app.indexOf("async function refreshAll");
+  const refreshEnd = app.indexOf("function renderFetchFailure", refreshStart);
+  const refresh = app.slice(refreshStart, refreshEnd);
+  assert.ok(refreshStart >= 0 && refreshEnd > refreshStart);
+  assert.match(refresh, /fetchJson\("\/api\/predictive-leader"\)/);
+  assert.match(refresh, /normalizePredictiveLeaderApiSnapshot\(requests\[7\]\.value\)/);
+  assert.match(refresh, /normalizedPredictiveLeaderAccount\(snapshot\?\.account\)/);
+  assert.match(refresh, /store\.predictiveLeaderLoaded = true/);
+  assert.match(refresh, /store\.predictiveLeaderError = true/);
+  assert.match(refresh, /store\.predictiveLeaderRequiresFreshSnapshot = false/);
+
+  const eventErrorStart = app.indexOf('source.addEventListener("error"');
+  const eventErrorEnd = app.indexOf("});", eventErrorStart);
+  const eventError = app.slice(eventErrorStart, eventErrorEnd);
+  assert.ok(eventErrorStart >= 0 && eventErrorEnd > eventErrorStart);
+  assert.match(eventError, /store\.predictiveLeaderRequiresFreshSnapshot = true/);
+  assert.match(eventError, /renderCombinedPick\(\)/);
 });
 
 test("combined leader is the first dashboard block and renders exactly one number", () => {
@@ -92,10 +113,18 @@ test("combined leader is the first dashboard block and renders exactly one numbe
   assert.match(block, /эвристический ранговый индекс, не вероятность и не гарантия преимущества/);
   assert.match(block, /Давность, виртуальная цель, невыпавшие числа, survivor и исторический аналог остаются только наблюдением/);
   assert.match(block, /1 из 37 \(≈2,7%\)/);
-  assert.match(html, /<script type="module" src="\/app\.js\?v=40"><\/script>/);
+  assert.match(html, /<script type="module" src="\/app\.js\?v=42"><\/script>/);
 
-  assert.match(app, /from "\.\/combined-number\.js\?v=6"/);
-  assert.match(app, /assessCombinedNumberFreshness\(store\.state\)/);
+  assert.match(app, /from "\.\/combined-number\.js\?v=7"/);
+  assert.match(app, /normalizePredictiveLeaderApiSnapshot/);
+  assert.match(app, /predictiveLeaderNumberContext/);
+  assert.match(combinedNumber, /export function normalizePredictiveLeaderApiSnapshot\(value\)/);
+  assert.match(combinedNumber, /export function predictiveLeaderNumberContext\(/);
+  assert.match(combinedNumber, /value\.schemaVersion !== PREDICTIVE_LEADER_API_SCHEMA_VERSION/);
+  assert.match(combinedNumber, /value\.algorithmVersion !== PREDICTIVE_LEADER_API_ALGORITHM_VERSION/);
+  assert.match(combinedNumber, /value\.mode !== "observation"/);
+  assert.match(combinedNumber, /value\.executionEnabled !== false/);
+  assert.match(combinedNumber, /value\.advisoryOnly !== true/);
   assert.match(app, /const LEARNED_LEADER_SCHEMA_VERSION = 1/);
   assert.match(app, /const LEARNED_LEADER_ALGORITHM_VERSION = "learned-predictive-family-index-v5"/);
   assert.match(app, /function normalizedPredictiveLeader\(value\)/);
@@ -119,15 +148,12 @@ test("combined leader is the first dashboard block and renders exactly one numbe
   const contextEnd = app.indexOf("function renderCombinedPick", contextStart);
   const contextBlock = app.slice(contextStart, contextEnd);
   assert.ok(contextStart >= 0 && contextEnd > contextStart);
-  assert.match(contextBlock, /stateHasIntegrityGap\(store\.state\)/);
-  assert.match(contextBlock, /assessCombinedNumberFreshness\(store\.state\)/);
-  assert.match(contextBlock, /sameEntityId\(latestForecast\.roundId, currentRoundId\)/);
-  assert.match(contextBlock, /latestForecast\.settlement !== null/);
-  assert.match(contextBlock, /latestForecast\.predictiveLeader/);
-  assert.match(contextBlock, /normalizedPredictiveLeader\(latestForecast\.predictiveLeader\)/);
-  assert.match(contextBlock, /sameTimestamp\(leader\.lockedAt, latestForecast\.lockedAt\)/);
-  assert.match(contextBlock, /leader\.status !== "ready"/);
-  assert.match(contextBlock, /predictiveLeaderMetrics/);
+  assert.match(contextBlock, /predictiveLeaderNumberContext\(/);
+  assert.match(contextBlock, /loaded: store\.predictiveLeaderLoaded/);
+  assert.match(contextBlock, /error: store\.predictiveLeaderError/);
+  assert.match(contextBlock, /requiresFreshSnapshot: store\.predictiveLeaderRequiresFreshSnapshot/);
+  assert.match(contextBlock, /snapshot: store\.predictiveLeaderSnapshot/);
+  assert.doesNotMatch(contextBlock, /store\.state|precloseForecast|latestForecast/);
   assert.doesNotMatch(contextBlock, /combineNumberRankings|combinedTripleFollowerRanking/);
   assert.doesNotMatch(contextBlock, /rankedNumbers|trajectoryShadow|pairHistory|followerTop5Tracker|tripleFollowerSignal/);
   assert.doesNotMatch(contextBlock, /currentOverdueRanking|currentVirtualRecencySignals/);
@@ -142,10 +168,10 @@ test("combined leader is the first dashboard block and renders exactly one numbe
   const renderEnd = app.indexOf("function renderPrecloseComparison", renderStart);
   const renderBlock = app.slice(renderStart, renderEnd);
   assert.ok(renderStart >= 0 && renderEnd > renderStart);
-  assert.match(renderBlock, /const \{ leader, metrics \} = context/);
-  assert.match(renderBlock, /leader\.number/);
+  assert.match(renderBlock, /const \{ snapshot \} = context/);
+  assert.match(renderBlock, /const \{ model, metrics, number \} = snapshot/);
   assert.match(renderBlock, /зафиксировано сервером до результата/);
-  assert.match(renderBlock, /обучение \$\{leader\.learning\.trainingCount\}/);
+  assert.match(renderBlock, /обучение \$\{model\.trainingCount\}/);
   assert.match(renderBlock, /вес цены/);
   assert.match(renderBlock, /истории/);
   assert.match(renderBlock, /Top‑1/);
@@ -219,7 +245,12 @@ test("predictive leader account is an independent strict paper simulation", () =
   assert.match(normalizer, /value\.executionEnabled !== false/);
   assert.match(normalizer, /value\.advisoryOnly !== true/);
   assert.match(normalizer, /value\.model\.netHitMultiplier !== PREDICTIVE_LEADER_ACCOUNT_MODEL\.netHitMultiplier/);
-  assert.match(normalizer, /value\.betCount !== value\.settledCount \+ value\.pendingCount/);
+  assert.match(
+    normalizer,
+    /value\.betCount !== value\.settledCount \+ value\.pendingCount \+ voidCount/,
+  );
+  assert.match(normalizer, /value\.latestVoid\.reason !== "integrity_gap"/);
+  assert.match(normalizer, /\(voidCount > 0\) !== \(latestVoid !== null\)/);
   assert.match(normalizer, /value\.settledCount !== value\.hitCount \+ value\.missCount/);
   assert.match(normalizer, /value\.currentBalance !== computedBalance/);
   assert.match(normalizer, /value\.nextStake !== expectedNextStake/);
@@ -231,8 +262,9 @@ test("predictive leader account is an independent strict paper simulation", () =
   const contextEnd = app.indexOf("function renderPredictiveLeaderAccount", contextStart);
   const context = app.slice(contextStart, contextEnd);
   assert.ok(contextStart >= 0 && contextEnd > contextStart);
-  assert.match(context, /store\.state\.precloseForecast\?\.predictiveLeaderAccount/);
-  assert.match(context, /normalizedPredictiveLeaderAccount/);
+  assert.match(context, /store\.predictiveLeaderSnapshot\?\.account/);
+  assert.doesNotMatch(context, /store\.state|precloseForecast/);
+  assert.match(app, /normalizedPredictiveLeaderAccount\(snapshot\?\.account\)/);
   assert.doesNotMatch(context, /currentCombinedNumberContext|predictiveLeaderMetrics|latestForecast/);
 
   const rendererStart = app.indexOf("function renderPredictiveLeaderAccount()");
@@ -247,6 +279,10 @@ test("predictive leader account is an independent strict paper simulation", () =
   assert.match(renderer, /trajectoryShadowShareFormatter\.format\(account\.hitRate\)/);
   assert.match(renderer, /account\.nextStake/);
   assert.match(renderer, /account\.ladder\.missCount/);
+  assert.match(renderer, /account\.latestVoid/);
+  assert.match(renderer, /account\.voidCount/);
+  assert.match(renderer, /Последняя ставка аннулирована из-за разрыва данных/);
+  assert.match(renderer, /аннулировано из-за разрыва/);
   assert.match(renderer, /не вероятность/);
   assert.doesNotMatch(renderer, /вероятность следующего|улучшит|повысит шанс/);
   assert.ok(
@@ -864,7 +900,7 @@ test("warm next-round forecast exposes a strict 5-percent walk-forward contract"
   assert.match(html, /id="follower-dynamic-next-title"[^>]*>[^<]*≥5%/);
   assert.match(html, /id="follower-dynamic-next-note"[^>]*>[\s\S]*?5%/);
   assert.match(html, /styles\.css\?v=30/);
-  assert.match(html, /app\.js\?v=40/);
+  assert.match(html, /app\.js\?v=42/);
   assert.match(styles, /\.follower-dynamic-next\s*\{/);
   assert.match(styles, /\.follower-warm-current\s*\{/);
   assert.match(styles, /\.follower-warm-picks\s*\{/);
@@ -949,7 +985,8 @@ test("live fixed top-5 account gates one shared ticket ladder on cumulative 80 p
     "follower-live-account-balance",
     "follower-live-account-result-card",
     "follower-live-account-result",
-    "follower-live-account-staked",
+    "follower-live-account-last-stake",
+    "follower-live-account-last-stake-detail",
     "follower-live-account-bets",
     "follower-live-account-record",
     "follower-live-account-stake",
@@ -978,11 +1015,12 @@ test("live fixed top-5 account gates one shared ticket ladder on cumulative 80 p
   assert.match(app, /startEvidence\.rate < strategy\.threshold/);
   assert.match(app, /function renderFollowerLiveGatedAccount\(account,/);
   assert.match(app, /renderFollowerLiveGatedAccount\(tracker\.gatedAccount, \{ stale \}\)/);
-  assert.match(app, /followerLiveAccountStaked,[\s\S]*?formatRiskAmount\(account\.totalStaked\)/);
+  assert.match(app, /followerLiveAccountLastStake,[\s\S]*?formatRiskAmount\(account\.latestOutcome\.totalStake\)/);
+  assert.match(app, /followerLiveAccountLastStakeDetail,[\s\S]*?account\.latestOutcome\.stakePerNumber/);
   assert.match(app, /liveGatePercentFormatter/);
   assert.match(html, /Счёт с накопительным порогом 80%/);
-  assert.match(html, /Всего поставлено/);
-  assert.match(html, /с начала счёта 80%/);
+  assert.match(html, /Последний разыгранный билет/);
+  assert.match(html, /Разыгранных билетов ещё нет/);
   assert.match(html, /Порог 80% — накопительная архивная доля/);
   assert.match(html, /а не вероятность следующего раунда/);
   assert.match(html, /Независимый шанс попадания пяти чисел[^<]*5 из 37/);
@@ -1090,7 +1128,7 @@ test("cycle comparison language is descriptive, responsive, and cache-busted", (
   assert.match(block, /не предсказывает следующее число/);
   assert.doesNotMatch(block, /должн/iu);
   assert.match(html, /href="\/styles\.css\?v=30"/);
-  assert.match(html, /src="\/app\.js\?v=40"/);
+  assert.match(html, /src="\/app\.js\?v=42"/);
   assert.match(styles, /\.cycle-sequence-list\s*\{[\s\S]*?repeat\(auto-fill, minmax\(50px, 1fr\)\)/);
   assert.match(
     styles,

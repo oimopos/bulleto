@@ -4,9 +4,10 @@ import { buildCycleStageMarker } from "./cycle-stage-marker.js?v=1";
 import {
   TRAJECTORY_RANK37_BASIS,
   TRAJECTORY_RANK37_VERSION,
-  assessCombinedNumberFreshness,
   combinedTrajectorySignals,
-} from "./combined-number.js?v=6";
+  normalizePredictiveLeaderApiSnapshot,
+  predictiveLeaderNumberContext,
+} from "./combined-number.js?v=7";
 
 (() => {
   "use strict";
@@ -127,7 +128,8 @@ import {
     followerLiveAccountBalance: document.getElementById("follower-live-account-balance"),
     followerLiveAccountResultCard: document.getElementById("follower-live-account-result-card"),
     followerLiveAccountResult: document.getElementById("follower-live-account-result"),
-    followerLiveAccountStaked: document.getElementById("follower-live-account-staked"),
+    followerLiveAccountLastStake: document.getElementById("follower-live-account-last-stake"),
+    followerLiveAccountLastStakeDetail: document.getElementById("follower-live-account-last-stake-detail"),
     followerLiveAccountBets: document.getElementById("follower-live-account-bets"),
     followerLiveAccountRecord: document.getElementById("follower-live-account-record"),
     followerLiveAccountStake: document.getElementById("follower-live-account-stake"),
@@ -269,6 +271,10 @@ import {
     cycleComparisonError: false,
     stateLoaded: false,
     stateError: false,
+    predictiveLeaderSnapshot: null,
+    predictiveLeaderLoaded: false,
+    predictiveLeaderError: false,
+    predictiveLeaderRequiresFreshSnapshot: false,
     triples: [],
     triplesLoaded: false,
     triplesError: false,
@@ -1204,7 +1210,8 @@ import {
       fetchJson("/api/sequences?limit=50"),
       fetchJson("/api/pairs"),
       fetchJson("/api/forecasts/hits?limit=20"),
-      fetchJson("/api/cycle-comparison")
+      fetchJson("/api/cycle-comparison"),
+      fetchJson("/api/predictive-leader")
     ]);
 
     let successfulRequests = 0;
@@ -1260,6 +1267,27 @@ import {
       successfulRequests += 1;
     } else {
       store.cycleComparisonError = true;
+    }
+    if (requests[7].status === "fulfilled") {
+      const snapshot = normalizePredictiveLeaderApiSnapshot(requests[7].value);
+      const account = snapshot?.account === null
+        ? null
+        : normalizedPredictiveLeaderAccount(snapshot?.account);
+      store.predictiveLeaderLoaded = true;
+      if (snapshot && (snapshot.account === null || account)) {
+        store.predictiveLeaderSnapshot = { ...snapshot, account };
+        store.predictiveLeaderError = false;
+        store.predictiveLeaderRequiresFreshSnapshot = false;
+        captureServerClock(snapshot.serverTime);
+        successfulRequests += 1;
+      } else {
+        store.predictiveLeaderSnapshot = null;
+        store.predictiveLeaderError = true;
+      }
+    } else {
+      store.predictiveLeaderSnapshot = null;
+      store.predictiveLeaderLoaded = true;
+      store.predictiveLeaderError = true;
     }
 
     if (successfulRequests > 0) {
@@ -2488,12 +2516,19 @@ import {
       return null;
     }
 
-    const expectedReason = {
-      waiting: ["waiting_first_frozen_leader", "waiting_next_frozen_leader"],
-      pending: ["bet_frozen"],
-      exhausted: ["bankroll_exhausted"],
-    }[value.status];
-    if (!expectedReason.includes(value.reason)) return null;
+    if (
+      typeof value.reason !== "string"
+      || value.reason.trim() === ""
+      || value.reason !== value.reason.trim()
+      || (value.status === "pending" && value.reason !== "bet_frozen")
+      || (value.status === "exhausted" && value.reason !== "bankroll_exhausted")
+    ) {
+      return null;
+    }
+
+    const voidCount = value.voidCount === undefined
+      ? 0
+      : value.voidCount;
 
     const nonNegativeIntegerFields = [
       "currentBalance",
@@ -2522,8 +2557,9 @@ import {
       || value.totalGrossPayout
         % (PREDICTIVE_LEADER_ACCOUNT_MODEL.stakeStep
           * PREDICTIVE_LEADER_ACCOUNT_MODEL.grossPayoutMultiplier) !== 0
+      || !isStrictSafeNonNegativeInteger(voidCount)
       || value.pendingCount > 1
-      || value.betCount !== value.settledCount + value.pendingCount
+      || value.betCount !== value.settledCount + value.pendingCount + voidCount
       || value.settledCount !== value.hitCount + value.missCount
     ) {
       return null;
@@ -2651,6 +2687,33 @@ import {
     }
     if ((value.settledCount > 0) !== (latestOutcome !== null)) return null;
 
+    let latestVoid = null;
+    if (value.latestVoid !== null && value.latestVoid !== undefined) {
+      const voidedAt = strictTimestamp(value.latestVoid?.voidedAt);
+      if (
+        !isPlainRecord(value.latestVoid)
+        || !Number.isSafeInteger(value.latestVoid.forecastId)
+        || value.latestVoid.forecastId <= 0
+        || !isStrictRouletteNumber(value.latestVoid.targetNumber)
+        || !isStrictSafeNonNegativeInteger(value.latestVoid.stake)
+        || value.latestVoid.stake < PREDICTIVE_LEADER_ACCOUNT_MODEL.initialStake
+        || value.latestVoid.stake > PREDICTIVE_LEADER_ACCOUNT_MODEL.maxStake
+        || value.latestVoid.stake % PREDICTIVE_LEADER_ACCOUNT_MODEL.stakeStep !== 0
+        || value.latestVoid.reason !== "integrity_gap"
+        || !voidedAt
+      ) {
+        return null;
+      }
+      latestVoid = {
+        forecastId: value.latestVoid.forecastId,
+        targetNumber: value.latestVoid.targetNumber,
+        stake: value.latestVoid.stake,
+        reason: value.latestVoid.reason,
+        voidedAt: value.latestVoid.voidedAt,
+      };
+    }
+    if ((voidCount > 0) !== (latestVoid !== null)) return null;
+
     const startedAt = strictTimestamp(value.startedAt);
     const updatedAt = strictTimestamp(value.updatedAt);
     const exhaustedAt = strictTimestamp(value.exhaustedAt);
@@ -2665,6 +2728,8 @@ import {
         || value.minimumBalance !== value.initialBalance
         || value.maximumDrawdown !== 0
         || value.continuityGapCount !== 0
+        || voidCount !== 0
+        || latestVoid !== null
         || value.startedAt !== null
         || value.updatedAt !== null
         || value.exhaustedAt !== null
@@ -2688,6 +2753,10 @@ import {
         strictTimestamp(latestOutcome.occurredAt).getTime() < startedAt.getTime()
         || strictTimestamp(latestOutcome.occurredAt).getTime() > updatedAt.getTime()
       ))
+      || (latestVoid && (
+        strictTimestamp(latestVoid.voidedAt).getTime() < startedAt.getTime()
+        || strictTimestamp(latestVoid.voidedAt).getTime() > updatedAt.getTime()
+      ))
     ) {
       return null;
     }
@@ -2704,6 +2773,7 @@ import {
       canAffordNext: value.canAffordNext,
       shortfall: value.shortfall,
       betCount: value.betCount,
+      voidCount,
       settledCount: value.settledCount,
       pendingCount: value.pendingCount,
       hitCount: value.hitCount,
@@ -2719,15 +2789,14 @@ import {
       },
       pendingBet,
       latestOutcome,
+      latestVoid,
     };
   }
 
   function currentPredictiveLeaderAccountContext() {
-    if (!store.stateLoaded) return { state: "loading" };
-    if (store.stateError || !store.state) return { state: "error" };
-    const account = normalizedPredictiveLeaderAccount(
-      store.state.precloseForecast?.predictiveLeaderAccount,
-    );
+    if (store.predictiveLeaderError) return { state: "error" };
+    if (!store.predictiveLeaderLoaded) return { state: "loading" };
+    const account = store.predictiveLeaderSnapshot?.account ?? null;
     return account ? { state: "ready", account } : { state: "unavailable" };
   }
 
@@ -2769,9 +2838,11 @@ import {
       ? `Условная ставка ${formatRiskAmount(account.pendingBet.stake)} на число ${account.pendingBet.targetNumber} зафиксирована до результата`
       : account.status === "exhausted"
         ? `Стоп · не хватает ${formatRiskAmount(account.shortfall)}`
-        : account.reason === "waiting_first_frozen_leader"
-          ? "Пока без завершённых прогнозов"
-          : "Рассчитан · ждём следующий зафиксированный лидер";
+        : account.latestVoid
+          ? "Последняя ставка аннулирована из-за разрыва данных · ждём следующий лидер"
+          : account.reason === "waiting_first_frozen_leader"
+            ? "Пока без завершённых прогнозов"
+            : "Рассчитан · ждём следующий зафиксированный лидер";
     setTextIfChanged(elements.combinedPickAccountStatus, statusText);
     setTextIfChanged(
       elements.combinedPickAccountBalance,
@@ -2789,9 +2860,12 @@ import {
       `${formatRiskAmount(account.hitCount)} / ${formatRiskAmount(account.missCount)}`,
     );
     const pendingText = account.pendingCount === 1 ? " · 1 ждёт результата" : "";
+    const voidText = account.voidCount > 0
+      ? ` · ${formatRiskAmount(account.voidCount)} аннулировано из-за разрыва`
+      : "";
     setTextIfChanged(
       elements.combinedPickAccountSettled,
-      `${formatRiskAmount(account.settledCount)} ${pluralForm(account.settledCount, "завершён", "завершено", "завершено")}${pendingText}`,
+      `${formatRiskAmount(account.settledCount)} ${pluralForm(account.settledCount, "завершён", "завершено", "завершено")}${pendingText}${voidText}`,
     );
     setTextIfChanged(
       elements.combinedPickAccountRate,
@@ -2826,48 +2900,12 @@ import {
   }
 
   function currentCombinedNumberContext() {
-    if (!store.stateLoaded) return { state: "loading" };
-    if (store.stateError || !store.state) return { state: "error" };
-    if (stateHasIntegrityGap(store.state)) return { state: "paused" };
-
-    const freshness = assessCombinedNumberFreshness(store.state);
-    if (freshness.status !== "ready") {
-      return { state: freshness.status };
-    }
-
-    const currentRoundId = freshness.currentRoundId;
-    if (
-      currentRoundId === null
-      || currentRoundId === undefined
-      || currentRoundId === ""
-    ) {
-      return { state: "waiting" };
-    }
-
-    const latestForecast = store.state.precloseForecast?.latest;
-    if (
-      !isPlainRecord(latestForecast)
-      || !sameEntityId(latestForecast.roundId, currentRoundId)
-      || latestForecast.settlement !== null
-      || !parseDate(latestForecast.lockedAt)
-    ) {
-      return { state: "waiting" };
-    }
-    if (latestForecast.predictiveLeader === null || latestForecast.predictiveLeader === undefined) {
-      return { state: "waiting" };
-    }
-    const leader = normalizedPredictiveLeader(latestForecast.predictiveLeader);
-    if (!leader || !sameTimestamp(leader.lockedAt, latestForecast.lockedAt)) {
-      return { state: "paused" };
-    }
-    if (leader.status !== "ready") return { state: "waiting" };
-    return {
-      state: "ready",
-      leader,
-      metrics: normalizedPredictiveLeaderMetrics(
-        store.state.precloseForecast?.predictiveLeaderMetrics,
-      ),
-    };
+    return predictiveLeaderNumberContext({
+      loaded: store.predictiveLeaderLoaded,
+      error: store.predictiveLeaderError,
+      requiresFreshSnapshot: store.predictiveLeaderRequiresFreshSnapshot,
+      snapshot: store.predictiveLeaderSnapshot,
+    });
   }
 
   function renderCombinedPick() {
@@ -2902,33 +2940,34 @@ import {
       return;
     }
 
-    const { leader, metrics } = context;
+    const { snapshot } = context;
+    const { model, metrics, number } = snapshot;
     elements.combinedPick.dataset.state = "ready";
     elements.combinedPick.setAttribute("aria-busy", "false");
-    elements.combinedPickNumber.className = `result-ball combined-pick__number ${rouletteColorClass(leader.number)}`;
-    elements.combinedPickNumber.textContent = String(leader.number);
+    elements.combinedPickNumber.className = `result-ball combined-pick__number ${rouletteColorClass(number)}`;
+    elements.combinedPickNumber.textContent = String(number);
     elements.combinedPickNumber.setAttribute(
       "aria-label",
-      `Единый лидер: число ${leader.number}, ${rouletteColorLabel(leader.number)}`,
+      `Единый лидер: число ${number}, ${rouletteColorLabel(number)}`,
     );
 
     setTextIfChanged(
       elements.combinedPickStatus,
-      leader.learning.status === "cold_start"
+      model.learningStatus === "cold_start"
         ? "Число зафиксировано сервером до результата. Холодный старт: веса ещё стянуты к 50/50; улучшение не гарантируется."
         : "Число зафиксировано сервером до результата. Веса рассчитаны только по прошлым завершённым общим снимкам; улучшение не гарантируется.",
     );
-    const priceWeight = leader.learning.familyWeights.price;
-    const historyWeight = leader.learning.familyWeights["conditional-history"];
-    const currentFamilyText = leader.familyCount === 1
-      ? ` · в этом lock доступна только ${leader.familyWeights.price === 1 ? "цена" : "условная история"}`
+    const priceWeight = model.learnedFamilyWeights.price;
+    const historyWeight = model.learnedFamilyWeights["conditional-history"];
+    const currentFamilyText = model.familyCount === 1
+      ? ` · в этом lock доступна только ${model.activeFamilyWeights.price === 1 ? "цена" : "условная история"}`
       : "";
     const metricText = metrics?.settledCount > 0
       ? ` · Top‑1 ${metrics.top1Hits}/${metrics.settledCount} (${trajectoryShadowShareFormatter.format(metrics.top1Rate)})`
       : "";
     setTextIfChanged(
       elements.combinedPickSources,
-      `${leader.sourceCount} ${pluralForm(leader.sourceCount, "источник", "источника", "источников")} · ${leader.familyCount} ${pluralForm(leader.familyCount, "семья", "семьи", "семей")} · обучение ${leader.learning.trainingCount} · обучаемый вес цены ${trajectoryShadowShareFormatter.format(priceWeight)} · истории ${trajectoryShadowShareFormatter.format(historyWeight)}${currentFamilyText}${metricText}`,
+      `${model.sourceCount} ${pluralForm(model.sourceCount, "источник", "источника", "источников")} · ${model.familyCount} ${pluralForm(model.familyCount, "семья", "семьи", "семей")} · обучение ${model.trainingCount} · обучаемый вес цены ${trajectoryShadowShareFormatter.format(priceWeight)} · истории ${trajectoryShadowShareFormatter.format(historyWeight)}${currentFamilyText}${metricText}`,
     );
   }
 
@@ -5026,7 +5065,8 @@ import {
     const resetValues = () => {
       setTextIfChanged(elements.followerLiveAccountBalance, "—");
       setTextIfChanged(elements.followerLiveAccountResult, "—");
-      setTextIfChanged(elements.followerLiveAccountStaked, "—");
+      setTextIfChanged(elements.followerLiveAccountLastStake, "—");
+      setTextIfChanged(elements.followerLiveAccountLastStakeDetail, "Разыгранных билетов ещё нет");
       setTextIfChanged(elements.followerLiveAccountBets, "—");
       setTextIfChanged(elements.followerLiveAccountRecord, "— попаданий · — промахов");
       setTextIfChanged(elements.followerLiveAccountStake, "—");
@@ -5093,8 +5133,14 @@ import {
       elements.followerLiveAccountResultCard.classList.add("is-loss");
     }
     setTextIfChanged(
-      elements.followerLiveAccountStaked,
-      formatRiskAmount(account.totalStaked)
+      elements.followerLiveAccountLastStake,
+      account.latestOutcome ? formatRiskAmount(account.latestOutcome.totalStake) : "—"
+    );
+    setTextIfChanged(
+      elements.followerLiveAccountLastStakeDetail,
+      account.latestOutcome
+        ? `по ${formatRiskAmount(account.latestOutcome.stakePerNumber)} на каждое из 5 чисел`
+        : "Разыгранных билетов ещё нет"
     );
     setTextIfChanged(elements.followerLiveAccountBets, formatRiskAmount(account.betCount));
     setTextIfChanged(
@@ -6750,6 +6796,7 @@ import {
 
     source.addEventListener("open", () => {
       setConnection("online", "Онлайн");
+      if (store.predictiveLeaderRequiresFreshSnapshot) scheduleRefresh();
     });
 
     source.addEventListener("update", (event) => {
@@ -6766,6 +6813,9 @@ import {
     source.addEventListener("message", scheduleRefresh);
 
     source.addEventListener("error", () => {
+      if (store.eventSource !== source) return;
+      store.predictiveLeaderRequiresFreshSnapshot = true;
+      renderCombinedPick();
       if (source.readyState === EventSource.CLOSED) {
         setConnection("offline", "Эфир отключён");
       } else {
