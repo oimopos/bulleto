@@ -79,6 +79,8 @@ const TRAJECTORY_DISPLAY_RANGE_VERSION = "trajectory-display-range-v1";
 const TRAJECTORY_DISPLAY_RANGE_POLICY =
   "q50-centered-contiguous-max6-v1";
 const TRAJECTORY_DISPLAY_RANGE_MAX_CELLS = 6;
+const PREDICTIVE_LEADER_ACCOUNT_RESET_KEY = "manual-ladder-restart-2026-10-12";
+const PREDICTIVE_LEADER_ACCOUNT_RESET_REASON = "user_requested";
 const FOLLOWER_TOP5_HORIZONS = Object.freeze([1, 2, 3, 5, 10, 20]);
 const FOLLOWER_TOP5_ALL_HORIZONS = Object.freeze(
   Array.from({ length: 20 }, (_, index) => index + 1),
@@ -4033,6 +4035,7 @@ export class RouletteDatabase {
     this.#migratePredictiveLeaderSnapshotsV16();
     this.#migratePredictiveLeaderAccountV17();
     this.#migratePredictiveLeaderAccountVoidV18();
+    this.#migratePredictiveLeaderAccountLadderResetV19(startingVersion);
   }
 
   #migratePrecloseForecastsV10() {
@@ -5003,6 +5006,126 @@ export class RouletteDatabase {
         PRAGMA user_version = 18;
         COMMIT;
       `);
+    } catch (error) {
+      try {
+        this.sqlite.exec("ROLLBACK");
+      } catch {
+        // Preserve the migration error.
+      }
+      throw error;
+    }
+  }
+
+  #migratePredictiveLeaderAccountLadderResetV19(startingVersion) {
+    const shouldRequestReset = startingVersion >= 17 && startingVersion < 19;
+    const requestedAt = shouldRequestReset
+      ? asTimestamp(this.clock(), undefined, "predictive leader reset requestedAt")
+      : null;
+    this.sqlite.exec("BEGIN IMMEDIATE");
+    try {
+      this.sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS predictive_leader_account_ladder_resets (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          source TEXT NOT NULL,
+          instrument TEXT NOT NULL,
+          reset_key TEXT NOT NULL CHECK (length(trim(reset_key)) > 0),
+          reason TEXT NOT NULL CHECK (reason = 'user_requested'),
+          status TEXT NOT NULL CHECK (status IN ('pending', 'applied')),
+          requested_at TEXT NOT NULL,
+          applied_after_forecast_id INTEGER UNIQUE REFERENCES
+            predictive_leader_account_bets(forecast_id),
+          balance_before INTEGER CHECK (balance_before IS NULL OR balance_before >= 0),
+          balance_after INTEGER CHECK (balance_after IS NULL OR balance_after >= 0),
+          ladder_total_loss_before INTEGER CHECK (
+            ladder_total_loss_before IS NULL
+            OR (ladder_total_loss_before >= 0 AND ladder_total_loss_before % 10 = 0)
+          ),
+          ladder_miss_count_before INTEGER CHECK (
+            ladder_miss_count_before IS NULL OR ladder_miss_count_before >= 0
+          ),
+          next_stake_before INTEGER CHECK (
+            next_stake_before IS NULL
+            OR (next_stake_before > 0 AND next_stake_before <= 2500
+              AND next_stake_before % 10 = 0)
+          ),
+          ladder_total_loss_after INTEGER CHECK (
+            ladder_total_loss_after IS NULL OR ladder_total_loss_after = 0
+          ),
+          ladder_miss_count_after INTEGER CHECK (
+            ladder_miss_count_after IS NULL OR ladder_miss_count_after = 0
+          ),
+          next_stake_after INTEGER CHECK (
+            next_stake_after IS NULL OR next_stake_after = 10
+          ),
+          applied_at TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(source, instrument, reset_key),
+          CHECK (
+            (status = 'pending'
+              AND applied_after_forecast_id IS NULL
+              AND balance_before IS NULL AND balance_after IS NULL
+              AND ladder_total_loss_before IS NULL
+              AND ladder_miss_count_before IS NULL
+              AND next_stake_before IS NULL
+              AND ladder_total_loss_after IS NULL
+              AND ladder_miss_count_after IS NULL
+              AND next_stake_after IS NULL AND applied_at IS NULL)
+            OR
+            (status = 'applied'
+              AND applied_after_forecast_id IS NOT NULL
+              AND balance_before IS NOT NULL AND balance_after = balance_before
+              AND ladder_total_loss_before IS NOT NULL
+              AND ladder_miss_count_before IS NOT NULL
+              AND next_stake_before IS NOT NULL
+              AND ladder_total_loss_after = 0
+              AND ladder_miss_count_after = 0
+              AND next_stake_after = 10 AND applied_at IS NOT NULL)
+          )
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS predictive_leader_account_reset_pending_idx
+          ON predictive_leader_account_ladder_resets(source, instrument)
+          WHERE status = 'pending';
+        CREATE INDEX IF NOT EXISTS predictive_leader_account_reset_stream_idx
+          ON predictive_leader_account_ladder_resets(source, instrument, id);
+      `);
+      if (shouldRequestReset) {
+        this.sqlite
+          .prepare(`
+            INSERT INTO predictive_leader_account_ladder_resets (
+              source, instrument, reset_key, reason, status, requested_at,
+              created_at, updated_at
+            )
+            SELECT
+              accounts.source,
+              accounts.instrument,
+              ?,
+              ?,
+              'pending',
+              CASE WHEN accounts.updated_at > ? THEN accounts.updated_at ELSE ? END,
+              CASE WHEN accounts.updated_at > ? THEN accounts.updated_at ELSE ? END,
+              CASE WHEN accounts.updated_at > ? THEN accounts.updated_at ELSE ? END
+            FROM predictive_leader_accounts AS accounts
+            WHERE EXISTS (
+              SELECT 1
+              FROM predictive_leader_account_bets AS bets
+              WHERE bets.source = accounts.source
+                AND bets.instrument = accounts.instrument
+            )
+            ON CONFLICT(source, instrument, reset_key) DO NOTHING
+          `)
+          .run(
+            PREDICTIVE_LEADER_ACCOUNT_RESET_KEY,
+            PREDICTIVE_LEADER_ACCOUNT_RESET_REASON,
+            requestedAt,
+            requestedAt,
+            requestedAt,
+            requestedAt,
+            requestedAt,
+            requestedAt,
+          );
+      }
+      this.sqlite.exec("PRAGMA user_version = 19; COMMIT");
     } catch (error) {
       try {
         this.sqlite.exec("ROLLBACK");
@@ -9448,11 +9571,199 @@ export class RouletteDatabase {
     if (Number(accountUpdate.changes) !== 1) {
       throw new Error("predictive leader account was not released after void");
     }
+    this.#applyPendingPredictiveLeaderAccountResetInTransaction({
+      source,
+      instrument,
+      appliedAt: safeVoidedAt,
+    });
     return {
       voided: 1,
       reason: "integrity_gap",
       forecastId: Number(bet.forecast_id),
     };
+  }
+
+  #applyPendingPredictiveLeaderAccountResetInTransaction({
+    source,
+    instrument,
+    appliedAt,
+  }) {
+    const reset = this.sqlite
+      .prepare(`
+        SELECT *
+        FROM predictive_leader_account_ladder_resets
+        WHERE source = ? AND instrument = ? AND status = 'pending'
+        ORDER BY id
+        LIMIT 1
+      `)
+      .get(source, instrument);
+    if (!reset) return { applied: 0, reason: "no_pending_reset" };
+    if (
+      reset.reset_key !== PREDICTIVE_LEADER_ACCOUNT_RESET_KEY
+      || reset.reason !== PREDICTIVE_LEADER_ACCOUNT_RESET_REASON
+    ) {
+      throw new Error("predictive leader account reset request is invalid");
+    }
+
+    const account = this.sqlite
+      .prepare(`
+        SELECT *
+        FROM predictive_leader_accounts
+        WHERE source = ? AND instrument = ?
+      `)
+      .get(source, instrument);
+    if (!account) {
+      throw new Error("predictive leader account reset has no account");
+    }
+    if (account.pending_forecast_id !== null) {
+      return { applied: 0, reason: "prior_pending" };
+    }
+    const lastBet = this.sqlite
+      .prepare(`
+        SELECT *
+        FROM predictive_leader_account_bets
+        WHERE source = ? AND instrument = ?
+        ORDER BY forecast_id DESC
+        LIMIT 1
+      `)
+      .get(source, instrument);
+    if (!lastBet || lastBet.status === "pending") {
+      throw new Error("predictive leader account reset boundary is invalid");
+    }
+
+    const currentBalance = Number(account.current_balance);
+    const ladderTotalLoss = Number(account.ladder_total_loss);
+    const ladderMissCount = Number(account.ladder_miss_count);
+    const previousNextStake = Number(account.next_stake);
+    const expectedBalance = lastBet.status === "settled"
+      ? Number(lastBet.balance_after)
+      : Number(lastBet.balance_before);
+    const expectedLadderLoss = lastBet.status === "settled"
+      ? Number(lastBet.ladder_loss_after)
+      : 0;
+    const expectedLadderMissCount = lastBet.status === "settled"
+      ? Number(lastBet.ladder_miss_count_after)
+      : 0;
+    if (
+      Number(account.schema_version) !== PREDICTIVE_LEADER_ACCOUNT_SCHEMA_VERSION
+      || account.strategy_version !== PREDICTIVE_LEADER_ACCOUNT_STRATEGY_VERSION
+      || account.leader_algorithm_version !== LEARNED_LEADER_ALGORITHM_VERSION
+      || !["running", "exhausted"].includes(account.status)
+      || !Number.isSafeInteger(currentBalance)
+      || !Number.isSafeInteger(ladderTotalLoss)
+      || !Number.isSafeInteger(ladderMissCount)
+      || previousNextStake !== nextPredictiveLeaderStake(ladderTotalLoss)
+      || currentBalance !== expectedBalance
+      || ladderTotalLoss !== expectedLadderLoss
+      || ladderMissCount !== expectedLadderMissCount
+    ) {
+      throw new Error("predictive leader account reset cursor is invalid");
+    }
+
+    const requestedAtMs = Date.parse(reset.requested_at);
+    const accountUpdatedAtMs = Date.parse(account.updated_at);
+    const betUpdatedAtMs = Date.parse(lastBet.updated_at);
+    const candidateAppliedAt = asTimestamp(
+      appliedAt,
+      undefined,
+      "predictive leader reset appliedAt",
+    );
+    const appliedAtMs = Math.max(
+      Date.parse(candidateAppliedAt),
+      requestedAtMs,
+      accountUpdatedAtMs,
+      betUpdatedAtMs,
+    );
+    if (
+      !Number.isFinite(requestedAtMs)
+      || !Number.isFinite(accountUpdatedAtMs)
+      || !Number.isFinite(betUpdatedAtMs)
+      || !Number.isFinite(appliedAtMs)
+    ) {
+      throw new Error("predictive leader account reset timestamps are invalid");
+    }
+    const safeAppliedAt = new Date(appliedAtMs).toISOString();
+    const nextStake = nextPredictiveLeaderStake(0);
+    const canResume = currentBalance >= nextStake;
+    const nextStatus = canResume ? "running" : "exhausted";
+    const exhaustedAt = canResume
+      ? null
+      : account.exhausted_at ?? safeAppliedAt;
+
+    const accountUpdate = this.sqlite
+      .prepare(`
+        UPDATE predictive_leader_accounts
+        SET status = ?, next_stake = ?, ladder_miss_count = 0,
+          ladder_total_loss = 0, updated_at = ?, exhausted_at = ?
+        WHERE source = ? AND instrument = ? AND pending_forecast_id IS NULL
+          AND current_balance = ? AND next_stake = ?
+          AND ladder_miss_count = ? AND ladder_total_loss = ?
+      `)
+      .run(
+        nextStatus,
+        nextStake,
+        safeAppliedAt,
+        exhaustedAt,
+        source,
+        instrument,
+        currentBalance,
+        previousNextStake,
+        ladderMissCount,
+        ladderTotalLoss,
+      );
+    if (Number(accountUpdate.changes) !== 1) {
+      throw new Error("predictive leader account reset was not applied exactly once");
+    }
+    const resetUpdate = this.sqlite
+      .prepare(`
+        UPDATE predictive_leader_account_ladder_resets
+        SET status = 'applied', applied_after_forecast_id = ?,
+          balance_before = ?, balance_after = ?, ladder_total_loss_before = ?,
+          ladder_miss_count_before = ?, next_stake_before = ?,
+          ladder_total_loss_after = 0, ladder_miss_count_after = 0,
+          next_stake_after = ?, applied_at = ?, updated_at = ?
+        WHERE id = ? AND status = 'pending'
+      `)
+      .run(
+        Number(lastBet.forecast_id),
+        currentBalance,
+        currentBalance,
+        ladderTotalLoss,
+        ladderMissCount,
+        previousNextStake,
+        nextStake,
+        safeAppliedAt,
+        safeAppliedAt,
+        Number(reset.id),
+      );
+    if (Number(resetUpdate.changes) !== 1) {
+      throw new Error("predictive leader account reset audit was not applied exactly once");
+    }
+    return {
+      applied: 1,
+      reason: "stake_restart",
+      afterForecastId: Number(lastBet.forecast_id),
+      previousNextStake,
+      nextStake,
+    };
+  }
+
+  applyPredictiveLeaderAccountReset(source = "buleto", instrument = "default") {
+    this.#assertOpen();
+    const safeSource = asNonEmptyText(source, undefined, "source");
+    const safeInstrument = asNonEmptyText(instrument, undefined, "instrument");
+    const now = asTimestamp(
+      this.clock(),
+      undefined,
+      "predictive leader reset appliedAt",
+    );
+    return this.#transaction(() => (
+      this.#applyPendingPredictiveLeaderAccountResetInTransaction({
+        source: safeSource,
+        instrument: safeInstrument,
+        appliedAt: now,
+      })
+    ));
   }
 
   #placePredictiveLeaderAccountBetInTransaction({
@@ -9494,6 +9805,11 @@ export class RouletteDatabase {
         placedAt,
         placedAt,
       );
+    this.#applyPendingPredictiveLeaderAccountResetInTransaction({
+      source,
+      instrument,
+      appliedAt: placedAt,
+    });
     const account = this.sqlite
       .prepare(`
         SELECT *
@@ -10618,6 +10934,11 @@ export class RouletteDatabase {
       if (Number(accountUpdate.changes) !== 1) {
         throw new Error("predictive leader account was not updated exactly once");
       }
+      this.#applyPendingPredictiveLeaderAccountResetInTransaction({
+        source: safeSource,
+        instrument: safeInstrument,
+        appliedAt: now,
+      });
       return { settled: 1 };
     });
   }
@@ -10696,6 +11017,11 @@ export class RouletteDatabase {
           voided: voidOutcome.voided,
         };
       }
+      this.#applyPendingPredictiveLeaderAccountResetInTransaction({
+        source: safeSource,
+        instrument: safeInstrument,
+        appliedAt: now,
+      });
 
       const candidate = this.sqlite
         .prepare(`
@@ -10981,6 +11307,58 @@ export class RouletteDatabase {
         ORDER BY bets.forecast_id
       `)
       .all(source, instrument);
+    const resetRows = this.sqlite
+      .prepare(`
+        SELECT *
+        FROM predictive_leader_account_ladder_resets
+        WHERE source = ? AND instrument = ?
+        ORDER BY id
+      `)
+      .all(source, instrument);
+    const appliedResetByForecastId = new Map();
+    let pendingResetCount = 0;
+    for (const reset of resetRows) {
+      const requestedAtMs = Date.parse(reset.requested_at);
+      if (
+        reset.reset_key !== PREDICTIVE_LEADER_ACCOUNT_RESET_KEY
+        || reset.reason !== PREDICTIVE_LEADER_ACCOUNT_RESET_REASON
+        || !Number.isFinite(requestedAtMs)
+      ) {
+        return null;
+      }
+      if (reset.status === "pending") {
+        pendingResetCount += 1;
+        if (
+          pendingResetCount > 1
+          || reset.applied_after_forecast_id !== null
+          || reset.balance_before !== null
+          || reset.balance_after !== null
+          || reset.ladder_total_loss_before !== null
+          || reset.ladder_miss_count_before !== null
+          || reset.next_stake_before !== null
+          || reset.ladder_total_loss_after !== null
+          || reset.ladder_miss_count_after !== null
+          || reset.next_stake_after !== null
+          || reset.applied_at !== null
+        ) {
+          return null;
+        }
+        continue;
+      }
+      const afterForecastId = Number(reset.applied_after_forecast_id);
+      const appliedAtMs = Date.parse(reset.applied_at);
+      if (
+        reset.status !== "applied"
+        || !Number.isSafeInteger(afterForecastId)
+        || afterForecastId < 1
+        || !Number.isFinite(appliedAtMs)
+        || appliedAtMs < requestedAtMs
+        || appliedResetByForecastId.has(afterForecastId)
+      ) {
+        return null;
+      }
+      appliedResetByForecastId.set(afterForecastId, reset);
+    }
     let balance = PREDICTIVE_LEADER_ACCOUNT_STARTING_BALANCE;
     let peakBalance = balance;
     let minimumBalance = balance;
@@ -10997,7 +11375,43 @@ export class RouletteDatabase {
     let pendingBet = null;
     let latestVoid = null;
     let latestOutcome = null;
+    let priorForecastId = null;
+    let priorUpdatedAt = null;
+    let appliedResetCount = 0;
+    const applyResetBoundary = (forecastId, lowerAt, upperAt = null) => {
+      const reset = appliedResetByForecastId.get(forecastId);
+      if (!reset) return true;
+      const appliedAtMs = Date.parse(reset.applied_at);
+      const lowerAtMs = Date.parse(lowerAt);
+      const upperAtMs = upperAt === null ? null : Date.parse(upperAt);
+      if (
+        !Number.isFinite(lowerAtMs)
+        || (upperAt !== null && !Number.isFinite(upperAtMs))
+        || appliedAtMs < lowerAtMs
+        || (upperAtMs !== null && appliedAtMs > upperAtMs)
+        || Number(reset.balance_before) !== balance
+        || Number(reset.balance_after) !== balance
+        || Number(reset.ladder_total_loss_before) !== ladderTotalLoss
+        || Number(reset.ladder_miss_count_before) !== ladderMissCount
+        || Number(reset.next_stake_before) !== nextPredictiveLeaderStake(ladderTotalLoss)
+        || Number(reset.ladder_total_loss_after) !== 0
+        || Number(reset.ladder_miss_count_after) !== 0
+        || Number(reset.next_stake_after) !== nextPredictiveLeaderStake(0)
+      ) {
+        return false;
+      }
+      ladderMissCount = 0;
+      ladderTotalLoss = 0;
+      appliedResetCount += 1;
+      return true;
+    };
     for (const row of rows) {
+      if (
+        priorForecastId !== null
+        && !applyResetBoundary(priorForecastId, priorUpdatedAt, row.placed_at)
+      ) {
+        return null;
+      }
       const stake = Number(row.stake);
       const continuityEpoch = row.continuity_epoch === null
         ? null
@@ -11033,6 +11447,8 @@ export class RouletteDatabase {
         return null;
       }
       lastContinuityEpoch = continuityEpoch;
+      priorForecastId = Number(row.forecast_id);
+      priorUpdatedAt = row.updated_at;
       if (row.status === "pending") {
         if (
           pendingBet
@@ -11142,6 +11558,13 @@ export class RouletteDatabase {
         occurredAt: row.occurred_at,
       };
     }
+    if (
+      priorForecastId !== null
+      && !applyResetBoundary(priorForecastId, priorUpdatedAt)
+    ) {
+      return null;
+    }
+    if (appliedResetCount !== appliedResetByForecastId.size) return null;
     const pendingId = account.pending_forecast_id === null
       ? null
       : Number(account.pending_forecast_id);

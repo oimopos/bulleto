@@ -413,6 +413,7 @@ test("schema contains all persistence tables", () => {
       "incident_resolutions",
       "incidents",
       "predictive_leader_account_bets",
+      "predictive_leader_account_ladder_resets",
       "predictive_leader_accounts",
       "round_forecasts",
       "round_results",
@@ -423,7 +424,13 @@ test("schema contains all persistence tables", () => {
       "virtual_bet_sessions",
       "virtual_bets",
     ]);
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 18);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 19);
+    assert.equal(
+      database.sqlite
+        .prepare("SELECT COUNT(*) AS count FROM predictive_leader_account_ladder_resets")
+        .get().count,
+      0,
+    );
     assert.deepEqual(
       database.sqlite
         .prepare("PRAGMA table_info(forecast_pair_snapshots)")
@@ -630,7 +637,7 @@ test("version 13 creates one live follower tracker at the current tail", () => {
       "buleto",
       "PRIMECOIN(XPM)/RUB",
     );
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 18);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 19);
     assert.equal(migrated.status, "armed");
     assert.equal(migrated.currentSession.sourceNumber, 9);
     assert.deepEqual(migrated.currentSession.fixedNumbers, [5, 4, 3, 2, 1]);
@@ -1138,6 +1145,186 @@ test("predictive leader account freezes a 1000-point ladder bet before outcome a
   }
 });
 
+test("version 19 restarts an existing predictive leader ladder at 10 without rewriting history", () => {
+  const directory = mkdtempSync(join(tmpdir(), "roulette-leader-reset-"));
+  const path = join(directory, "leader-reset.sqlite");
+  const source = "buleto";
+  const instrument = "PRIMECOIN(XPM)/RUB";
+  let clockMs = BASE_TIME + 10_000;
+  let database = createDatabase({ path, clock: () => new Date(clockMs) });
+
+  try {
+    database.ingestBatch(
+      [9, 4, 9, 4, 9, 5, 9].map((number, index) => event(
+        number,
+        `leader-reset-history-${index}`,
+        index,
+        { externalRoundId: String(100 + index) },
+      )),
+    );
+    markResultsCreatedAtObservation(database, "leader-reset-history-");
+
+    for (let attempt = 0; attempt < 36; attempt += 1) {
+      const roundId = String(107 + attempt);
+      const lockMs = BASE_TIME + 51_000 + attempt * 100_000;
+      clockMs = lockMs + 1_000;
+      database.recordPrecloseForecast(precloseForecast(roundId, {
+        bettingClosesAt: iso(lockMs + 9_000),
+        lockedAt: iso(lockMs),
+        factorAt: iso(lockMs),
+        roundEndsAt: iso(lockMs + 49_000),
+        features: {
+          samples: [
+            { dt: iso(lockMs - 4_000), v: 5.38 },
+            { dt: iso(lockMs - 2_000), v: 5.39 },
+            { dt: iso(lockMs), v: 5.4 },
+          ],
+          windowSeconds: 4,
+          slopePerSecond: 0.005,
+          secondsToEnd: 49,
+        },
+      }));
+      const attemptState = database.getPrecloseForecastState(source, instrument);
+      const pending = attemptState.predictiveLeaderAccount.pendingBet;
+      assert.ok(pending, JSON.stringify({
+        attempt: attempt + 1,
+        latest: attemptState.latest,
+        account: attemptState.predictiveLeaderAccount,
+      }));
+      clockMs = lockMs + 50_000;
+      database.ingestBatch([event(
+        pending.targetNumber === 9 ? 4 : 9,
+        `leader-reset-miss-${attempt}`,
+        100 + attempt * 100,
+        { externalRoundId: roundId },
+      )]);
+      markResultsCreatedAtObservation(database, `leader-reset-miss-${attempt}`);
+      assert.equal(database.settlePrecloseForecasts(source, instrument).settled, 1);
+      assert.equal(database.settlePredictiveLeaderAccount(source, instrument).settled, 1);
+    }
+
+    const beforeState = database.getPrecloseForecastState(source, instrument)
+      .predictiveLeaderAccount;
+    assert.equal(beforeState.nextStake, 20);
+    assert.deepEqual(beforeState.ladder, { missCount: 36, totalLoss: 360 });
+    const beforeBets = database.sqlite
+      .prepare(`
+        SELECT *
+        FROM predictive_leader_account_bets
+        WHERE source = ? AND instrument = ?
+        ORDER BY forecast_id
+      `)
+      .all(source, instrument)
+      .map((row) => ({ ...row }));
+    database.sqlite.exec("PRAGMA user_version = 18");
+    database.close();
+
+    clockMs += 1_000;
+    database = createDatabase({ path, clock: () => new Date(clockMs) });
+    const queued = database.sqlite
+      .prepare("SELECT * FROM predictive_leader_account_ladder_resets")
+      .get();
+    assert.equal(queued.status, "pending");
+    assert.equal(queued.applied_after_forecast_id, null);
+    assert.deepEqual(database.applyPredictiveLeaderAccountReset(source, instrument), {
+      applied: 1,
+      reason: "stake_restart",
+      afterForecastId: beforeBets.at(-1).forecast_id,
+      previousNextStake: 20,
+      nextStake: 10,
+    });
+
+    const afterState = database.getPrecloseForecastState(source, instrument)
+      .predictiveLeaderAccount;
+    assert.equal(afterState.currentBalance, beforeState.currentBalance);
+    assert.equal(afterState.totalStaked, beforeState.totalStaked);
+    assert.equal(afterState.totalGrossPayout, beforeState.totalGrossPayout);
+    assert.equal(afterState.betCount, beforeState.betCount);
+    assert.equal(afterState.missCount, beforeState.missCount);
+    assert.equal(afterState.continuityGapCount, beforeState.continuityGapCount);
+    assert.equal(afterState.nextStake, 10);
+    assert.deepEqual(afterState.ladder, { missCount: 0, totalLoss: 0 });
+    assert.deepEqual(
+      database.sqlite
+        .prepare(`
+          SELECT *
+          FROM predictive_leader_account_bets
+          WHERE source = ? AND instrument = ?
+          ORDER BY forecast_id
+        `)
+        .all(source, instrument)
+        .map((row) => ({ ...row })),
+      beforeBets,
+    );
+    const applied = database.sqlite
+      .prepare("SELECT * FROM predictive_leader_account_ladder_resets")
+      .get();
+    assert.equal(applied.status, "applied");
+    assert.equal(Number(applied.balance_before), beforeState.currentBalance);
+    assert.equal(Number(applied.balance_after), beforeState.currentBalance);
+    assert.equal(Number(applied.ladder_total_loss_before), 360);
+    assert.equal(Number(applied.next_stake_before), 20);
+    assert.equal(Number(applied.next_stake_after), 10);
+
+    database.close();
+    database = createDatabase({ path, clock: () => new Date(clockMs + 1_000) });
+    assert.deepEqual(database.applyPredictiveLeaderAccountReset(source, instrument), {
+      applied: 0,
+      reason: "no_pending_reset",
+    });
+    assert.equal(
+      database.sqlite
+        .prepare("SELECT COUNT(*) AS count FROM predictive_leader_account_ladder_resets")
+        .get().count,
+      1,
+    );
+    database.sqlite
+      .prepare(`
+        UPDATE predictive_leader_account_ladder_resets
+        SET balance_before = balance_before + 10, balance_after = balance_after + 10
+      `)
+      .run();
+    assert.equal(
+      database.getPrecloseForecastState(source, instrument).predictiveLeaderAccount,
+      null,
+    );
+    database.sqlite
+      .prepare(`
+        UPDATE predictive_leader_account_ladder_resets
+        SET balance_before = balance_before - 10, balance_after = balance_after - 10
+      `)
+      .run();
+
+    const nextRoundId = "143";
+    const nextLockMs = BASE_TIME + 51_000 + 36 * 100_000;
+    clockMs = nextLockMs + 1_000;
+    database.recordPrecloseForecast(precloseForecast(nextRoundId, {
+      bettingClosesAt: iso(nextLockMs + 9_000),
+      lockedAt: iso(nextLockMs),
+      factorAt: iso(nextLockMs),
+      roundEndsAt: iso(nextLockMs + 49_000),
+      features: {
+        samples: [
+          { dt: iso(nextLockMs - 4_000), v: 5.38 },
+          { dt: iso(nextLockMs - 2_000), v: 5.39 },
+          { dt: iso(nextLockMs), v: 5.4 },
+        ],
+        windowSeconds: 4,
+        slopePerSecond: 0.005,
+        secondsToEnd: 49,
+      },
+    }));
+    const nextState = database.getPrecloseForecastState(source, instrument)
+      .predictiveLeaderAccount;
+    assert.equal(nextState.status, "pending");
+    assert.equal(nextState.pendingBet.stake, 10);
+    assert.equal(nextState.pendingBet.balanceBefore, beforeState.currentBalance);
+  } finally {
+    database.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("predictive leader account voids a missing pending result at a gap and resumes after reopen", () => {
   const directory = mkdtempSync(join(tmpdir(), "roulette-leader-void-"));
   const path = join(directory, "leader-void.sqlite");
@@ -1164,6 +1351,16 @@ test("predictive leader account voids a missing pending result at a gap and resu
     const firstState = database.getPrecloseForecastState(source, instrument);
     const firstForecastId = firstState.latest.id;
     assert.equal(firstState.predictiveLeaderAccount.status, "pending");
+
+    database.sqlite.exec("PRAGMA user_version = 18");
+    database.close();
+    database = createDatabase({ path, clock: () => new Date(clockMs) });
+    assert.equal(
+      database.sqlite
+        .prepare("SELECT status FROM predictive_leader_account_ladder_resets")
+        .get().status,
+      "pending",
+    );
 
     const gap = database.markGap({
       source,
@@ -1206,6 +1403,13 @@ test("predictive leader account voids a missing pending result at a gap and resu
       reason: "integrity_gap",
       voidedAt: bet.voided_at,
     });
+    const reset = database.sqlite
+      .prepare("SELECT * FROM predictive_leader_account_ladder_resets")
+      .get();
+    assert.equal(reset.status, "applied");
+    assert.equal(Number(reset.applied_after_forecast_id), firstForecastId);
+    assert.equal(Number(reset.balance_before), 1_000);
+    assert.equal(Number(reset.next_stake_after), 10);
 
     database.close();
     database = createDatabase({
@@ -3874,7 +4078,7 @@ test("versions 11 and 12 do not backfill derived snapshots for version 10 foreca
       path,
       clock: () => new Date(BASE_TIME + 52_000),
     });
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 18);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 19);
     assert.equal(
       Number(
         database.sqlite
@@ -3953,7 +4157,7 @@ test("version 12 does not backfill consensus for legacy version 11 forecasts", (
       path,
       clock: () => new Date(BASE_TIME + 52_000),
     });
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 18);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 19);
     assert.equal(
       database.sqlite
         .prepare("SELECT COUNT(*) AS count FROM forecast_consensus_snapshots")
@@ -4015,7 +4219,7 @@ test("version 14 migration preserves a legacy Borda consensus row exactly", () =
       clock: () => new Date(BASE_TIME + 52_000),
     });
 
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 18);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 19);
     const migratedRow = {
       ...database.sqlite.prepare("SELECT * FROM forecast_consensus_snapshots").get(),
     };
@@ -4040,7 +4244,7 @@ test("version 14 migration preserves a legacy Borda consensus row exactly", () =
   }
 });
 
-test("versions 15 through 18 add empty prospective tables without backfilling legacy forecasts", () => {
+test("versions 15 through 19 add empty prospective tables without backfilling legacy forecasts", () => {
   const directory = mkdtempSync(join(tmpdir(), "roulette-trajectory-v14-"));
   const path = join(directory, "legacy-forecast.sqlite");
   let database = createDatabase({
@@ -4069,7 +4273,7 @@ test("versions 15 through 18 add empty prospective tables without backfilling le
       path,
       clock: () => new Date(BASE_TIME + 52_000),
     });
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 18);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 19);
     assert.equal(
       database.sqlite.prepare("SELECT COUNT(*) AS count FROM round_trajectories").get()
         .count,
@@ -4165,7 +4369,7 @@ test("version 17 never backfills an existing version 16 leader into the paper ac
       path,
       clock: () => new Date(BASE_TIME + 52_000),
     });
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 18);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 19);
     assert.equal(
       database.sqlite
         .prepare("SELECT COUNT(*) AS count FROM forecast_predictive_leader_snapshots")
@@ -4271,6 +4475,7 @@ test("version 18 preserves version 17 bet rows and adds nullable void audit fiel
     database.sqlite.exec("PRAGMA foreign_keys = OFF");
     database.sqlite.exec(`
       BEGIN IMMEDIATE;
+      DROP TABLE predictive_leader_account_ladder_resets;
       ALTER TABLE predictive_leader_account_bets
         RENAME TO predictive_leader_account_bets_v18_source;
       CREATE TABLE predictive_leader_account_bets (
@@ -4315,7 +4520,7 @@ test("version 18 preserves version 17 bet rows and adds nullable void audit fiel
       path,
       clock: () => new Date(clockMs),
     });
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 18);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 19);
     const after = database.sqlite
       .prepare("SELECT * FROM predictive_leader_account_bets ORDER BY forecast_id")
       .all();
@@ -4340,6 +4545,53 @@ test("version 18 preserves version 17 bet rows and adds nullable void audit fiel
     assert.equal(account.settledCount, 1);
     assert.equal(account.pendingCount, 1);
     assert.equal(account.voidCount, 0);
+    assert.equal(
+      database.sqlite
+        .prepare("SELECT status FROM predictive_leader_account_ladder_resets")
+        .get().status,
+      "pending",
+    );
+    assert.deepEqual(
+      database.applyPredictiveLeaderAccountReset(
+        "buleto",
+        "PRIMECOIN(XPM)/RUB",
+      ),
+      { applied: 0, reason: "prior_pending" },
+    );
+    assert.equal(
+      database.getPrecloseForecastState("buleto", "PRIMECOIN(XPM)/RUB")
+        .predictiveLeaderAccount.pendingBet.forecastId,
+      account.pendingBet.forecastId,
+    );
+    clockMs = BASE_TIME + 201_000;
+    database.ingestBatch([event(
+      (account.pendingBet.targetNumber + 1) % 37,
+      "leader-v18-pending-result",
+      200,
+      { externalRoundId: "108" },
+    )]);
+    markResultsCreatedAtObservation(database, "leader-v18-pending-result");
+    assert.equal(
+      database.settlePrecloseForecasts("buleto", "PRIMECOIN(XPM)/RUB").settled,
+      1,
+    );
+    assert.equal(
+      database.settlePredictiveLeaderAccount("buleto", "PRIMECOIN(XPM)/RUB")
+        .settled,
+      1,
+    );
+    const restarted = database.getPrecloseForecastState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    ).predictiveLeaderAccount;
+    assert.equal(restarted.pendingCount, 0);
+    assert.equal(restarted.nextStake, 10);
+    assert.deepEqual(restarted.ladder, { missCount: 0, totalLoss: 0 });
+    const reset = database.sqlite
+      .prepare("SELECT * FROM predictive_leader_account_ladder_resets")
+      .get();
+    assert.equal(reset.status, "applied");
+    assert.equal(Number(reset.applied_after_forecast_id), account.pendingBet.forecastId);
   } finally {
     database.close();
     rmSync(directory, { recursive: true, force: true });
@@ -4642,7 +4894,7 @@ test("version 5 history is backfilled into continuity epochs before migration co
 
   const database = createDatabase({ path });
   try {
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 18);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 19);
     assert.deepEqual(
       database.sqlite
         .prepare("SELECT continuity_epoch FROM round_results ORDER BY settled_at, id")
@@ -4702,7 +4954,7 @@ test("version 9 reconciles a proven contiguous shutdown boundary without deletin
 
     database = createDatabase({ path, gapThresholdSeconds: 135 });
     const state = database.getDashboardState();
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 18);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 19);
     assert.equal(state.totals.results, 5, "raw results are never recreated or deleted");
     assert.equal(state.totals.cycles, 1);
     assert.equal(state.totals.invalidCycles, 0);
@@ -6931,7 +7183,7 @@ test("v7 paper history initializes v8 bankroll with all known net results exactl
       "buleto",
       "PRIMECOIN(XPM)/RUB",
     );
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 18);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 19);
     assert.equal(state.testBank.initialBalance, 87_700);
     assert.equal(state.testBank.currentBalance, 87_910);
     assert.equal(state.testBank.netResult, 210);

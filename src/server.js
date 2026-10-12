@@ -113,6 +113,7 @@ const resultPipeline = new ResultPipeline({
 db.initializeVirtualBettor('buleto', config.instrument);
 db.settlePrecloseForecasts('buleto', config.instrument);
 db.settlePredictiveLeaderAccount('buleto', config.instrument);
+db.applyPredictiveLeaderAccountReset('buleto', config.instrument);
 db.reconcilePredictiveLeaderAccount('buleto', config.instrument);
 
 const sseClients = new Set();
@@ -644,6 +645,19 @@ function publishPipelineOutcome(outcome) {
   } catch (error) {
     console.error(
       '[predictive-leader] account settlement failed; it will be retried',
+      error,
+    );
+    retryError ??= error;
+  }
+  try {
+    const resetOutcome = db.applyPredictiveLeaderAccountReset(
+      'buleto',
+      config.instrument,
+    );
+    if (resetOutcome.applied > 0) broadcastUpdate('predictive-leader-account');
+  } catch (error) {
+    console.error(
+      '[predictive-leader] account reset failed; it will be retried',
       error,
     );
     retryError ??= error;
