@@ -115,6 +115,18 @@ db.settlePrecloseForecasts('buleto', config.instrument);
 db.settlePredictiveLeaderAccount('buleto', config.instrument);
 db.applyPredictiveLeaderAccountReset('buleto', config.instrument);
 db.reconcilePredictiveLeaderAccount('buleto', config.instrument);
+const trajectoryValidationWarmStartedAt = Date.now();
+try {
+  const warmed = db.warmPrecloseForecastValidation('buleto', config.instrument);
+  const durationMs = Date.now() - trajectoryValidationWarmStartedAt;
+  console.info(
+    `[trajectory] validation cache warmed: ${warmed.validCount}/${warmed.checkedCount} valid; `
+      + `cacheSize=${warmed.cacheSize}; hits=${warmed.hits}; `
+      + `misses=${warmed.misses}; durationMs=${durationMs}`,
+  );
+} catch (error) {
+  console.error('[trajectory] validation cache warm-up failed; continuing cold', error);
+}
 
 const sseClients = new Set();
 

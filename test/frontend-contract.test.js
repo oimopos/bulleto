@@ -92,6 +92,19 @@ test("predictive leader read path excludes dashboard and trajectory metric work"
   );
 });
 
+test("server warms trajectory validation after recovery and before listen", () => {
+  const recovery = server.indexOf("db.reconcilePredictiveLeaderAccount(");
+  const warm = server.indexOf("db.warmPrecloseForecastValidation(");
+  const warmEnd = server.indexOf("const sseClients", warm);
+  const listen = server.indexOf("server.listen(");
+  const warmBlock = server.slice(recovery, warmEnd);
+
+  assert.ok(recovery >= 0 && warm > recovery && warmEnd > warm);
+  assert.ok(listen > warmEnd);
+  assert.match(warmBlock, /try \{[\s\S]*?warmPrecloseForecastValidation/);
+  assert.match(warmBlock, /catch \(error\) \{[\s\S]*?continuing cold/);
+});
+
 test("dashboard wires predictive leader loading and SSE invalidation fail-closed", () => {
   const refreshStart = app.indexOf("async function refreshAll");
   const refreshEnd = app.indexOf("function renderFetchFailure", refreshStart);

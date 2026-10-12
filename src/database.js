@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 
 import {
@@ -2365,6 +2366,65 @@ const TRAJECTORY_SAMPLE_KEYS = Object.freeze([
 ]);
 const TRAJECTORY_ADAPTIVE_VALIDATOR_SQL_FUNCTION =
   "trajectory_adaptive_snapshot_valid_v2";
+const TRAJECTORY_ADAPTIVE_VALIDATOR_ARGUMENT_COUNT = 15;
+
+function trajectoryAdaptiveValidatorFingerprint(values) {
+  if (values.length !== TRAJECTORY_ADAPTIVE_VALIDATOR_ARGUMENT_COUNT) {
+    throw new TypeError(
+      `trajectory validator requires ${TRAJECTORY_ADAPTIVE_VALIDATOR_ARGUMENT_COUNT} arguments`,
+    );
+  }
+
+  const hash = createHash("sha256");
+  hash.update("trajectory-adaptive-snapshot-valid-v2/15\0", "utf8");
+  for (const value of values) {
+    let type;
+    let byteLength;
+    let bytes = null;
+    let text = null;
+    let encoding = null;
+    if (value === null) {
+      type = 0;
+      byteLength = 0;
+    } else if (typeof value === "string") {
+      type = 1;
+      byteLength = value.length * 2;
+      text = value;
+      encoding = "utf16le";
+    } else if (typeof value === "number") {
+      type = 2;
+      bytes = Buffer.allocUnsafe(8);
+      bytes.writeDoubleBE(value);
+      byteLength = bytes.byteLength;
+    } else if (typeof value === "bigint") {
+      type = 3;
+      text = value.toString(10);
+      encoding = "ascii";
+      byteLength = Buffer.byteLength(text, encoding);
+    } else if (value instanceof Uint8Array) {
+      type = 4;
+      bytes = Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+      byteLength = bytes.byteLength;
+    } else if (value === undefined) {
+      type = 5;
+      byteLength = 0;
+    } else if (typeof value === "boolean") {
+      type = 6;
+      bytes = Buffer.from([Number(value)]);
+      byteLength = bytes.byteLength;
+    } else {
+      throw new TypeError("unsupported trajectory validator argument type");
+    }
+
+    const frame = Buffer.allocUnsafe(9);
+    frame.writeUInt8(type, 0);
+    frame.writeBigUInt64BE(BigInt(byteLength), 1);
+    hash.update(frame);
+    if (text !== null) hash.update(text, encoding);
+    else if (bytes !== null) hash.update(bytes);
+  }
+  return hash.digest("base64url");
+}
 
 function trajectoryNumbersEqual(left, right, tolerance = 1e-9) {
   return (
@@ -3783,6 +3843,9 @@ export class RouletteDatabase {
     );
     this.followerTop5HitCurveCache = new Map();
     this.followerTop5GatedAccountCache = new Map();
+    this.trajectoryAdaptiveValidationCache = new Map();
+    this.trajectoryAdaptiveValidationCacheHits = 0;
+    this.trajectoryAdaptiveValidationCacheMisses = 0;
     this.closed = false;
     this.sqlite = new DatabaseSync(path);
 
@@ -3790,7 +3853,7 @@ export class RouletteDatabase {
       this.sqlite.function(
         TRAJECTORY_ADAPTIVE_VALIDATOR_SQL_FUNCTION,
         { deterministic: true },
-        validAdaptiveTrajectorySnapshotSql,
+        this.#validAdaptiveTrajectorySnapshotSql.bind(this),
       );
       this.sqlite.exec("PRAGMA foreign_keys = ON");
       this.sqlite.exec("PRAGMA busy_timeout = 5000");
@@ -3802,6 +3865,53 @@ export class RouletteDatabase {
       this.closed = true;
       throw error;
     }
+  }
+
+  #validAdaptiveTrajectorySnapshotSql(
+    status,
+    cutoffAt,
+    snapshotLockedAt,
+    lockPrice,
+    snapshotCurrentPrice,
+    medianCellWidth,
+    direction,
+    probabilitiesJson,
+    expectedDeltaCellWidths,
+    sampleJson,
+    nearestIdsJson,
+    parametersJson,
+    currentPrefixJson,
+    integrationJson,
+    cellsJson,
+  ) {
+    const values = [
+      status,
+      cutoffAt,
+      snapshotLockedAt,
+      lockPrice,
+      snapshotCurrentPrice,
+      medianCellWidth,
+      direction,
+      probabilitiesJson,
+      expectedDeltaCellWidths,
+      sampleJson,
+      nearestIdsJson,
+      parametersJson,
+      currentPrefixJson,
+      integrationJson,
+      cellsJson,
+    ];
+    const fingerprint = trajectoryAdaptiveValidatorFingerprint(values);
+    const cached = this.trajectoryAdaptiveValidationCache.get(fingerprint);
+    if (cached !== undefined) {
+      this.trajectoryAdaptiveValidationCacheHits += 1;
+      return cached;
+    }
+
+    this.trajectoryAdaptiveValidationCacheMisses += 1;
+    const result = validAdaptiveTrajectorySnapshotSql(...values);
+    this.trajectoryAdaptiveValidationCache.set(fingerprint, result);
+    return result;
   }
 
   #assertOpen() {
@@ -11779,6 +11889,57 @@ export class RouletteDatabase {
     };
   }
 
+  warmPrecloseForecastValidation(source = "buleto", instrument = "default") {
+    this.#assertOpen();
+    const safeSource = asNonEmptyText(source, undefined, "source");
+    const safeInstrument = asNonEmptyText(instrument, undefined, "instrument");
+    const row = this.sqlite
+      .prepare(`
+        SELECT
+          COUNT(*) AS checked_count,
+          COALESCE(SUM(
+            trajectory_adaptive_snapshot_valid_v2(
+              trajectory_shadows.status,
+              trajectory_shadows.cutoff_at,
+              snapshots.locked_at,
+              trajectory_shadows.lock_price,
+              snapshots.current_price,
+              trajectory_shadows.median_cell_width,
+              trajectory_shadows.direction,
+              trajectory_shadows.probabilities_json,
+              trajectory_shadows.expected_delta_cell_widths,
+              trajectory_shadows.sample_json,
+              trajectory_shadows.nearest_ids_json,
+              trajectory_shadows.parameters_json,
+              trajectory_shadows.current_prefix_json,
+              trajectory_shadows.integration_json,
+              snapshots.cells_json
+            )
+          ), 0) AS valid_count
+        FROM forecast_trajectory_shadows AS trajectory_shadows
+        JOIN round_forecasts AS forecasts
+          ON forecasts.id = trajectory_shadows.forecast_id
+        JOIN forecast_snapshots AS snapshots
+          ON snapshots.id = forecasts.snapshot_id
+        WHERE snapshots.source = ?
+          AND snapshots.instrument = ?
+          AND trajectory_shadows.model_version = ?
+          AND trajectory_shadows.status = 'ready'
+      `)
+      .get(
+        safeSource,
+        safeInstrument,
+        TRAJECTORY_SHADOW_ADAPTIVE_VERSION,
+      );
+    return {
+      checkedCount: Number(row.checked_count),
+      validCount: Number(row.valid_count),
+      cacheSize: this.trajectoryAdaptiveValidationCache.size,
+      hits: this.trajectoryAdaptiveValidationCacheHits,
+      misses: this.trajectoryAdaptiveValidationCacheMisses,
+    };
+  }
+
   getPredictiveLeaderReadState(source = "buleto", instrument = "default") {
     this.#assertOpen();
     const safeSource = asNonEmptyText(source, undefined, "source");
@@ -12517,6 +12678,7 @@ export class RouletteDatabase {
       return;
     }
     this.sqlite.close();
+    this.trajectoryAdaptiveValidationCache.clear();
     this.closed = true;
   }
 }

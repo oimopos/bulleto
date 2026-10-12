@@ -16,6 +16,8 @@ const BASE_TIME = Date.parse("2026-10-10T00:00:00.000Z");
 const SOURCE = "buleto";
 const INSTRUMENT = "PRIMECOIN(XPM)/RUB";
 const quietLogger = { info() {}, warn() {}, error() {} };
+const TRAJECTORY_VALIDATOR_SQL_FUNCTION =
+  "trajectory_adaptive_snapshot_valid_v2";
 
 function iso(milliseconds) {
   return new Date(milliseconds).toISOString();
@@ -198,6 +200,45 @@ function frozenRows(database, forecastId) {
         .get(forecastId),
     },
   };
+}
+
+function trajectoryValidatorArguments(database, forecastId) {
+  const row = database.sqlite
+    .prepare(`
+      SELECT
+        shadows.status,
+        shadows.cutoff_at,
+        snapshots.locked_at,
+        shadows.lock_price,
+        snapshots.current_price,
+        shadows.median_cell_width,
+        shadows.direction,
+        shadows.probabilities_json,
+        shadows.expected_delta_cell_widths,
+        shadows.sample_json,
+        shadows.nearest_ids_json,
+        shadows.parameters_json,
+        shadows.current_prefix_json,
+        shadows.integration_json,
+        snapshots.cells_json
+      FROM forecast_trajectory_shadows AS shadows
+      JOIN round_forecasts AS forecasts ON forecasts.id = shadows.forecast_id
+      JOIN forecast_snapshots AS snapshots ON snapshots.id = forecasts.snapshot_id
+      WHERE shadows.forecast_id = ?
+    `)
+    .get(forecastId);
+  assert.ok(row);
+  return Object.values(row);
+}
+
+function validateTrajectoryArguments(database, values) {
+  assert.equal(values.length, 15);
+  const placeholders = values.map(() => "?").join(", ");
+  return Number(
+    database.sqlite
+      .prepare(`SELECT ${TRAJECTORY_VALIDATOR_SQL_FUNCTION}(${placeholders}) AS valid`)
+      .get(...values).valid,
+  );
 }
 
 async function availablePort() {
@@ -436,6 +477,95 @@ test(
         logger: quietLogger,
       });
 
+      const firstWarm = database.warmPrecloseForecastValidation(
+        SOURCE,
+        INSTRUMENT,
+      );
+      assert.deepEqual(firstWarm, {
+        checkedCount: 1,
+        validCount: 1,
+        cacheSize: 1,
+        hits: 0,
+        misses: 1,
+      });
+      assert.deepEqual(
+        database.warmPrecloseForecastValidation(SOURCE, INSTRUMENT),
+        {
+          checkedCount: 1,
+          validCount: 1,
+          cacheSize: 1,
+          hits: 1,
+          misses: 1,
+        },
+      );
+
+      const validatorArguments = trajectoryValidatorArguments(
+        database,
+        latestForecastId,
+      );
+      assert.equal(validateTrajectoryArguments(database, validatorArguments), 1);
+      const argumentMutations = [
+        ["status", 0, "insufficient_history"],
+        ["cutoffAt", 1, iso(Date.parse(validatorArguments[1]) + 1)],
+        ["snapshotLockedAt", 2, iso(Date.parse(validatorArguments[2]) + 1)],
+        ["lockPrice", 3, Number(validatorArguments[3]) + 0.01],
+        ["snapshotCurrentPrice", 4, Number(validatorArguments[4]) + 0.01],
+        ["medianCellWidth", 5, Number(validatorArguments[5]) * 2],
+        [
+          "direction",
+          6,
+          validatorArguments[6] === "up" ? "down" : "up",
+        ],
+        ["probabilitiesJson", 7, "{}"],
+        [
+          "expectedDeltaCellWidths",
+          8,
+          Number(validatorArguments[8]) + 1,
+        ],
+        ["sampleJson", 9, "{}"],
+        ["nearestIdsJson", 10, "[]"],
+        ["parametersJson", 11, "{}"],
+        ["currentPrefixJson", 12, "[]"],
+        ["integrationJson", 13, "{}"],
+        ["cellsJson", 14, "[]"],
+      ];
+      for (const [label, index, replacement] of argumentMutations) {
+        const mutated = [...validatorArguments];
+        mutated[index] = replacement;
+        assert.equal(
+          validateTrajectoryArguments(database, mutated),
+          0,
+          `${label} must participate in the validation-cache fingerprint`,
+        );
+      }
+      const repeatedInvalid = [...validatorArguments];
+      repeatedInvalid[0] = "insufficient_history";
+      assert.equal(validateTrajectoryArguments(database, repeatedInvalid), 0);
+
+      const framedLeft = [...validatorArguments];
+      framedLeft[9] = "ab";
+      framedLeft[10] = "c";
+      const framedRight = [...validatorArguments];
+      framedRight[9] = "a";
+      framedRight[10] = "bc";
+      const typedNull = [...validatorArguments];
+      typedNull[6] = null;
+      const typedNullText = [...validatorArguments];
+      typedNullText[6] = "null";
+      for (const values of [framedLeft, framedRight, typedNull, typedNullText]) {
+        assert.equal(validateTrajectoryArguments(database, values), 0);
+      }
+      assert.deepEqual(
+        database.warmPrecloseForecastValidation(SOURCE, INSTRUMENT),
+        {
+          checkedCount: 1,
+          validCount: 1,
+          cacheSize: 20,
+          hits: 4,
+          misses: 20,
+        },
+      );
+
       const reopenedState = database.getPrecloseForecastState(SOURCE, INSTRUMENT);
       const reopenedRows = preservedRows(database);
       const reopenedEvidence = modelEvidence(reopenedState);
@@ -474,6 +604,66 @@ test(
         assert.deepEqual(passState.latest.trajectoryShadow, beforeState.latest.trajectoryShadow);
         assert.deepEqual(passState.latest.predictiveLeader, beforeState.latest.predictiveLeader);
       }
+      assert.deepEqual(preservedRows(database), beforeRows);
+
+      const originalIntegrationJson = validatorArguments[13];
+      const tamperedIntegration = JSON.parse(originalIntegrationJson);
+      tamperedIntegration.adaptive.trainingCount += 1;
+      const tamperedIntegrationJson = JSON.stringify(tamperedIntegration);
+      database.sqlite
+        .prepare(`
+          UPDATE forecast_trajectory_shadows
+          SET integration_json = ?
+          WHERE forecast_id = ?
+        `)
+        .run(tamperedIntegrationJson, latestForecastId);
+      const tamperedState = database.getPrecloseForecastState(SOURCE, INSTRUMENT);
+      assert.equal(tamperedState.latest.trajectoryShadow, null);
+      assert.equal(
+        tamperedState.trajectoryMetrics.readyCount,
+        beforeState.trajectoryMetrics.readyCount - 1,
+      );
+      assert.equal(
+        validateTrajectoryArguments(
+          database,
+          trajectoryValidatorArguments(database, latestForecastId),
+        ),
+        0,
+      );
+      assert.equal(
+        database.warmPrecloseForecastValidation(SOURCE, INSTRUMENT).validCount,
+        0,
+      );
+      database.sqlite
+        .prepare(`
+          UPDATE forecast_trajectory_shadows
+          SET integration_json = ?
+          WHERE forecast_id = ?
+        `)
+        .run(originalIntegrationJson, latestForecastId);
+      assert.deepEqual(
+        database.getPrecloseForecastState(SOURCE, INSTRUMENT),
+        beforeState,
+      );
+      assert.deepEqual(preservedRows(database), beforeRows);
+      database.close();
+
+      database = createDatabase({
+        path: databasePath,
+        clock: () => new Date(clockMs + 1_500),
+        logger: quietLogger,
+      });
+      assert.deepEqual(
+        database.warmPrecloseForecastValidation(SOURCE, INSTRUMENT),
+        {
+          checkedCount: 1,
+          validCount: 1,
+          cacheSize: 1,
+          hits: 0,
+          misses: 1,
+        },
+        "each reopened database must start with an instance-local cold cache",
+      );
       assert.deepEqual(preservedRows(database), beforeRows);
       database.close();
 
