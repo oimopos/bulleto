@@ -17,6 +17,9 @@ import {
 } from "./forecast-consensus.js";
 import {
   PRECLOSE_FORECAST_FACTOR_WINDOW_MS,
+  PRECLOSE_FORECAST_HORIZON_SECONDS,
+  PRECLOSE_FORECAST_MAX_LEAD_MS,
+  PRECLOSE_FORECAST_MIN_LEAD_MS,
   PRECLOSE_FORECAST_SHADOW_MODEL_VERSION,
   PRECLOSE_START_PRICE_MODEL_VERSION,
   calculatePrecloseOlsSlope,
@@ -10033,10 +10036,16 @@ export class RouletteDatabase {
     const factorMs = Date.parse(factorAt);
     const roundEndsMs = Date.parse(roundEndsAt);
     const leadTimeMs = closesMs - lockedMs;
+    const minimumLeadTimeMs = horizonSeconds === PRECLOSE_FORECAST_HORIZON_SECONDS
+      ? PRECLOSE_FORECAST_MIN_LEAD_MS
+      : horizonSeconds * 1_000;
+    const maximumLeadTimeMs = horizonSeconds === PRECLOSE_FORECAST_HORIZON_SECONDS
+      ? PRECLOSE_FORECAST_MAX_LEAD_MS
+      : (horizonSeconds + 2.5) * 1_000;
     if (
       leadTimeMs < 5_000 ||
-      leadTimeMs < horizonSeconds * 1_000 ||
-      leadTimeMs > (horizonSeconds + 2.5) * 1_000
+      leadTimeMs < minimumLeadTimeMs ||
+      leadTimeMs > maximumLeadTimeMs
     ) {
       throw new RangeError("forecast must be locked inside its pre-bcd horizon window");
     }
@@ -11547,7 +11556,10 @@ export class RouletteDatabase {
     return {
       mode: "observation",
       executionEnabled: false,
-      captureLeadSeconds: { min: 8, max: 10 },
+      captureLeadSeconds: {
+        min: PRECLOSE_FORECAST_MIN_LEAD_MS / 1_000,
+        max: PRECLOSE_FORECAST_MAX_LEAD_MS / 1_000,
+      },
       minimumPersistedLeadSeconds: 5,
       latest,
       trajectoryMetrics,

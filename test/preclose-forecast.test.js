@@ -126,7 +126,7 @@ test("fails closed on missing cutoff timestamps", () => {
   );
 });
 
-test("enforces the inclusive 8 to 10 second pre-bcd lock window", () => {
+test("enforces the inclusive 8 to 15 second pre-bcd lock window", () => {
   assert.doesNotThrow(() =>
     buildPrecloseForecast({
       round: round(),
@@ -142,11 +142,11 @@ test("enforces the inclusive 8 to 10 second pre-bcd lock window", () => {
     buildPrecloseForecast({
       round: round(),
       factors: [
-        { dt: "2026-09-25T11:59:46Z", v: 19.6 },
-        { dt: "2026-09-25T11:59:48Z", v: 19.8 },
-        { dt: "2026-09-25T11:59:50Z", v: 20 },
+        { dt: "2026-09-25T11:59:41Z", v: 19.6 },
+        { dt: "2026-09-25T11:59:43Z", v: 19.8 },
+        { dt: "2026-09-25T11:59:45Z", v: 20 },
       ],
-      receivedAt: "2026-09-25T11:59:50Z",
+      receivedAt: "2026-09-25T11:59:45Z",
     }),
   );
   assert.throws(
@@ -156,19 +156,19 @@ test("enforces the inclusive 8 to 10 second pre-bcd lock window", () => {
         factors,
         receivedAt: "2026-09-25T11:59:52.001Z",
       }),
-    /between 8 and 10 seconds/,
+    /between 8 and 15 seconds/,
   );
   assert.throws(
     () =>
       buildPrecloseForecast({
         round: round(),
         factors,
-        receivedAt: "2026-09-25T11:59:49.999Z",
+        receivedAt: "2026-09-25T11:59:44.999Z",
       }),
-    /between 8 and 10 seconds/,
+    /between 8 and 15 seconds/,
   );
   assert.equal(PRECLOSE_FORECAST_MIN_LEAD_MS, 8_000);
-  assert.equal(PRECLOSE_FORECAST_MAX_LEAD_MS, 10_000);
+  assert.equal(PRECLOSE_FORECAST_MAX_LEAD_MS, 15_000);
 });
 
 test("ignores factor points timestamped after receivedAt", () => {

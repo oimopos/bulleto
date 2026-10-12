@@ -1,6 +1,6 @@
 export const PRECLOSE_FORECAST_HORIZON_SECONDS = 8;
 export const PRECLOSE_FORECAST_MIN_LEAD_MS = 8_000;
-export const PRECLOSE_FORECAST_MAX_LEAD_MS = 10_000;
+export const PRECLOSE_FORECAST_MAX_LEAD_MS = 15_000;
 export const PRECLOSE_FORECAST_FACTOR_WINDOW_MS = 12_000;
 export const PRECLOSE_FORECAST_MAX_FACTOR_AGE_MS = 5_000;
 export const PRECLOSE_FORECAST_MIN_FACTOR_POINTS = 3;
@@ -257,7 +257,7 @@ export function buildPrecloseForecast({ round, factors, receivedAt } = {}) {
     leadTimeMs < PRECLOSE_FORECAST_MIN_LEAD_MS ||
     leadTimeMs > PRECLOSE_FORECAST_MAX_LEAD_MS
   ) {
-    throw new RangeError("forecast must be locked between 8 and 10 seconds before round.bcd");
+    throw new RangeError("forecast must be locked between 8 and 15 seconds before round.bcd");
   }
   if (endsAt.milliseconds <= bettingClosesAt.milliseconds) {
     throw new RangeError("round.ed must be after round.bcd");

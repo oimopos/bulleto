@@ -671,7 +671,7 @@ test("pre-close forecasts enforce the five-second lock boundary and fresh factor
       "PRIMECOIN(XPM)/RUB",
     );
     assert.equal(state.executionEnabled, false);
-    assert.deepEqual(state.captureLeadSeconds, { min: 8, max: 10 });
+    assert.deepEqual(state.captureLeadSeconds, { min: 8, max: 15 });
     assert.equal(state.minimumPersistedLeadSeconds, 5);
     assert.equal(state.latest.roundId, "forecast-valid-t-minus-6");
     assert.equal(state.latest.leadSeconds, 9);
@@ -2982,6 +2982,181 @@ test("pre-close forecast rolls back when the transaction finishes inside the fiv
         `${table} must roll back with the late transaction`,
       );
     }
+  } finally {
+    database.close();
+  }
+});
+
+test("early capture leaves enough compute time to freeze a causal predictive leader", () => {
+  let forecastClockCalls = null;
+  const database = createDatabase({
+    path: ":memory:",
+    clock: () => {
+      if (forecastClockCalls === null) return new Date(BASE_TIME + 10_000);
+      forecastClockCalls += 1;
+      return new Date(BASE_TIME + (forecastClockCalls <= 2 ? 47_000 : 54_000));
+    },
+  });
+  const lockedAt = iso(BASE_TIME + 45_000);
+  const attempt = precloseForecast("107", {
+    lockedAt,
+    factorAt: lockedAt,
+    features: {
+      samples: [
+        { dt: iso(BASE_TIME + 41_000), v: 5.38 },
+        { dt: iso(BASE_TIME + 43_000), v: 5.39 },
+        { dt: lockedAt, v: 5.4 },
+      ],
+      windowSeconds: 4,
+      slopePerSecond: 0.005,
+      secondsToEnd: 55,
+    },
+  });
+
+  try {
+    database.ingestBatch([
+      ...[9, 4, 9, 4, 9, 5, 9].map((number, index) => event(
+        number,
+        `compute-window-history-${index}`,
+        index,
+        { externalRoundId: String(100 + index) },
+      )),
+      event(36, "compute-window-future-result", 46, {
+        externalRoundId: "999",
+      }),
+    ]);
+    markResultsCreatedAtObservation(database, "compute-window-");
+
+    // Production spent several seconds building the trajectory shadow. Model
+    // that wall-clock advance without allowing rows observed after lockedAt to
+    // enter the frozen decision.
+    forecastClockCalls = 0;
+    assert.deepEqual(database.recordPrecloseForecast(attempt), {
+      inserted: true,
+      roundId: "107",
+    });
+
+    for (const table of [
+      "forecast_snapshots",
+      "forecast_trajectory_shadows",
+      "forecast_predictive_leader_snapshots",
+    ]) {
+      assert.equal(
+        database.sqlite.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get().count,
+        1,
+      );
+    }
+    const storedLeader = database.sqlite
+      .prepare(`
+        SELECT status, predicted_number, history_max_result_id, locked_at, created_at
+        FROM forecast_predictive_leader_snapshots
+      `)
+      .get();
+    assert.equal(storedLeader.status, "ready");
+    assert.equal(storedLeader.predicted_number, 4);
+    assert.equal(storedLeader.history_max_result_id, 7);
+    assert.equal(storedLeader.locked_at, lockedAt);
+    assert.equal(storedLeader.created_at, iso(BASE_TIME + 54_000));
+    assert.ok(
+      Date.parse(attempt.bettingClosesAt) - Date.parse(storedLeader.created_at) >= 5_000,
+    );
+
+    const state = database.getPrecloseForecastState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    const leader = state.latest.predictiveLeader;
+    assert.equal(leader.status, "ready");
+    assert.equal(leader.leaderNumber, 4);
+    assert.equal(leader.lockedAt, lockedAt);
+    assert.equal(leader.learning.learningCutoffAt, lockedAt);
+    assert.equal(leader.sourceManifest.length, 1);
+    assert.equal(leader.sourceManifest[0].cursor.historyMaxResultId, 7);
+    assert.equal(leader.sourceManifest[0].cursor.cutoffAt, lockedAt);
+    assert.equal(state.predictiveLeaderAccount.status, "pending");
+    assert.equal(state.predictiveLeaderAccount.pendingBet.targetNumber, 4);
+  } finally {
+    database.close();
+  }
+});
+
+test("predictive leader still fails closed when compute crosses the five-second boundary", () => {
+  let forecastClockCalls = null;
+  const errors = [];
+  const database = createDatabase({
+    path: ":memory:",
+    clock: () => {
+      if (forecastClockCalls === null) return new Date(BASE_TIME + 10_000);
+      forecastClockCalls += 1;
+      return new Date(
+        BASE_TIME + (forecastClockCalls <= 2 ? 47_000 : 55_001),
+      );
+    },
+    logger: {
+      error(payload, message) {
+        errors.push({ payload, message });
+      },
+    },
+  });
+  const lockedAt = iso(BASE_TIME + 45_000);
+
+  try {
+    database.ingestBatch(
+      [9, 4, 9, 4, 9, 5, 9].map((number, index) => event(
+        number,
+        `late-compute-history-${index}`,
+        index,
+        { externalRoundId: String(100 + index) },
+      )),
+    );
+    markResultsCreatedAtObservation(database, "late-compute-history-");
+    forecastClockCalls = 0;
+    assert.deepEqual(
+      database.recordPrecloseForecast(precloseForecast("107", {
+        lockedAt,
+        factorAt: lockedAt,
+        features: {
+          samples: [
+            { dt: iso(BASE_TIME + 41_000), v: 5.38 },
+            { dt: iso(BASE_TIME + 43_000), v: 5.39 },
+            { dt: lockedAt, v: 5.4 },
+          ],
+          windowSeconds: 4,
+          slopePerSecond: 0.005,
+          secondsToEnd: 55,
+        },
+      })),
+      { inserted: true, roundId: "107" },
+    );
+
+    assert.equal(
+      database.sqlite.prepare("SELECT COUNT(*) AS count FROM forecast_snapshots").get().count,
+      1,
+    );
+    assert.equal(
+      database.sqlite
+        .prepare("SELECT COUNT(*) AS count FROM forecast_trajectory_shadows")
+        .get().count,
+      1,
+    );
+    assert.equal(
+      database.sqlite
+        .prepare("SELECT COUNT(*) AS count FROM forecast_predictive_leader_snapshots")
+        .get().count,
+      0,
+    );
+    assert.equal(
+      database.sqlite
+        .prepare("SELECT COUNT(*) AS count FROM predictive_leader_account_bets")
+        .get().count,
+      0,
+    );
+    assert.equal(errors.length, 1);
+    assert.equal(
+      errors[0].message,
+      "predictive leader persistence failed after primary forecast commit",
+    );
+    assert.match(errors[0].payload.error.message, /at least five seconds/);
   } finally {
     database.close();
   }

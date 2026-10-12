@@ -16,6 +16,7 @@ import {
   const ALL_NUMBERS = Array.from({ length: 37 }, (_, number) => number);
   const REFRESH_INTERVAL_MS = 45_000;
   const AGE_UPDATE_INTERVAL_MS = 30_000;
+  const PRECLOSE_CAPTURE_MAX_LEAD_MS = 15_000;
   const FOLLOWER_COLLAPSED_LIMIT = 5;
   const FOLLOWER_HIT_HORIZONS = [1, 2, 3, 5, 10, 20];
   const FOLLOWER_WARM_THRESHOLD = 0.05;
@@ -3249,12 +3250,15 @@ import {
         elements.preclosePanel.dataset.state = "waiting";
         elements.precloseBadge.textContent = "Ждём раунд";
         elements.precloseStatus.textContent = "Собираем данные до блокировки ставок.";
-        elements.precloseTiming.textContent = "Фиксация выполняется примерно за 8–10 секунд до bcd.";
+        elements.precloseTiming.textContent = "Фиксация выполняется примерно за 8–15 секунд до bcd.";
         return;
       }
 
-      if (nowMs < closesMs - 10_000) {
-        const secondsToCapture = Math.max(1, Math.ceil((closesMs - 10_000 - nowMs) / 1_000));
+      if (nowMs < closesMs - PRECLOSE_CAPTURE_MAX_LEAD_MS) {
+        const secondsToCapture = Math.max(
+          1,
+          Math.ceil((closesMs - PRECLOSE_CAPTURE_MAX_LEAD_MS - nowMs) / 1_000),
+        );
         elements.preclosePanel.dataset.state = "waiting";
         elements.precloseBadge.textContent = `Открыто · ${secondsUntilClose}с`;
         elements.precloseStatus.textContent = `Раунд ${compactId(currentRoundId)}: цена поступает, прогноз ещё не зафиксирован.`;

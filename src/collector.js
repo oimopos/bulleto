@@ -780,7 +780,7 @@ export class BuletoCollector extends EventEmitter {
       const receivedAt = new Date();
       if (closesAtMs - receivedAt.getTime() > PRECLOSE_FORECAST_MAX_LEAD_MS) {
         // A backwards clock adjustment or an early timer callback must not
-        // escape the inclusive 8-10 second lock window.
+        // escape the inclusive 8-15 second lock window.
         this.#schedulePrecloseForecastAttempt();
         return;
       }

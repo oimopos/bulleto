@@ -7,6 +7,10 @@ import {
   normalizeLastResults,
   normalizeWireResult,
 } from '../src/collector.js';
+import {
+  PRECLOSE_FORECAST_MAX_LEAD_MS,
+  PRECLOSE_FORECAST_MIN_LEAD_MS,
+} from '../src/preclose-forecast.js';
 
 class FakeWebSocket extends EventTarget {
   static CONNECTING = 0;
@@ -363,7 +367,7 @@ test('same-message trajectory always precedes pre-close forecast for both wire o
   });
 
   const baseMs = Date.now() - 250;
-  const bettingClosesAtMs = baseMs + 9_250;
+  const bettingClosesAtMs = baseMs + PRECLOSE_FORECAST_MIN_LEAD_MS + 1_250;
   const factors = [
     { dt: iso(baseMs - 4_000), v: 19.6 },
     { dt: iso(baseMs - 2_000), v: 19.8 },
@@ -406,12 +410,15 @@ test('collector emits a pre-close forecast in the safe window and ignores future
   collector.on('preclose-forecast', (forecast) => forecasts.push(forecast));
   collector.on('collector-error', (error) => errors.push(error));
 
-  // Keep the received message near nine seconds before bcd, comfortably inside
-  // the inclusive 8-10 second lock window without replacing the global clock.
+  // Keep the received message comfortably inside the inclusive lock window
+  // without replacing the global clock.
   const factorBaseMs = Date.now() - 250;
   socket.message({
     type: 'round',
-    data: forecastRound({ id: 501, bettingClosesAtMs: factorBaseMs + 9_250 }),
+    data: forecastRound({
+      id: 501,
+      bettingClosesAtMs: factorBaseMs + PRECLOSE_FORECAST_MIN_LEAD_MS + 1_250,
+    }),
   });
   socket.message({
     type: 'factors',
@@ -426,8 +433,8 @@ test('collector emits a pre-close forecast in the safe window and ignores future
   assert.equal(errors.length, 0);
   assert.equal(forecasts.length, 1);
   assert.equal(forecasts[0].round.externalRoundId, '501');
-  assert.ok(forecasts[0].features.leadTimeMs >= 8_000);
-  assert.ok(forecasts[0].features.leadTimeMs <= 10_000);
+  assert.ok(forecasts[0].features.leadTimeMs >= PRECLOSE_FORECAST_MIN_LEAD_MS);
+  assert.ok(forecasts[0].features.leadTimeMs <= PRECLOSE_FORECAST_MAX_LEAD_MS);
   assert.equal(forecasts[0].features.factorCount, 3);
   assert.equal(forecasts[0].features.latestPrice, 20);
   assert.equal(forecasts[0].modelVersion, 'start-price-v2');
@@ -479,7 +486,8 @@ test('collector does not emit a forecast when upstream status is closed', (t) =>
   const factorBaseMs = Date.now() - 250;
   const closedRound = forecastRound({
     id: 504,
-    bettingClosesAtMs: factorBaseMs + 9_250,
+    bettingClosesAtMs:
+      factorBaseMs + PRECLOSE_FORECAST_MIN_LEAD_MS + 1_250,
   });
   closedRound.s = 4;
   socket.message({ type: 'round', data: closedRound });
@@ -506,7 +514,8 @@ test('collector never derives a forecast from a final round carrying rr', (t) =>
     type: 'round',
     data: forecastRound({
       id: 503,
-      bettingClosesAtMs: factorBaseMs + 9_250,
+      bettingClosesAtMs:
+        factorBaseMs + PRECLOSE_FORECAST_MIN_LEAD_MS + 1_250,
       result: { dt: iso(factorBaseMs), c: 3, v: 20 },
     }),
   });
@@ -539,7 +548,10 @@ test('collector captures a pre-close forecast on schedule when the websocket is 
   });
   socket.message({
     type: 'round',
-    data: forecastRound({ id: 505, bettingClosesAtMs: factorBaseMs + 10_300 }),
+    data: forecastRound({
+      id: 505,
+      bettingClosesAtMs: factorBaseMs + PRECLOSE_FORECAST_MAX_LEAD_MS + 300,
+    }),
   });
 
   assert.equal(forecasts.length, 0, 'round arrives before the safe lock window');
@@ -547,8 +559,8 @@ test('collector captures a pre-close forecast on schedule when the websocket is 
 
   assert.equal(forecasts.length, 1);
   assert.equal(forecasts[0].round.externalRoundId, '505');
-  assert.ok(forecasts[0].features.leadTimeMs >= 8_000);
-  assert.ok(forecasts[0].features.leadTimeMs <= 10_000);
+  assert.ok(forecasts[0].features.leadTimeMs >= PRECLOSE_FORECAST_MIN_LEAD_MS);
+  assert.ok(forecasts[0].features.leadTimeMs <= PRECLOSE_FORECAST_MAX_LEAD_MS);
 
   socket.message({
     type: 'factors',
@@ -577,7 +589,10 @@ test('collector skips scheduled and immediate forecasts before initial history s
   });
   socket.message({
     type: 'round',
-    data: forecastRound({ id: 506, bettingClosesAtMs: factorBaseMs + 10_250 }),
+    data: forecastRound({
+      id: 506,
+      bettingClosesAtMs: factorBaseMs + PRECLOSE_FORECAST_MAX_LEAD_MS + 250,
+    }),
   });
 
   await new Promise((resolve) => setTimeout(resolve, 500));
@@ -612,11 +627,18 @@ test('collector cancels the scheduled pre-close attempt when the round closes', 
   });
   socket.message({
     type: 'round',
-    data: forecastRound({ id: 507, bettingClosesAtMs: factorBaseMs + 10_250 }),
+    data: forecastRound({
+      id: 507,
+      bettingClosesAtMs: factorBaseMs + PRECLOSE_FORECAST_MAX_LEAD_MS + 250,
+    }),
   });
   socket.message({
     type: 'round',
-    data: forecastRound({ id: 507, bettingClosesAtMs: factorBaseMs + 10_250, result: null }),
+    data: forecastRound({
+      id: 507,
+      bettingClosesAtMs: factorBaseMs + PRECLOSE_FORECAST_MAX_LEAD_MS + 250,
+      result: null,
+    }),
   });
 
   await new Promise((resolve) => setTimeout(resolve, 500));
