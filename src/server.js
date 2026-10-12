@@ -276,10 +276,18 @@ function followerTop5GatedForApi() {
 }
 
 function predictiveLeaderForApi() {
+  const source = 'buleto';
+  const instrument = config.instrument;
+  const state = db.getPredictiveLeaderReadState(source, instrument);
   return predictiveLeaderSnapshotForApi({
-    state: dashboardState(),
-    source: 'buleto',
-    instrument: config.instrument,
+    state: {
+      ...state,
+      latestResult: resultForApi(state.latestResult),
+      collector: collector.getStatus(),
+      pipelinePending: resultPipeline.getPendingCounts(),
+    },
+    source,
+    instrument,
     now: new Date(),
   });
 }

@@ -1532,6 +1532,82 @@ function trajectoryDirection(deltaCellWidths, flatThresholdCellWidths) {
   return "flat";
 }
 
+function roundTrajectoryPrefixFromRows(rows, startsAt, cutoffAt) {
+  const latestByTimestamp = new Map();
+  for (const row of rows) latestByTimestamp.set(row.factor_at, row);
+  const prefix = [...latestByTimestamp.values()].map((row) => ({
+    at: row.factor_at,
+    price: Number(row.price),
+  }));
+  let maxGapMs = null;
+  if (prefix.length > 1) {
+    maxGapMs = 0;
+    for (let index = 1; index < prefix.length; index += 1) {
+      maxGapMs = Math.max(
+        maxGapMs,
+        Date.parse(prefix[index].at) - Date.parse(prefix[index - 1].at),
+      );
+    }
+  }
+  const coverage = {
+    tickCount: prefix.length,
+    firstAt: prefix[0]?.at ?? null,
+    lastAt: prefix.at(-1)?.at ?? null,
+    maxGapMs,
+  };
+  if (prefix.length < 3) {
+    return {
+      usable: false,
+      reason: "fewer_than_three_distinct_timestamps",
+      prefix,
+      coverage,
+    };
+  }
+  const startsMs = Date.parse(startsAt);
+  const cutoffMs = Date.parse(cutoffAt);
+  const firstMs = Date.parse(prefix[0].at);
+  const lastMs = Date.parse(prefix.at(-1).at);
+  if (!(cutoffMs > startsMs) || !(lastMs > firstMs)) {
+    return {
+      usable: false,
+      reason: "non_positive_prefix_span",
+      prefix,
+      coverage,
+    };
+  }
+  if (firstMs > startsMs + TRAJECTORY_PREFIX_EDGE_TOLERANCE_MS) {
+    return {
+      usable: false,
+      reason: "prefix_starts_after_round_tolerance",
+      prefix,
+      coverage,
+    };
+  }
+  if (lastMs < cutoffMs - TRAJECTORY_PREFIX_EDGE_TOLERANCE_MS) {
+    return {
+      usable: false,
+      reason: "prefix_ends_before_cutoff_tolerance",
+      prefix,
+      coverage,
+    };
+  }
+  if (maxGapMs > TRAJECTORY_PREFIX_EDGE_TOLERANCE_MS) {
+    return {
+      usable: false,
+      reason: "prefix_gap_exceeds_tolerance",
+      prefix,
+      coverage,
+    };
+  }
+  return {
+    usable: true,
+    reason: null,
+    prefix,
+    coverage,
+    lockPrice: prefix.at(-1).price,
+  };
+}
+
 function trajectoryBandPoint(band) {
   return {
     wireCell: band.wireCell,
@@ -3547,6 +3623,30 @@ function mapPrecloseForecast(row) {
             createdAt: row.settlement_created_at,
           },
     createdAt: row.forecast_created_at ?? row.created_at,
+  };
+}
+
+function mapPredictiveLeaderForecast(row) {
+  if (!row) return null;
+  return {
+    id: Number(row.forecast_id),
+    source: row.source,
+    instrument: row.instrument,
+    roundId: row.external_round_id,
+    horizonSeconds: Number(row.horizon_seconds),
+    bettingClosesAt: row.betting_closes_at,
+    roundEndsAt: row.round_ends_at,
+    lockedAt: row.locked_at,
+    predictiveLeader: mapForecastPredictiveLeader(row),
+    settlement:
+      row.actual_number === null || row.actual_number === undefined
+        ? null
+        : {
+            resultId: Number(row.round_result_id),
+            actualNumber: Number(row.actual_number),
+            settledAt: row.settled_at,
+            createdAt: row.settlement_created_at,
+          },
   };
 }
 
@@ -8444,79 +8544,66 @@ export class RouletteDatabase {
         createdBefore,
         createdBefore,
       );
-    const latestByTimestamp = new Map();
-    for (const row of rows) latestByTimestamp.set(row.factor_at, row);
-    const prefix = [...latestByTimestamp.values()].map((row) => ({
-      at: row.factor_at,
-      price: Number(row.price),
-    }));
-    let maxGapMs = null;
-    if (prefix.length > 1) {
-      maxGapMs = 0;
-      for (let index = 1; index < prefix.length; index += 1) {
-        maxGapMs = Math.max(
-          maxGapMs,
-          Date.parse(prefix[index].at) - Date.parse(prefix[index - 1].at),
-        );
+    return roundTrajectoryPrefixFromRows(rows, startsAt, cutoffAt);
+  }
+
+  #roundTrajectoryPrefixes(requests, { createdBefore = null } = {}) {
+    if (requests.length === 0) return new Map();
+    const requestByTrajectoryId = new Map();
+    for (const request of requests) {
+      const trajectoryId = Number(request.trajectoryId);
+      if (requestByTrajectoryId.has(trajectoryId)) {
+        throw new Error("round trajectory prefix batch contains a duplicate id");
       }
+      requestByTrajectoryId.set(trajectoryId, request);
     }
-    const coverage = {
-      tickCount: prefix.length,
-      firstAt: prefix[0]?.at ?? null,
-      lastAt: prefix.at(-1)?.at ?? null,
-      maxGapMs,
-    };
-    if (prefix.length < 3) {
-      return {
-        usable: false,
-        reason: "fewer_than_three_distinct_timestamps",
-        prefix,
-        coverage,
-      };
+    const requestJson = JSON.stringify(
+      requests.map((request) => ({
+        trajectoryId: Number(request.trajectoryId),
+        cutoffAt: request.cutoffAt,
+      })),
+    );
+    const rows = this.sqlite
+      .prepare(`
+        WITH requested AS (
+          SELECT
+            CAST(json_extract(value, '$.trajectoryId') AS INTEGER)
+              AS trajectory_id,
+            json_extract(value, '$.cutoffAt') AS cutoff_at
+          FROM json_each(?)
+        )
+        SELECT
+          ticks.trajectory_id,
+          ticks.id,
+          ticks.factor_at,
+          ticks.price,
+          ticks.received_at,
+          ticks.created_at
+        FROM requested
+        JOIN round_trajectory_ticks AS ticks
+          ON ticks.trajectory_id = requested.trajectory_id
+        WHERE ticks.factor_at <= requested.cutoff_at
+          AND ticks.received_at <= requested.cutoff_at
+          AND (? IS NULL OR ticks.created_at < ?)
+        ORDER BY ticks.trajectory_id, ticks.factor_at, ticks.received_at, ticks.id
+      `)
+      .all(requestJson, createdBefore, createdBefore);
+    const rowsByTrajectoryId = new Map(
+      requests.map((request) => [Number(request.trajectoryId), []]),
+    );
+    for (const row of rows) {
+      rowsByTrajectoryId.get(Number(row.trajectory_id)).push(row);
     }
-    const startsMs = Date.parse(startsAt);
-    const cutoffMs = Date.parse(cutoffAt);
-    const firstMs = Date.parse(prefix[0].at);
-    const lastMs = Date.parse(prefix.at(-1).at);
-    if (!(cutoffMs > startsMs) || !(lastMs > firstMs)) {
-      return {
-        usable: false,
-        reason: "non_positive_prefix_span",
-        prefix,
-        coverage,
-      };
-    }
-    if (firstMs > startsMs + TRAJECTORY_PREFIX_EDGE_TOLERANCE_MS) {
-      return {
-        usable: false,
-        reason: "prefix_starts_after_round_tolerance",
-        prefix,
-        coverage,
-      };
-    }
-    if (lastMs < cutoffMs - TRAJECTORY_PREFIX_EDGE_TOLERANCE_MS) {
-      return {
-        usable: false,
-        reason: "prefix_ends_before_cutoff_tolerance",
-        prefix,
-        coverage,
-      };
-    }
-    if (maxGapMs > TRAJECTORY_PREFIX_EDGE_TOLERANCE_MS) {
-      return {
-        usable: false,
-        reason: "prefix_gap_exceeds_tolerance",
-        prefix,
-        coverage,
-      };
-    }
-    return {
-      usable: true,
-      reason: null,
-      prefix,
-      coverage,
-      lockPrice: prefix.at(-1).price,
-    };
+    return new Map(
+      [...requestByTrajectoryId].map(([trajectoryId, request]) => [
+        trajectoryId,
+        roundTrajectoryPrefixFromRows(
+          rowsByTrajectoryId.get(trajectoryId),
+          request.startsAt,
+          request.cutoffAt,
+        ),
+      ]),
+    );
   }
 
   #buildForecastTrajectoryShadow({
@@ -8668,6 +8755,7 @@ export class RouletteDatabase {
 
     const history = [];
     let excludedCoverageCount = 0;
+    const candidateContexts = [];
     for (const candidate of candidates) {
       const cutoffMs = Date.parse(candidate.round_ends_at) - secondsToEndMs;
       const startsMs = Date.parse(candidate.starts_at);
@@ -8677,12 +8765,18 @@ export class RouletteDatabase {
         continue;
       }
       const cutoffAt = new Date(cutoffMs).toISOString();
-      const prefix = this.#roundTrajectoryPrefix(
-        Number(candidate.id),
-        candidate.starts_at,
+      candidateContexts.push({ candidate, cutoffAt });
+    }
+    const candidatePrefixes = this.#roundTrajectoryPrefixes(
+      candidateContexts.map(({ candidate, cutoffAt }) => ({
+        trajectoryId: Number(candidate.id),
+        startsAt: candidate.starts_at,
         cutoffAt,
-        { createdBefore: lockedAt },
-      );
+      })),
+      { createdBefore: lockedAt },
+    );
+    for (const { candidate, cutoffAt } of candidateContexts) {
+      const prefix = candidatePrefixes.get(Number(candidate.id));
       const candidateBands = deserializeJson(candidate.bands_json);
       const cellWidths = Array.isArray(candidateBands)
         ? candidateBands.map((band) => Number(band.upper) - Number(band.lower))
@@ -11228,6 +11322,57 @@ export class RouletteDatabase {
     });
   }
 
+  #predictiveLeaderMetricRows(source, instrument, horizonSeconds) {
+    return this.sqlite
+      .prepare(`
+        SELECT
+          forecasts.id AS forecast_id,
+          snapshots.locked_at,
+          leaders.forecast_id AS leader_forecast_id,
+          leaders.schema_version AS leader_schema_version,
+          leaders.algorithm_version AS leader_algorithm_version,
+          leaders.status AS leader_status,
+          leaders.locked_at AS leader_locked_at,
+          leaders.history_max_result_id AS leader_history_max_result_id,
+          leaders.training_through_forecast_id
+            AS leader_training_through_forecast_id,
+          leaders.training_through_result_id
+            AS leader_training_through_result_id,
+          leader_training_settlements.round_result_id
+            AS leader_expected_training_result_id,
+          leaders.training_count AS leader_training_count,
+          leaders.predicted_number AS leader_predicted_number,
+          leaders.score AS leader_score,
+          leaders.snapshot_json AS leader_snapshot_json,
+          leaders.created_at AS leader_created_at,
+          settlements.round_result_id,
+          settlements.actual_number,
+          settlements.settled_at,
+          settlements.created_at AS settlement_created_at
+        FROM forecast_predictive_leader_snapshots AS leaders
+        JOIN round_forecasts AS forecasts ON forecasts.id = leaders.forecast_id
+        JOIN forecast_snapshots AS snapshots ON snapshots.id = forecasts.snapshot_id
+        LEFT JOIN forecast_settlements AS settlements
+          ON settlements.forecast_id = forecasts.id
+        LEFT JOIN forecast_settlements AS leader_training_settlements
+          ON leader_training_settlements.forecast_id =
+            leaders.training_through_forecast_id
+        WHERE snapshots.source = ?
+          AND snapshots.instrument = ?
+          AND snapshots.horizon_seconds = ?
+          AND leaders.schema_version = ?
+          AND leaders.algorithm_version = ?
+        ORDER BY leaders.forecast_id
+      `)
+      .all(
+        source,
+        instrument,
+        horizonSeconds,
+        LEARNED_LEADER_SCHEMA_VERSION,
+        LEARNED_LEADER_ALGORITHM_VERSION,
+      );
+  }
+
   #predictiveLeaderAccountState(source, instrument) {
     const base = {
       schemaVersion: PREDICTIVE_LEADER_ACCOUNT_SCHEMA_VERSION,
@@ -11634,6 +11779,106 @@ export class RouletteDatabase {
     };
   }
 
+  getPredictiveLeaderReadState(source = "buleto", instrument = "default") {
+    this.#assertOpen();
+    const safeSource = asNonEmptyText(source, undefined, "source");
+    const safeInstrument = asNonEmptyText(instrument, undefined, "instrument");
+    const latestRow = this.sqlite
+      .prepare(`
+        SELECT
+          forecasts.id AS forecast_id,
+          snapshots.source,
+          snapshots.instrument,
+          snapshots.external_round_id,
+          snapshots.horizon_seconds,
+          snapshots.betting_closes_at,
+          snapshots.round_ends_at,
+          snapshots.locked_at,
+          settlements.round_result_id,
+          settlements.actual_number,
+          settlements.settled_at,
+          settlements.created_at AS settlement_created_at,
+          leaders.forecast_id AS leader_forecast_id,
+          leaders.schema_version AS leader_schema_version,
+          leaders.algorithm_version AS leader_algorithm_version,
+          leaders.status AS leader_status,
+          leaders.locked_at AS leader_locked_at,
+          leaders.history_max_result_id AS leader_history_max_result_id,
+          leaders.training_through_forecast_id
+            AS leader_training_through_forecast_id,
+          leaders.training_through_result_id
+            AS leader_training_through_result_id,
+          leader_training_settlements.round_result_id
+            AS leader_expected_training_result_id,
+          leaders.training_count AS leader_training_count,
+          leaders.predicted_number AS leader_predicted_number,
+          leaders.score AS leader_score,
+          leaders.snapshot_json AS leader_snapshot_json,
+          leaders.created_at AS leader_created_at
+        FROM round_forecasts AS forecasts
+        JOIN forecast_snapshots AS snapshots ON snapshots.id = forecasts.snapshot_id
+        LEFT JOIN forecast_settlements AS settlements
+          ON settlements.forecast_id = forecasts.id
+        LEFT JOIN forecast_predictive_leader_snapshots AS leaders
+          ON leaders.forecast_id = forecasts.id
+        LEFT JOIN forecast_settlements AS leader_training_settlements
+          ON leader_training_settlements.forecast_id =
+            leaders.training_through_forecast_id
+        WHERE snapshots.source = ? AND snapshots.instrument = ?
+        ORDER BY snapshots.locked_at DESC, forecasts.id DESC
+        LIMIT 1
+      `)
+      .get(safeSource, safeInstrument);
+    const latest = mapPredictiveLeaderForecast(latestRow);
+    const activeCycleRow = this.sqlite
+      .prepare(`
+        SELECT status
+        FROM cycles
+        WHERE source = ? AND instrument = ? AND status = 'active'
+        ORDER BY last_event_at DESC, id DESC
+        LIMIT 1
+      `)
+      .get(safeSource, safeInstrument);
+    const warningRows = this.sqlite
+      .prepare(`
+        SELECT incidents.kind
+        FROM incidents
+        WHERE incidents.source = ?
+          AND incidents.instrument = ?
+          AND NOT EXISTS (
+            SELECT 1
+            FROM incident_resolutions
+            WHERE incident_resolutions.incident_id = incidents.id
+          )
+        ORDER BY incidents.detected_at DESC, incidents.id DESC
+        LIMIT 10
+      `)
+      .all(safeSource, safeInstrument);
+    const predictiveLeaderRows = latest
+      ? this.#predictiveLeaderMetricRows(
+          safeSource,
+          safeInstrument,
+          latest.horizonSeconds,
+        )
+      : [];
+
+    return {
+      activeCycle: activeCycleRow
+        ? { status: activeCycleRow.status, integrityStatus: "ok" }
+        : null,
+      warnings: warningRows.map((row) => ({ type: row.kind })),
+      latestResult: this.getLatestResult(safeSource, safeInstrument),
+      precloseForecast: {
+        latest,
+        predictiveLeaderMetrics: mapPredictiveLeaderMetrics(predictiveLeaderRows),
+        predictiveLeaderAccount: this.#predictiveLeaderAccountState(
+          safeSource,
+          safeInstrument,
+        ),
+      },
+    };
+  }
+
   getPrecloseForecastState(source = "buleto", instrument = "default") {
     this.#assertOpen();
     const safeSource = asNonEmptyText(source, undefined, "source");
@@ -11920,54 +12165,11 @@ export class RouletteDatabase {
         ),
     );
     const predictiveLeaderRows = latest
-      ? this.sqlite
-          .prepare(`
-            SELECT
-              forecasts.id AS forecast_id,
-              snapshots.locked_at,
-              leaders.forecast_id AS leader_forecast_id,
-              leaders.schema_version AS leader_schema_version,
-              leaders.algorithm_version AS leader_algorithm_version,
-              leaders.status AS leader_status,
-              leaders.locked_at AS leader_locked_at,
-              leaders.history_max_result_id AS leader_history_max_result_id,
-              leaders.training_through_forecast_id
-                AS leader_training_through_forecast_id,
-              leaders.training_through_result_id
-                AS leader_training_through_result_id,
-              leader_training_settlements.round_result_id
-                AS leader_expected_training_result_id,
-              leaders.training_count AS leader_training_count,
-              leaders.predicted_number AS leader_predicted_number,
-              leaders.score AS leader_score,
-              leaders.snapshot_json AS leader_snapshot_json,
-              leaders.created_at AS leader_created_at,
-              settlements.round_result_id,
-              settlements.actual_number,
-              settlements.settled_at,
-              settlements.created_at AS settlement_created_at
-            FROM forecast_predictive_leader_snapshots AS leaders
-            JOIN round_forecasts AS forecasts ON forecasts.id = leaders.forecast_id
-            JOIN forecast_snapshots AS snapshots ON snapshots.id = forecasts.snapshot_id
-            LEFT JOIN forecast_settlements AS settlements
-              ON settlements.forecast_id = forecasts.id
-            LEFT JOIN forecast_settlements AS leader_training_settlements
-              ON leader_training_settlements.forecast_id =
-                leaders.training_through_forecast_id
-            WHERE snapshots.source = ?
-              AND snapshots.instrument = ?
-              AND snapshots.horizon_seconds = ?
-              AND leaders.schema_version = ?
-              AND leaders.algorithm_version = ?
-            ORDER BY leaders.forecast_id
-          `)
-          .all(
-            safeSource,
-            safeInstrument,
-            latest.horizonSeconds,
-            LEARNED_LEADER_SCHEMA_VERSION,
-            LEARNED_LEADER_ALGORITHM_VERSION,
-          )
+      ? this.#predictiveLeaderMetricRows(
+          safeSource,
+          safeInstrument,
+          latest.horizonSeconds,
+        )
       : [];
     const predictiveLeaderMetrics = mapPredictiveLeaderMetrics(
       predictiveLeaderRows,

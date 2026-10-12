@@ -10,6 +10,7 @@ const combinedNumber = readFileSync(
 );
 const styles = readFileSync(new URL("../public/styles.css", import.meta.url), "utf8");
 const server = readFileSync(new URL("../src/server.js", import.meta.url), "utf8");
+const database = readFileSync(new URL("../src/database.js", import.meta.url), "utf8");
 
 test("every app DOM reference exists exactly once in the dashboard", () => {
   const htmlIds = [...html.matchAll(/\bid="([^"]+)"/g)].map((match) => match[1]);
@@ -55,12 +56,40 @@ test("dashboard keeps the exact read-only fetch URL list", () => {
 });
 
 test("server exposes a separate read-only predictive leader GET", () => {
+  const viewStart = server.indexOf("function predictiveLeaderForApi()");
+  const viewEnd = server.indexOf("function clampLimit", viewStart);
+  const view = server.slice(viewStart, viewEnd);
+
+  assert.ok(viewStart >= 0 && viewEnd > viewStart);
   assert.match(
     server,
     /if \(pathname === '\/api\/predictive-leader'\) \{[\s\S]*?sendJson\(response, 200, predictiveLeaderForApi\(\)\)/,
   );
-  assert.match(server, /predictiveLeaderSnapshotForApi\(\{/);
-  assert.match(server, /state: dashboardState\(\)/);
+  assert.match(view, /db\.getPredictiveLeaderReadState\(source, instrument\)/);
+  assert.match(view, /predictiveLeaderSnapshotForApi\(\{/);
+  assert.match(view, /collector: collector\.getStatus\(\)/);
+  assert.match(view, /pipelinePending: resultPipeline\.getPendingCounts\(\)/);
+  assert.doesNotMatch(view, /dashboardState|getDashboardState|getPrecloseForecastState/);
+});
+
+test("predictive leader read path excludes dashboard and trajectory metric work", () => {
+  const readStart = database.indexOf("getPredictiveLeaderReadState(");
+  const readEnd = database.indexOf("getPrecloseForecastState(", readStart);
+  const metricStart = database.indexOf("#predictiveLeaderMetricRows(");
+  const metricEnd = database.indexOf("#predictiveLeaderAccountState(", metricStart);
+  const readPath = database.slice(readStart, readEnd);
+  const leaderMetricQuery = database.slice(metricStart, metricEnd);
+
+  assert.ok(readStart >= 0 && readEnd > readStart);
+  assert.ok(metricStart >= 0 && metricEnd > metricStart);
+  assert.match(readPath, /mapPredictiveLeaderForecast\(latestRow\)/);
+  assert.match(readPath, /#predictiveLeaderMetricRows\(/);
+  assert.match(readPath, /#predictiveLeaderAccountState\(/);
+  assert.match(readPath, /getLatestResult\(safeSource, safeInstrument\)/);
+  assert.doesNotMatch(
+    `${readPath}\n${leaderMetricQuery}`,
+    /trajectory_adaptive_snapshot_valid|mapTrajectoryMetrics|getDashboardState|getPrecloseForecastState/,
+  );
 });
 
 test("dashboard wires predictive leader loading and SSE invalidation fail-closed", () => {
