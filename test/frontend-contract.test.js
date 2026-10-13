@@ -92,17 +92,12 @@ test("predictive leader read path excludes dashboard and trajectory metric work"
   );
 });
 
-test("server warms trajectory validation after recovery and before listen", () => {
+test("server starts without a synchronous full-history validation warmup", () => {
   const recovery = server.indexOf("db.reconcilePredictiveLeaderAccount(");
-  const warm = server.indexOf("db.warmPrecloseForecastValidation(");
-  const warmEnd = server.indexOf("const sseClients", warm);
   const listen = server.indexOf("server.listen(");
-  const warmBlock = server.slice(recovery, warmEnd);
 
-  assert.ok(recovery >= 0 && warm > recovery && warmEnd > warm);
-  assert.ok(listen > warmEnd);
-  assert.match(warmBlock, /try \{[\s\S]*?warmPrecloseForecastValidation/);
-  assert.match(warmBlock, /catch \(error\) \{[\s\S]*?continuing cold/);
+  assert.ok(recovery >= 0 && listen > recovery);
+  assert.doesNotMatch(server, /db\.warmPrecloseForecastValidation\(/);
 });
 
 test("dashboard wires predictive leader loading and SSE invalidation fail-closed", () => {
@@ -155,7 +150,7 @@ test("combined leader is the first dashboard block and renders exactly one numbe
   assert.match(block, /эвристический ранговый индекс, не вероятность и не гарантия преимущества/);
   assert.match(block, /Давность, виртуальная цель, невыпавшие числа, survivor и исторический аналог остаются только наблюдением/);
   assert.match(block, /1 из 37 \(≈2,7%\)/);
-  assert.match(html, /<script type="module" src="\/app\.js\?v=43"><\/script>/);
+  assert.match(html, /<script type="module" src="\/app\.js\?v=44"><\/script>/);
 
   assert.match(app, /from "\.\/combined-number\.js\?v=7"/);
   assert.match(app, /normalizePredictiveLeaderApiSnapshot/);
@@ -945,7 +940,7 @@ test("warm next-round forecast exposes a strict 5-percent walk-forward contract"
   assert.match(html, /id="follower-dynamic-next-title"[^>]*>[^<]*≥5%/);
   assert.match(html, /id="follower-dynamic-next-note"[^>]*>[\s\S]*?5%/);
   assert.match(html, /styles\.css\?v=30/);
-  assert.match(html, /app\.js\?v=43/);
+  assert.match(html, /app\.js\?v=44/);
   assert.match(styles, /\.follower-dynamic-next\s*\{/);
   assert.match(styles, /\.follower-warm-current\s*\{/);
   assert.match(styles, /\.follower-warm-picks\s*\{/);
@@ -1173,7 +1168,7 @@ test("cycle comparison language is descriptive, responsive, and cache-busted", (
   assert.match(block, /не предсказывает следующее число/);
   assert.doesNotMatch(block, /должн/iu);
   assert.match(html, /href="\/styles\.css\?v=30"/);
-  assert.match(html, /src="\/app\.js\?v=43"/);
+  assert.match(html, /src="\/app\.js\?v=44"/);
   assert.match(styles, /\.cycle-sequence-list\s*\{[\s\S]*?repeat\(auto-fill, minmax\(50px, 1fr\)\)/);
   assert.match(
     styles,

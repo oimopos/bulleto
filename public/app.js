@@ -15,6 +15,7 @@ import {
   const RED_NUMBERS = new Set([1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36]);
   const ALL_NUMBERS = Array.from({ length: 37 }, (_, number) => number);
   const REFRESH_INTERVAL_MS = 45_000;
+  const REFRESH_DEBOUNCE_MS = 180;
   const AGE_UPDATE_INTERVAL_MS = 30_000;
   const PRECLOSE_CAPTURE_MAX_LEAD_MS = 15_000;
   const FOLLOWER_COLLAPSED_LIMIT = 5;
@@ -1199,6 +1200,8 @@ import {
       return;
     }
 
+    window.clearTimeout(store.refreshTimer);
+    store.refreshTimer = null;
     store.refreshing = true;
     elements.refreshButton.classList.add("is-loading");
     elements.refreshButton.disabled = true;
@@ -1309,10 +1312,7 @@ import {
     elements.refreshButton.disabled = false;
     elements.main.removeAttribute("aria-busy");
 
-    if (store.refreshQueued) {
-      store.refreshQueued = false;
-      refreshAll();
-    }
+    scheduleQueuedRefresh();
   }
 
   function renderFetchFailure() {
@@ -6783,7 +6783,16 @@ import {
 
   function scheduleRefresh() {
     window.clearTimeout(store.refreshTimer);
-    store.refreshTimer = window.setTimeout(() => refreshAll(), 180);
+    store.refreshTimer = window.setTimeout(() => {
+      store.refreshTimer = null;
+      refreshAll();
+    }, REFRESH_DEBOUNCE_MS);
+  }
+
+  function scheduleQueuedRefresh() {
+    if (!store.refreshQueued) return;
+    store.refreshQueued = false;
+    scheduleRefresh();
   }
 
   function connectEventStream() {

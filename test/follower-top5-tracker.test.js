@@ -2089,8 +2089,9 @@ test("state API and frontend share the persisted tracker and all-points contract
 
   assert.match(
     server,
-    /followerTop5Tracker:\s*db\.getFollowerTop5TrackerState\('buleto',\s*config\.instrument\)/,
+    /function followerTop5TrackerFromDatabase\(\)[\s\S]*?db\.getFollowerTop5TrackerState\('buleto',\s*config\.instrument\)/,
   );
+  assert.match(server, /followerTop5Tracker:\s*followerTop5TrackerFromDatabase\(\)/);
   assert.match(app, /followerTop5Tracker/);
   assert.match(app, /follower-top5-live-v1/);
   assert.match(app, /persisted-batch-aware/);
