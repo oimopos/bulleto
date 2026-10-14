@@ -77,18 +77,6 @@ import {
     combinedPickNumber: document.getElementById("combined-pick-number"),
     combinedPickStatus: document.getElementById("combined-pick-status"),
     combinedPickSources: document.getElementById("combined-pick-sources"),
-    combinedPickAccount: document.getElementById("combined-pick-account"),
-    combinedPickAccountStatus: document.getElementById("combined-pick-account-status"),
-    combinedPickAccountBalanceCard: document.getElementById("combined-pick-account-balance-card"),
-    combinedPickAccountBalance: document.getElementById("combined-pick-account-balance"),
-    combinedPickAccountProfit: document.getElementById("combined-pick-account-profit"),
-    combinedPickAccountRecord: document.getElementById("combined-pick-account-record"),
-    combinedPickAccountSettled: document.getElementById("combined-pick-account-settled"),
-    combinedPickAccountRate: document.getElementById("combined-pick-account-rate"),
-    combinedPickAccountRateDetail: document.getElementById("combined-pick-account-rate-detail"),
-    combinedPickAccountStakeLabel: document.getElementById("combined-pick-account-stake-label"),
-    combinedPickAccountStake: document.getElementById("combined-pick-account-stake"),
-    combinedPickAccountLadder: document.getElementById("combined-pick-account-ladder"),
     lastNumber: document.getElementById("last-number"),
     lastTime: document.getElementById("last-time"),
     lastPrice: document.getElementById("last-price"),
@@ -1475,7 +1463,6 @@ import {
 
   function renderFetchFailure() {
     renderCombinedPick();
-    renderPredictiveLeaderAccount();
     renderPrecloseForecast();
     if (!store.hasCompletedInitialRender) {
       elements.resultsBody.replaceChildren(emptyTableRow("Не удалось загрузить результаты. Повторим попытку автоматически."));
@@ -1511,7 +1498,6 @@ import {
     renderCollector(store.state?.collector);
     renderGapWarning(store.state);
     renderCombinedPick();
-    renderPredictiveLeaderAccount();
     renderLatestResult(latestResult);
     renderPrecloseForecast();
     renderForecastHitHistory();
@@ -3373,107 +3359,6 @@ import {
       latestOutcome,
       latestVoid,
     };
-  }
-
-  function currentPredictiveLeaderAccountContext() {
-    if (store.predictiveLeaderError) return { state: "error" };
-    if (!store.predictiveLeaderLoaded) return { state: "loading" };
-    const account = store.predictiveLeaderSnapshot?.account ?? null;
-    return account ? { state: "ready", account } : { state: "unavailable" };
-  }
-
-  function renderPredictiveLeaderAccount() {
-    const context = currentPredictiveLeaderAccountContext();
-    elements.combinedPickAccountBalanceCard.classList.remove("is-positive", "is-loss");
-
-    if (context.state !== "ready") {
-      const messages = {
-        loading: "Загрузка…",
-        error: "Свежий снимок счёта недоступен",
-        unavailable: "Контракт счёта не подтверждён",
-      };
-      elements.combinedPickAccount.dataset.state = context.state;
-      elements.combinedPickAccount.setAttribute("aria-busy", String(context.state === "loading"));
-      setTextIfChanged(
-        elements.combinedPickAccountStatus,
-        messages[context.state] || messages.unavailable,
-      );
-      setTextIfChanged(elements.combinedPickAccountBalance, "—");
-      setTextIfChanged(elements.combinedPickAccountProfit, "старт 1 000 · результат —");
-      setTextIfChanged(elements.combinedPickAccountRecord, "— / —");
-      setTextIfChanged(elements.combinedPickAccountSettled, "завершено —");
-      setTextIfChanged(elements.combinedPickAccountRate, "—");
-      setTextIfChanged(
-        elements.combinedPickAccountRateDetail,
-        "по завершённым · не вероятность; база 1/37 ≈2,7%",
-      );
-      setTextIfChanged(elements.combinedPickAccountStakeLabel, "Следующая ставка");
-      setTextIfChanged(elements.combinedPickAccountStake, "—");
-      setTextIfChanged(elements.combinedPickAccountLadder, "ступень — · серия —");
-      return;
-    }
-
-    const { account } = context;
-    elements.combinedPickAccount.dataset.state = account.status;
-    elements.combinedPickAccount.setAttribute("aria-busy", "false");
-    const statusText = account.status === "pending"
-      ? `Условная ставка ${formatRiskAmount(account.pendingBet.stake)} на число ${account.pendingBet.targetNumber} зафиксирована до результата`
-      : account.status === "exhausted"
-        ? `Стоп · не хватает ${formatRiskAmount(account.shortfall)}`
-        : account.latestVoid
-          ? "Последняя ставка аннулирована из-за разрыва данных · ждём следующий лидер"
-          : account.reason === "waiting_first_frozen_leader"
-            ? "Пока без завершённых прогнозов"
-            : "Рассчитан · ждём следующий зафиксированный лидер";
-    setTextIfChanged(elements.combinedPickAccountStatus, statusText);
-    setTextIfChanged(
-      elements.combinedPickAccountBalance,
-      formatRiskAmount(account.currentBalance),
-    );
-    setTextIfChanged(
-      elements.combinedPickAccountProfit,
-      `старт ${formatRiskAmount(account.initialBalance)} · результат ${formatSignedRiskAmount(account.profit)}`,
-    );
-    if (account.profit > 0) elements.combinedPickAccountBalanceCard.classList.add("is-positive");
-    if (account.profit < 0) elements.combinedPickAccountBalanceCard.classList.add("is-loss");
-
-    setTextIfChanged(
-      elements.combinedPickAccountRecord,
-      `${formatRiskAmount(account.hitCount)} / ${formatRiskAmount(account.missCount)}`,
-    );
-    const pendingText = account.pendingCount === 1 ? " · 1 ждёт результата" : "";
-    const voidText = account.voidCount > 0
-      ? ` · ${formatRiskAmount(account.voidCount)} аннулировано из-за разрыва`
-      : "";
-    setTextIfChanged(
-      elements.combinedPickAccountSettled,
-      `${formatRiskAmount(account.settledCount)} ${pluralForm(account.settledCount, "завершён", "завершено", "завершено")}${pendingText}${voidText}`,
-    );
-    setTextIfChanged(
-      elements.combinedPickAccountRate,
-      account.hitRate === null ? "—" : trajectoryShadowShareFormatter.format(account.hitRate),
-    );
-    setTextIfChanged(
-      elements.combinedPickAccountRateDetail,
-      account.settledCount > 0
-        ? `${formatRiskAmount(account.hitCount)} из ${formatRiskAmount(account.settledCount)} · не вероятность; база 1/37 ≈2,7%`
-        : "нет завершённых · не вероятность; база 1/37 ≈2,7%",
-    );
-
-    setTextIfChanged(
-      elements.combinedPickAccountStakeLabel,
-      account.status === "pending"
-        ? "Текущая ставка"
-        : account.status === "exhausted"
-          ? "Требуемая ставка"
-          : "Следующая ставка",
-    );
-    setTextIfChanged(elements.combinedPickAccountStake, formatRiskAmount(account.nextStake));
-    const ladderLevel = account.nextStake / account.model.stakeStep;
-    setTextIfChanged(
-      elements.combinedPickAccountLadder,
-      `ступень №${formatRiskAmount(ladderLevel)} · серия ${formatRiskAmount(account.ladder.missCount)} ${pluralForm(account.ladder.missCount, "промах", "промаха", "промахов")} · накоплено ${formatRiskAmount(account.ladder.totalLoss)}`,
-    );
   }
 
   function currentPriceTrajectorySignals(latestForecast) {

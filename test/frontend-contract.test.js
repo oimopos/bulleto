@@ -680,7 +680,7 @@ test("combined leader is the first dashboard block and renders exactly one numbe
   assert.match(block, /Команда BET закрыта/);
   assert.match(block, /1 000 проспективных прогнозов/);
   assert.match(block, /нижнюю границу Wilson 95% выше случайной базы 1\/37/);
-  assert.match(html, /<script type="module" src="\/app\.js\?v=49"><\/script>/);
+  assert.match(html, /<script type="module" src="\/app\.js\?v=50"><\/script>/);
 
   assert.match(app, /from "\.\/combined-number\.js\?v=8"/);
   assert.match(app, /normalizePredictiveLeaderApiSnapshot/);
@@ -753,43 +753,14 @@ test("combined leader is the first dashboard block and renders exactly one numbe
   );
 });
 
-test("predictive leader account is an independent strict paper simulation", () => {
-  const accountIds = [
-    "combined-pick-account",
-    "combined-pick-account-status",
-    "combined-pick-account-balance-card",
-    "combined-pick-account-balance",
-    "combined-pick-account-profit",
-    "combined-pick-account-record",
-    "combined-pick-account-settled",
-    "combined-pick-account-rate",
-    "combined-pick-account-rate-detail",
-    "combined-pick-account-stake-label",
-    "combined-pick-account-stake",
-    "combined-pick-account-ladder",
-  ];
-  for (const id of accountIds) {
-    assert.match(html, new RegExp(`\\bid="${id}"`));
-    assert.match(app, new RegExp(`getElementById\\("${id}"\\)`));
-  }
-
+test("dashboard does not display the ungated predictive leader reference simulation", () => {
   const blockStart = html.indexOf('id="combined-pick"');
   const blockEnd = html.indexOf('class="page-heading"', blockStart);
   const block = html.slice(blockStart, blockEnd);
-  const accountStart = block.indexOf('id="combined-pick-account"');
-  const accountBlock = block.slice(accountStart);
-  assert.ok(accountStart > block.indexOf('id="combined-pick-number"'));
   assert.equal([...block.matchAll(/<output\b/g)].length, 1);
-  assert.equal([...accountBlock.matchAll(/<output\b/g)].length, 0);
-  assert.equal([...accountBlock.matchAll(/<dd\b/g)].length, 4);
-  assert.match(accountBlock, /Эталонная симуляция · без допуска BET/);
-  assert.match(accountBlock, /Бумажный счёт лидера/);
-  assert.match(accountBlock, /Текущий счёт/);
-  assert.match(accountBlock, /Попадания \/ промахи/);
-  assert.match(accountBlock, /Наблюдаемая частота попаданий/);
-  assert.match(accountBlock, /Следующая ставка/);
-  assert.match(accountBlock, /безусловный бумажный эталон для оценки лидера/);
-  assert.match(accountBlock, /Используйте для решения только отдельное действие BET/);
+  assert.doesNotMatch(block, /бумажный счёт|Следующая ставка|Условная ставка/);
+  assert.doesNotMatch(html, /combined-pick-account/);
+  assert.doesNotMatch(app, /combinedPickAccount|renderPredictiveLeaderAccount/);
 
   assert.match(app, /const PREDICTIVE_LEADER_ACCOUNT_SCHEMA_VERSION = 1/);
   assert.match(
@@ -801,7 +772,7 @@ test("predictive leader account is an independent strict paper simulation", () =
   assert.match(app, /grossPayoutMultiplier: 36[\s\S]*?payoutIncludesStake: true[\s\S]*?netHitMultiplier: 35/);
 
   const normalizerStart = app.indexOf("function normalizedPredictiveLeaderAccount(value)");
-  const normalizerEnd = app.indexOf("function currentPredictiveLeaderAccountContext", normalizerStart);
+  const normalizerEnd = app.indexOf("function currentPriceTrajectorySignals", normalizerStart);
   const normalizer = app.slice(normalizerStart, normalizerEnd);
   assert.ok(normalizerStart >= 0 && normalizerEnd > normalizerStart);
   assert.match(normalizer, /value\.schemaVersion !== PREDICTIVE_LEADER_ACCOUNT_SCHEMA_VERSION/);
@@ -824,53 +795,8 @@ test("predictive leader account is an independent strict paper simulation", () =
   assert.match(normalizer, /\(value\.status === "pending"\) !== \(pendingBet !== null\)/);
   assert.match(normalizer, /\(value\.status === "exhausted"\) !== !value\.canAffordNext/);
 
-  const contextStart = app.indexOf("function currentPredictiveLeaderAccountContext()");
-  const contextEnd = app.indexOf("function renderPredictiveLeaderAccount", contextStart);
-  const context = app.slice(contextStart, contextEnd);
-  assert.ok(contextStart >= 0 && contextEnd > contextStart);
-  assert.match(context, /store\.predictiveLeaderSnapshot\?\.account/);
-  assert.doesNotMatch(context, /store\.state|precloseForecast/);
   assert.match(app, /normalizedPredictiveLeaderAccount\(snapshot\?\.account\)/);
-  assert.doesNotMatch(context, /currentCombinedNumberContext|predictiveLeaderMetrics|latestForecast/);
-
-  const rendererStart = app.indexOf("function renderPredictiveLeaderAccount()");
-  const rendererEnd = app.indexOf("function currentPriceTrajectorySignals", rendererStart);
-  const renderer = app.slice(rendererStart, rendererEnd);
-  assert.ok(rendererStart >= 0 && rendererEnd > rendererStart);
-  assert.match(renderer, /context\.state !== "ready"/);
-  assert.match(renderer, /combinedPickAccountBalance, "—"/);
-  assert.match(renderer, /account\.currentBalance/);
-  assert.match(renderer, /account\.hitCount/);
-  assert.match(renderer, /account\.missCount/);
-  assert.match(renderer, /trajectoryShadowShareFormatter\.format\(account\.hitRate\)/);
-  assert.match(renderer, /account\.nextStake/);
-  assert.match(renderer, /account\.ladder\.missCount/);
-  assert.match(renderer, /account\.latestVoid/);
-  assert.match(renderer, /account\.voidCount/);
-  assert.match(renderer, /Последняя ставка аннулирована из-за разрыва данных/);
-  assert.match(renderer, /аннулировано из-за разрыва/);
-  assert.match(renderer, /не вероятность/);
-  assert.doesNotMatch(renderer, /вероятность следующего|улучшит|повысит шанс/);
-  assert.ok(
-    [...app.matchAll(/renderPredictiveLeaderAccount\(\)/g)].length >= 3,
-    "account must render on normal and failed refresh paths",
-  );
-
-  assert.match(styles, /\.combined-pick-account\s*\{[\s\S]*?grid-column: 1 \/ -1/);
-  assert.match(
-    styles,
-    /\.combined-pick-account__metrics\s*\{[\s\S]*?grid-template-columns: repeat\(4, minmax\(0, 1fr\)\)/,
-  );
-  const tabletStyles = styles.slice(
-    styles.indexOf("@media (max-width: 680px)"),
-    styles.indexOf("@media (max-width: 430px)"),
-  );
-  const narrowStyles = styles.slice(
-    styles.indexOf("@media (max-width: 360px)"),
-    styles.indexOf("@media (prefers-reduced-motion: reduce)"),
-  );
-  assert.match(tabletStyles, /\.combined-pick-account__metrics\s*\{[\s\S]*?repeat\(2/);
-  assert.match(narrowStyles, /\.combined-pick-account__metrics\s*\{[\s\S]*?minmax\(0, 1fr\)/);
+  assert.doesNotMatch(styles, /combined-pick-account/);
 });
 
 test("experimental forecast shows only the first three places of the full Rank-37", () => {
@@ -1807,8 +1733,8 @@ test("warm next-round forecast exposes a strict 5-percent walk-forward contract"
   );
   assert.match(html, /id="follower-dynamic-next-title"[^>]*>[^<]*≥5%/);
   assert.match(html, /id="follower-dynamic-next-note"[^>]*>[\s\S]*?5%/);
-  assert.match(html, /styles\.css\?v=31/);
-  assert.match(html, /app\.js\?v=49/);
+  assert.match(html, /styles\.css\?v=32/);
+  assert.match(html, /app\.js\?v=50/);
   assert.match(styles, /\.follower-dynamic-next\s*\{/);
   assert.match(styles, /\.follower-warm-current\s*\{/);
   assert.match(styles, /\.follower-warm-picks\s*\{/);
@@ -2035,8 +1961,8 @@ test("cycle comparison language is descriptive, responsive, and cache-busted", (
   assert.match(block, /не прогноз/);
   assert.match(block, /не предсказывает следующее число/);
   assert.doesNotMatch(block, /должн/iu);
-  assert.match(html, /href="\/styles\.css\?v=31"/);
-  assert.match(html, /src="\/app\.js\?v=49"/);
+  assert.match(html, /href="\/styles\.css\?v=32"/);
+  assert.match(html, /src="\/app\.js\?v=50"/);
   assert.match(styles, /\.cycle-sequence-list\s*\{[\s\S]*?repeat\(auto-fill, minmax\(50px, 1fr\)\)/);
   assert.match(
     styles,

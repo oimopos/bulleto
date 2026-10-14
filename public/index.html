@@ -7,8 +7,8 @@
     <meta name="color-scheme" content="dark">
     <meta name="description" content="Онлайн-монитор результатов рулетки и циклов исключения чисел от 0 до 36">
     <title>Круг 37 — монитор результатов</title>
-    <link rel="stylesheet" href="/styles.css?v=31">
-    <script type="module" src="/app.js?v=49"></script>
+    <link rel="stylesheet" href="/styles.css?v=32">
+    <script type="module" src="/app.js?v=50"></script>
   </head>
   <body>
     <a class="skip-link" href="#main-content">Перейти к содержимому</a>
@@ -58,38 +58,6 @@
           <output class="result-ball result-ball--empty combined-pick__number" id="combined-pick-number" aria-label="Сводное число пока не рассчитано">—</output>
           <span class="combined-pick__sources" id="combined-pick-sources">Ожидаем данные</span>
         </div>
-        <section class="combined-pick-account" id="combined-pick-account" data-state="loading" aria-labelledby="combined-pick-account-title" aria-describedby="combined-pick-account-note" aria-busy="true">
-          <div class="combined-pick-account__header">
-            <div>
-              <p class="eyebrow">Эталонная симуляция · без допуска BET</p>
-              <h3 id="combined-pick-account-title">Бумажный счёт лидера</h3>
-            </div>
-            <span class="combined-pick-account__status" id="combined-pick-account-status" role="status" aria-live="polite" aria-atomic="true">Загрузка…</span>
-          </div>
-          <dl class="combined-pick-account__metrics" aria-label="Показатели виртуального счёта единого лидера">
-            <div class="combined-pick-account__metric" id="combined-pick-account-balance-card">
-              <dt>Текущий счёт</dt>
-              <dd id="combined-pick-account-balance">—</dd>
-              <small id="combined-pick-account-profit">старт 1 000 · результат —</small>
-            </div>
-            <div class="combined-pick-account__metric">
-              <dt>Попадания / промахи</dt>
-              <dd id="combined-pick-account-record">— / —</dd>
-              <small id="combined-pick-account-settled">завершено —</small>
-            </div>
-            <div class="combined-pick-account__metric">
-              <dt>Наблюдаемая частота попаданий</dt>
-              <dd id="combined-pick-account-rate">—</dd>
-              <small id="combined-pick-account-rate-detail">по завершённым · не вероятность; база 1/37 ≈2,7%</small>
-            </div>
-            <div class="combined-pick-account__metric">
-              <dt id="combined-pick-account-stake-label">Следующая ставка</dt>
-              <dd id="combined-pick-account-stake">—</dd>
-              <small id="combined-pick-account-ladder">ступень — · серия —</small>
-            </div>
-          </dl>
-          <p class="combined-pick-account__note" id="combined-pick-account-note">Это безусловный бумажный эталон для оценки лидера, а не разрешённый сигнал: он может считать виртуальные ставки и до прохождения quality gate. Используйте для решения только отдельное действие BET в /api/predictive-leader; до подтверждения там будет WAIT. Реальных ставок и действий нет.</p>
-        </section>
       </section>
 
       <div class="page-heading">
