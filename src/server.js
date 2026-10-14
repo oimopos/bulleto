@@ -391,6 +391,19 @@ function predictiveLeaderChallengersForApi() {
   };
 }
 
+function trajectoryDirectionChallengerForApi() {
+  const source = 'buleto';
+  const instrument = config.instrument;
+  const state = cachedDatabaseRead(
+    `trajectory-direction-challenger-state:${source}:${instrument}`,
+    () => db.getTrajectoryDirectionChallengerState(source, instrument),
+  );
+  return {
+    ...state,
+    serverTime: new Date().toISOString(),
+  };
+}
+
 function predictiveLeaderHitBreakdownForApi() {
   const source = 'buleto';
   const instrument = config.instrument;
@@ -541,6 +554,11 @@ const server = createServer((request, response) => {
 
     if (pathname === '/api/predictive-leader/challengers') {
       sendJson(response, 200, predictiveLeaderChallengersForApi());
+      return;
+    }
+
+    if (pathname === '/api/trajectory-direction/challenger') {
+      sendJson(response, 200, trajectoryDirectionChallengerForApi());
       return;
     }
 

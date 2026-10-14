@@ -411,6 +411,7 @@ test("schema contains all persistence tables", () => {
       "forecast_predictive_leader_snapshots",
       "forecast_settlements",
       "forecast_snapshots",
+      "forecast_trajectory_direction_challenger_snapshots",
       "forecast_trajectory_shadows",
       "incident_resolutions",
       "incidents",
@@ -423,11 +424,12 @@ test("schema contains all persistence tables", () => {
       "round_trajectories",
       "round_trajectory_ticks",
       "stream_state",
+      "trajectory_direction_challenger_cohorts",
       "virtual_bankrolls",
       "virtual_bet_sessions",
       "virtual_bets",
     ]);
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 20);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 21);
     assert.equal(
       database.sqlite
         .prepare("SELECT COUNT(*) AS count FROM predictive_leader_account_ladder_resets")
@@ -537,6 +539,193 @@ test("schema contains all persistence tables", () => {
         "snapshot_json",
         "created_at",
       ],
+    );
+    assert.deepEqual(
+      database.sqlite
+        .prepare("PRAGMA table_info(trajectory_direction_challenger_cohorts)")
+        .all()
+        .map((column) => column.name),
+      [
+        "challenger_key",
+        "schema_version",
+        "model_version",
+        "champion_model_version",
+        "mode",
+        "first_forecast_id",
+        "started_at",
+        "config_json",
+        "created_at",
+      ],
+    );
+    assert.deepEqual(
+      database.sqlite
+        .prepare(
+          "PRAGMA table_info(forecast_trajectory_direction_challenger_snapshots)",
+        )
+        .all()
+        .map((column) => column.name),
+      [
+        "forecast_id",
+        "challenger_key",
+        "schema_version",
+        "model_version",
+        "status",
+        "reason",
+        "locked_at",
+        "direction",
+        "probability_up",
+        "probability_down",
+        "probability_flat",
+        "expected_delta_cell_widths",
+        "snapshot_json",
+        "created_at",
+      ],
+    );
+    const directionCohort = database.sqlite
+      .prepare("SELECT * FROM trajectory_direction_challenger_cohorts")
+      .get();
+    assert.equal(directionCohort.challenger_key, "structural-center-v1");
+    assert.equal(directionCohort.schema_version, 1);
+    assert.equal(
+      directionCohort.model_version,
+      "trajectory-direction-structural-v1",
+    );
+    assert.equal(
+      directionCohort.champion_model_version,
+      "trajectory-shadow-adaptive-v2",
+    );
+    assert.equal(directionCohort.mode, "prospective-shadow");
+    assert.equal(directionCohort.first_forecast_id, 1);
+    assert.deepEqual(JSON.parse(directionCohort.config_json), {
+      flatThresholdCellWidths: 0.5,
+      targetPointPolicy: "core-midpoint-v1",
+      eligibilityPolicy: "start-edge-and-lock-remaining-same-sign-v1",
+    });
+    assert.equal(directionCohort.started_at, directionCohort.created_at);
+  } finally {
+    database.close();
+  }
+});
+
+test("version 21 direction challenger freezes one validated snapshot per forecast", () => {
+  const database = createDatabase({
+    path: ":memory:",
+    clock: () => new Date(BASE_TIME + 52_000),
+  });
+  const insertSnapshot = database.sqlite.prepare(`
+    INSERT INTO forecast_trajectory_direction_challenger_snapshots (
+      forecast_id, challenger_key, schema_version, model_version,
+      status, reason, locked_at, direction,
+      probability_up, probability_down, probability_flat,
+      expected_delta_cell_widths, snapshot_json, created_at
+    ) VALUES (?, 'structural-center-v1', 1,
+      'trajectory-direction-structural-v1', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const storedForecast = (roundId) => {
+    assert.equal(database.recordPrecloseForecast(precloseForecast(roundId)).inserted, true);
+    const forecast = database.sqlite
+      .prepare(`
+        SELECT forecasts.id, snapshots.locked_at
+        FROM round_forecasts AS forecasts
+        JOIN forecast_snapshots AS snapshots ON snapshots.id = forecasts.snapshot_id
+        WHERE snapshots.external_round_id = ?
+      `)
+      .get(roundId);
+    // This test exercises the schema constraints directly. The runtime path
+    // may already have stored its immutable challenger row for this forecast.
+    database.sqlite
+      .prepare(`
+        DELETE FROM forecast_trajectory_direction_challenger_snapshots
+        WHERE forecast_id = ?
+      `)
+      .run(Number(forecast.id));
+    return forecast;
+  };
+
+  try {
+    const readyForecast = storedForecast("direction-challenger-ready");
+    const readySnapshot = {
+      version: "trajectory-direction-structural-v1",
+      status: "ready",
+      reason: null,
+      direction: "up",
+      probabilities: null,
+      expectedDeltaCellWidths: null,
+      parameters: {
+        flatThresholdCellWidths: 0.5,
+        targetPointPolicy: "core-midpoint-v1",
+        eligibilityPolicy: "start-edge-and-lock-remaining-same-sign-v1",
+      },
+      audit: {},
+    };
+    const readyArguments = [
+      Number(readyForecast.id),
+      "ready",
+      null,
+      readyForecast.locked_at,
+      "up",
+      null,
+      null,
+      null,
+      null,
+      JSON.stringify(readySnapshot),
+      iso(BASE_TIME + 52_000),
+    ];
+    assert.equal(insertSnapshot.run(...readyArguments).changes, 1);
+    assert.throws(
+      () => insertSnapshot.run(...readyArguments),
+      /UNIQUE constraint failed/,
+      "a retry must not replace its already frozen direction snapshot",
+    );
+
+    const unselectedForecast = storedForecast("direction-challenger-unselected");
+    const unselectedSnapshot = {
+      version: "trajectory-direction-structural-v1",
+      status: "unselected",
+      reason: "start_within_center_band",
+      direction: null,
+      probabilities: null,
+      expectedDeltaCellWidths: null,
+      parameters: readySnapshot.parameters,
+      audit: {},
+    };
+    assert.equal(
+      insertSnapshot.run(
+        Number(unselectedForecast.id),
+        "unselected",
+        "start_within_center_band",
+        unselectedForecast.locked_at,
+        null,
+        null,
+        null,
+        null,
+        null,
+        JSON.stringify(unselectedSnapshot),
+        iso(BASE_TIME + 52_000),
+      ).changes,
+      1,
+    );
+
+    const malformedForecast = storedForecast("direction-challenger-malformed");
+    const malformedSnapshot = {
+      ...readySnapshot,
+      probabilities: { up: 0.6, down: 0.2, flat: 0.1 },
+    };
+    assert.throws(
+      () => insertSnapshot.run(
+        Number(malformedForecast.id),
+        "ready",
+        null,
+        malformedForecast.locked_at,
+        "up",
+        0.6,
+        0.2,
+        0.1,
+        null,
+        JSON.stringify(malformedSnapshot),
+        iso(BASE_TIME + 52_000),
+      ),
+      /CHECK constraint failed/,
     );
   } finally {
     database.close();
@@ -678,7 +867,7 @@ test("version 13 creates one live follower tracker at the current tail", () => {
       "buleto",
       "PRIMECOIN(XPM)/RUB",
     );
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 20);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 21);
     assert.equal(migrated.status, "armed");
     assert.equal(migrated.currentSession.sourceNumber, 9);
     assert.deepEqual(migrated.currentSession.fixedNumbers, [5, 4, 3, 2, 1]);
@@ -2537,6 +2726,30 @@ test("trajectory shadow freezes a correction-aware past-only READY prediction an
       Math.abs(latest.trajectoryShadow.evaluation.deltaCellWidths - 2) < 1e-9,
     );
 
+    const directionChallenger = database.getTrajectoryDirectionChallengerState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    assert.equal(directionChallenger.latest.forecastId, currentForecastId);
+    assert.equal(directionChallenger.latest.challenger.status, "ready");
+    assert.equal(directionChallenger.latest.challenger.direction, "up");
+    assert.equal(
+      directionChallenger.latest.challenger.evaluation.actualDirection,
+      "up",
+    );
+    assert.equal(
+      directionChallenger.latest.challenger.evaluation.directionHit,
+      true,
+    );
+    assert.deepEqual(directionChallenger.latest.champion, {
+      modelVersion: "trajectory-shadow-adaptive-v2",
+      status: "ready",
+      direction: "up",
+      createdAt: shadow.createdAt,
+    });
+    assert.ok(directionChallenger.metrics.paired.count >= 1);
+    assert.ok(directionChallenger.metrics.paired.bothHit >= 1);
+
     const currentResultId = latest.trajectoryShadow.evaluation.resultId;
     const setCurrentZero = database.sqlite.prepare(`
       UPDATE round_results
@@ -4305,7 +4518,7 @@ test("versions 11 and 12 do not backfill derived snapshots for version 10 foreca
       path,
       clock: () => new Date(BASE_TIME + 52_000),
     });
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 20);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 21);
     assert.equal(
       Number(
         database.sqlite
@@ -4384,7 +4597,7 @@ test("version 12 does not backfill consensus for legacy version 11 forecasts", (
       path,
       clock: () => new Date(BASE_TIME + 52_000),
     });
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 20);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 21);
     assert.equal(
       database.sqlite
         .prepare("SELECT COUNT(*) AS count FROM forecast_consensus_snapshots")
@@ -4446,7 +4659,7 @@ test("version 14 migration preserves a legacy Borda consensus row exactly", () =
       clock: () => new Date(BASE_TIME + 52_000),
     });
 
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 20);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 21);
     const migratedRow = {
       ...database.sqlite.prepare("SELECT * FROM forecast_consensus_snapshots").get(),
     };
@@ -4471,7 +4684,7 @@ test("version 14 migration preserves a legacy Borda consensus row exactly", () =
   }
 });
 
-test("versions 15 through 20 add empty prospective tables without backfilling legacy forecasts", () => {
+test("versions 15 through 21 add empty prospective tables without backfilling legacy forecasts", () => {
   const directory = mkdtempSync(join(tmpdir(), "roulette-trajectory-v14-"));
   const path = join(directory, "legacy-forecast.sqlite");
   let database = createDatabase({
@@ -4486,6 +4699,8 @@ test("versions 15 through 20 add empty prospective tables without backfilling le
       true,
     );
     database.sqlite.exec(`
+      DROP TABLE forecast_trajectory_direction_challenger_snapshots;
+      DROP TABLE trajectory_direction_challenger_cohorts;
       DROP TABLE forecast_predictive_challenger_snapshots;
       DROP TABLE predictive_leader_challenger_cohorts;
       DROP TABLE predictive_leader_account_bets;
@@ -4502,7 +4717,7 @@ test("versions 15 through 20 add empty prospective tables without backfilling le
       path,
       clock: () => new Date(BASE_TIME + 52_000),
     });
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 20);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 21);
     assert.equal(
       database.sqlite.prepare("SELECT COUNT(*) AS count FROM round_trajectories").get()
         .count,
@@ -4519,6 +4734,34 @@ test("versions 15 through 20 add empty prospective tables without backfilling le
       .get();
     assert.equal(cohort.first_forecast_id, 2);
     assert.equal(cohort.algorithm_version, "learned-predictive-hierarchical-v6-shadow");
+    const directionCohort = database.sqlite
+      .prepare("SELECT * FROM trajectory_direction_challenger_cohorts")
+      .get();
+    assert.equal(directionCohort.first_forecast_id, 2);
+    assert.equal(directionCohort.challenger_key, "structural-center-v1");
+    assert.equal(
+      directionCohort.model_version,
+      "trajectory-direction-structural-v1",
+    );
+    assert.equal(
+      directionCohort.champion_model_version,
+      "trajectory-shadow-adaptive-v2",
+    );
+    assert.equal(directionCohort.mode, "prospective-shadow");
+    assert.deepEqual(JSON.parse(directionCohort.config_json), {
+      flatThresholdCellWidths: 0.5,
+      targetPointPolicy: "core-midpoint-v1",
+      eligibilityPolicy: "start-edge-and-lock-remaining-same-sign-v1",
+    });
+    assert.equal(
+      database.sqlite
+        .prepare(`
+          SELECT COUNT(*) AS count
+          FROM forecast_trajectory_direction_challenger_snapshots
+        `)
+        .get().count,
+      0,
+    );
     assert.equal(
       database.sqlite
         .prepare("SELECT COUNT(*) AS count FROM forecast_trajectory_shadows")
@@ -4609,7 +4852,7 @@ test("version 17 never backfills an existing version 16 leader into the paper ac
       path,
       clock: () => new Date(BASE_TIME + 52_000),
     });
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 20);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 21);
     assert.equal(
       database.sqlite
         .prepare("SELECT COUNT(*) AS count FROM forecast_predictive_leader_snapshots")
@@ -4760,7 +5003,7 @@ test("version 18 preserves version 17 bet rows and adds nullable void audit fiel
       path,
       clock: () => new Date(clockMs),
     });
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 20);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 21);
     const after = database.sqlite
       .prepare("SELECT * FROM predictive_leader_account_bets ORDER BY forecast_id")
       .all();
@@ -5134,7 +5377,7 @@ test("version 5 history is backfilled into continuity epochs before migration co
 
   const database = createDatabase({ path });
   try {
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 20);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 21);
     assert.deepEqual(
       database.sqlite
         .prepare("SELECT continuity_epoch FROM round_results ORDER BY settled_at, id")
@@ -5194,7 +5437,7 @@ test("version 9 reconciles a proven contiguous shutdown boundary without deletin
 
     database = createDatabase({ path, gapThresholdSeconds: 135 });
     const state = database.getDashboardState();
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 20);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 21);
     assert.equal(state.totals.results, 5, "raw results are never recreated or deleted");
     assert.equal(state.totals.cycles, 1);
     assert.equal(state.totals.invalidCycles, 0);
@@ -7423,7 +7666,7 @@ test("v7 paper history initializes v8 bankroll with all known net results exactl
       "buleto",
       "PRIMECOIN(XPM)/RUB",
     );
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 20);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 21);
     assert.equal(state.testBank.initialBalance, 87_700);
     assert.equal(state.testBank.currentBalance, 87_910);
     assert.equal(state.testBank.netResult, 210);

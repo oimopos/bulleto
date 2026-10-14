@@ -7,8 +7,8 @@
     <meta name="color-scheme" content="dark">
     <meta name="description" content="Онлайн-монитор результатов рулетки и циклов исключения чисел от 0 до 36">
     <title>Круг 37 — монитор результатов</title>
-    <link rel="stylesheet" href="/styles.css?v=30">
-    <script type="module" src="/app.js?v=44"></script>
+    <link rel="stylesheet" href="/styles.css?v=31">
+    <script type="module" src="/app.js?v=46"></script>
   </head>
   <body>
     <a class="skip-link" href="#main-content">Перейти к содержимому</a>
@@ -275,21 +275,34 @@
           <p class="preclose-comparison__note" id="preclose-comparison-note">Rank‑37 строится по замороженным движениям похожих завершённых траекторий. Тройка показывается только при ненулевой исходной массе минимум у трёх разных чисел; технический нулевой хвост не влияет на верхнего лидера. Старый <code>start-price-v2</code> не получает отдельного голоса.</p>
         </section>
 
-        <section class="preclose-comparison" id="trajectory-shadow-panel" aria-labelledby="trajectory-shadow-title" aria-describedby="trajectory-shadow-status trajectory-shadow-shares trajectory-shadow-number-area trajectory-shadow-training trajectory-shadow-range-metrics trajectory-shadow-sample trajectory-shadow-note" aria-busy="true">
+        <section class="preclose-comparison" id="trajectory-shadow-panel" aria-labelledby="trajectory-shadow-title" aria-describedby="trajectory-shadow-observed trajectory-shadow-status trajectory-direction-challenger trajectory-shadow-shares trajectory-shadow-number-area trajectory-shadow-training trajectory-shadow-range-metrics trajectory-shadow-sample trajectory-shadow-note" aria-busy="true">
           <div class="preclose-comparison__header">
             <div>
-              <p class="eyebrow">Shadow · только наблюдение</p>
-              <h3 id="trajectory-shadow-title">Форма траектории перед lock → ed</h3>
+              <p class="eyebrow">Shadow · факт отдельно от прогноза</p>
+              <h3 id="trajectory-shadow-title">Диаграмма до lock и движение до ed</h3>
             </div>
             <span class="preclose-comparison__badge" id="trajectory-shadow-badge">Сбор истории</span>
           </div>
-          <p class="preclose-comparison__status" id="trajectory-shadow-status" role="status" aria-live="polite" aria-atomic="true">Prospective shadow появится после накопления полных завершённых траекторий.</p>
-          <p class="preclose-comparison__status" id="trajectory-shadow-shares">Доли похожих завершённых траекторий: вверх — · вниз — · без движения —.</p>
+          <dl class="trajectory-shadow__directions">
+            <div>
+              <dt>Факт · сохранённая диаграмма до lock</dt>
+              <dd id="trajectory-shadow-observed">Подтверждённая диаграмма текущего раунда ещё не зафиксирована.</dd>
+            </div>
+            <div>
+              <dt>Прогноз · отдельное движение lock → ed</dt>
+              <dd id="trajectory-shadow-status" role="status" aria-live="polite" aria-atomic="true">Prospective shadow появится после накопления полных завершённых траекторий.</dd>
+            </div>
+            <div class="trajectory-shadow__challenger">
+              <dt>Проверка альтернативы · lock → ed</dt>
+              <dd id="trajectory-direction-challenger" role="status" aria-live="polite" aria-atomic="true">Проверяемая альтернатива для текущего раунда ещё не зафиксирована. Adaptive v2 остаётся основным прогнозом.</dd>
+            </div>
+          </dl>
+          <p class="preclose-comparison__status" id="trajectory-shadow-shares">Архивное основание прогноза: вверх — · вниз — · без движения —.</p>
           <p class="preclose-comparison__status trajectory-shadow__range" id="trajectory-shadow-number-area" aria-live="polite" aria-atomic="true">ПРОГНОЗ УЧАСТКА: НЕТ ДАННЫХ</p>
           <p class="preclose-comparison__status" id="trajectory-shadow-training">Обучение: — результатов · adaptive-снимок для этого раунда отсутствует.</p>
           <p class="preclose-comparison__status" id="trajectory-shadow-range-metrics" aria-live="polite" aria-atomic="true">Участок: — из — (нет данных) · Adaptive v2, проспективное наблюдение.</p>
           <p class="preclose-comparison__status" id="trajectory-shadow-sample">Полные сопоставимые раунды: —/30; соседи формы: —/10.</p>
-          <p class="preclose-comparison__note" id="trajectory-shadow-note">Цель — движение цены от последней доступной точки перед forecast lock (возраст точки не более 5 с) до финальной цены результата <code>ed</code>, а не следующий тик. Adaptive v2 фиксирует при lock не более 6 соседних ценовых полос вокруг типичного q50 внутри полного коридора q20/q80; legacy KNN v1 восстанавливает такое же компактное окно только для отображения. Основная шкала идёт от 0 сверху к 36 снизу, а нижняя дублирующая нулевая полоса помечается отдельно. Обучение использует только завершённые снимки, известные строго до lock нового снимка. «Участок» и Rank‑37 проверяются только на проспективно зафиксированных Adaptive v2 снимках; архивные доли попаданий не являются вероятностью следующего раунда. В блок «Одно число по прогнозным блокам» Rank‑37 входит с замороженной исходной массой: числа с нулевой массой данных не получают вес из-за технического порядка. Компактный диапазон усредняется с ним внутри одной ценовой группы и не создаёт второй независимый вес.</p>
+          <p class="preclose-comparison__note" id="trajectory-shadow-note">«Факт» показывает общее изменение первой и последней сохранённых точек уже построенной диаграммы до lock. «Прогноз» относится только к движению от последней доступной точки перед forecast lock (возраст точки не более 5 с) до финальной цены результата <code>ed</code>, которое ещё не было известно в момент lock, а не к текущему наклону и не к следующему тику. Эти направления могут быть противоположными — это не переворот оси. «Без заметного движения» означает изменение не более половины ширины ценовой полосы. Adaptive v2 фиксирует при lock не более 6 соседних ценовых полос вокруг типичного q50 внутри полного коридора q20/q80; legacy KNN v1 восстанавливает такое же компактное окно только для отображения. Основная шкала идёт от 0 сверху к 36 снизу, а нижняя дублирующая нулевая полоса помечается отдельно. Обучение использует только завершённые снимки, известные строго до lock нового снимка. «Участок» и Rank‑37 проверяются только на проспективно зафиксированных Adaptive v2 снимках; архивные доли попаданий не являются вероятностью следующего раунда. В блок «Одно число по прогнозным блокам» Rank‑37 входит с замороженной исходной массой: числа с нулевой массой данных не получают вес из-за технического порядка. Компактный диапазон усредняется с ним внутри одной ценовой группы и не создаёт второй независимый вес.</p>
         </section>
 
         <details class="preclose-hit-history disclosure disclosure--inset" id="preclose-hit-history" data-state="loading" aria-labelledby="preclose-hit-history-title" aria-describedby="preclose-hit-history-status" aria-busy="true">

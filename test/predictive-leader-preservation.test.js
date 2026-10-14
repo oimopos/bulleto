@@ -150,6 +150,14 @@ const PRESERVED_TABLES = Object.freeze({
   pairForecasts: ["forecast_pair_snapshots", "forecast_id"],
   consensusForecasts: ["forecast_consensus_snapshots", "forecast_id"],
   trajectoryShadows: ["forecast_trajectory_shadows", "forecast_id"],
+  trajectoryDirectionCohorts: [
+    "trajectory_direction_challenger_cohorts",
+    "challenger_key",
+  ],
+  trajectoryDirectionSnapshots: [
+    "forecast_trajectory_direction_challenger_snapshots",
+    "forecast_id, challenger_key",
+  ],
   leaders: ["forecast_predictive_leader_snapshots", "forecast_id"],
   challengerCohorts: ["predictive_leader_challenger_cohorts", "challenger_key"],
   challengers: [
@@ -471,6 +479,8 @@ test(
         SOURCE,
         INSTRUMENT,
       );
+      const beforeDirectionChallengerState =
+        database.getTrajectoryDirectionChallengerState(SOURCE, INSTRUMENT);
       const beforeJsonState = JSON.parse(JSON.stringify(beforeState));
       assert.equal(beforeRows.resets.length, 1);
       assert.equal(beforeRows.resets[0].status, "applied");
@@ -606,6 +616,10 @@ test(
         database.getPredictiveLeaderChallengerState(SOURCE, INSTRUMENT),
         beforeChallengerState,
       );
+      assert.deepEqual(
+        database.getTrajectoryDirectionChallengerState(SOURCE, INSTRUMENT),
+        beforeDirectionChallengerState,
+      );
       assert.equal(
         reopenedEvidence.queriedCandidateCount,
         beforeEvidence.queriedCandidateCount,
@@ -732,11 +746,15 @@ test(
       const challengerRead = await measureJson(
         "/api/predictive-leader/challengers",
       );
+      const directionChallengerRead = await measureJson(
+        "/api/trajectory-direction/challenger",
+      );
       const trajectoryRead = await measureJson("/api/forecasts");
       for (const measurement of [
         firstLeaderRead,
         secondLeaderRead,
         challengerRead,
+        directionChallengerRead,
         trajectoryRead,
       ]) {
         assert.equal(Number.isFinite(measurement.elapsedMs), true);
@@ -758,6 +776,17 @@ test(
       );
       assert.deepEqual(challengerRead.payload.latest, beforeChallengerState.latest);
       assert.deepEqual(challengerRead.payload.metrics, beforeChallengerState.metrics);
+      assert.equal(directionChallengerRead.payload.mode, "prospective-shadow");
+      assert.equal(directionChallengerRead.payload.executionEnabled, false);
+      assert.equal(directionChallengerRead.payload.advisoryOnly, true);
+      assert.deepEqual(
+        directionChallengerRead.payload.latest,
+        beforeDirectionChallengerState.latest,
+      );
+      assert.deepEqual(
+        directionChallengerRead.payload.metrics,
+        beforeDirectionChallengerState.metrics,
+      );
 
       await stopChild(child);
       child = null;
@@ -774,6 +803,10 @@ test(
       assert.deepEqual(
         database.getPredictiveLeaderChallengerState(SOURCE, INSTRUMENT),
         beforeChallengerState,
+      );
+      assert.deepEqual(
+        database.getTrajectoryDirectionChallengerState(SOURCE, INSTRUMENT),
+        beforeDirectionChallengerState,
       );
     } finally {
       await stopChild(child);

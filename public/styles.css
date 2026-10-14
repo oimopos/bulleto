@@ -1259,6 +1259,47 @@ h2 {
   color: var(--muted-strong);
 }
 
+.trajectory-shadow__directions {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 8px;
+  margin: 10px 0 0;
+}
+
+.trajectory-shadow__directions > div {
+  padding: 10px 11px;
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.018);
+}
+
+.trajectory-shadow__directions dt {
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 760;
+  letter-spacing: 0.045em;
+  line-height: 1.35;
+  text-transform: uppercase;
+}
+
+.trajectory-shadow__directions dd {
+  margin: 5px 0 0;
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 650;
+  line-height: 1.45;
+}
+
+.trajectory-shadow__directions > .trajectory-shadow__challenger {
+  grid-column: 1 / -1;
+  border-color: rgba(228, 189, 115, 0.2);
+  background: rgba(228, 189, 115, 0.035);
+}
+
+.trajectory-shadow__challenger dd {
+  color: var(--muted-strong);
+}
+
 .trajectory-shadow__range {
   margin-top: 14px;
   color: var(--text);

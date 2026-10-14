@@ -47,12 +47,166 @@ test("dashboard keeps the exact read-only fetch URL list", () => {
     "/api/forecasts/hits?limit=20",
     "/api/cycle-comparison",
     "/api/predictive-leader",
+    "/api/trajectory-direction/challenger",
   ]);
   assert.equal(
     [...app.matchAll(/\bfetchJson\(/g)].length,
     fetchUrls.length + 1,
     "the helper definition plus the exact literal GET calls are the only fetchJson uses",
   );
+});
+
+test("partial refresh marks cached dashboard state stale before rendering fresh side data", async () => {
+  const functionStart = app.indexOf("  async function refreshAll({ notify = false } = {}) {");
+  const functionEnd = app.indexOf("\n\n  function latestResultForRender", functionStart);
+  assert.ok(functionStart >= 0 && functionEnd > functionStart);
+  const staleState = {
+    precloseForecast: { latest: { trajectoryShadow: { direction: "up" } } },
+  };
+  const store = {
+    state: staleState,
+    stateLoaded: true,
+    stateError: false,
+    results: [{ id: "old" }],
+    resultsLoaded: true,
+    resultsError: false,
+    refreshing: false,
+    refreshQueued: false,
+    refreshTimer: 7,
+    eventSource: null,
+  };
+  const classList = { add() {}, remove() {} };
+  const elements = {
+    refreshButton: { classList, disabled: false },
+    main: { setAttribute() {}, removeAttribute() {} },
+  };
+  const rendered = [];
+  const fetchJson = async (url) => {
+    if (url === "/api/results?limit=80") return { items: [{ id: "fresh" }] };
+    throw new Error(`failed ${url}`);
+  };
+  const build = new Function(
+    "window",
+    "store",
+    "elements",
+    "fetchJson",
+    "extractItems",
+    "renderAll",
+    "setConnection",
+    "scheduleQueuedRefresh",
+    `"use strict"; ${app.slice(functionStart, functionEnd)}; return refreshAll;`,
+  );
+  const refreshAll = build(
+    { clearTimeout() {} },
+    store,
+    elements,
+    fetchJson,
+    (payload) => Array.isArray(payload?.items) ? payload.items : [],
+    () => rendered.push({ state: store.state, stateError: store.stateError }),
+    () => {},
+    () => {},
+  );
+
+  await refreshAll();
+
+  assert.equal(store.state, staleState, "last-good state remains available to explicitly stale panels");
+  assert.equal(store.stateError, true);
+  assert.equal(store.resultsLoaded, true);
+  assert.equal(store.resultsError, false);
+  assert.deepEqual(store.results, [{ id: "fresh" }]);
+  assert.deepEqual(rendered, [{ state: staleState, stateError: true }]);
+});
+
+test("trajectory challenger endpoint failure stays isolated from dashboard state", async () => {
+  const functionStart = app.indexOf("  async function refreshAll({ notify = false } = {}) {");
+  const functionEnd = app.indexOf("\n\n  function latestResultForRender", functionStart);
+  const store = {
+    state: null,
+    stateLoaded: false,
+    stateError: false,
+    refreshing: false,
+    refreshQueued: false,
+    refreshTimer: null,
+    eventSource: null,
+  };
+  const elements = {
+    refreshButton: { classList: { add() {}, remove() {} }, disabled: false },
+    main: { setAttribute() {}, removeAttribute() {} },
+  };
+  const fetchJson = async (url) => {
+    if (url === "/api/state") return { serverTime: null, collector: { currentRound: null } };
+    throw new Error(`failed ${url}`);
+  };
+  const build = new Function(
+    "window",
+    "store",
+    "elements",
+    "fetchJson",
+    "extractItems",
+    "renderAll",
+    "setConnection",
+    "scheduleQueuedRefresh",
+    "captureServerClock",
+    `"use strict"; ${app.slice(functionStart, functionEnd)}; return refreshAll;`,
+  );
+  const refreshAll = build(
+    { clearTimeout() {} },
+    store,
+    elements,
+    fetchJson,
+    () => [],
+    () => {},
+    () => {},
+    () => {},
+    () => {},
+  );
+
+  await refreshAll();
+
+  assert.equal(store.stateError, false);
+  assert.equal(store.trajectoryDirectionChallengerLoaded, true);
+  assert.equal(store.trajectoryDirectionChallengerError, true);
+  assert.equal(store.trajectoryDirectionChallengerSnapshot, null);
+});
+
+test("latest result selection distinguishes a fresh results response from two stale caches", () => {
+  const functionStart = app.indexOf("  function latestResultForRender() {");
+  const functionEnd = app.indexOf("  function renderFetchFailure()", functionStart);
+  assert.ok(functionStart >= 0 && functionEnd > functionStart);
+  const build = new Function(
+    "store",
+    `"use strict"; ${app.slice(functionStart, functionEnd)}; return latestResultForRender;`,
+  );
+  const stateResult = { id: "state", settledAt: "2026-10-14T12:00:20.000Z" };
+  const olderResult = { id: "older", settledAt: "2026-10-14T12:00:10.000Z" };
+  const newerResult = { id: "newer", settledAt: "2026-10-14T12:00:30.000Z" };
+  const pick = (overrides = {}) => build({
+    state: { latestResult: stateResult },
+    stateError: true,
+    results: [olderResult],
+    resultsLoaded: true,
+    resultsError: false,
+    ...overrides,
+  })();
+
+  assert.equal(pick(), olderResult, "a successful /api/results response is authoritative");
+  assert.equal(pick({ results: [] }), null, "a successful empty response stays empty");
+  assert.equal(pick({ resultsError: true }), stateResult, "newer cached state wins after dual failure");
+  assert.equal(
+    pick({ results: [newerResult], resultsError: true }),
+    newerResult,
+    "timestamps resolve two stale caches without rolling the dashboard back",
+  );
+  assert.equal(pick({ stateError: false, results: [newerResult] }), stateResult);
+});
+
+test("a total refresh failure immediately replaces the cached trajectory display", () => {
+  const functionStart = app.indexOf("  function renderFetchFailure() {");
+  const functionEnd = app.indexOf("  function renderAll()", functionStart);
+  assert.ok(functionStart >= 0 && functionEnd > functionStart);
+  const block = app.slice(functionStart, functionEnd);
+
+  assert.match(block, /renderPrecloseForecast\(\)/);
 });
 
 test("server exposes a separate read-only predictive leader GET", () => {
@@ -150,7 +304,7 @@ test("combined leader is the first dashboard block and renders exactly one numbe
   assert.match(block, /эвристический ранговый индекс, не вероятность и не гарантия преимущества/);
   assert.match(block, /Давность, виртуальная цель, невыпавшие числа, survivor и исторический аналог остаются только наблюдением/);
   assert.match(block, /1 из 37 \(≈2,7%\)/);
-  assert.match(html, /<script type="module" src="\/app\.js\?v=44"><\/script>/);
+  assert.match(html, /<script type="module" src="\/app\.js\?v=46"><\/script>/);
 
   assert.match(app, /from "\.\/combined-number\.js\?v=7"/);
   assert.match(app, /normalizePredictiveLeaderApiSnapshot/);
@@ -374,12 +528,14 @@ test("trajectory shadow is prospective and exposes the full Rank-37 contract", (
   const rendererIds = [
     "trajectory-shadow-panel",
     "trajectory-shadow-badge",
+    "trajectory-shadow-observed",
     "trajectory-shadow-status",
     "trajectory-shadow-shares",
     "trajectory-shadow-number-area",
     "trajectory-shadow-training",
     "trajectory-shadow-range-metrics",
     "trajectory-shadow-sample",
+    "trajectory-direction-challenger",
   ];
   const semanticIds = ["trajectory-shadow-title", "trajectory-shadow-note"];
 
@@ -394,11 +550,17 @@ test("trajectory shadow is prospective and exposes the full Rank-37 contract", (
   const blockEnd = html.indexOf('id="preclose-hit-history"');
   const block = html.slice(blockStart, blockEnd);
   assert.ok(blockStart >= 0 && blockEnd > blockStart);
-  assert.match(block, /Shadow · только наблюдение/);
+  assert.match(block, /Shadow · факт отдельно от прогноза/);
+  assert.match(block, /Факт · сохранённая диаграмма до lock/);
+  assert.match(block, /Прогноз · отдельное движение lock → ed/);
+  assert.match(block, /Проверка альтернативы · lock → ed/);
+  assert.match(block, /trajectory-shadow-status trajectory-direction-challenger/);
   assert.match(block, /последней доступной точки перед forecast lock/);
   assert.match(block, /возраст точки не более 5 с/);
-  assert.match(block, /а не следующий тик/);
-  assert.match(block, /Доли похожих завершённых траекторий/);
+  assert.match(block, /не к текущему наклону и не к следующему тику/);
+  assert.match(block, /направления могут быть противоположными/);
+  assert.match(block, /это не переворот оси/);
+  assert.match(block, /Архивное основание прогноза/);
   assert.match(block, /ПРОГНОЗ УЧАСТКА: НЕТ ДАННЫХ/);
   assert.match(block, /не более 6 соседних ценовых полос вокруг типичного q50/);
   assert.match(block, /полного коридора q20\/q80/);
@@ -429,21 +591,26 @@ test("trajectory shadow is prospective and exposes the full Rank-37 contract", (
   assert.match(combinedNumber, /evidenceCandidateCount/);
   assert.match(combinedNumber, /weights: evidenceRawMass\.map/);
   assert.match(app, /const TRAJECTORY_NUMBER_AREA_MAX_DISPLAY_CELLS = 6/);
+  assert.match(app, /const TRAJECTORY_DIRECTION_CHALLENGER_SCHEMA_VERSION = 1/);
+  assert.match(app, /const TRAJECTORY_DIRECTION_CHALLENGER_KEY = "structural-center-v1"/);
+  assert.match(app, /const TRAJECTORY_DIRECTION_CHALLENGER_MODEL = "trajectory-direction-structural-v1"/);
+  assert.match(app, /const TRAJECTORY_DIRECTION_CHALLENGER_MODE = "prospective-shadow"/);
   assert.match(app, /function normalizedTrajectoryNumberArea\(value\)/);
   assert.match(app, /function normalizedTrajectoryDisplayRange\(value, numberArea\)/);
   assert.match(app, /function normalizedTrajectoryAdaptive\(value\)/);
+  assert.match(app, /function normalizedTrajectoryObservedChange\(value\)/);
   assert.match(app, /function normalizedTrajectoryEvaluation\(value, \{ numberArea, displayRange \}\)/);
   assert.match(app, /function normalizedTrajectoryMetrics\(value\)/);
   assert.match(app, /function trajectoryNumberAreaDisplayCells\(area\)/);
   assert.match(app, /function trajectoryShadowDisplayCells\(shadow\)/);
   assert.match(app, /function trajectoryNumberAreaText\(shadow\)/);
   assert.match(app, /function normalizedTrajectoryShadow\(value\)/);
-  assert.match(app, /function renderTrajectoryShadow\(value, metricsValue\)/);
+  assert.match(app, /function renderTrajectoryShadow\(value, metricsValue, \{ failed = false \} = \{\}\)/);
   assert.match(app, /"insufficient_current"/);
   assert.match(app, /график неполный/);
   assert.match(
     app,
-    /renderTrajectoryShadow\(\s*matchesCurrent \? latest\?\.trajectoryShadow : null,\s*forecastState\?\.trajectoryMetrics,\s*\)/,
+    /renderTrajectoryShadow\(\s*matchesCurrent \? latest\?\.trajectoryShadow : null,\s*forecastState\?\.trajectoryMetrics,\s*\{ failed: store\.stateError \},\s*\)/,
   );
   assert.match(app, /shadow\.isAdaptive\s*\? shadow\.displayRange\?\.cells \?\? \[\]/);
   assert.match(app, /value\.modelVersion !== TRAJECTORY_SHADOW_ADAPTIVE_VERSION/);
@@ -458,7 +625,7 @@ test("trajectory shadow is prospective and exposes the full Rank-37 contract", (
   assert.match(app, /Top‑3 \$\{metrics\.rank37Top3Hits\}/);
   assert.match(app, /проспективное наблюдение/);
   assert.match(app, /Полные сопоставимые раунды:/);
-  assert.match(app, /Доли похожих завершённых траекторий:/);
+  assert.match(app, /Архивное основание прогноза:/);
   assert.ok(app.includes("ПРОГНОЗ УЧАСТКА: ОТ ${from} ДО ${to}"));
   assert.match(
     app,
@@ -478,7 +645,258 @@ test("trajectory shadow is prospective and exposes the full Rank-37 contract", (
     /if \(point\.wireCell === 0\) return "0 \(ВЕРХНЯЯ ПОЛОСА\)"/,
   );
   assert.match(styles, /\.trajectory-shadow__range\s*\{[\s\S]*?font-size: clamp\(18px, 4vw, 28px\)/);
+  assert.match(styles, /\.trajectory-shadow__directions > \.trajectory-shadow__challenger\s*\{[\s\S]*?grid-column: 1 \/ -1/);
   assert.doesNotMatch(app, /trajectoryShadowPanel\.(?:dataset|classList)/);
+});
+
+test("trajectory direction challenger is advisory, current-round only, and fail-closed", () => {
+  const functionStart = app.indexOf("  function normalizedTrajectoryDirectionChallengerMetrics(value) {");
+  const functionEnd = app.indexOf("\n\n  function trajectoryNumberAreaLabel(point)", functionStart);
+  assert.ok(functionStart >= 0 && functionEnd > functionStart);
+
+  const target = () => ({ textContent: "" });
+  const elements = { trajectoryDirectionChallenger: target() };
+  const build = new Function(
+    "TRAJECTORY_DIRECTION_CHALLENGER_SCHEMA_VERSION",
+    "TRAJECTORY_DIRECTION_CHALLENGER_KEY",
+    "TRAJECTORY_DIRECTION_CHALLENGER_MODEL",
+    "TRAJECTORY_DIRECTION_CHALLENGER_MODE",
+    "TRAJECTORY_SHADOW_ADAPTIVE_VERSION",
+    "TRAJECTORY_SHADOW_DIRECTION_LABELS",
+    "trajectoryShadowShareFormatter",
+    "elements",
+    "setTextIfChanged",
+    `"use strict"; ${app.slice(functionStart, functionEnd)}; return { normalizedTrajectoryDirectionChallenger, renderTrajectoryDirectionChallenger };`,
+  );
+  const { normalizedTrajectoryDirectionChallenger: normalize, renderTrajectoryDirectionChallenger: render } = build(
+    1,
+    "structural-center-v1",
+    "trajectory-direction-structural-v1",
+    "prospective-shadow",
+    "trajectory-shadow-adaptive-v2",
+    { up: "вверх", down: "вниз", flat: "без движения" },
+    new Intl.NumberFormat("ru-RU", {
+      style: "percent",
+      minimumFractionDigits: 1,
+      maximumFractionDigits: 1,
+    }),
+    elements,
+    (element, value) => { element.textContent = value; },
+  );
+  const metrics = {
+    eligibleCount: 4,
+    storedCount: 4,
+    validStoredCount: 4,
+    selectedCount: 3,
+    unselectedCount: 1,
+    unavailableCount: 0,
+    evaluatedSelected: 2,
+    settledSelected: 2,
+    pendingSelected: 1,
+    ungradableSelected: 0,
+    hits: 1,
+    invalidStoredCount: 0,
+    decisionCoverage: 0.75,
+    selectiveAccuracy: 0.5,
+    paired: {
+      count: 2,
+      challengerHits: 1,
+      championHits: 0,
+      challengerRate: 0.5,
+      championRate: 0,
+      uplift: 0.5,
+      bothHit: 0,
+      challengerOnly: 1,
+      championOnly: 0,
+      bothWrong: 1,
+      discordantCount: 1,
+    },
+    window: {
+      limit: 1_000,
+      eligibleCount: 4,
+      storedCount: 4,
+      validStoredCount: 4,
+      totalEligibleCount: 4,
+      totalStoredCount: 4,
+      truncated: false,
+    },
+  };
+  const ready = {
+    schemaVersion: 1,
+    challengerKey: "structural-center-v1",
+    modelVersion: "trajectory-direction-structural-v1",
+    championModelVersion: "trajectory-shadow-adaptive-v2",
+    mode: "prospective-shadow",
+    advisoryOnly: true,
+    executionEnabled: false,
+    latest: {
+      roundId: "round-42",
+      challenger: {
+        schemaVersion: 1,
+        challengerKey: "structural-center-v1",
+        modelVersion: "trajectory-direction-structural-v1",
+        status: "ready",
+        reason: null,
+        direction: "up",
+        probabilities: null,
+        selection: { eligible: true },
+      },
+      champion: {
+        modelVersion: "trajectory-shadow-adaptive-v2",
+        status: "ready",
+        direction: "down",
+      },
+    },
+    metrics,
+  };
+
+  assert.notEqual(normalize(ready), null);
+  assert.equal(normalize({ ...ready, advisoryOnly: false }), null);
+  assert.equal(normalize({ ...ready, executionEnabled: true }), null);
+  assert.equal(normalize({ ...ready, mode: "observation" }), null);
+
+  const withUngradable = structuredClone(ready);
+  Object.assign(withUngradable.metrics, {
+    evaluatedSelected: 1,
+    settledSelected: 2,
+    pendingSelected: 1,
+    ungradableSelected: 1,
+    hits: 1,
+    selectiveAccuracy: 1,
+    paired: {
+      count: 1,
+      challengerHits: 1,
+      championHits: 0,
+      challengerRate: 1,
+      championRate: 0,
+      uplift: 1,
+      bothHit: 0,
+      challengerOnly: 1,
+      championOnly: 0,
+      bothWrong: 0,
+      discordantCount: 1,
+    },
+  });
+  assert.notEqual(normalize(withUngradable), null);
+  assert.equal(normalize({
+    ...withUngradable,
+    metrics: { ...withUngradable.metrics, settledSelected: 1 },
+  }), null);
+
+  render(ready, "round-42");
+  assert.match(elements.trajectoryDirectionChallenger.textContent, /Проверяемая альтернатива: вверх/);
+  assert.match(elements.trajectoryDirectionChallenger.textContent, /Не заменяет Adaptive v2/);
+  assert.match(elements.trajectoryDirectionChallenger.textContent, /вероятность не рассчитана/);
+  assert.match(elements.trajectoryDirectionChallenger.textContent, /Проспективно: 1\/2 \(50,0\s?%\)/);
+  assert.match(elements.trajectoryDirectionChallenger.textContent, /отбор 3\/4 \(75,0\s?%\)/);
+  assert.match(elements.trajectoryDirectionChallenger.textContent, /Пары с Adaptive v2: альтернатива 1\/2/);
+  assert.doesNotMatch(elements.trajectoryDirectionChallenger.textContent, /альтернатива: вниз/);
+
+  render(ready, "round-43");
+  assert.match(elements.trajectoryDirectionChallenger.textContent, /для текущего раунда ещё не зафиксирована/);
+  assert.doesNotMatch(elements.trajectoryDirectionChallenger.textContent, /1\/2|вверх/);
+
+  for (const [reason, text] of [
+    ["start_within_center_band", /старт был в центральной зоне/],
+    ["lock_within_center_band", /lock оказался в центральной зоне/],
+    ["center_side_changed", /цена пересекла центр/],
+  ]) {
+    const unselected = structuredClone(ready);
+    Object.assign(unselected.latest.challenger, {
+      status: "unselected",
+      reason,
+      direction: null,
+      selection: { eligible: false },
+    });
+    render(unselected, "round-42");
+    assert.match(elements.trajectoryDirectionChallenger.textContent, text);
+    assert.match(elements.trajectoryDirectionChallenger.textContent, /Adaptive v2 не заменён/);
+  }
+
+  const unavailable = structuredClone(ready);
+  Object.assign(unavailable.latest.challenger, {
+    status: "unavailable",
+    reason: "invalid_core",
+    direction: null,
+    selection: { eligible: false },
+  });
+  render(unavailable, "round-42");
+  assert.match(elements.trajectoryDirectionChallenger.textContent, /недоступна для этого снимка/);
+
+  const missing = structuredClone(ready);
+  missing.latest.challenger = null;
+  render(missing, "round-42");
+  assert.match(elements.trajectoryDirectionChallenger.textContent, /ещё не зафиксирована/);
+
+  render(ready, "round-42");
+  render(ready, "round-42", { failed: true });
+  assert.match(elements.trajectoryDirectionChallenger.textContent, /скрыта: её данные не обновились/);
+  assert.doesNotMatch(elements.trajectoryDirectionChallenger.textContent, /1\/2|вверх|75/);
+});
+
+test("trajectory forecast hides every stale value when dashboard state did not refresh", () => {
+  const functionStart = app.indexOf("  function renderTrajectoryShadow(value, metricsValue");
+  const functionEnd = app.indexOf("\n\n  function sameEntityId", functionStart);
+  assert.ok(functionStart >= 0 && functionEnd > functionStart);
+
+  const target = () => ({ textContent: "stale", title: "stale" });
+  const elements = {
+    trajectoryShadowPanel: { setAttribute() {} },
+    trajectoryShadowBadge: target(),
+    trajectoryShadowObserved: target(),
+    trajectoryShadowStatus: target(),
+    trajectoryShadowShares: target(),
+    trajectoryShadowNumberArea: target(),
+    trajectoryShadowTraining: target(),
+    trajectoryShadowRangeMetrics: target(),
+    trajectoryShadowSample: target(),
+  };
+  const build = new Function(
+    "normalizedTrajectoryShadow",
+    "normalizedTrajectoryMetrics",
+    "elements",
+    "setTextIfChanged",
+    `"use strict"; ${app.slice(functionStart, functionEnd)}; return renderTrajectoryShadow;`,
+  );
+  const render = build(
+    () => ({ direction: "up", observedChange: { startPrice: 5.1, endPrice: 5.2 } }),
+    () => ({ rank37Top1Hits: 99 }),
+    elements,
+    (element, value) => { element.textContent = value; },
+  );
+
+  render({ stale: true }, { stale: true }, { failed: true });
+
+  assert.equal(elements.trajectoryShadowBadge.textContent, "Не обновлено");
+  assert.match(elements.trajectoryShadowStatus.textContent, /Прогноз lock → ed скрыт/);
+  assert.equal(
+    elements.trajectoryShadowNumberArea.textContent,
+    "ПРОГНОЗ УЧАСТКА: ДАННЫЕ НЕ ОБНОВЛЕНЫ",
+  );
+  const renderedText = Object.values(elements)
+    .map((element) => element.textContent || "")
+    .join(" ");
+  assert.doesNotMatch(renderedText, /5[,.][12]|вверх|99/);
+});
+
+test("preclose trajectory metrics never turn an API failure into plausible zeroes", () => {
+  const functionStart = app.indexOf("  function renderPrecloseTrajectoryMetrics(");
+  const functionEnd = app.indexOf("  function renderPrecloseForecast()", functionStart);
+  assert.ok(functionStart >= 0 && functionEnd > functionStart);
+  const elements = {
+    precloseSampleCount: { textContent: "0 из 100", title: "stale" },
+    precloseTop3Rate: { textContent: "0 из 0 · мало данных" },
+  };
+  const build = new Function(
+    "elements",
+    `"use strict"; ${app.slice(functionStart, functionEnd)}; return renderPrecloseTrajectoryMetrics;`,
+  );
+
+  build(elements)({ rank37EvaluatedCount: 0, rank37Top3Hits: 0 }, { failed: true });
+
+  assert.equal(elements.precloseSampleCount.textContent, "—");
+  assert.equal(elements.precloseSampleCount.title, "Статистика Rank‑37 не обновлена.");
+  assert.equal(elements.precloseTop3Rate.textContent, "Не обновлено");
 });
 
 test("trajectory number area display keeps at most six cells around q50", () => {
@@ -590,6 +1008,66 @@ test("adaptive trajectory display range accepts only the frozen contiguous max-s
     normalize({ ...range(0, 5), maxCells: "6" }, area(0, 20, 0)),
     null,
   );
+});
+
+test("observed trajectory change is frozen separately from the lock-to-ed forecast", () => {
+  const functionStart = app.indexOf("  function normalizedTrajectoryObservedChange(value) {");
+  const functionEnd = app.indexOf("\n\n  function normalizedTrajectoryNumberArea", functionStart);
+  assert.ok(functionStart >= 0 && functionEnd > functionStart);
+  const normalize = new Function(
+    `"use strict"; ${app.slice(functionStart, functionEnd)}; return normalizedTrajectoryObservedChange;`,
+  )();
+  const point = (second, price) => ({
+    at: `2026-10-14T12:00:${String(second).padStart(2, "0")}.000Z`,
+    price,
+  });
+  const input = (endPrice) => ({
+    cutoffAt: "2026-10-14T12:00:10.000Z",
+    lockPrice: endPrice,
+    medianCellWidth: 0.01,
+    parameters: { flatThresholdCellWidths: 0.5 },
+    currentPrefix: [
+      point(0, 5.2),
+      point(5, 5.21),
+      point(10, endPrice),
+    ],
+  });
+
+  const up = normalize(input(5.23));
+  assert.equal(up.direction, "up");
+  assert.equal(up.startPrice, 5.2);
+  assert.equal(up.endPrice, 5.23);
+  assert.equal(up.pointCount, 3);
+  assert.equal(normalize(input(5.19)).direction, "down");
+  assert.equal(normalize(input(5.204)).direction, "flat");
+  assert.equal(normalize({ ...input(5.23), lockPrice: 5.230000001 }).direction, "up");
+  assert.equal(normalize({ ...input(5.23), lockPrice: 5.24 }), null);
+  const exactBoundary = {
+    cutoffAt: "2026-10-14T12:00:10.000Z",
+    lockPrice: 1.5,
+    medianCellWidth: 1,
+    parameters: { flatThresholdCellWidths: 0.5 },
+    currentPrefix: [point(0, 1), point(5, 1.25), point(10, 1.5)],
+  };
+  assert.equal(normalize(exactBoundary).direction, "flat");
+  assert.equal(normalize({
+    ...exactBoundary,
+    lockPrice: 1,
+    currentPrefix: [point(0, 1.5), point(5, 1.25), point(10, 1)],
+  }).direction, "flat");
+  assert.equal(normalize({ ...input(5.23), currentPrefix: [point(10, 5.23)] }), null);
+  assert.equal(normalize({
+    ...input(5.23),
+    currentPrefix: [point(0, 5.2), point(5, 5.21), point(5, 5.23)],
+  }), null);
+  assert.equal(normalize({
+    ...input(5.23),
+    currentPrefix: [point(0, 5.2), point(10, 5.21), point(5, 5.23)],
+  }), null);
+  assert.equal(normalize({
+    ...input(5.23),
+    currentPrefix: [point(0, 5.2), point(5, 5.21), point(11, 5.23)],
+  }), null);
 });
 
 test("adaptive trajectory metrics fail closed on inconsistent prospective counts", () => {
@@ -732,8 +1210,17 @@ test("trajectory shadow normalizer keeps legacy v1 readable and requires frozen 
   };
   const base = {
     status: "ready",
-    direction: "up",
-    probabilities: { up: 0.5, down: 0.3, flat: 0.2 },
+    direction: "down",
+    probabilities: { up: 0.3, down: 0.5, flat: 0.2 },
+    cutoffAt: "2026-10-14T12:00:10.000Z",
+    lockPrice: 1,
+    medianCellWidth: 0.1,
+    parameters: { flatThresholdCellWidths: 0.5 },
+    currentPrefix: [
+      { at: "2026-10-14T12:00:00.000Z", price: 0.8 },
+      { at: "2026-10-14T12:00:05.000Z", price: 0.9 },
+      { at: "2026-10-14T12:00:10.000Z", price: 1 },
+    ],
     sample,
     numberArea,
     evaluation: null,
@@ -746,6 +1233,8 @@ test("trajectory shadow normalizer keeps legacy v1 readable and requires frozen 
   });
   assert.equal(legacy.isAdaptive, false);
   assert.equal(legacy.displayRange, null);
+  assert.equal(legacy.direction, "down");
+  assert.equal(legacy.observedChange.direction, "up");
 
   const displayRange = {
     version: "trajectory-display-range-v1",
@@ -765,6 +1254,8 @@ test("trajectory shadow normalizer keeps legacy v1 readable and requires frozen 
   const adaptive = normalize(adaptiveInput);
   assert.equal(adaptive.isAdaptive, true);
   assert.equal(adaptive.adaptive.trainingCount, 4);
+  assert.equal(adaptive.direction, "down");
+  assert.equal(adaptive.observedChange.direction, "up");
   assert.deepEqual(adaptive.displayRange.cells, cells);
   const priceLessSettlement = normalize({
     ...adaptiveInput,
@@ -787,6 +1278,8 @@ test("trajectory shadow normalizer keeps legacy v1 readable and requires frozen 
   assert.equal(normalize({ ...adaptiveInput, displayRange: null }), null);
   assert.equal(normalize({ ...adaptiveInput, adaptive: null }), null);
   assert.equal(normalize({ ...adaptiveInput, adaptive: { trainingCount: "4" } }), null);
+  assert.equal(normalize({ ...adaptiveInput, currentPrefix: [] }), null);
+  assert.equal(normalize({ ...adaptiveInput, lockPrice: 1.1 }), null);
 });
 
 test("trajectory evaluation distinguishes both zero bands and leaves missing raw cells ungraded", () => {
@@ -939,8 +1432,8 @@ test("warm next-round forecast exposes a strict 5-percent walk-forward contract"
   );
   assert.match(html, /id="follower-dynamic-next-title"[^>]*>[^<]*≥5%/);
   assert.match(html, /id="follower-dynamic-next-note"[^>]*>[\s\S]*?5%/);
-  assert.match(html, /styles\.css\?v=30/);
-  assert.match(html, /app\.js\?v=44/);
+  assert.match(html, /styles\.css\?v=31/);
+  assert.match(html, /app\.js\?v=46/);
   assert.match(styles, /\.follower-dynamic-next\s*\{/);
   assert.match(styles, /\.follower-warm-current\s*\{/);
   assert.match(styles, /\.follower-warm-picks\s*\{/);
@@ -1167,8 +1660,8 @@ test("cycle comparison language is descriptive, responsive, and cache-busted", (
   assert.match(block, /не прогноз/);
   assert.match(block, /не предсказывает следующее число/);
   assert.doesNotMatch(block, /должн/iu);
-  assert.match(html, /href="\/styles\.css\?v=30"/);
-  assert.match(html, /src="\/app\.js\?v=44"/);
+  assert.match(html, /href="\/styles\.css\?v=31"/);
+  assert.match(html, /src="\/app\.js\?v=46"/);
   assert.match(styles, /\.cycle-sequence-list\s*\{[\s\S]*?repeat\(auto-fill, minmax\(50px, 1fr\)\)/);
   assert.match(
     styles,

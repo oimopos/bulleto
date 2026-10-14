@@ -36,6 +36,15 @@ import {
   predictAdaptiveTrajectoryShadow,
 } from "./trajectory-shadow-adaptive.js";
 import {
+  TRAJECTORY_DIRECTION_CHALLENGER_KEY,
+  TRAJECTORY_DIRECTION_STRUCTURAL_DEFAULTS,
+  TRAJECTORY_DIRECTION_STRUCTURAL_VERSION,
+  buildTrajectoryDirectionChallenger,
+} from "./trajectory-direction-challenger.js";
+import {
+  summarizeTrajectoryDirectionChallenger,
+} from "./trajectory-direction-challenger-metrics.js";
+import {
   TRAJECTORY_RANK37_BASIS,
   TRAJECTORY_RANK37_EVIDENCE_MASS_THRESHOLD,
   TRAJECTORY_RANK37_MIN_EVIDENCE_CANDIDATES,
@@ -90,6 +99,8 @@ const TRAJECTORY_DISPLAY_RANGE_VERSION = "trajectory-display-range-v1";
 const TRAJECTORY_DISPLAY_RANGE_POLICY =
   "q50-centered-contiguous-max6-v1";
 const TRAJECTORY_DISPLAY_RANGE_MAX_CELLS = 6;
+const TRAJECTORY_DIRECTION_CHALLENGER_SCHEMA_VERSION = 1;
+const TRAJECTORY_DIRECTION_CHALLENGER_METRIC_WINDOW_LIMIT = 1_000;
 const PREDICTIVE_LEADER_ACCOUNT_RESET_KEY = "manual-ladder-restart-2026-10-12";
 const PREDICTIVE_LEADER_ACCOUNT_RESET_REASON = "user_requested";
 const PREDICTIVE_LEADER_V6_CHALLENGER_KEY =
@@ -3383,6 +3394,163 @@ function mapForecastTrajectoryShadow(row) {
   };
 }
 
+function exactTrajectoryDirectionValue(left, right) {
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return (
+      Array.isArray(left) &&
+      Array.isArray(right) &&
+      left.length === right.length &&
+      left.every((value, index) =>
+        exactTrajectoryDirectionValue(value, right[index]))
+    );
+  }
+  if (
+    left !== null &&
+    right !== null &&
+    typeof left === "object" &&
+    typeof right === "object"
+  ) {
+    const leftKeys = Object.keys(left).sort();
+    const rightKeys = Object.keys(right).sort();
+    return (
+      leftKeys.length === rightKeys.length &&
+      leftKeys.every((key, index) => key === rightKeys[index]) &&
+      leftKeys.every((key) =>
+        exactTrajectoryDirectionValue(left[key], right[key]))
+    );
+  }
+  return Object.is(left, right);
+}
+
+function mapTrajectoryDirectionChallenger(row, cohort) {
+  if (
+    row?.challenger_forecast_id === null ||
+    row?.challenger_forecast_id === undefined
+  ) return null;
+
+  try {
+    const forecastId = Number(row.forecast_id);
+    const firstForecastId = Number(cohort.first_forecast_id);
+    const schemaVersion = Number(row.challenger_schema_version);
+    const createdAtMs = Date.parse(row.challenger_created_at);
+    const lockedAtMs = Date.parse(row.locked_at);
+    const closesAtMs = Date.parse(row.betting_closes_at);
+    const settlementAtMs = row.settled_at == null
+      ? null
+      : Date.parse(row.settled_at);
+    const settlementCreatedAtMs = row.settlement_created_at == null
+      ? null
+      : Date.parse(row.settlement_created_at);
+    if (
+      !Number.isSafeInteger(forecastId) ||
+      forecastId < firstForecastId ||
+      row.challenger_key !== cohort.challenger_key ||
+      schemaVersion !== Number(cohort.schema_version) ||
+      row.challenger_model_version !== cohort.model_version ||
+      row.challenger_locked_at !== row.locked_at ||
+      !Number.isFinite(createdAtMs) ||
+      !Number.isFinite(lockedAtMs) ||
+      !Number.isFinite(closesAtMs) ||
+      createdAtMs < lockedAtMs ||
+      closesAtMs - createdAtMs < 5_000 ||
+      (settlementAtMs !== null &&
+        (!Number.isFinite(settlementAtMs) || createdAtMs >= settlementAtMs)) ||
+      (settlementCreatedAtMs !== null &&
+        (!Number.isFinite(settlementCreatedAtMs) ||
+          createdAtMs >= settlementCreatedAtMs))
+    ) return null;
+
+    const config = deserializeJson(cohort.config_json);
+    if (!exactTrajectoryDirectionValue(
+      config,
+      TRAJECTORY_DIRECTION_STRUCTURAL_DEFAULTS,
+    )) return null;
+    const cells = deserializeJson(row.trajectory_cells_json);
+    if (!Array.isArray(cells)) return null;
+    const bands = trajectoryBandsFromForecastCells(cells);
+    const medianCellWidth = trajectoryMedianCellWidth(bands);
+    const expected = buildTrajectoryDirectionChallenger({
+      bands,
+      startPrice: Number(row.start_price),
+      lockPrice: Number(row.current_price),
+      medianCellWidth,
+      flatThresholdCellWidths: config.flatThresholdCellWidths,
+    });
+    const stored = deserializeJson(row.challenger_snapshot_json);
+    if (!exactTrajectoryDirectionValue(stored, expected)) return null;
+    if (
+      row.challenger_status !== expected.status ||
+      row.challenger_reason !== expected.reason ||
+      row.challenger_direction !== expected.direction ||
+      (row.challenger_probability_up !== null ||
+        row.challenger_probability_down !== null ||
+        row.challenger_probability_flat !== null) ||
+      (expected.expectedDeltaCellWidths === null
+        ? row.challenger_expected_delta_cell_widths !== null
+        : !Object.is(
+            Number(row.challenger_expected_delta_cell_widths),
+            expected.expectedDeltaCellWidths,
+          ))
+    ) return null;
+
+    const settled =
+      row.round_result_id !== null && row.round_result_id !== undefined;
+    let evaluation = null;
+    if (settled) {
+      const actualPrice = Number(row.trajectory_actual_price);
+      if (
+        row.trajectory_actual_price !== null &&
+        row.trajectory_actual_price !== undefined &&
+        Number.isFinite(actualPrice) &&
+        medianCellWidth > 0
+      ) {
+        const delta = actualPrice - Number(row.current_price);
+        const deltaCellWidths = delta / medianCellWidth;
+        const actualDirection = trajectoryDirection(
+          deltaCellWidths,
+          config.flatThresholdCellWidths,
+        );
+        evaluation = {
+          resultId: Number(row.round_result_id),
+          actualPrice,
+          settledAt: row.settled_at,
+          delta,
+          deltaCellWidths,
+          actualDirection,
+          directionHit: expected.status === "ready"
+            ? expected.direction === actualDirection
+            : null,
+        };
+      }
+    }
+
+    return {
+      schemaVersion,
+      challengerKey: row.challenger_key,
+      modelVersion: row.challenger_model_version,
+      status: expected.status,
+      reason: expected.reason,
+      lockedAt: row.challenger_locked_at,
+      direction: expected.direction,
+      probabilities: null,
+      expectedDeltaCellWidths: expected.expectedDeltaCellWidths,
+      parameters: expected.parameters,
+      selection: expected.selection,
+      audit: expected.audit,
+      settled,
+      evaluationStatus: !settled
+        ? "pending"
+        : evaluation === null
+          ? "ungradable"
+          : "evaluated",
+      evaluation,
+      createdAt: row.challenger_created_at,
+    };
+  } catch {
+    return null;
+  }
+}
+
 function mapTrajectoryMetrics(row) {
   const readyCount = Number(row?.ready_count ?? 0);
   const settledCount = Number(row?.settled_count ?? 0);
@@ -4842,6 +5010,7 @@ export class RouletteDatabase {
     this.#migratePredictiveLeaderAccountVoidV18();
     this.#migratePredictiveLeaderAccountLadderResetV19(startingVersion);
     this.#migratePredictiveLeaderChallengersV20();
+    this.#migrateTrajectoryDirectionChallengerV21();
   }
 
   #migratePrecloseForecastsV10() {
@@ -6055,6 +6224,176 @@ export class RouletteDatabase {
           startedAt,
         );
       this.sqlite.exec("PRAGMA user_version = 20; COMMIT");
+    } catch (error) {
+      try {
+        this.sqlite.exec("ROLLBACK");
+      } catch {
+        // Preserve the migration error.
+      }
+      throw error;
+    }
+  }
+
+  #migrateTrajectoryDirectionChallengerV21() {
+    this.sqlite.exec("BEGIN IMMEDIATE");
+    try {
+      // As with the predictive-leader challenger, migration time establishes a
+      // prospective cohort boundary without consuming the injected event clock.
+      const startedAt = new Date().toISOString();
+      const firstForecastId = Number(
+        this.sqlite
+          .prepare("SELECT COALESCE(MAX(id), 0) + 1 AS id FROM round_forecasts")
+          .get().id,
+      );
+      this.sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS trajectory_direction_challenger_cohorts (
+          challenger_key TEXT PRIMARY KEY CHECK (length(trim(challenger_key)) > 0),
+          schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+          model_version TEXT NOT NULL CHECK (length(trim(model_version)) > 0),
+          champion_model_version TEXT NOT NULL CHECK (
+            length(trim(champion_model_version)) > 0
+          ),
+          mode TEXT NOT NULL CHECK (mode = 'prospective-shadow'),
+          first_forecast_id INTEGER NOT NULL CHECK (first_forecast_id > 0),
+          started_at TEXT NOT NULL,
+          config_json TEXT NOT NULL CHECK (
+            json_valid(config_json)
+            AND json_type(config_json) = 'object'
+          ),
+          created_at TEXT NOT NULL,
+          UNIQUE(model_version),
+          UNIQUE(challenger_key, schema_version, model_version),
+          CHECK (model_version <> champion_model_version),
+          CHECK (started_at = created_at)
+        );
+
+        CREATE TABLE IF NOT EXISTS forecast_trajectory_direction_challenger_snapshots (
+          forecast_id INTEGER NOT NULL REFERENCES round_forecasts(id),
+          challenger_key TEXT NOT NULL,
+          schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+          model_version TEXT NOT NULL CHECK (length(trim(model_version)) > 0),
+          status TEXT NOT NULL CHECK (
+            status IN ('ready', 'unselected', 'unavailable')
+          ),
+          reason TEXT,
+          locked_at TEXT NOT NULL,
+          direction TEXT CHECK (
+            direction IS NULL OR direction IN ('up', 'down')
+          ),
+          probability_up REAL CHECK (
+            probability_up IS NULL OR probability_up BETWEEN 0 AND 1
+          ),
+          probability_down REAL CHECK (
+            probability_down IS NULL OR probability_down BETWEEN 0 AND 1
+          ),
+          probability_flat REAL CHECK (
+            probability_flat IS NULL OR probability_flat BETWEEN 0 AND 1
+          ),
+          expected_delta_cell_widths REAL,
+          snapshot_json TEXT NOT NULL CHECK (
+            json_valid(snapshot_json)
+            AND json_type(snapshot_json) = 'object'
+          ),
+          created_at TEXT NOT NULL,
+          PRIMARY KEY (forecast_id, challenger_key),
+          FOREIGN KEY (challenger_key, schema_version, model_version)
+            REFERENCES trajectory_direction_challenger_cohorts(
+              challenger_key, schema_version, model_version
+            ),
+          CHECK (locked_at <= created_at),
+          CHECK (
+            (status = 'ready' AND reason IS NULL AND direction IS NOT NULL
+              AND expected_delta_cell_widths IS NULL)
+            OR
+            (status = 'unselected' AND reason IS NOT NULL
+              AND length(trim(reason)) > 0 AND direction IS NULL
+              AND expected_delta_cell_widths IS NULL)
+            OR
+            (status = 'unavailable' AND reason IS NOT NULL
+              AND length(trim(reason)) > 0
+              AND direction IS NULL AND expected_delta_cell_widths IS NULL)
+          ),
+          CHECK (
+            (probability_up IS NULL
+              AND probability_down IS NULL
+              AND probability_flat IS NULL)
+            OR
+            (probability_up IS NOT NULL
+              AND probability_down IS NOT NULL
+              AND probability_flat IS NOT NULL
+              AND abs(probability_up + probability_down + probability_flat - 1) <= 1e-9)
+          ),
+          CHECK (COALESCE((
+            json_type(snapshot_json, '$.version') = 'text'
+            AND json_extract(snapshot_json, '$.version') = model_version
+          ), 0)),
+          CHECK (COALESCE((
+            json_type(snapshot_json, '$.status') = 'text'
+            AND json_extract(snapshot_json, '$.status') = status
+          ), 0)),
+          CHECK (COALESCE((
+            (reason IS NULL AND json_type(snapshot_json, '$.reason') = 'null')
+            OR (reason IS NOT NULL
+              AND json_type(snapshot_json, '$.reason') = 'text'
+              AND json_extract(snapshot_json, '$.reason') = reason)
+          ), 0)),
+          CHECK (COALESCE((
+            (direction IS NULL AND json_type(snapshot_json, '$.direction') = 'null')
+            OR (direction IS NOT NULL
+              AND json_type(snapshot_json, '$.direction') = 'text'
+              AND json_extract(snapshot_json, '$.direction') = direction)
+          ), 0)),
+          CHECK (COALESCE((
+            (expected_delta_cell_widths IS NULL
+              AND json_type(snapshot_json, '$.expectedDeltaCellWidths') = 'null')
+            OR (expected_delta_cell_widths IS NOT NULL
+              AND json_type(snapshot_json, '$.expectedDeltaCellWidths')
+                IN ('integer', 'real')
+              AND json_extract(snapshot_json, '$.expectedDeltaCellWidths')
+                = expected_delta_cell_widths)
+          ), 0)),
+          CHECK (COALESCE((
+            (probability_up IS NULL
+              AND json_type(snapshot_json, '$.probabilities') = 'null')
+            OR
+            (json_type(snapshot_json, '$.probabilities') = 'object'
+              AND json_type(snapshot_json, '$.probabilities.up')
+                IN ('integer', 'real')
+              AND json_type(snapshot_json, '$.probabilities.down')
+                IN ('integer', 'real')
+              AND json_type(snapshot_json, '$.probabilities.flat')
+                IN ('integer', 'real')
+              AND json_extract(snapshot_json, '$.probabilities.up') = probability_up
+              AND json_extract(snapshot_json, '$.probabilities.down') = probability_down
+              AND json_extract(snapshot_json, '$.probabilities.flat') = probability_flat)
+          ), 0))
+        );
+
+        CREATE INDEX IF NOT EXISTS forecast_trajectory_direction_challenger_idx
+          ON forecast_trajectory_direction_challenger_snapshots(
+            challenger_key, model_version, status, forecast_id DESC
+          );
+      `);
+      this.sqlite
+        .prepare(`
+          INSERT INTO trajectory_direction_challenger_cohorts (
+            challenger_key, schema_version, model_version,
+            champion_model_version, mode, first_forecast_id, started_at,
+            config_json, created_at
+          ) VALUES (?, ?, ?, ?, 'prospective-shadow', ?, ?, ?, ?)
+          ON CONFLICT(challenger_key) DO NOTHING
+        `)
+        .run(
+          TRAJECTORY_DIRECTION_CHALLENGER_KEY,
+          TRAJECTORY_DIRECTION_CHALLENGER_SCHEMA_VERSION,
+          TRAJECTORY_DIRECTION_STRUCTURAL_VERSION,
+          TRAJECTORY_SHADOW_ADAPTIVE_VERSION,
+          firstForecastId,
+          startedAt,
+          JSON.stringify(TRAJECTORY_DIRECTION_STRUCTURAL_DEFAULTS),
+          startedAt,
+        );
+      this.sqlite.exec("PRAGMA user_version = 21; COMMIT");
     } catch (error) {
       try {
         this.sqlite.exec("ROLLBACK");
@@ -11332,6 +11671,143 @@ export class RouletteDatabase {
     });
   }
 
+  #recordTrajectoryDirectionChallengerSnapshot(forecastId) {
+    return this.#transaction(() => {
+      const cohort = this.sqlite
+        .prepare(`
+          SELECT *
+          FROM trajectory_direction_challenger_cohorts
+          WHERE challenger_key = ? AND model_version = ?
+        `)
+        .get(
+          TRAJECTORY_DIRECTION_CHALLENGER_KEY,
+          TRAJECTORY_DIRECTION_STRUCTURAL_VERSION,
+        );
+      if (!cohort || Number(forecastId) < Number(cohort.first_forecast_id)) {
+        return { inserted: false, reason: "outside_prospective_cohort" };
+      }
+      const config = deserializeJson(cohort.config_json);
+      if (
+        Number(cohort.schema_version) !==
+          TRAJECTORY_DIRECTION_CHALLENGER_SCHEMA_VERSION ||
+        cohort.champion_model_version !== TRAJECTORY_SHADOW_ADAPTIVE_VERSION ||
+        cohort.mode !== "prospective-shadow" ||
+        !exactTrajectoryDirectionValue(
+          config,
+          TRAJECTORY_DIRECTION_STRUCTURAL_DEFAULTS,
+        )
+      ) {
+        throw new Error("trajectory direction challenger cohort is invalid");
+      }
+      const existing = this.sqlite
+        .prepare(`
+          SELECT forecast_id
+          FROM forecast_trajectory_direction_challenger_snapshots
+          WHERE forecast_id = ? AND challenger_key = ?
+        `)
+        .get(forecastId, TRAJECTORY_DIRECTION_CHALLENGER_KEY);
+      if (existing) return { inserted: false, reason: "already_frozen" };
+
+      const parent = this.sqlite
+        .prepare(`
+          SELECT
+            forecasts.id AS forecast_id,
+            snapshots.source,
+            snapshots.instrument,
+            snapshots.external_round_id,
+            snapshots.locked_at,
+            snapshots.betting_closes_at,
+            snapshots.current_price,
+            snapshots.start_price,
+            snapshots.cells_json,
+            settlements.forecast_id AS settlement_forecast_id
+          FROM round_forecasts AS forecasts
+          JOIN forecast_snapshots AS snapshots ON snapshots.id = forecasts.snapshot_id
+          LEFT JOIN forecast_settlements AS settlements
+            ON settlements.forecast_id = forecasts.id
+          WHERE forecasts.id = ?
+        `)
+        .get(forecastId);
+      if (!parent || parent.settlement_forecast_id != null) {
+        throw new Error(
+          "trajectory direction challenger requires an unsettled frozen forecast",
+        );
+      }
+      const knownTarget = this.sqlite
+        .prepare(`
+          SELECT id
+          FROM round_results
+          WHERE source = ? AND instrument = ? AND external_round_id = ?
+          LIMIT 1
+        `)
+        .get(parent.source, parent.instrument, parent.external_round_id);
+      if (knownTarget) {
+        throw new Error(
+          "trajectory direction challenger cannot be captured after its result",
+        );
+      }
+
+      const createdAt = asTimestamp(
+        this.clock(),
+        undefined,
+        "trajectory direction challenger createdAt",
+      );
+      if (
+        Date.parse(createdAt) < Date.parse(parent.locked_at) ||
+        Date.parse(parent.betting_closes_at) - Date.parse(createdAt) < 5_000
+      ) {
+        throw new RangeError(
+          "trajectory direction challenger must be stored at least five seconds before betting closes",
+        );
+      }
+      const cells = deserializeJson(parent.cells_json);
+      const bands = trajectoryBandsFromForecastCells(cells);
+      const medianCellWidth = trajectoryMedianCellWidth(bands);
+      const snapshot = buildTrajectoryDirectionChallenger({
+        bands,
+        startPrice: Number(parent.start_price),
+        lockPrice: Number(parent.current_price),
+        medianCellWidth,
+        flatThresholdCellWidths: config.flatThresholdCellWidths,
+      });
+      this.sqlite
+        .prepare(`
+          INSERT INTO forecast_trajectory_direction_challenger_snapshots (
+            forecast_id, challenger_key, schema_version, model_version,
+            status, reason, locked_at, direction, probability_up,
+            probability_down, probability_flat, expected_delta_cell_widths,
+            snapshot_json, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?)
+        `)
+        .run(
+          forecastId,
+          TRAJECTORY_DIRECTION_CHALLENGER_KEY,
+          TRAJECTORY_DIRECTION_CHALLENGER_SCHEMA_VERSION,
+          TRAJECTORY_DIRECTION_STRUCTURAL_VERSION,
+          snapshot.status,
+          snapshot.reason,
+          parent.locked_at,
+          snapshot.direction,
+          snapshot.expectedDeltaCellWidths,
+          JSON.stringify(snapshot),
+          createdAt,
+        );
+      const commitCheckedAt = asTimestamp(
+        this.clock(),
+        undefined,
+        "trajectory direction challenger commitCheckedAt",
+      );
+      if (
+        Date.parse(parent.betting_closes_at) - Date.parse(commitCheckedAt) < 5_000
+      ) {
+        throw new RangeError(
+          "trajectory direction challenger transaction must finish at least five seconds before betting closes",
+        );
+      }
+      return { inserted: true, reason: "frozen" };
+    });
+  }
+
   #buildForecastPairSnapshot({
     source,
     instrument,
@@ -12042,6 +12518,31 @@ export class RouletteDatabase {
         },
         "predictive leader v6 shadow persistence failed without affecting v5",
       );
+    }
+
+    try {
+      this.#recordTrajectoryDirectionChallengerSnapshot(
+        primaryOutcome.forecastId,
+      );
+    } catch (error) {
+      if (
+        !(error instanceof RangeError) ||
+        !/at least five seconds/.test(error.message)
+      ) {
+        emitLog(
+          this.logger,
+          "error",
+          {
+            error,
+            source,
+            instrument,
+            externalRoundId,
+            forecastId: primaryOutcome.forecastId,
+            challengerKey: TRAJECTORY_DIRECTION_CHALLENGER_KEY,
+          },
+          "trajectory direction challenger persistence failed without affecting primary forecast",
+        );
+      }
     }
 
     return { inserted: primaryOutcome.inserted, roundId: externalRoundId };
@@ -12768,6 +13269,284 @@ export class RouletteDatabase {
         PREDICTIVE_LEADER_V6_METRIC_WINDOW_LIMIT,
       )
       .reverse();
+  }
+
+  #trajectoryDirectionChallengerRows(source, instrument, firstForecastId) {
+    return this.sqlite
+      .prepare(`
+        SELECT
+          forecasts.id AS forecast_id,
+          snapshots.external_round_id,
+          snapshots.horizon_seconds,
+          snapshots.lead_time_ms,
+          snapshots.betting_closes_at,
+          snapshots.round_ends_at,
+          snapshots.locked_at,
+          snapshots.current_price,
+          snapshots.start_price,
+          snapshots.cells_json AS trajectory_cells_json,
+          challengers.forecast_id AS challenger_forecast_id,
+          challengers.challenger_key,
+          challengers.schema_version AS challenger_schema_version,
+          challengers.model_version AS challenger_model_version,
+          challengers.status AS challenger_status,
+          challengers.reason AS challenger_reason,
+          challengers.locked_at AS challenger_locked_at,
+          challengers.direction AS challenger_direction,
+          challengers.probability_up AS challenger_probability_up,
+          challengers.probability_down AS challenger_probability_down,
+          challengers.probability_flat AS challenger_probability_flat,
+          challengers.expected_delta_cell_widths
+            AS challenger_expected_delta_cell_widths,
+          challengers.snapshot_json AS challenger_snapshot_json,
+          challengers.created_at AS challenger_created_at,
+          trajectory_shadows.forecast_id AS trajectory_shadow_forecast_id,
+          trajectory_shadows.trajectory_id AS trajectory_shadow_trajectory_id,
+          trajectory_shadows.schema_version AS trajectory_shadow_schema_version,
+          trajectory_shadows.model_version AS trajectory_shadow_model_version,
+          trajectory_shadows.status AS trajectory_shadow_status,
+          trajectory_shadows.reason AS trajectory_shadow_reason,
+          trajectory_shadows.cutoff_at AS trajectory_shadow_cutoff_at,
+          trajectory_shadows.lock_price AS trajectory_shadow_lock_price,
+          trajectory_shadows.median_cell_width
+            AS trajectory_shadow_median_cell_width,
+          trajectory_shadows.direction AS trajectory_shadow_direction,
+          trajectory_shadows.probabilities_json
+            AS trajectory_shadow_probabilities_json,
+          trajectory_shadows.expected_delta_cell_widths
+            AS trajectory_shadow_expected_delta_cell_widths,
+          trajectory_shadows.sample_json AS trajectory_shadow_sample_json,
+          trajectory_shadows.nearest_ids_json
+            AS trajectory_shadow_nearest_ids_json,
+          trajectory_shadows.parameters_json
+            AS trajectory_shadow_parameters_json,
+          trajectory_shadows.current_prefix_json
+            AS trajectory_shadow_current_prefix_json,
+          trajectory_shadows.integration_json
+            AS trajectory_shadow_integration_json,
+          trajectory_shadows.created_at AS trajectory_shadow_created_at,
+          settlements.round_result_id,
+          settlements.actual_number,
+          settlements.settled_at,
+          settlements.created_at AS settlement_created_at,
+          settlement_results.price AS trajectory_actual_price,
+          settlement_results.raw_cell AS trajectory_actual_raw_cell
+        FROM round_forecasts AS forecasts
+        JOIN forecast_snapshots AS snapshots ON snapshots.id = forecasts.snapshot_id
+        LEFT JOIN forecast_trajectory_direction_challenger_snapshots AS challengers
+          ON challengers.forecast_id = forecasts.id
+          AND challengers.challenger_key = ?
+          AND challengers.model_version = ?
+        LEFT JOIN forecast_trajectory_shadows AS trajectory_shadows
+          ON trajectory_shadows.forecast_id = forecasts.id
+          AND trajectory_shadows.model_version = ?
+        LEFT JOIN forecast_settlements AS settlements
+          ON settlements.forecast_id = forecasts.id
+        LEFT JOIN round_results AS settlement_results
+          ON settlement_results.id = settlements.round_result_id
+        WHERE snapshots.source = ?
+          AND snapshots.instrument = ?
+          AND forecasts.id >= ?
+        ORDER BY forecasts.id DESC
+        LIMIT ?
+      `)
+      .all(
+        TRAJECTORY_DIRECTION_CHALLENGER_KEY,
+        TRAJECTORY_DIRECTION_STRUCTURAL_VERSION,
+        TRAJECTORY_SHADOW_ADAPTIVE_VERSION,
+        source,
+        instrument,
+        firstForecastId,
+        TRAJECTORY_DIRECTION_CHALLENGER_METRIC_WINDOW_LIMIT,
+      )
+      .reverse();
+  }
+
+  getTrajectoryDirectionChallengerState(
+    source = "buleto",
+    instrument = "default",
+  ) {
+    this.#assertOpen();
+    const safeSource = asNonEmptyText(source, undefined, "source");
+    const safeInstrument = asNonEmptyText(instrument, undefined, "instrument");
+    const cohort = this.sqlite
+      .prepare(`
+        SELECT *
+        FROM trajectory_direction_challenger_cohorts
+        WHERE challenger_key = ?
+      `)
+      .get(TRAJECTORY_DIRECTION_CHALLENGER_KEY);
+    const config = deserializeJson(cohort?.config_json);
+    if (
+      !cohort ||
+      Number(cohort.schema_version) !==
+        TRAJECTORY_DIRECTION_CHALLENGER_SCHEMA_VERSION ||
+      cohort.model_version !== TRAJECTORY_DIRECTION_STRUCTURAL_VERSION ||
+      cohort.champion_model_version !== TRAJECTORY_SHADOW_ADAPTIVE_VERSION ||
+      cohort.mode !== "prospective-shadow" ||
+      !Number.isSafeInteger(Number(cohort.first_forecast_id)) ||
+      Number(cohort.first_forecast_id) < 1 ||
+      !Number.isFinite(Date.parse(cohort.started_at)) ||
+      !exactTrajectoryDirectionValue(
+        config,
+        TRAJECTORY_DIRECTION_STRUCTURAL_DEFAULTS,
+      )
+    ) throw new Error("trajectory direction challenger cohort is invalid");
+
+    const firstForecastId = Number(cohort.first_forecast_id);
+    const totals = this.sqlite
+      .prepare(`
+        SELECT
+          COUNT(forecasts.id) AS eligible_count,
+          COUNT(challengers.forecast_id) AS stored_count
+        FROM round_forecasts AS forecasts
+        JOIN forecast_snapshots AS snapshots ON snapshots.id = forecasts.snapshot_id
+        LEFT JOIN forecast_trajectory_direction_challenger_snapshots AS challengers
+          ON challengers.forecast_id = forecasts.id
+          AND challengers.challenger_key = ?
+          AND challengers.model_version = ?
+        WHERE snapshots.source = ?
+          AND snapshots.instrument = ?
+          AND forecasts.id >= ?
+      `)
+      .get(
+        TRAJECTORY_DIRECTION_CHALLENGER_KEY,
+        TRAJECTORY_DIRECTION_STRUCTURAL_VERSION,
+        safeSource,
+        safeInstrument,
+        firstForecastId,
+      );
+    const rows = this.#trajectoryDirectionChallengerRows(
+      safeSource,
+      safeInstrument,
+      firstForecastId,
+    );
+    const mappedByForecastId = new Map();
+    for (const row of rows) {
+      mappedByForecastId.set(
+        Number(row.forecast_id),
+        mapTrajectoryDirectionChallenger(row, cohort),
+      );
+    }
+    const entries = [];
+    for (const row of rows) {
+      const forecastId = Number(row.forecast_id);
+      const challenger = mappedByForecastId.get(forecastId);
+      if (!challenger) continue;
+      let championDirection = null;
+      const championCreatedAtMs = Date.parse(row.trajectory_shadow_created_at);
+      const championChronologyValid =
+        Number.isFinite(championCreatedAtMs) &&
+        championCreatedAtMs >= Date.parse(row.locked_at) &&
+        Date.parse(row.betting_closes_at) - championCreatedAtMs >= 5_000 &&
+        (row.settled_at == null ||
+          championCreatedAtMs < Date.parse(row.settled_at)) &&
+        (row.settlement_created_at == null ||
+          championCreatedAtMs < Date.parse(row.settlement_created_at));
+      const champion = championChronologyValid
+        ? mapForecastTrajectoryShadow(row)
+        : null;
+      if (
+        champion?.modelVersion === TRAJECTORY_SHADOW_ADAPTIVE_VERSION &&
+        champion.status === "ready"
+      ) championDirection = champion.direction;
+      entries.push({
+        forecastId,
+        status: challenger.status,
+        reason: challenger.reason,
+        predictedDirection: challenger.direction,
+        actualDirection: challenger.evaluation?.actualDirection ?? null,
+        championDirection,
+        settled: challenger.settled,
+      });
+    }
+    const windowStoredCount = rows.filter(
+      (row) => row.challenger_forecast_id != null,
+    ).length;
+    const metrics = summarizeTrajectoryDirectionChallenger(entries, {
+      eligibleForecastCount: rows.length,
+      totalStoredCount: windowStoredCount,
+    });
+    const latestRow = rows.at(-1) ?? null;
+    const latestChallenger = latestRow
+      ? mappedByForecastId.get(Number(latestRow.forecast_id))
+      : null;
+    let latestChampion = null;
+    if (latestRow) {
+      const createdAtMs = Date.parse(latestRow.trajectory_shadow_created_at);
+      const chronologyValid =
+        Number.isFinite(createdAtMs) &&
+        createdAtMs >= Date.parse(latestRow.locked_at) &&
+        Date.parse(latestRow.betting_closes_at) - createdAtMs >= 5_000 &&
+        (latestRow.settled_at == null ||
+          createdAtMs < Date.parse(latestRow.settled_at)) &&
+        (latestRow.settlement_created_at == null ||
+          createdAtMs < Date.parse(latestRow.settlement_created_at));
+      const candidate = chronologyValid
+        ? mapForecastTrajectoryShadow(latestRow)
+        : null;
+      if (
+        candidate?.modelVersion === TRAJECTORY_SHADOW_ADAPTIVE_VERSION &&
+        candidate.status === "ready"
+      ) {
+        latestChampion = {
+          modelVersion: candidate.modelVersion,
+          status: candidate.status,
+          direction: candidate.direction,
+          createdAt: candidate.createdAt,
+        };
+      }
+    }
+    const totalEligibleCount = Number(totals.eligible_count);
+    const totalStoredCount = Number(totals.stored_count);
+    return {
+      schemaVersion: TRAJECTORY_DIRECTION_CHALLENGER_SCHEMA_VERSION,
+      challengerKey: TRAJECTORY_DIRECTION_CHALLENGER_KEY,
+      modelVersion: TRAJECTORY_DIRECTION_STRUCTURAL_VERSION,
+      championModelVersion: TRAJECTORY_SHADOW_ADAPTIVE_VERSION,
+      mode: "prospective-shadow",
+      advisoryOnly: true,
+      executionEnabled: false,
+      source: safeSource,
+      instrument: safeInstrument,
+      cohort: {
+        firstForecastId,
+        startedAt: cohort.started_at,
+        config,
+      },
+      latest: latestRow
+        ? {
+            forecastId: Number(latestRow.forecast_id),
+            roundId: latestRow.external_round_id,
+            horizonSeconds: Number(latestRow.horizon_seconds),
+            leadSeconds: Number(latestRow.lead_time_ms) / 1_000,
+            lockedAt: latestRow.locked_at,
+            bettingClosesAt: latestRow.betting_closes_at,
+            roundEndsAt: latestRow.round_ends_at,
+            challenger: latestChallenger,
+            champion: latestChampion,
+          }
+        : null,
+      metrics: {
+        ...metrics,
+        invalidStoredCount: windowStoredCount - metrics.validStoredCount,
+        window: {
+          limit: TRAJECTORY_DIRECTION_CHALLENGER_METRIC_WINDOW_LIMIT,
+          eligibleCount: rows.length,
+          storedCount: windowStoredCount,
+          validStoredCount: metrics.validStoredCount,
+          totalEligibleCount,
+          totalStoredCount,
+          truncated: totalEligibleCount > rows.length,
+          firstForecastId: rows.length > 0
+            ? Number(rows[0].forecast_id)
+            : null,
+          lastForecastId: latestRow
+            ? Number(latestRow.forecast_id)
+            : null,
+        },
+      },
+    };
   }
 
   #predictiveLeaderV6CohortCounts(source, instrument, firstForecastId) {

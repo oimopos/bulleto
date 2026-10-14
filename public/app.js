@@ -30,6 +30,10 @@ import {
   const TRAJECTORY_DISPLAY_RANGE_VERSION = "trajectory-display-range-v1";
   const TRAJECTORY_DISPLAY_RANGE_POLICY = "q50-centered-contiguous-max6-v1";
   const TRAJECTORY_NUMBER_AREA_MAX_DISPLAY_CELLS = 6;
+  const TRAJECTORY_DIRECTION_CHALLENGER_SCHEMA_VERSION = 1;
+  const TRAJECTORY_DIRECTION_CHALLENGER_KEY = "structural-center-v1";
+  const TRAJECTORY_DIRECTION_CHALLENGER_MODEL = "trajectory-direction-structural-v1";
+  const TRAJECTORY_DIRECTION_CHALLENGER_MODE = "prospective-shadow";
   const TRAJECTORY_SHADOW_REQUIRED_HISTORY = 30;
   const TRAJECTORY_SHADOW_REQUIRED_NEIGHBORS = 10;
   const LEARNED_LEADER_SCHEMA_VERSION = 1;
@@ -104,12 +108,14 @@ import {
     precloseComparisonWarning: document.getElementById("preclose-comparison-warning"),
     trajectoryShadowPanel: document.getElementById("trajectory-shadow-panel"),
     trajectoryShadowBadge: document.getElementById("trajectory-shadow-badge"),
+    trajectoryShadowObserved: document.getElementById("trajectory-shadow-observed"),
     trajectoryShadowStatus: document.getElementById("trajectory-shadow-status"),
     trajectoryShadowShares: document.getElementById("trajectory-shadow-shares"),
     trajectoryShadowNumberArea: document.getElementById("trajectory-shadow-number-area"),
     trajectoryShadowTraining: document.getElementById("trajectory-shadow-training"),
     trajectoryShadowRangeMetrics: document.getElementById("trajectory-shadow-range-metrics"),
     trajectoryShadowSample: document.getElementById("trajectory-shadow-sample"),
+    trajectoryDirectionChallenger: document.getElementById("trajectory-direction-challenger"),
     precloseHitHistory: document.getElementById("preclose-hit-history"),
     precloseHitHistoryCount: document.getElementById("preclose-hit-history-count"),
     precloseHitHistoryList: document.getElementById("preclose-hit-history-list"),
@@ -267,6 +273,8 @@ import {
   const store = {
     state: null,
     results: [],
+    resultsLoaded: false,
+    resultsError: false,
     cycles: [],
     cycleComparison: null,
     cycleComparisonLoaded: false,
@@ -277,6 +285,9 @@ import {
     predictiveLeaderLoaded: false,
     predictiveLeaderError: false,
     predictiveLeaderRequiresFreshSnapshot: false,
+    trajectoryDirectionChallengerSnapshot: null,
+    trajectoryDirectionChallengerLoaded: false,
+    trajectoryDirectionChallengerError: false,
     triples: [],
     triplesLoaded: false,
     triplesError: false,
@@ -1215,7 +1226,8 @@ import {
       fetchJson("/api/pairs"),
       fetchJson("/api/forecasts/hits?limit=20"),
       fetchJson("/api/cycle-comparison"),
-      fetchJson("/api/predictive-leader")
+      fetchJson("/api/predictive-leader"),
+      fetchJson("/api/trajectory-direction/challenger")
     ]);
 
     let successfulRequests = 0;
@@ -1231,7 +1243,11 @@ import {
     }
     if (requests[1].status === "fulfilled") {
       store.results = extractItems(requests[1].value);
+      store.resultsLoaded = true;
+      store.resultsError = false;
       successfulRequests += 1;
+    } else {
+      store.resultsError = true;
     }
     if (requests[2].status === "fulfilled") {
       store.cycles = extractItems(requests[2].value);
@@ -1293,6 +1309,21 @@ import {
       store.predictiveLeaderLoaded = true;
       store.predictiveLeaderError = true;
     }
+    if (requests[8].status === "fulfilled") {
+      store.trajectoryDirectionChallengerLoaded = true;
+      if (normalizedTrajectoryDirectionChallenger(requests[8].value)) {
+        store.trajectoryDirectionChallengerSnapshot = requests[8].value;
+        store.trajectoryDirectionChallengerError = false;
+        successfulRequests += 1;
+      } else {
+        store.trajectoryDirectionChallengerSnapshot = null;
+        store.trajectoryDirectionChallengerError = true;
+      }
+    } else {
+      store.trajectoryDirectionChallengerSnapshot = null;
+      store.trajectoryDirectionChallengerLoaded = true;
+      store.trajectoryDirectionChallengerError = true;
+    }
 
     if (successfulRequests > 0) {
       store.lastSyncAt = new Date();
@@ -1315,9 +1346,27 @@ import {
     scheduleQueuedRefresh();
   }
 
+  function latestResultForRender() {
+    const stateResult = store.state?.latestResult || null;
+    const resultsResult = store.results[0] || null;
+    if (!store.stateError) return stateResult || resultsResult;
+    if (store.resultsLoaded && !store.resultsError) return resultsResult;
+    if (!stateResult || !resultsResult) return stateResult || resultsResult;
+
+    const timestamp = (result) => {
+      const value = Date.parse(result?.settledAt || result?.observedAt || "");
+      return Number.isFinite(value) ? value : null;
+    };
+    const stateTime = timestamp(stateResult);
+    const resultsTime = timestamp(resultsResult);
+    if (stateTime === null || resultsTime === null) return stateResult;
+    return resultsTime > stateTime ? resultsResult : stateResult;
+  }
+
   function renderFetchFailure() {
     renderCombinedPick();
     renderPredictiveLeaderAccount();
+    renderPrecloseForecast();
     if (!store.hasCompletedInitialRender) {
       elements.resultsBody.replaceChildren(emptyTableRow("Не удалось загрузить результаты. Повторим попытку автоматически."));
       elements.cyclesList.replaceChildren(createElement("li", "empty-state", "Не удалось загрузить архив циклов."));
@@ -1338,7 +1387,7 @@ import {
       elements.boardNote.textContent = "Не удалось получить состояние активного цикла.";
     }
     if (store.hasCompletedInitialRender) {
-      renderFollowers(store.state?.latestResult || store.results[0] || null);
+      renderFollowers(latestResultForRender());
     }
     renderFollowerTop5Tracker(store.state?.followerTop5Tracker || null);
     renderFollowerHitCurve();
@@ -1348,7 +1397,7 @@ import {
   }
 
   function renderAll() {
-    const latestResult = store.state?.latestResult || store.results[0] || null;
+    const latestResult = latestResultForRender();
     renderCollector(store.state?.collector);
     renderGapWarning(store.state);
     renderCombinedPick();
@@ -1401,6 +1450,85 @@ import {
       return null;
     }
     return { wireCell, number };
+  }
+
+  function normalizedTrajectoryObservedChange(value) {
+    const prefix = value?.currentPrefix;
+    const parameters = value?.parameters;
+    const cutoffMs = Date.parse(value?.cutoffAt);
+    const lockPrice = value?.lockPrice;
+    const medianCellWidth = value?.medianCellWidth;
+    const flatThresholdCellWidths = parameters?.flatThresholdCellWidths;
+    if (
+      !Array.isArray(prefix)
+      || prefix.length < 3
+      || !Number.isFinite(cutoffMs)
+      || typeof lockPrice !== "number"
+      || !Number.isFinite(lockPrice)
+      || typeof medianCellWidth !== "number"
+      || !Number.isFinite(medianCellWidth)
+      || medianCellWidth <= 0
+      || typeof flatThresholdCellWidths !== "number"
+      || !Number.isFinite(flatThresholdCellWidths)
+      || flatThresholdCellWidths < 0
+    ) {
+      return null;
+    }
+
+    let previousAtMs = null;
+    const points = [];
+    for (const point of prefix) {
+      const atMs = Date.parse(point?.at);
+      const price = point?.price;
+      if (
+        !point
+        || typeof point !== "object"
+        || Array.isArray(point)
+        || !Number.isFinite(atMs)
+        || atMs > cutoffMs
+        || (previousAtMs !== null && atMs <= previousAtMs)
+        || typeof price !== "number"
+        || !Number.isFinite(price)
+      ) {
+        return null;
+      }
+      previousAtMs = atMs;
+      points.push({ at: point.at, atMs, price });
+    }
+
+    const first = points[0];
+    const last = points.at(-1);
+    const priceTolerance = 1e-9 * Math.max(
+      1,
+      Math.abs(last.price),
+      Math.abs(lockPrice),
+    );
+    if (
+      last.atMs <= first.atMs
+      || Math.abs(last.price - lockPrice) > priceTolerance
+    ) {
+      return null;
+    }
+
+    const delta = last.price - first.price;
+    const deltaCellWidths = delta / medianCellWidth;
+    if (!Number.isFinite(deltaCellWidths)) return null;
+    const direction = deltaCellWidths > flatThresholdCellWidths
+      ? "up"
+      : deltaCellWidths < -flatThresholdCellWidths
+        ? "down"
+        : "flat";
+    return {
+      direction,
+      startPrice: first.price,
+      endPrice: last.price,
+      firstAt: first.at,
+      lastAt: last.at,
+      pointCount: points.length,
+      delta,
+      deltaCellWidths,
+      flatThresholdCellWidths
+    };
   }
 
   function normalizedTrajectoryNumberArea(value) {
@@ -1720,6 +1848,10 @@ import {
       return null;
     }
     if (isAdaptive && status !== "insufficient_current" && !adaptive) return null;
+    const observedChange = status === "insufficient_current"
+      ? null
+      : normalizedTrajectoryObservedChange(value);
+    if (status !== "insufficient_current" && !observedChange) return null;
 
     if (status === "insufficient_current") {
       if (
@@ -1737,6 +1869,7 @@ import {
         status,
         direction: null,
         probabilities: null,
+        observedChange: null,
         sample: null,
         numberArea: null,
         displayRange: null,
@@ -1785,6 +1918,7 @@ import {
         status,
         direction: null,
         probabilities: null,
+        observedChange,
         sample,
         numberArea: null,
         displayRange: null,
@@ -1809,6 +1943,7 @@ import {
         status,
         direction: null,
         probabilities: null,
+        observedChange,
         sample,
         numberArea: null,
         displayRange: null,
@@ -1861,12 +1996,297 @@ import {
       status,
       direction,
       probabilities: shares,
+      observedChange,
       sample,
       numberArea,
       displayRange,
       numberRanking: value.numberRanking ?? null,
       evaluation
     };
+  }
+
+  function normalizedTrajectoryDirectionChallengerMetrics(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    const countKeys = [
+      "eligibleCount",
+      "storedCount",
+      "validStoredCount",
+      "selectedCount",
+      "unselectedCount",
+      "unavailableCount",
+      "evaluatedSelected",
+      "settledSelected",
+      "pendingSelected",
+      "ungradableSelected",
+      "hits",
+      "invalidStoredCount"
+    ];
+    if (countKeys.some(
+      (key) => !Number.isSafeInteger(value[key]) || value[key] < 0,
+    )) return null;
+
+    const rateMatches = (rate, numerator, denominator) => {
+      if (denominator === 0) return rate === null;
+      return typeof rate === "number"
+        && Number.isFinite(rate)
+        && rate >= 0
+        && rate <= 1
+        && Math.abs(rate - (numerator / denominator)) <= 1e-9;
+    };
+    const paired = value.paired;
+    const pairedCountKeys = [
+      "count",
+      "challengerHits",
+      "championHits",
+      "bothHit",
+      "challengerOnly",
+      "championOnly",
+      "bothWrong",
+      "discordantCount"
+    ];
+    if (
+      value.eligibleCount < value.storedCount
+      || value.storedCount < value.validStoredCount
+      || value.validStoredCount !== (
+        value.selectedCount + value.unselectedCount + value.unavailableCount
+      )
+      || value.settledSelected !== (
+        value.evaluatedSelected + value.ungradableSelected
+      )
+      || value.selectedCount !== value.pendingSelected + value.settledSelected
+      || value.hits > value.evaluatedSelected
+      || value.invalidStoredCount !== value.storedCount - value.validStoredCount
+      || !rateMatches(
+        value.decisionCoverage,
+        value.selectedCount,
+        value.validStoredCount,
+      )
+      || !rateMatches(
+        value.selectiveAccuracy,
+        value.hits,
+        value.evaluatedSelected,
+      )
+      || !paired
+      || typeof paired !== "object"
+      || Array.isArray(paired)
+      || pairedCountKeys.some(
+        (key) => !Number.isSafeInteger(paired[key]) || paired[key] < 0,
+      )
+      || paired.count > value.evaluatedSelected
+      || paired.count !== (
+        paired.bothHit
+        + paired.challengerOnly
+        + paired.championOnly
+        + paired.bothWrong
+      )
+      || paired.challengerHits !== paired.bothHit + paired.challengerOnly
+      || paired.championHits !== paired.bothHit + paired.championOnly
+      || paired.discordantCount !== paired.challengerOnly + paired.championOnly
+      || !rateMatches(paired.challengerRate, paired.challengerHits, paired.count)
+      || !rateMatches(paired.championRate, paired.championHits, paired.count)
+      || (paired.count === 0
+        ? paired.uplift !== null
+        : typeof paired.uplift !== "number"
+          || !Number.isFinite(paired.uplift)
+          || Math.abs(
+            paired.uplift
+              - ((paired.challengerHits - paired.championHits) / paired.count),
+          ) > 1e-9)
+    ) return null;
+
+    const window = value.window;
+    if (
+      !window
+      || typeof window !== "object"
+      || Array.isArray(window)
+      || !Number.isSafeInteger(window.limit)
+      || window.limit < 1
+      || window.eligibleCount !== value.eligibleCount
+      || window.storedCount !== value.storedCount
+      || window.validStoredCount !== value.validStoredCount
+      || !Number.isSafeInteger(window.totalEligibleCount)
+      || window.totalEligibleCount < window.eligibleCount
+      || !Number.isSafeInteger(window.totalStoredCount)
+      || window.totalStoredCount < window.storedCount
+      || window.totalStoredCount > window.totalEligibleCount
+      || window.truncated !== (window.totalEligibleCount > window.eligibleCount)
+    ) return null;
+
+    return {
+      validStoredCount: value.validStoredCount,
+      selectedCount: value.selectedCount,
+      evaluatedSelected: value.evaluatedSelected,
+      settledSelected: value.settledSelected,
+      pendingSelected: value.pendingSelected,
+      ungradableSelected: value.ungradableSelected,
+      hits: value.hits,
+      selectiveAccuracy: value.selectiveAccuracy,
+      decisionCoverage: value.decisionCoverage,
+      paired: {
+        count: paired.count,
+        challengerHits: paired.challengerHits,
+        championHits: paired.championHits,
+        challengerRate: paired.challengerRate,
+        championRate: paired.championRate
+      }
+    };
+  }
+
+  function normalizedTrajectoryDirectionChallenger(value) {
+    if (
+      !value
+      || typeof value !== "object"
+      || Array.isArray(value)
+      || value.schemaVersion !== TRAJECTORY_DIRECTION_CHALLENGER_SCHEMA_VERSION
+      || value.challengerKey !== TRAJECTORY_DIRECTION_CHALLENGER_KEY
+      || value.modelVersion !== TRAJECTORY_DIRECTION_CHALLENGER_MODEL
+      || value.championModelVersion !== TRAJECTORY_SHADOW_ADAPTIVE_VERSION
+      || value.mode !== TRAJECTORY_DIRECTION_CHALLENGER_MODE
+      || value.advisoryOnly !== true
+      || value.executionEnabled !== false
+    ) return null;
+
+    const metrics = normalizedTrajectoryDirectionChallengerMetrics(value.metrics);
+    if (!metrics) return null;
+    if (value.latest === null) return { latest: null, metrics };
+    const latest = value.latest;
+    if (
+      !latest
+      || typeof latest !== "object"
+      || Array.isArray(latest)
+      || latest.roundId === null
+      || latest.roundId === undefined
+    ) return null;
+
+    let challenger = null;
+    if (latest.challenger !== null) {
+      const candidate = latest.challenger;
+      if (
+        !candidate
+        || typeof candidate !== "object"
+        || Array.isArray(candidate)
+        || candidate.schemaVersion !== TRAJECTORY_DIRECTION_CHALLENGER_SCHEMA_VERSION
+        || candidate.challengerKey !== TRAJECTORY_DIRECTION_CHALLENGER_KEY
+        || candidate.modelVersion !== TRAJECTORY_DIRECTION_CHALLENGER_MODEL
+        || candidate.probabilities !== null
+        || !["ready", "unselected", "unavailable"].includes(candidate.status)
+      ) return null;
+      if (
+        candidate.status === "ready"
+        && (
+          !["up", "down"].includes(candidate.direction)
+          || candidate.reason !== null
+          || candidate.selection?.eligible !== true
+        )
+      ) return null;
+      if (
+        candidate.status === "unselected"
+        && (
+          candidate.direction !== null
+          || ![
+            "start_within_center_band",
+            "lock_within_center_band",
+            "center_side_changed"
+          ].includes(candidate.reason)
+          || candidate.selection?.eligible !== false
+        )
+      ) return null;
+      if (
+        candidate.status === "unavailable"
+        && (
+          candidate.direction !== null
+          || typeof candidate.reason !== "string"
+          || candidate.reason.length === 0
+          || candidate.selection?.eligible !== false
+        )
+      ) return null;
+      challenger = {
+        status: candidate.status,
+        reason: candidate.reason,
+        direction: candidate.direction
+      };
+    }
+
+    return {
+      latest: {
+        roundId: String(latest.roundId),
+        challenger
+      },
+      metrics
+    };
+  }
+
+  function trajectoryDirectionChallengerMetricsText(metrics) {
+    const coverage = metrics.validStoredCount > 0
+      ? ` · отбор ${metrics.selectedCount}/${metrics.validStoredCount} (${trajectoryShadowShareFormatter.format(metrics.decisionCoverage)})`
+      : "";
+    if (metrics.evaluatedSelected === 0) {
+      return `Собираем проспективную выборку${coverage}.`;
+    }
+    const accuracy = `Проспективно: ${metrics.hits}/${metrics.evaluatedSelected} (${trajectoryShadowShareFormatter.format(metrics.selectiveAccuracy)})${coverage}.`;
+    if (metrics.paired.count === 0) return accuracy;
+    const paired = metrics.paired;
+    return `${accuracy} Пары с Adaptive v2: альтернатива ${paired.challengerHits}/${paired.count} (${trajectoryShadowShareFormatter.format(paired.challengerRate)}), Adaptive v2 ${paired.championHits}/${paired.count} (${trajectoryShadowShareFormatter.format(paired.championRate)}).`;
+  }
+
+  function renderTrajectoryDirectionChallenger(
+    value,
+    currentRoundId,
+    { failed = false, loading = false } = {},
+  ) {
+    if (failed) {
+      setTextIfChanged(
+        elements.trajectoryDirectionChallenger,
+        "Проверяемая альтернатива скрыта: её данные не обновились. Adaptive v2 остаётся основным прогнозом.",
+      );
+      return;
+    }
+    if (loading) {
+      setTextIfChanged(
+        elements.trajectoryDirectionChallenger,
+        "Получаем проверяемую альтернативу. Adaptive v2 остаётся основным прогнозом.",
+      );
+      return;
+    }
+
+    const normalized = normalizedTrajectoryDirectionChallenger(value);
+    const matchesCurrent = normalized?.latest !== null
+      && normalized?.latest !== undefined
+      && currentRoundId !== null
+      && String(currentRoundId) === normalized.latest.roundId;
+    if (!normalized || !matchesCurrent || !normalized.latest.challenger) {
+      setTextIfChanged(
+        elements.trajectoryDirectionChallenger,
+        "Проверяемая альтернатива для текущего раунда ещё не зафиксирована. Adaptive v2 остаётся основным прогнозом.",
+      );
+      return;
+    }
+
+    const challenger = normalized.latest.challenger;
+    const metricsText = trajectoryDirectionChallengerMetricsText(normalized.metrics);
+    if (challenger.status === "ready") {
+      setTextIfChanged(
+        elements.trajectoryDirectionChallenger,
+        `Проверяемая альтернатива: ${TRAJECTORY_SHADOW_DIRECTION_LABELS[challenger.direction]}. Не заменяет Adaptive v2; вероятность не рассчитана. ${metricsText}`,
+      );
+      return;
+    }
+    if (challenger.status === "unselected") {
+      const reasons = {
+        start_within_center_band: "старт был в центральной зоне",
+        lock_within_center_band: "lock оказался в центральной зоне",
+        center_side_changed: "между стартом и lock цена пересекла центр"
+      };
+      setTextIfChanged(
+        elements.trajectoryDirectionChallenger,
+        `Проверяемая альтернатива не выбрана: ${reasons[challenger.reason]}. Adaptive v2 не заменён. ${metricsText}`,
+      );
+      return;
+    }
+    setTextIfChanged(
+      elements.trajectoryDirectionChallenger,
+      `Проверяемая альтернатива недоступна для этого снимка. Adaptive v2 не заменён. ${metricsText}`,
+    );
   }
 
   function trajectoryNumberAreaLabel(point) {
@@ -1903,10 +2323,61 @@ import {
     return `ПРОГНОЗ УЧАСТКА: ОТ ${from} ДО ${to}`;
   }
 
-  function renderTrajectoryShadow(value, metricsValue) {
+  function trajectoryObservedChangeText(change) {
+    if (!change) {
+      return "Подтверждённое общее изменение диаграммы до lock недоступно.";
+    }
+    const pointLabel = pluralForm(change.pointCount, "точка", "точки", "точек");
+    return `Общее изменение до lock: ${TRAJECTORY_SHADOW_DIRECTION_LABELS[change.direction]} · ${formatPrice(change.startPrice)} → ${formatPrice(change.endPrice)} · ${change.pointCount} ${pointLabel}; последняя точка ${formatDateTime(change.lastAt)}.`;
+  }
+
+  function renderTrajectoryShadow(value, metricsValue, { failed = false } = {}) {
     const shadow = normalizedTrajectoryShadow(value);
     const metrics = normalizedTrajectoryMetrics(metricsValue);
     elements.trajectoryShadowPanel.setAttribute("aria-busy", "false");
+
+    if (failed) {
+      elements.trajectoryShadowBadge.textContent = "Не обновлено";
+      setTextIfChanged(
+        elements.trajectoryShadowObserved,
+        "Фактическая диаграмма текущего раунда недоступна: /api/state не обновился.",
+      );
+      elements.trajectoryShadowObserved.title = "";
+      setTextIfChanged(
+        elements.trajectoryShadowStatus,
+        "Прогноз lock → ed скрыт, чтобы старое направление не выглядело текущим. Запрос будет повторён автоматически.",
+      );
+      setTextIfChanged(
+        elements.trajectoryShadowShares,
+        "Архивное основание прогноза недоступно до свежего ответа /api/state.",
+      );
+      setTextIfChanged(
+        elements.trajectoryShadowNumberArea,
+        "ПРОГНОЗ УЧАСТКА: ДАННЫЕ НЕ ОБНОВЛЕНЫ",
+      );
+      setTextIfChanged(
+        elements.trajectoryShadowTraining,
+        "Обучение: данные временно недоступны.",
+      );
+      setTextIfChanged(
+        elements.trajectoryShadowRangeMetrics,
+        "Участок и Rank‑37: данные временно недоступны.",
+      );
+      elements.trajectoryShadowRangeMetrics.title = "";
+      setTextIfChanged(
+        elements.trajectoryShadowSample,
+        "Снимок появится только после подтверждения актуального раунда сервером.",
+      );
+      return;
+    }
+
+    setTextIfChanged(
+      elements.trajectoryShadowObserved,
+      trajectoryObservedChangeText(shadow?.observedChange),
+    );
+    elements.trajectoryShadowObserved.title = shadow?.observedChange
+      ? `Смещение первой → последней точки: ${shadow.observedChange.deltaCellWidths.toFixed(2).replace(".", ",")} ширины полосы; порог «без заметного движения»: ±${shadow.observedChange.flatThresholdCellWidths.toFixed(2).replace(".", ",")}.`
+      : "";
 
     if (shadow?.isAdaptive && shadow.adaptive) {
       const trainingCount = shadow.adaptive.trainingCount;
@@ -1952,11 +2423,11 @@ import {
       elements.trajectoryShadowBadge.textContent = "Снимка нет";
       setTextIfChanged(
         elements.trajectoryShadowStatus,
-        "Adaptive-снимок для текущего раунда ещё не опубликован; полный рейтинг 37 чисел пока не формируется.",
+        "Прогноз lock → ed для текущего раунда ещё не опубликован; полный рейтинг 37 чисел пока не формируется.",
       );
       setTextIfChanged(
         elements.trajectoryShadowShares,
-        "Доли похожих завершённых траекторий: вверх — · вниз — · без движения —.",
+        "Архивное основание прогноза: вверх — · вниз — · без движения —.",
       );
       setTextIfChanged(
         elements.trajectoryShadowNumberArea,
@@ -1974,7 +2445,7 @@ import {
       elements.trajectoryShadowBadge.textContent = `${modelLabel} · график неполный`;
       setTextIfChanged(
         elements.trajectoryShadowStatus,
-        "Направление не рассчитывается: текущая траектория началась не от старта раунда, содержит разрыв или не дошла до точки фиксации.",
+        "Прогноз lock → ed не рассчитывается: текущая диаграмма началась не от старта раунда, содержит разрыв или не дошла до точки фиксации.",
       );
       setTextIfChanged(
         elements.trajectoryShadowShares,
@@ -1996,7 +2467,7 @@ import {
       elements.trajectoryShadowBadge.textContent = `${modelLabel} · сбор ${sample.eligibleCount}/${sample.requiredHistory}`;
       setTextIfChanged(
         elements.trajectoryShadowStatus,
-        "Направление не рассчитывается: накапливается prospective-история полных завершённых раундов.",
+        "Прогноз lock → ed не рассчитывается: накапливается prospective-история полных завершённых раундов.",
       );
       setTextIfChanged(
         elements.trajectoryShadowShares,
@@ -2017,7 +2488,7 @@ import {
       elements.trajectoryShadowBadge.textContent = `${modelLabel} · соседи ${sample.withinDistanceCount}/${sample.requiredNeighbors}`;
       setTextIfChanged(
         elements.trajectoryShadowStatus,
-        "Направление не рассчитывается: пока недостаточно завершённых траекторий с похожей формой.",
+        "Прогноз lock → ed не рассчитывается: пока недостаточно завершённых траекторий с похожей формой.",
       );
       setTextIfChanged(
         elements.trajectoryShadowShares,
@@ -2034,16 +2505,16 @@ import {
       return;
     }
 
-    elements.trajectoryShadowBadge.textContent = `${modelLabel} · наблюдение`;
+    elements.trajectoryShadowBadge.textContent = `${modelLabel} · прогноз`;
     setTextIfChanged(
       elements.trajectoryShadowStatus,
-      `Наблюдательное направление цены от последней доступной точки перед forecast lock до финального ed: ${TRAJECTORY_SHADOW_DIRECTION_LABELS[shadow.direction]}. Точка может быть не старше 5 секунд; исход shadow для этого раунда ещё не валидирован.`,
+      `Прогнозируемый класс отдельного движения после lock → ed: ${TRAJECTORY_SHADOW_DIRECTION_LABELS[shadow.direction]}. Это не описание уже построенной диаграммы до lock; направления могут не совпадать.`,
     );
     setTextIfChanged(
       elements.trajectoryShadowShares,
       shadow.isAdaptive
-        ? `Взвешенные архивные доли направлений: вверх ${trajectoryShadowShareFormatter.format(shadow.probabilities.up)} · вниз ${trajectoryShadowShareFormatter.format(shadow.probabilities.down)} · без движения ${trajectoryShadowShareFormatter.format(shadow.probabilities.flat)}.`
-        : `Доли похожих завершённых траекторий: вверх ${trajectoryShadowShareFormatter.format(shadow.probabilities.up)} · вниз ${trajectoryShadowShareFormatter.format(shadow.probabilities.down)} · без движения ${trajectoryShadowShareFormatter.format(shadow.probabilities.flat)}.`,
+        ? `Архивное основание прогноза: вверх ${trajectoryShadowShareFormatter.format(shadow.probabilities.up)} · вниз ${trajectoryShadowShareFormatter.format(shadow.probabilities.down)} · без движения ${trajectoryShadowShareFormatter.format(shadow.probabilities.flat)}.`
+        : `Архивное основание прогноза по похожим траекториям: вверх ${trajectoryShadowShareFormatter.format(shadow.probabilities.up)} · вниз ${trajectoryShadowShareFormatter.format(shadow.probabilities.down)} · без движения ${trajectoryShadowShareFormatter.format(shadow.probabilities.flat)}.`,
     );
     setTextIfChanged(
       elements.trajectoryShadowNumberArea,
@@ -3195,10 +3666,37 @@ import {
     );
   }
 
+  function renderPrecloseTrajectoryMetrics(trajectoryMetrics, { failed = false } = {}) {
+    if (failed) {
+      elements.precloseSampleCount.textContent = "—";
+      elements.precloseSampleCount.title = "Статистика Rank‑37 не обновлена.";
+      elements.precloseTop3Rate.textContent = "Не обновлено";
+      return;
+    }
+
+    const rankedSettledCount = trajectoryMetrics?.rank37SettledCount ?? 0;
+    const rankedPendingCount = trajectoryMetrics?.rank37PendingCount ?? 0;
+    const rankedEvaluatedCount = trajectoryMetrics?.rank37EvaluatedCount ?? 0;
+    const rankedTop3Hits = trajectoryMetrics?.rank37Top3Hits ?? 0;
+    const rankedTop3Rate = trajectoryMetrics?.rank37Top3Rate ?? null;
+    elements.precloseSampleCount.textContent = rankedEvaluatedCount < 100
+      ? `${rankedEvaluatedCount} из 100`
+      : `${rankedEvaluatedCount} проверено`;
+    elements.precloseSampleCount.title = `Rank‑37: завершено ${rankedSettledCount}; ожидают результата ${rankedPendingCount}`;
+    elements.precloseTop3Rate.textContent = rankedEvaluatedCount >= 100 && Number.isFinite(rankedTop3Rate)
+      ? `${rankedTop3Hits} из ${rankedEvaluatedCount} · ${(rankedTop3Rate * 100).toFixed(1).replace(".", ",")}%`
+      : `${rankedTop3Hits} из ${rankedEvaluatedCount} · мало данных`;
+  }
+
   function renderPrecloseForecast() {
-    const forecastState = store.state?.precloseForecast || null;
+    const stateAvailable = !store.stateError;
+    const forecastState = stateAvailable
+      ? store.state?.precloseForecast || null
+      : null;
     const latest = forecastState?.latest || null;
-    const currentRound = store.state?.collector?.currentRound || null;
+    const currentRound = stateAvailable
+      ? store.state?.collector?.currentRound || null
+      : null;
     const currentRoundId = currentRound?.id == null ? null : String(currentRound.id);
     const latestRoundId = latest?.roundId == null ? null : String(latest.roundId);
     const closesAt = currentRound?.bettingClosesAt || currentRound?.closesAt || null;
@@ -3207,7 +3705,8 @@ import {
     const secondsUntilClose = closesMs === null
       ? null
       : Math.max(0, Math.ceil((closesMs - nowMs) / 1_000));
-    const matchesCurrent = latest !== null
+    const matchesCurrent = stateAvailable
+      && latest !== null
       && currentRoundId !== null
       && latestRoundId === currentRoundId;
     const shadow = matchesCurrent
@@ -3219,32 +3718,51 @@ import {
     const trajectoryMetrics = normalizedTrajectoryMetrics(
       forecastState?.trajectoryMetrics,
     );
-    const rankedSettledCount = trajectoryMetrics?.rank37SettledCount ?? 0;
-    const rankedPendingCount = trajectoryMetrics?.rank37PendingCount ?? 0;
-    const rankedEvaluatedCount = trajectoryMetrics?.rank37EvaluatedCount ?? 0;
-    const rankedTop3Hits = trajectoryMetrics?.rank37Top3Hits ?? 0;
-    const rankedTop3Rate = trajectoryMetrics?.rank37Top3Rate ?? null;
-
-    elements.precloseSampleCount.textContent = rankedEvaluatedCount < 100
-      ? `${rankedEvaluatedCount} из 100`
-      : `${rankedEvaluatedCount} проверено`;
-    elements.precloseSampleCount.title = `Rank‑37: завершено ${rankedSettledCount}; ожидают результата ${rankedPendingCount}`;
-    elements.precloseTop3Rate.textContent = rankedEvaluatedCount >= 100 && Number.isFinite(rankedTop3Rate)
-      ? `${rankedTop3Hits} из ${rankedEvaluatedCount} · ${(rankedTop3Rate * 100).toFixed(1).replace(".", ",")}%`
-      : `${rankedTop3Hits} из ${rankedEvaluatedCount} · мало данных`;
+    renderPrecloseTrajectoryMetrics(trajectoryMetrics, { failed: store.stateError });
     renderPrecloseComparison(matchesCurrent ? latest : null, trajectory, shadow);
     renderTrajectoryShadow(
       matchesCurrent ? latest?.trajectoryShadow : null,
       forecastState?.trajectoryMetrics,
+      { failed: store.stateError },
+    );
+    renderTrajectoryDirectionChallenger(
+      store.trajectoryDirectionChallengerSnapshot,
+      currentRoundId,
+      {
+        failed: store.stateError || store.trajectoryDirectionChallengerError,
+        loading: !store.trajectoryDirectionChallengerLoaded,
+      },
     );
 
     if (!matchesCurrent) {
       elements.precloseRanking.setAttribute("aria-busy", "true");
       elements.precloseRanking.replaceChildren(
-        createElement("li", "empty-state", "Прогноз этого раунда ещё не зафиксирован."),
+        createElement(
+          "li",
+          "empty-state",
+          store.stateError
+            ? "Актуальный прогноз скрыт: состояние сервера не обновилось."
+            : "Прогноз этого раунда ещё не зафиксирован.",
+        ),
       );
       elements.precloseLivePrice.textContent = "—";
       elements.precloseProjectedPrice.textContent = "—";
+
+      if (store.stateError) {
+        elements.precloseRanking.setAttribute("aria-busy", "false");
+        elements.precloseComparison.dataset.state = "unavailable";
+        elements.precloseComparison.setAttribute("aria-busy", "false");
+        elements.precloseComparisonBadge.textContent = "Не обновлено";
+        setTextIfChanged(
+          elements.precloseComparisonStatus,
+          "Rank‑37 скрыт до свежего ответа /api/state.",
+        );
+        elements.preclosePanel.dataset.state = "error";
+        elements.precloseBadge.textContent = "Не обновлено";
+        elements.precloseStatus.textContent = "Не удалось подтвердить текущий раунд через /api/state. Старый Rank‑37 и старое направление скрыты.";
+        elements.precloseTiming.textContent = "Запрос будет повторён автоматически; отсчёт по старому раунду остановлен.";
+        return;
+      }
 
       if (closesMs === null || currentRoundId === null) {
         elements.preclosePanel.dataset.state = "waiting";
@@ -6844,13 +7362,13 @@ import {
     store.followerSourceNumber = sourceNumber;
     store.followerSourceLocked = true;
     store.followerVisibleCount = FOLLOWER_COLLAPSED_LIMIT;
-    renderFollowers(store.state?.latestResult || store.results[0] || null);
+    renderFollowers(latestResultForRender());
   });
   elements.followerToggle.addEventListener("click", () => {
     store.followerVisibleCount = store.followerVisibleCount >= ALL_NUMBERS.length
       ? FOLLOWER_COLLAPSED_LIMIT
       : ALL_NUMBERS.length;
-    renderFollowers(store.state?.latestResult || store.results[0] || null);
+    renderFollowers(latestResultForRender());
   });
   elements.riskRounds.addEventListener("input", renderRiskCalculator);
   elements.triplesToggle.addEventListener("click", () => {
