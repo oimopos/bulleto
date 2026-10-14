@@ -151,6 +151,11 @@ const PRESERVED_TABLES = Object.freeze({
   consensusForecasts: ["forecast_consensus_snapshots", "forecast_id"],
   trajectoryShadows: ["forecast_trajectory_shadows", "forecast_id"],
   leaders: ["forecast_predictive_leader_snapshots", "forecast_id"],
+  challengerCohorts: ["predictive_leader_challenger_cohorts", "challenger_key"],
+  challengers: [
+    "forecast_predictive_challenger_snapshots",
+    "forecast_id, challenger_key",
+  ],
   settlements: ["forecast_settlements", "forecast_id"],
   accounts: ["predictive_leader_accounts", "source, instrument"],
   bets: ["predictive_leader_account_bets", "forecast_id"],
@@ -197,6 +202,15 @@ function frozenRows(database, forecastId) {
     leader: {
       ...database.sqlite
         .prepare("SELECT * FROM forecast_predictive_leader_snapshots WHERE forecast_id = ?")
+        .get(forecastId),
+    },
+    challenger: {
+      ...database.sqlite
+        .prepare(`
+          SELECT *
+          FROM forecast_predictive_challenger_snapshots
+          WHERE forecast_id = ?
+        `)
         .get(forecastId),
     },
   };
@@ -453,6 +467,10 @@ test(
         SOURCE,
         INSTRUMENT,
       );
+      const beforeChallengerState = database.getPredictiveLeaderChallengerState(
+        SOURCE,
+        INSTRUMENT,
+      );
       const beforeJsonState = JSON.parse(JSON.stringify(beforeState));
       assert.equal(beforeRows.resets.length, 1);
       assert.equal(beforeRows.resets[0].status, "applied");
@@ -584,6 +602,10 @@ test(
         database.getPredictiveLeaderReadState(SOURCE, INSTRUMENT),
         beforeReadState,
       );
+      assert.deepEqual(
+        database.getPredictiveLeaderChallengerState(SOURCE, INSTRUMENT),
+        beforeChallengerState,
+      );
       assert.equal(
         reopenedEvidence.queriedCandidateCount,
         beforeEvidence.queriedCandidateCount,
@@ -707,8 +729,16 @@ test(
 
       const firstLeaderRead = await measureJson("/api/predictive-leader");
       const secondLeaderRead = await measureJson("/api/predictive-leader");
+      const challengerRead = await measureJson(
+        "/api/predictive-leader/challengers",
+      );
       const trajectoryRead = await measureJson("/api/forecasts");
-      for (const measurement of [firstLeaderRead, secondLeaderRead, trajectoryRead]) {
+      for (const measurement of [
+        firstLeaderRead,
+        secondLeaderRead,
+        challengerRead,
+        trajectoryRead,
+      ]) {
         assert.equal(Number.isFinite(measurement.elapsedMs), true);
         assert.ok(measurement.elapsedMs >= 0);
       }
@@ -719,6 +749,15 @@ test(
       assert.deepEqual(firstLeaderRead.payload.account, beforeJsonState.predictiveLeaderAccount);
       assert.deepEqual(secondLeaderRead.payload.account, firstLeaderRead.payload.account);
       assert.deepEqual(secondLeaderRead.payload.metrics, firstLeaderRead.payload.metrics);
+      assert.equal(challengerRead.payload.mode, "prospective-shadow");
+      assert.equal(challengerRead.payload.executionEnabled, false);
+      assert.equal(challengerRead.payload.advisoryOnly, true);
+      assert.equal(
+        challengerRead.payload.algorithmVersion,
+        "learned-predictive-hierarchical-v6-shadow",
+      );
+      assert.deepEqual(challengerRead.payload.latest, beforeChallengerState.latest);
+      assert.deepEqual(challengerRead.payload.metrics, beforeChallengerState.metrics);
 
       await stopChild(child);
       child = null;
@@ -732,6 +771,10 @@ test(
       const finalState = database.getPrecloseForecastState(SOURCE, INSTRUMENT);
       assert.deepEqual(finalState, beforeState);
       assert.deepEqual(modelEvidence(finalState), beforeEvidence);
+      assert.deepEqual(
+        database.getPredictiveLeaderChallengerState(SOURCE, INSTRUMENT),
+        beforeChallengerState,
+      );
     } finally {
       await stopChild(child);
       try {

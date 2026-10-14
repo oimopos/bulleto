@@ -378,6 +378,19 @@ function predictiveLeaderForApi() {
   });
 }
 
+function predictiveLeaderChallengersForApi() {
+  const source = 'buleto';
+  const instrument = config.instrument;
+  const state = cachedDatabaseRead(
+    'predictive-leader-challengers-state',
+    () => db.getPredictiveLeaderChallengerState(source, instrument),
+  );
+  return {
+    ...state,
+    serverTime: new Date().toISOString(),
+  };
+}
+
 function clampLimit(rawValue, fallback, max) {
   if (rawValue === null || rawValue === '') return fallback;
   const value = Number(rawValue);
@@ -510,6 +523,11 @@ const server = createServer((request, response) => {
 
     if (pathname === '/api/predictive-leader') {
       sendJson(response, 200, predictiveLeaderForApi());
+      return;
+    }
+
+    if (pathname === '/api/predictive-leader/challengers') {
+      sendJson(response, 200, predictiveLeaderChallengersForApi());
       return;
     }
 
@@ -899,8 +917,10 @@ collector.on('preclose-forecast', (forecast) => {
       console.info(
         `[forecast] locked round ${outcome.roundId} before betting close`,
       );
-      broadcastUpdate('forecast');
     }
+    // An idempotent retry can repair a missing trajectory/leader/challenger
+    // child row even when the primary forecast already existed.
+    broadcastUpdate('forecast');
   } catch (error) {
     console.error('[forecast] persistence failed; waiting for the next pre-close tick', error);
   }

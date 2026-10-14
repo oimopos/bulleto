@@ -7,6 +7,7 @@ import { DatabaseSync } from "node:sqlite";
 
 import { createDatabase } from "../src/database.js";
 import { buildLearnedLeaderDecision } from "../src/learned-leader.js";
+import { buildLearnedLeaderV6Decision } from "../src/learned-leader-v6.js";
 
 const BASE_TIME = Date.parse("2026-09-21T00:00:00.000Z");
 
@@ -406,6 +407,7 @@ test("schema contains all persistence tables", () => {
       "follower_top5_sessions",
       "forecast_consensus_snapshots",
       "forecast_pair_snapshots",
+      "forecast_predictive_challenger_snapshots",
       "forecast_predictive_leader_snapshots",
       "forecast_settlements",
       "forecast_snapshots",
@@ -415,6 +417,7 @@ test("schema contains all persistence tables", () => {
       "predictive_leader_account_bets",
       "predictive_leader_account_ladder_resets",
       "predictive_leader_accounts",
+      "predictive_leader_challenger_cohorts",
       "round_forecasts",
       "round_results",
       "round_trajectories",
@@ -424,7 +427,7 @@ test("schema contains all persistence tables", () => {
       "virtual_bet_sessions",
       "virtual_bets",
     ]);
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 19);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 20);
     assert.equal(
       database.sqlite
         .prepare("SELECT COUNT(*) AS count FROM predictive_leader_account_ladder_resets")
@@ -483,6 +486,44 @@ test("schema contains all persistence tables", () => {
         .map((column) => column.name),
       [
         "forecast_id",
+        "schema_version",
+        "algorithm_version",
+        "status",
+        "locked_at",
+        "history_max_result_id",
+        "training_through_forecast_id",
+        "training_through_result_id",
+        "training_count",
+        "predicted_number",
+        "score",
+        "snapshot_json",
+        "created_at",
+      ],
+    );
+    assert.deepEqual(
+      database.sqlite
+        .prepare("PRAGMA table_info(predictive_leader_challenger_cohorts)")
+        .all()
+        .map((column) => column.name),
+      [
+        "challenger_key",
+        "schema_version",
+        "algorithm_version",
+        "mode",
+        "first_forecast_id",
+        "started_at",
+        "config_json",
+        "created_at",
+      ],
+    );
+    assert.deepEqual(
+      database.sqlite
+        .prepare("PRAGMA table_info(forecast_predictive_challenger_snapshots)")
+        .all()
+        .map((column) => column.name),
+      [
+        "forecast_id",
+        "challenger_key",
         "schema_version",
         "algorithm_version",
         "status",
@@ -637,7 +678,7 @@ test("version 13 creates one live follower tracker at the current tail", () => {
       "buleto",
       "PRIMECOIN(XPM)/RUB",
     );
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 19);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 20);
     assert.equal(migrated.status, "armed");
     assert.equal(migrated.currentSession.sourceNumber, 9);
     assert.deepEqual(migrated.currentSession.fixedNumbers, [5, 4, 3, 2, 1]);
@@ -832,6 +873,15 @@ test("predictive leader is frozen before outcome, settles independently, and rem
     assert.equal(frozenRow.status, "ready");
     assert.equal(frozenRow.predicted_number, 4);
     assert.equal(frozenRow.training_count, 0);
+    const frozenChallengerRow = database.sqlite
+      .prepare(`
+        SELECT snapshot_json, status, predicted_number, training_count
+        FROM forecast_predictive_challenger_snapshots
+      `)
+      .get();
+    assert.equal(frozenChallengerRow.status, "ready");
+    assert.equal(frozenChallengerRow.predicted_number, 4);
+    assert.equal(frozenChallengerRow.training_count, 0);
 
     let state = database.getPrecloseForecastState(
       "buleto",
@@ -873,6 +923,24 @@ test("predictive leader is frozen before outcome, settles independently, and rem
       uniformBrierLoss: 18 / 37,
       beatsUniform: null,
     });
+    let challengerState = database.getPredictiveLeaderChallengerState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    assert.equal(challengerState.mode, "prospective-shadow");
+    assert.equal(challengerState.executionEnabled, false);
+    assert.equal(challengerState.latest.forecastId, state.latest.id);
+    assert.equal(challengerState.latest.challenger.leaderNumber, 4);
+    assert.equal(challengerState.latest.champion.leaderNumber, 4);
+    assert.equal(challengerState.latest.challenger.selection.eligible, false);
+    assert.equal(challengerState.metrics.eligibleForecastCount, 1);
+    assert.equal(challengerState.metrics.cohortEligibleForecastCount, 1);
+    assert.equal(challengerState.metrics.evaluationWindow.forecastCount, 1);
+    assert.equal(challengerState.metrics.evaluationWindow.truncated, false);
+    assert.equal(challengerState.metrics.storedCount, 1);
+    assert.equal(challengerState.metrics.readyCount, 1);
+    assert.equal(challengerState.metrics.settledCount, 0);
+    assert.equal(challengerState.metrics.frozenCoverageRate, 1);
 
     assert.deepEqual(database.recordPrecloseForecast(attempt), {
       inserted: false,
@@ -883,6 +951,12 @@ test("predictive leader is frozen before outcome, settles independently, and rem
         .prepare("SELECT snapshot_json FROM forecast_predictive_leader_snapshots")
         .get().snapshot_json,
       frozenRow.snapshot_json,
+    );
+    assert.equal(
+      database.sqlite
+        .prepare("SELECT snapshot_json FROM forecast_predictive_challenger_snapshots")
+        .get().snapshot_json,
+      frozenChallengerRow.snapshot_json,
     );
 
     clockMs = BASE_TIME + 101_000;
@@ -910,12 +984,39 @@ test("predictive leader is frozen before outcome, settles independently, and rem
     assert.equal(state.predictiveLeaderMetrics.top3Rate, 1);
     assert.ok(state.predictiveLeaderMetrics.meanBrierLoss < 18 / 37);
     assert.equal(state.predictiveLeaderMetrics.beatsUniform, true);
+    challengerState = database.getPredictiveLeaderChallengerState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    assert.equal(challengerState.latest.challenger.evaluation.actualNumber, 4);
+    assert.equal(challengerState.latest.challenger.evaluation.top1Hit, true);
+    assert.equal(challengerState.metrics.settledCount, 1);
+    assert.equal(challengerState.metrics.top1Hits, 1);
+    assert.equal(challengerState.metrics.pairedVsChampion.pairedCount, 1);
+    assert.equal(challengerState.metrics.pairedVsChampion.bothCorrect, 1);
+    assert.equal(challengerState.metrics.selective.settledCount, 0);
+    assert.equal(
+      challengerState.metrics.selective.pairedVsChampion.pairedCount,
+      0,
+    );
+    assert.equal(challengerState.metrics.byHorizon["8"].settledCount, 1);
+    assert.equal(
+      challengerState.metrics.byHorizon["8"].pairedVsChampion.bothCorrect,
+      1,
+    );
     assert.equal(
       database.sqlite
         .prepare("SELECT snapshot_json FROM forecast_predictive_leader_snapshots")
         .get().snapshot_json,
       frozenRow.snapshot_json,
       "settlement must never rewrite the frozen decision",
+    );
+    assert.equal(
+      database.sqlite
+        .prepare("SELECT snapshot_json FROM forecast_predictive_challenger_snapshots")
+        .get().snapshot_json,
+      frozenChallengerRow.snapshot_json,
+      "settlement must never rewrite the frozen v6 challenger",
     );
 
     database.sqlite.exec("PRAGMA ignore_check_constraints = ON");
@@ -936,6 +1037,70 @@ test("predictive leader is frozen before outcome, settles independently, and rem
     assert.equal(state.latest.predictiveLeader, null);
     assert.equal(state.predictiveLeaderMetrics.readyCount, 0);
     assert.equal(state.predictiveLeaderMetrics.settledCount, 0);
+  } finally {
+    database.close();
+  }
+});
+
+test("corrupt v6 shadow fails closed without changing the v5 champion", () => {
+  let clockMs = BASE_TIME + 10_000;
+  const database = createDatabase({
+    path: ":memory:",
+    clock: () => new Date(clockMs),
+  });
+  try {
+    database.ingestBatch(
+      [9, 4, 9, 4, 9, 5, 9].map((number, index) => event(
+        number,
+        `v6-corruption-history-${index}`,
+        index,
+        { externalRoundId: String(100 + index) },
+      )),
+    );
+    markResultsCreatedAtObservation(database, "v6-corruption-history-");
+    clockMs = BASE_TIME + 52_000;
+    database.recordPrecloseForecast(precloseForecast("107"));
+
+    const championBefore = database.getPrecloseForecastState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    ).latest.predictiveLeader;
+    assert.equal(championBefore.status, "ready");
+    assert.equal(
+      database.getPredictiveLeaderChallengerState(
+        "buleto",
+        "PRIMECOIN(XPM)/RUB",
+      ).latest.challenger.status,
+      "ready",
+    );
+
+    database.sqlite.exec("PRAGMA ignore_check_constraints = ON");
+    try {
+      database.sqlite
+        .prepare(`
+          UPDATE forecast_predictive_challenger_snapshots
+          SET snapshot_json = json_set(snapshot_json, '$.leaderNumber', 36)
+        `)
+        .run();
+    } finally {
+      database.sqlite.exec("PRAGMA ignore_check_constraints = OFF");
+    }
+
+    const challengerState = database.getPredictiveLeaderChallengerState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    assert.equal(challengerState.latest.challenger, null);
+    assert.equal(challengerState.metrics.storedCount, 1);
+    assert.equal(challengerState.metrics.invalidCount, 1);
+    assert.equal(challengerState.metrics.readyCount, 0);
+    assert.deepEqual(
+      database.getPrecloseForecastState(
+        "buleto",
+        "PRIMECOIN(XPM)/RUB",
+      ).latest.predictiveLeader,
+      championBefore,
+    );
   } finally {
     database.close();
   }
@@ -1730,6 +1895,47 @@ test("a settled common-family leader changes only the learning state of a later 
         JSON.stringify(commonDecision),
         firstForecastId,
       );
+    const commonV6Decision = buildLearnedLeaderV6Decision({
+      sources: [
+        {
+          id: "price-v6-test-fixture",
+          family: "price",
+          numbers: [4],
+          weights: [1],
+          cursor: {
+            forecastId: firstForecastId,
+            cutoffAt: firstAttempt.lockedAt,
+            evidenceCandidateCount: 5,
+          },
+        },
+        {
+          id: "conditional-pair-full",
+          family: "conditional-history",
+          numbers: [5],
+          weights: [1],
+          cursor: {
+            historyMaxResultId: 7,
+            cutoffAt: firstAttempt.lockedAt,
+            sampleSize: 100,
+          },
+        },
+      ],
+      learningRows: [],
+      lockedAt: firstAttempt.lockedAt,
+      tieSeed: "fixture-v6-107",
+    });
+    database.sqlite
+      .prepare(`
+        UPDATE forecast_predictive_challenger_snapshots
+        SET predicted_number = ?, score = ?, snapshot_json = ?
+        WHERE forecast_id = ?
+      `)
+      .run(
+        commonV6Decision.leaderNumber,
+        commonV6Decision.leaderMass,
+        JSON.stringify(commonV6Decision),
+        firstForecastId,
+      );
 
     clockMs = BASE_TIME + 101_000;
     database.ingestBatch([
@@ -1885,6 +2091,16 @@ test("a settled common-family leader changes only the learning state of a later 
     assert.equal(secondLeader.trainingThroughForecastId, firstForecastId);
     assert.equal(secondLeader.trainingThroughResultId, 8);
     assert.deepEqual(secondLeader.familyWeights, { "conditional-history": 1 });
+    const secondV6 = database.getPredictiveLeaderChallengerState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    ).latest.challenger;
+    assert.equal(secondV6.status, "ready");
+    assert.equal(secondV6.learning.trainingCount, 1);
+    assert.equal(secondV6.learning.trainingThroughId, String(firstForecastId));
+    assert.ok(secondV6.learning.familyWeights.price > 0.7);
+    assert.equal(secondV6.trainingThroughForecastId, firstForecastId);
+    assert.equal(secondV6.trainingThroughResultId, 8);
     assert.equal(
       database.sqlite
         .prepare(`
@@ -3355,12 +3571,23 @@ test("predictive leader still fails closed when compute crosses the five-second 
         .get().count,
       0,
     );
-    assert.equal(errors.length, 1);
+    assert.equal(
+      database.sqlite
+        .prepare("SELECT COUNT(*) AS count FROM forecast_predictive_challenger_snapshots")
+        .get().count,
+      0,
+    );
+    assert.equal(errors.length, 2);
     assert.equal(
       errors[0].message,
       "predictive leader persistence failed after primary forecast commit",
     );
     assert.match(errors[0].payload.error.message, /at least five seconds/);
+    assert.equal(
+      errors[1].message,
+      "predictive leader v6 shadow persistence failed without affecting v5",
+    );
+    assert.match(errors[1].payload.error.message, /at least five seconds/);
   } finally {
     database.close();
   }
@@ -4078,7 +4305,7 @@ test("versions 11 and 12 do not backfill derived snapshots for version 10 foreca
       path,
       clock: () => new Date(BASE_TIME + 52_000),
     });
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 19);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 20);
     assert.equal(
       Number(
         database.sqlite
@@ -4157,7 +4384,7 @@ test("version 12 does not backfill consensus for legacy version 11 forecasts", (
       path,
       clock: () => new Date(BASE_TIME + 52_000),
     });
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 19);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 20);
     assert.equal(
       database.sqlite
         .prepare("SELECT COUNT(*) AS count FROM forecast_consensus_snapshots")
@@ -4219,7 +4446,7 @@ test("version 14 migration preserves a legacy Borda consensus row exactly", () =
       clock: () => new Date(BASE_TIME + 52_000),
     });
 
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 19);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 20);
     const migratedRow = {
       ...database.sqlite.prepare("SELECT * FROM forecast_consensus_snapshots").get(),
     };
@@ -4244,7 +4471,7 @@ test("version 14 migration preserves a legacy Borda consensus row exactly", () =
   }
 });
 
-test("versions 15 through 19 add empty prospective tables without backfilling legacy forecasts", () => {
+test("versions 15 through 20 add empty prospective tables without backfilling legacy forecasts", () => {
   const directory = mkdtempSync(join(tmpdir(), "roulette-trajectory-v14-"));
   const path = join(directory, "legacy-forecast.sqlite");
   let database = createDatabase({
@@ -4259,6 +4486,8 @@ test("versions 15 through 19 add empty prospective tables without backfilling le
       true,
     );
     database.sqlite.exec(`
+      DROP TABLE forecast_predictive_challenger_snapshots;
+      DROP TABLE predictive_leader_challenger_cohorts;
       DROP TABLE predictive_leader_account_bets;
       DROP TABLE predictive_leader_accounts;
       DROP TABLE forecast_predictive_leader_snapshots;
@@ -4273,12 +4502,23 @@ test("versions 15 through 19 add empty prospective tables without backfilling le
       path,
       clock: () => new Date(BASE_TIME + 52_000),
     });
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 19);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 20);
     assert.equal(
       database.sqlite.prepare("SELECT COUNT(*) AS count FROM round_trajectories").get()
         .count,
       0,
     );
+    assert.equal(
+      database.sqlite
+        .prepare("SELECT COUNT(*) AS count FROM forecast_predictive_challenger_snapshots")
+        .get().count,
+      0,
+    );
+    const cohort = database.sqlite
+      .prepare("SELECT * FROM predictive_leader_challenger_cohorts")
+      .get();
+    assert.equal(cohort.first_forecast_id, 2);
+    assert.equal(cohort.algorithm_version, "learned-predictive-hierarchical-v6-shadow");
     assert.equal(
       database.sqlite
         .prepare("SELECT COUNT(*) AS count FROM forecast_trajectory_shadows")
@@ -4369,7 +4609,7 @@ test("version 17 never backfills an existing version 16 leader into the paper ac
       path,
       clock: () => new Date(BASE_TIME + 52_000),
     });
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 19);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 20);
     assert.equal(
       database.sqlite
         .prepare("SELECT COUNT(*) AS count FROM forecast_predictive_leader_snapshots")
@@ -4520,7 +4760,7 @@ test("version 18 preserves version 17 bet rows and adds nullable void audit fiel
       path,
       clock: () => new Date(clockMs),
     });
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 19);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 20);
     const after = database.sqlite
       .prepare("SELECT * FROM predictive_leader_account_bets ORDER BY forecast_id")
       .all();
@@ -4894,7 +5134,7 @@ test("version 5 history is backfilled into continuity epochs before migration co
 
   const database = createDatabase({ path });
   try {
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 19);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 20);
     assert.deepEqual(
       database.sqlite
         .prepare("SELECT continuity_epoch FROM round_results ORDER BY settled_at, id")
@@ -4954,7 +5194,7 @@ test("version 9 reconciles a proven contiguous shutdown boundary without deletin
 
     database = createDatabase({ path, gapThresholdSeconds: 135 });
     const state = database.getDashboardState();
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 19);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 20);
     assert.equal(state.totals.results, 5, "raw results are never recreated or deleted");
     assert.equal(state.totals.cycles, 1);
     assert.equal(state.totals.invalidCycles, 0);
@@ -7183,7 +7423,7 @@ test("v7 paper history initializes v8 bankroll with all known net results exactl
       "buleto",
       "PRIMECOIN(XPM)/RUB",
     );
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 19);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 20);
     assert.equal(state.testBank.initialBalance, 87_700);
     assert.equal(state.testBank.currentBalance, 87_910);
     assert.equal(state.testBank.netResult, 210);

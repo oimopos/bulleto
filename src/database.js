@@ -54,6 +54,16 @@ import {
   normalizeLearnedLeaderDecision,
 } from "./learned-leader.js";
 import {
+  LEARNED_LEADER_V6_ALGORITHM_VERSION,
+  LEARNED_LEADER_V6_DEFAULTS,
+  LEARNED_LEADER_V6_LEARNING_VERSION,
+  LEARNED_LEADER_V6_SCHEMA_VERSION,
+  LEARNED_LEADER_V6_UNIFORM_BRIER_LOSS,
+  buildLearnedLeaderV6Decision,
+  evaluateLearnedLeaderV6Decision,
+  normalizeLearnedLeaderV6Decision,
+} from "./learned-leader-v6.js";
+import {
   PREDICTIVE_LEADER_ACCOUNT_MODEL,
   PREDICTIVE_LEADER_ACCOUNT_SCHEMA_VERSION,
   PREDICTIVE_LEADER_ACCOUNT_STARTING_BALANCE,
@@ -82,6 +92,10 @@ const TRAJECTORY_DISPLAY_RANGE_POLICY =
 const TRAJECTORY_DISPLAY_RANGE_MAX_CELLS = 6;
 const PREDICTIVE_LEADER_ACCOUNT_RESET_KEY = "manual-ladder-restart-2026-10-12";
 const PREDICTIVE_LEADER_ACCOUNT_RESET_REASON = "user_requested";
+const PREDICTIVE_LEADER_V6_CHALLENGER_KEY =
+  "leader-v6-calibrated-hierarchical";
+const PREDICTIVE_LEADER_V6_LEARNING_LIMIT = 500;
+const PREDICTIVE_LEADER_V6_METRIC_WINDOW_LIMIT = 1_000;
 const FOLLOWER_TOP5_HORIZONS = Object.freeze([1, 2, 3, 5, 10, 20]);
 const FOLLOWER_TOP5_ALL_HORIZONS = Object.freeze(
   Array.from({ length: 20 }, (_, index) => index + 1),
@@ -3599,6 +3613,408 @@ function mapForecastPredictiveLeader(row) {
   };
 }
 
+function validLearnedLeaderV6Audit(decision) {
+  const learning = decision?.learning;
+  if (
+    !learning
+    || typeof learning !== "object"
+    || Array.isArray(learning)
+    || learning.version !== LEARNED_LEADER_V6_LEARNING_VERSION
+    || !["regularized_static", "adaptive"].includes(learning.status)
+    || !Number.isSafeInteger(learning.trainingCount)
+    || learning.trainingCount < 0
+    || learning.learningCutoffAt !== decision.lockedAt
+    || (learning.trainingCount === 0) !== (learning.trainingThroughId === null)
+    || (learning.trainingCount === 0) !== (learning.lastTrainingCompletedAt === null)
+    || (
+      learning.lastTrainingCompletedAt !== null
+      && Date.parse(learning.lastTrainingCompletedAt) >= Date.parse(decision.lockedAt)
+    )
+    || !learning.parameters
+    || typeof learning.parameters !== "object"
+    || Array.isArray(learning.parameters)
+    || Object.keys(learning.parameters).length
+      !== Object.keys(LEARNED_LEADER_V6_DEFAULTS).length
+    || Object.entries(LEARNED_LEADER_V6_DEFAULTS).some(
+      ([key, value]) => learning.parameters[key] !== value,
+    )
+    || decision.shadow !== true
+    || !decision.selection
+    || typeof decision.selection !== "object"
+    || typeof decision.selection.eligible !== "boolean"
+  ) {
+    return false;
+  }
+  if (decision.sourceManifest.some((source) => (
+    !source?.cursor
+    || typeof source.cursor !== "object"
+    || Array.isArray(source.cursor)
+    || source.cursor.cutoffAt !== decision.lockedAt
+  ))) return false;
+  return decision.status === "ready"
+    ? decision.reason === learning.status
+    : decision.reason === "no_reliable_family"
+      && decision.leaderNumber === null
+      && decision.leaderMass === null;
+}
+
+function mapForecastPredictiveLeaderV6(row) {
+  if (
+    row?.challenger_forecast_id === null
+    || row?.challenger_forecast_id === undefined
+  ) return null;
+  const decision = normalizeLearnedLeaderV6Decision(
+    deserializeJson(row.challenger_snapshot_json),
+  );
+  const forecastId = Number(row.challenger_forecast_id);
+  const schemaVersion = Number(row.challenger_schema_version);
+  const trainingCount = Number(row.challenger_training_count);
+  const trainingThroughForecastId =
+    row.challenger_training_through_forecast_id == null
+      ? null
+      : Number(row.challenger_training_through_forecast_id);
+  const trainingThroughResultId =
+    row.challenger_training_through_result_id == null
+      ? null
+      : Number(row.challenger_training_through_result_id);
+  const expectedTrainingResultId =
+    row.challenger_expected_training_result_id == null
+      ? null
+      : Number(row.challenger_expected_training_result_id);
+  const predictedNumber = row.challenger_predicted_number == null
+    ? null
+    : Number(row.challenger_predicted_number);
+  const score = row.challenger_score == null
+    ? null
+    : Number(row.challenger_score);
+  const historyMaxResultId = row.challenger_history_max_result_id == null
+    ? null
+    : Number(row.challenger_history_max_result_id);
+  if (
+    !decision
+    || !validLearnedLeaderV6Audit(decision)
+    || !Number.isSafeInteger(forecastId)
+    || forecastId < 1
+    || forecastId !== Number(row.forecast_id)
+    || row.challenger_key !== PREDICTIVE_LEADER_V6_CHALLENGER_KEY
+    || schemaVersion !== LEARNED_LEADER_V6_SCHEMA_VERSION
+    || row.challenger_algorithm_version
+      !== LEARNED_LEADER_V6_ALGORITHM_VERSION
+    || row.challenger_status !== decision.status
+    || row.challenger_locked_at !== decision.lockedAt
+    || row.locked_at !== decision.lockedAt
+    || !Number.isSafeInteger(trainingCount)
+    || trainingCount !== decision.learning.trainingCount
+    || (
+      trainingThroughForecastId === null
+        ? decision.learning.trainingThroughId !== null
+        : String(trainingThroughForecastId)
+          !== decision.learning.trainingThroughId
+    )
+    || (trainingCount === 0) !== (trainingThroughResultId === null)
+    || trainingThroughResultId !== expectedTrainingResultId
+    || predictedNumber !== decision.leaderNumber
+    || (
+      score === null
+        ? decision.leaderMass !== null
+        : !Number.isFinite(score)
+          || Math.abs(score - decision.leaderMass) > 1e-12
+    )
+    || !Number.isFinite(Date.parse(row.challenger_created_at))
+    || Date.parse(row.challenger_created_at) < Date.parse(decision.lockedAt)
+  ) return null;
+  for (const source of decision.sourceManifest) {
+    if (
+      source.family === "price"
+      && Number(source.cursor.forecastId) !== forecastId
+    ) return null;
+    if (
+      source.family === "conditional-history"
+      && Number(source.cursor.historyMaxResultId) !== historyMaxResultId
+    ) return null;
+  }
+
+  let evaluation = null;
+  if (
+    decision.status === "ready"
+    && row.actual_number !== null
+    && row.actual_number !== undefined
+  ) {
+    try {
+      evaluation = {
+        resultId: Number(row.round_result_id),
+        settledAt: row.settled_at,
+        createdAt: row.settlement_created_at,
+        ...evaluateLearnedLeaderV6Decision(decision, Number(row.actual_number)),
+      };
+    } catch {
+      return null;
+    }
+  }
+  return {
+    ...decision,
+    forecastId,
+    challengerKey: PREDICTIVE_LEADER_V6_CHALLENGER_KEY,
+    historyMaxResultId,
+    trainingThroughForecastId,
+    trainingThroughResultId,
+    createdAt: row.challenger_created_at,
+    evaluation,
+  };
+}
+
+function wilsonInterval(hitCount, sampleSize, z = 1.959963984540054) {
+  if (!Number.isSafeInteger(sampleSize) || sampleSize <= 0) return null;
+  const rate = hitCount / sampleSize;
+  const denominator = 1 + (z ** 2) / sampleSize;
+  const center = (rate + (z ** 2) / (2 * sampleSize)) / denominator;
+  const radius = z * Math.sqrt(
+    (rate * (1 - rate) / sampleSize) + (z ** 2) / (4 * sampleSize ** 2),
+  ) / denominator;
+  return {
+    confidence: 0.95,
+    lower: Math.max(0, center - radius),
+    upper: Math.min(1, center + radius),
+  };
+}
+
+function mean(values) {
+  return values.length === 0
+    ? null
+    : values.reduce((total, value) => total + value, 0) / values.length;
+}
+
+function mappedEvaluationMetrics(leaders) {
+  const settled = leaders.filter((leader) => leader?.evaluation !== null);
+  const top1Hits = settled.reduce(
+    (total, leader) => total + Number(leader.evaluation.top1Hit),
+    0,
+  );
+  const top3Hits = settled.reduce(
+    (total, leader) => total + Number(leader.evaluation.top3Hit),
+    0,
+  );
+  return {
+    settledCount: settled.length,
+    top1Hits,
+    top3Hits,
+    top1Rate: settled.length > 0 ? top1Hits / settled.length : null,
+    top3Rate: settled.length > 0 ? top3Hits / settled.length : null,
+    top1Wilson95: wilsonInterval(top1Hits, settled.length),
+    meanBrierLoss: mean(settled.map(
+      (leader) => leader.evaluation.combinedBrierLoss,
+    )),
+    meanClippedLogLoss: mean(settled.map(
+      (leader) => leader.evaluation.combinedClippedLogLoss,
+    )),
+  };
+}
+
+function mappedPairedLeaderMetrics(mapped) {
+  const paired = mapped.filter(({ challenger, champion }) => (
+    challenger?.evaluation != null
+    && champion?.evaluation != null
+  ));
+  let bothCorrect = 0;
+  let challengerOnly = 0;
+  let championOnly = 0;
+  let neitherCorrect = 0;
+  let challengerTop3Hits = 0;
+  let championTop3Hits = 0;
+  for (const { challenger, champion } of paired) {
+    if (challenger.evaluation.top1Hit && champion.evaluation.top1Hit) bothCorrect += 1;
+    else if (challenger.evaluation.top1Hit) challengerOnly += 1;
+    else if (champion.evaluation.top1Hit) championOnly += 1;
+    else neitherCorrect += 1;
+    challengerTop3Hits += Number(challenger.evaluation.top3Hit);
+    championTop3Hits += Number(champion.evaluation.top3Hit);
+  }
+  const pairedCount = paired.length;
+  const challengerHits = bothCorrect + challengerOnly;
+  const championHits = bothCorrect + championOnly;
+  return {
+    championAlgorithmVersion: LEARNED_LEADER_ALGORITHM_VERSION,
+    pairedCount,
+    bothCorrect,
+    challengerOnly,
+    championOnly,
+    neitherCorrect,
+    discordantCount: challengerOnly + championOnly,
+    challengerTop1Hits: challengerHits,
+    championTop1Hits: championHits,
+    challengerTop1Rate: pairedCount > 0 ? challengerHits / pairedCount : null,
+    championTop1Rate: pairedCount > 0 ? championHits / pairedCount : null,
+    challengerTop3Hits,
+    championTop3Hits,
+    challengerTop3Rate: pairedCount > 0 ? challengerTop3Hits / pairedCount : null,
+    championTop3Rate: pairedCount > 0 ? championTop3Hits / pairedCount : null,
+    deltaTop1Rate: pairedCount > 0
+      ? (challengerHits - championHits) / pairedCount
+      : null,
+    deltaTop3Rate: pairedCount > 0
+      ? (challengerTop3Hits - championTop3Hits) / pairedCount
+      : null,
+    meanBrierDelta: mean(paired.map(({ challenger, champion }) => (
+      challenger.evaluation.combinedBrierLoss
+        - champion.evaluation.combinedBrierLoss
+    ))),
+  };
+}
+
+function mapPredictiveLeaderV6Metrics(rows, cohort, {
+  includeHorizonBreakdown = true,
+  cohortEligibleForecastCount = rows.length,
+  cohortHorizonCounts = new Map(),
+} = {}) {
+  const mapped = rows.map((row) => ({
+    row,
+    challenger: mapForecastPredictiveLeaderV6(row),
+    champion: mapForecastPredictiveLeader(row),
+  }));
+  const storedCount = rows.reduce(
+    (total, row) => total + Number(row.challenger_forecast_id != null),
+    0,
+  );
+  const valid = mapped.map(({ challenger }) => challenger).filter(Boolean);
+  const ready = valid.filter((leader) => leader.status === "ready");
+  const unavailable = valid.filter((leader) => leader.status === "unavailable");
+  const overall = mappedEvaluationMetrics(ready);
+  const selectedMapped = mapped.filter(({ challenger }) => (
+    challenger?.status === "ready" && challenger.selection.eligible
+  ));
+  const selected = selectedMapped.map(({ challenger }) => challenger);
+  const selective = mappedEvaluationMetrics(selected);
+  const settledReadyCount = overall.settledCount;
+
+  const componentMetrics = {};
+  for (const family of ["price", "conditional-history"]) {
+    const evaluations = ready
+      .filter((leader) => leader.evaluation?.familyEvaluations?.[family])
+      .map((leader) => leader.evaluation.familyEvaluations[family]);
+    const top1Hits = evaluations.reduce(
+      (total, evaluation) => total + Number(evaluation.top1Hit),
+      0,
+    );
+    const top3Hits = evaluations.reduce(
+      (total, evaluation) => total + Number(evaluation.top3Hit),
+      0,
+    );
+    componentMetrics[family] = {
+      settledCount: evaluations.length,
+      top1Hits,
+      top3Hits,
+      top1Rate: evaluations.length > 0 ? top1Hits / evaluations.length : null,
+      top3Rate: evaluations.length > 0 ? top3Hits / evaluations.length : null,
+      meanBrierLoss: mean(evaluations.map(({ brierLoss }) => brierLoss)),
+      meanClippedLogLoss: mean(
+        evaluations.map(({ clippedLogLoss }) => clippedLogLoss),
+      ),
+    };
+  }
+
+  const settledReady = ready.filter((leader) => leader.evaluation !== null);
+  const rolling = Object.fromEntries([250, 500].map((size) => [
+    `last${size}`,
+    mappedEvaluationMetrics(settledReady.slice(-size)),
+  ]));
+  const leadBuckets = Object.fromEntries([
+    ["under10", (seconds) => seconds >= 0 && seconds < 10],
+    ["10ToUnder12", (seconds) => seconds >= 10 && seconds < 12],
+    ["12To15", (seconds) => seconds >= 12 && seconds <= 15],
+    ["outsideExpectedWindow", (seconds) => seconds < 0 || seconds > 15],
+  ].map(([id, includes]) => {
+    const leaders = mapped
+      .filter(({ row, challenger }) => (
+        challenger?.status === "ready"
+        && includes(Number(row.lead_time_ms) / 1_000)
+      ))
+      .map(({ challenger }) => challenger);
+    return [id, {
+      readyCount: leaders.length,
+      ...mappedEvaluationMetrics(leaders),
+    }];
+  }));
+  const countReasons = (values) => Object.fromEntries(
+    [...new Set(values)].sort().map((reason) => [
+      reason,
+      values.filter((value) => value === reason).length,
+    ]),
+  );
+
+  const metrics = {
+    challengerKey: PREDICTIVE_LEADER_V6_CHALLENGER_KEY,
+    algorithmVersion: LEARNED_LEADER_V6_ALGORITHM_VERSION,
+    mode: "prospective-shadow",
+    firstForecastId: Number(cohort.first_forecast_id),
+    startedAt: cohort.started_at,
+    cohortEligibleForecastCount,
+    evaluationWindow: {
+      limit: PREDICTIVE_LEADER_V6_METRIC_WINDOW_LIMIT,
+      forecastCount: rows.length,
+      truncated: cohortEligibleForecastCount > rows.length,
+      firstForecastId: rows.length > 0 ? Number(rows[0].forecast_id) : null,
+      lastForecastId: rows.length > 0 ? Number(rows.at(-1).forecast_id) : null,
+    },
+    eligibleForecastCount: rows.length,
+    storedCount,
+    missingCount: Math.max(0, rows.length - storedCount),
+    invalidCount: Math.max(0, storedCount - valid.length),
+    readyCount: ready.length,
+    unavailableCount: unavailable.length,
+    unavailableReasons: countReasons(unavailable.map(({ reason }) => reason)),
+    pendingCount: Math.max(0, ready.length - overall.settledCount),
+    frozenCoverageRate: rows.length > 0 ? storedCount / rows.length : null,
+    validCoverageRate: rows.length > 0 ? valid.length / rows.length : null,
+    readyCoverageRate: rows.length > 0 ? ready.length / rows.length : null,
+    ...overall,
+    uniformBrierLoss: LEARNED_LEADER_V6_UNIFORM_BRIER_LOSS,
+    brierSkillVsUniform: overall.meanBrierLoss === null
+      ? null
+      : 1 - overall.meanBrierLoss / LEARNED_LEADER_V6_UNIFORM_BRIER_LOSS,
+    selective: {
+      ...selective,
+      readyCount: selected.length,
+      pendingCount: Math.max(0, selected.length - selective.settledCount),
+      settledCoverageRate: settledReadyCount > 0
+        ? selective.settledCount / settledReadyCount
+        : null,
+      excludedReasons: countReasons(ready
+        .filter((leader) => !leader.selection.eligible)
+        .flatMap((leader) => leader.selection.reasons)),
+      pairedVsChampion: mappedPairedLeaderMetrics(selectedMapped),
+    },
+    components: componentMetrics,
+    rolling,
+    leadBuckets,
+    pairedVsChampion: mappedPairedLeaderMetrics(mapped),
+  };
+  if (includeHorizonBreakdown) {
+    const horizons = [...new Set([
+      ...rows.map((row) => Number(row.horizon_seconds)),
+      ...cohortHorizonCounts.keys(),
+    ])]
+      .filter((horizon) => Number.isSafeInteger(horizon) && horizon > 0)
+      .sort((left, right) => left - right);
+    metrics.byHorizon = Object.fromEntries(horizons.map((horizon) => [
+      String(horizon),
+      {
+        horizonSeconds: horizon,
+        ...mapPredictiveLeaderV6Metrics(
+          rows.filter((row) => Number(row.horizon_seconds) === horizon),
+          cohort,
+          {
+            includeHorizonBreakdown: false,
+            cohortEligibleForecastCount:
+              cohortHorizonCounts.get(horizon) ?? 0,
+            cohortHorizonCounts,
+          },
+        ),
+      },
+    ]));
+  }
+  return metrics;
+}
+
 function mapPredictiveLeaderMetrics(rows) {
   const leaders = rows
     .map(mapForecastPredictiveLeader)
@@ -4246,6 +4662,7 @@ export class RouletteDatabase {
     this.#migratePredictiveLeaderAccountV17();
     this.#migratePredictiveLeaderAccountVoidV18();
     this.#migratePredictiveLeaderAccountLadderResetV19(startingVersion);
+    this.#migratePredictiveLeaderChallengersV20();
   }
 
   #migratePrecloseForecastsV10() {
@@ -5336,6 +5753,129 @@ export class RouletteDatabase {
           );
       }
       this.sqlite.exec("PRAGMA user_version = 19; COMMIT");
+    } catch (error) {
+      try {
+        this.sqlite.exec("ROLLBACK");
+      } catch {
+        // Preserve the migration error.
+      }
+      throw error;
+    }
+  }
+
+  #migratePredictiveLeaderChallengersV20() {
+    this.sqlite.exec("BEGIN IMMEDIATE");
+    try {
+      // Schema initialization must not consume the injected event clock. Some
+      // callers deliberately provide a finite sequence of event timestamps.
+      const startedAt = new Date().toISOString();
+      const firstForecastId = Number(
+        this.sqlite
+          .prepare("SELECT COALESCE(MAX(id), 0) + 1 AS id FROM round_forecasts")
+          .get().id,
+      );
+      this.sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS predictive_leader_challenger_cohorts (
+          challenger_key TEXT PRIMARY KEY CHECK (length(trim(challenger_key)) > 0),
+          schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+          algorithm_version TEXT NOT NULL CHECK (
+            length(trim(algorithm_version)) > 0
+          ),
+          mode TEXT NOT NULL CHECK (mode = 'prospective-shadow'),
+          first_forecast_id INTEGER NOT NULL CHECK (first_forecast_id > 0),
+          started_at TEXT NOT NULL,
+          config_json TEXT NOT NULL CHECK (
+            json_valid(config_json)
+            AND json_type(config_json) = 'object'
+          ),
+          created_at TEXT NOT NULL,
+          UNIQUE(algorithm_version),
+          UNIQUE(challenger_key, schema_version, algorithm_version),
+          CHECK (started_at = created_at)
+        );
+
+        CREATE TABLE IF NOT EXISTS forecast_predictive_challenger_snapshots (
+          forecast_id INTEGER NOT NULL REFERENCES round_forecasts(id),
+          challenger_key TEXT NOT NULL,
+          schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+          algorithm_version TEXT NOT NULL CHECK (
+            length(trim(algorithm_version)) > 0
+          ),
+          status TEXT NOT NULL CHECK (status IN ('ready', 'unavailable')),
+          locked_at TEXT NOT NULL,
+          history_max_result_id INTEGER REFERENCES round_results(id),
+          training_through_forecast_id INTEGER REFERENCES round_forecasts(id),
+          training_through_result_id INTEGER REFERENCES round_results(id),
+          training_count INTEGER NOT NULL CHECK (training_count >= 0),
+          predicted_number INTEGER CHECK (
+            predicted_number IS NULL OR predicted_number BETWEEN 0 AND 36
+          ),
+          score REAL CHECK (score IS NULL OR score BETWEEN 0 AND 1),
+          snapshot_json TEXT NOT NULL CHECK (
+            json_valid(snapshot_json)
+            AND json_type(snapshot_json) = 'object'
+          ),
+          created_at TEXT NOT NULL,
+          PRIMARY KEY (forecast_id, challenger_key),
+          FOREIGN KEY (challenger_key, schema_version, algorithm_version)
+            REFERENCES predictive_leader_challenger_cohorts(
+              challenger_key, schema_version, algorithm_version
+            ),
+          CHECK (locked_at <= created_at),
+          CHECK (json_extract(snapshot_json, '$.schemaVersion') = schema_version),
+          CHECK (json_extract(snapshot_json, '$.algorithmVersion') = algorithm_version),
+          CHECK (json_extract(snapshot_json, '$.status') = status),
+          CHECK (json_extract(snapshot_json, '$.lockedAt') = locked_at),
+          CHECK (json_extract(snapshot_json, '$.learning.trainingCount') = training_count),
+          CHECK (
+            (
+              status = 'ready'
+              AND predicted_number IS NOT NULL
+              AND score IS NOT NULL
+              AND json_extract(snapshot_json, '$.leaderNumber') = predicted_number
+              AND json_extract(snapshot_json, '$.leaderMass') = score
+            )
+            OR
+            (
+              status = 'unavailable'
+              AND predicted_number IS NULL
+              AND score IS NULL
+              AND json_type(snapshot_json, '$.leaderNumber') = 'null'
+              AND json_type(snapshot_json, '$.leaderMass') = 'null'
+            )
+          ),
+          CHECK (
+            (training_count = 0 AND training_through_forecast_id IS NULL
+              AND training_through_result_id IS NULL)
+            OR
+            (training_count > 0 AND training_through_forecast_id IS NOT NULL
+              AND training_through_result_id IS NOT NULL)
+          )
+        );
+
+        CREATE INDEX IF NOT EXISTS forecast_predictive_challenger_algorithm_idx
+          ON forecast_predictive_challenger_snapshots(
+            challenger_key, algorithm_version, status, forecast_id DESC
+          );
+      `);
+      this.sqlite
+        .prepare(`
+          INSERT INTO predictive_leader_challenger_cohorts (
+            challenger_key, schema_version, algorithm_version, mode,
+            first_forecast_id, started_at, config_json, created_at
+          ) VALUES (?, ?, ?, 'prospective-shadow', ?, ?, ?, ?)
+          ON CONFLICT(challenger_key) DO NOTHING
+        `)
+        .run(
+          PREDICTIVE_LEADER_V6_CHALLENGER_KEY,
+          LEARNED_LEADER_V6_SCHEMA_VERSION,
+          LEARNED_LEADER_V6_ALGORITHM_VERSION,
+          firstForecastId,
+          startedAt,
+          JSON.stringify(LEARNED_LEADER_V6_DEFAULTS),
+          startedAt,
+        );
+      this.sqlite.exec("PRAGMA user_version = 20; COMMIT");
     } catch (error) {
       try {
         this.sqlite.exec("ROLLBACK");
@@ -9242,6 +9782,63 @@ export class RouletteDatabase {
     ];
   }
 
+  #predictiveLeaderV6PriceSources(shadow, forecastId, lockedAt) {
+    const adaptive = shadow?.integration?.adaptive;
+    const numberRanking = shadow?.integration?.numberRanking;
+    if (
+      shadow?.status !== "ready"
+      || shadow.modelVersion !== TRAJECTORY_SHADOW_ADAPTIVE_VERSION
+      || shadow.cutoffAt !== lockedAt
+      || !Number.isSafeInteger(adaptive?.trainingCount)
+      || adaptive.trainingCount < TRAJECTORY_RANK37_MIN_TRAINING_COUNT
+      || numberRanking?.version !== TRAJECTORY_RANK37_VERSION
+      || numberRanking?.basis !== TRAJECTORY_RANK37_BASIS
+      || numberRanking?.candidateCount !== 37
+      || !Number.isSafeInteger(numberRanking?.evidenceCandidateCount)
+      || numberRanking.evidenceCandidateCount
+        < TRAJECTORY_RANK37_MIN_EVIDENCE_CANDIDATES
+      || !Array.isArray(numberRanking.ranking)
+      || numberRanking.ranking.length !== 37
+    ) return [];
+
+    const numbers = [];
+    const weights = [];
+    const seen = new Set();
+    for (let index = 0; index < numberRanking.ranking.length; index += 1) {
+      const candidate = numberRanking.ranking[index];
+      const number = Number(candidate?.number);
+      const mass = Number(candidate?.mass);
+      if (
+        candidate?.rank !== index + 1
+        || !Number.isInteger(number)
+        || number < 0
+        || number > 36
+        || seen.has(number)
+        || !Number.isFinite(mass)
+        || mass < 0
+        || mass > 1
+      ) return [];
+      seen.add(number);
+      numbers.push(number);
+      weights.push(mass);
+    }
+    const total = weights.reduce((sum, weight) => sum + weight, 0);
+    if (Math.abs(total - 1) > 1e-9) return [];
+    return [{
+      id: "price-trajectory-rank37-smoothed",
+      family: "price",
+      numbers,
+      weights: weights.map((weight) => weight / total),
+      cursor: {
+        forecastId,
+        cutoffAt: lockedAt,
+        massKind: "smoothed",
+        evidenceCandidateCount: numberRanking.evidenceCandidateCount,
+        rank37Version: TRAJECTORY_RANK37_VERSION,
+      },
+    }];
+  }
+
   #predictiveLeaderConditionalSources({
     source,
     instrument,
@@ -9559,6 +10156,103 @@ export class RouletteDatabase {
       learningRows.push({
         id: String(forecastId),
         algorithmVersion: LEARNED_LEADER_ALGORITHM_VERSION,
+        lockedAt: decision.lockedAt,
+        completedAt: row.settled_at,
+        actualNumber: Number(row.actual_number),
+        familyDistributions: decision.familyDistributions,
+      });
+      resultIdByForecastId.set(String(forecastId), Number(row.round_result_id));
+    }
+    return { learningRows, resultIdByForecastId };
+  }
+
+  #predictiveLeaderV6LearningRows(source, instrument, horizonSeconds, lockedAt) {
+    const rows = this.sqlite
+      .prepare(`
+        SELECT
+          challengers.forecast_id,
+          challengers.schema_version,
+          challengers.algorithm_version,
+          challengers.status,
+          challengers.locked_at AS challenger_locked_at,
+          challengers.training_count,
+          challengers.predicted_number,
+          challengers.score,
+          challengers.snapshot_json,
+          challengers.created_at AS challenger_created_at,
+          snapshots.locked_at,
+          forecasts.created_at AS forecast_created_at,
+          settlements.round_result_id,
+          settlements.actual_number,
+          settlements.settled_at,
+          settlements.created_at AS settlement_created_at,
+          results.observed_at AS result_observed_at,
+          results.created_at AS result_created_at
+        FROM forecast_predictive_challenger_snapshots AS challengers
+        JOIN round_forecasts AS forecasts ON forecasts.id = challengers.forecast_id
+        JOIN forecast_snapshots AS snapshots ON snapshots.id = forecasts.snapshot_id
+        JOIN forecast_settlements AS settlements
+          ON settlements.forecast_id = challengers.forecast_id
+        JOIN round_results AS results ON results.id = settlements.round_result_id
+        WHERE snapshots.source = ?
+          AND snapshots.instrument = ?
+          AND snapshots.horizon_seconds = ?
+          AND challengers.challenger_key = ?
+          AND challengers.schema_version = ?
+          AND challengers.algorithm_version = ?
+          AND challengers.status = 'ready'
+          AND challengers.created_at < ?
+          AND challengers.locked_at < ?
+          AND forecasts.created_at < ?
+          AND snapshots.locked_at < ?
+          AND settlements.settled_at < ?
+          AND settlements.created_at < ?
+          AND results.settled_at < ?
+          AND results.observed_at < ?
+          AND results.created_at < ?
+        ORDER BY settlements.settled_at DESC, challengers.forecast_id DESC
+        LIMIT ?
+      `)
+      .all(
+        source,
+        instrument,
+        horizonSeconds,
+        PREDICTIVE_LEADER_V6_CHALLENGER_KEY,
+        LEARNED_LEADER_V6_SCHEMA_VERSION,
+        LEARNED_LEADER_V6_ALGORITHM_VERSION,
+        lockedAt,
+        lockedAt,
+        lockedAt,
+        lockedAt,
+        lockedAt,
+        lockedAt,
+        lockedAt,
+        lockedAt,
+        lockedAt,
+        PREDICTIVE_LEADER_V6_LEARNING_LIMIT,
+      );
+    const learningRows = [];
+    const resultIdByForecastId = new Map();
+    for (const row of rows) {
+      const decision = normalizeLearnedLeaderV6Decision(
+        deserializeJson(row.snapshot_json),
+      );
+      if (
+        !decision
+        || !validLearnedLeaderV6Audit(decision)
+        || decision.status !== "ready"
+        || decision.lockedAt !== row.challenger_locked_at
+        || decision.lockedAt !== row.locked_at
+        || Number(row.schema_version) !== LEARNED_LEADER_V6_SCHEMA_VERSION
+        || row.algorithm_version !== LEARNED_LEADER_V6_ALGORITHM_VERSION
+        || Number(row.training_count) !== decision.learning.trainingCount
+        || Number(row.predicted_number) !== decision.leaderNumber
+        || Math.abs(Number(row.score) - decision.leaderMass) > 1e-12
+      ) continue;
+      const forecastId = Number(row.forecast_id);
+      learningRows.push({
+        id: String(forecastId),
+        algorithmVersion: LEARNED_LEADER_V6_ALGORITHM_VERSION,
         lockedAt: decision.lockedAt,
         completedAt: row.settled_at,
         actualNumber: Number(row.actual_number),
@@ -10303,6 +10997,162 @@ export class RouletteDatabase {
     });
   }
 
+  #recordPredictiveLeaderV6ChallengerSnapshot(forecastId, trajectoryShadow) {
+    return this.#transaction(() => {
+      const cohort = this.sqlite
+        .prepare(`
+          SELECT *
+          FROM predictive_leader_challenger_cohorts
+          WHERE challenger_key = ? AND algorithm_version = ?
+        `)
+        .get(
+          PREDICTIVE_LEADER_V6_CHALLENGER_KEY,
+          LEARNED_LEADER_V6_ALGORITHM_VERSION,
+        );
+      if (!cohort || Number(forecastId) < Number(cohort.first_forecast_id)) {
+        return { inserted: false, reason: "outside_prospective_cohort" };
+      }
+      const existing = this.sqlite
+        .prepare(`
+          SELECT forecast_id
+          FROM forecast_predictive_challenger_snapshots
+          WHERE forecast_id = ? AND challenger_key = ?
+        `)
+        .get(forecastId, PREDICTIVE_LEADER_V6_CHALLENGER_KEY);
+      if (existing) return { inserted: false, reason: "already_frozen" };
+
+      const parent = this.sqlite
+        .prepare(`
+          SELECT
+            forecasts.id AS forecast_id,
+            snapshots.source,
+            snapshots.instrument,
+            snapshots.external_round_id,
+            snapshots.horizon_seconds,
+            snapshots.locked_at,
+            snapshots.betting_closes_at,
+            settlements.forecast_id AS settlement_forecast_id
+          FROM round_forecasts AS forecasts
+          JOIN forecast_snapshots AS snapshots ON snapshots.id = forecasts.snapshot_id
+          LEFT JOIN forecast_settlements AS settlements
+            ON settlements.forecast_id = forecasts.id
+          WHERE forecasts.id = ?
+        `)
+        .get(forecastId);
+      if (!parent || parent.settlement_forecast_id != null) {
+        throw new Error("v6 challenger requires an unsettled frozen forecast");
+      }
+      const knownTarget = this.sqlite
+        .prepare(`
+          SELECT id
+          FROM round_results
+          WHERE source = ? AND instrument = ? AND external_round_id = ?
+          LIMIT 1
+        `)
+        .get(parent.source, parent.instrument, parent.external_round_id);
+      if (knownTarget) {
+        throw new Error("v6 challenger cannot be captured after its result");
+      }
+      const createdAt = asTimestamp(
+        this.clock(),
+        undefined,
+        "predictive leader v6 challenger createdAt",
+      );
+      if (
+        Date.parse(createdAt) < Date.parse(parent.locked_at)
+        || Date.parse(parent.betting_closes_at) - Date.parse(createdAt) < 5_000
+      ) {
+        throw new RangeError(
+          "v6 challenger must be stored at least five seconds before betting closes",
+        );
+      }
+
+      const conditional = this.#predictiveLeaderConditionalSources({
+        source: parent.source,
+        instrument: parent.instrument,
+        externalRoundId: parent.external_round_id,
+        lockedAt: parent.locked_at,
+      });
+      const sources = [
+        ...this.#predictiveLeaderV6PriceSources(
+          trajectoryShadow,
+          forecastId,
+          parent.locked_at,
+        ),
+        ...conditional.sources,
+      ];
+      const learning = this.#predictiveLeaderV6LearningRows(
+        parent.source,
+        parent.instrument,
+        Number(parent.horizon_seconds),
+        parent.locked_at,
+      );
+      const decision = buildLearnedLeaderV6Decision({
+        sources,
+        learningRows: learning.learningRows,
+        lockedAt: parent.locked_at,
+        tieSeed: `${conditional.historyMaxResultId ?? "none"}:${parent.external_round_id}`,
+      });
+      const normalized = normalizeLearnedLeaderV6Decision(decision);
+      if (!normalized || !validLearnedLeaderV6Audit(normalized)) {
+        throw new Error("v6 challenger builder returned an invalid snapshot");
+      }
+      const trainingThroughForecastId = decision.learning.trainingThroughId == null
+        ? null
+        : Number(decision.learning.trainingThroughId);
+      const trainingThroughResultId = decision.learning.trainingThroughId == null
+        ? null
+        : learning.resultIdByForecastId.get(decision.learning.trainingThroughId) ?? null;
+      if (
+        decision.learning.trainingCount > 0
+        && (
+          !Number.isSafeInteger(trainingThroughForecastId)
+          || !Number.isSafeInteger(trainingThroughResultId)
+        )
+      ) {
+        throw new Error("v6 challenger training cursor is incomplete");
+      }
+      this.sqlite
+        .prepare(`
+          INSERT INTO forecast_predictive_challenger_snapshots (
+            forecast_id, challenger_key, schema_version, algorithm_version,
+            status, locked_at, history_max_result_id,
+            training_through_forecast_id, training_through_result_id,
+            training_count, predicted_number, score, snapshot_json, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `)
+        .run(
+          forecastId,
+          PREDICTIVE_LEADER_V6_CHALLENGER_KEY,
+          LEARNED_LEADER_V6_SCHEMA_VERSION,
+          LEARNED_LEADER_V6_ALGORITHM_VERSION,
+          decision.status,
+          decision.lockedAt,
+          conditional.historyMaxResultId,
+          trainingThroughForecastId,
+          trainingThroughResultId,
+          decision.learning.trainingCount,
+          decision.leaderNumber,
+          decision.leaderMass,
+          JSON.stringify(decision),
+          createdAt,
+        );
+      const commitCheckedAt = asTimestamp(
+        this.clock(),
+        undefined,
+        "predictive leader v6 challenger commitCheckedAt",
+      );
+      if (
+        Date.parse(parent.betting_closes_at) - Date.parse(commitCheckedAt) < 5_000
+      ) {
+        throw new RangeError(
+          "v6 challenger transaction must finish at least five seconds before betting closes",
+        );
+      }
+      return { inserted: true, reason: "frozen" };
+    });
+  }
+
   #buildForecastPairSnapshot({
     source,
     instrument,
@@ -10994,6 +11844,27 @@ export class RouletteDatabase {
       );
     }
 
+    try {
+      this.#recordPredictiveLeaderV6ChallengerSnapshot(
+        primaryOutcome.forecastId,
+        trajectoryShadow,
+      );
+    } catch (error) {
+      emitLog(
+        this.logger,
+        "error",
+        {
+          error,
+          source,
+          instrument,
+          externalRoundId,
+          forecastId: primaryOutcome.forecastId,
+          challengerKey: PREDICTIVE_LEADER_V6_CHALLENGER_KEY,
+        },
+        "predictive leader v6 shadow persistence failed without affecting v5",
+      );
+    }
+
     return { inserted: primaryOutcome.inserted, roundId: externalRoundId };
   }
 
@@ -11481,6 +12352,204 @@ export class RouletteDatabase {
         LEARNED_LEADER_SCHEMA_VERSION,
         LEARNED_LEADER_ALGORITHM_VERSION,
       );
+  }
+
+  #predictiveLeaderV6MetricRows(source, instrument, firstForecastId) {
+    return this.sqlite
+      .prepare(`
+        SELECT
+          forecasts.id AS forecast_id,
+          snapshots.source,
+          snapshots.instrument,
+          snapshots.external_round_id,
+          snapshots.horizon_seconds,
+          snapshots.lead_time_ms,
+          snapshots.betting_closes_at,
+          snapshots.round_ends_at,
+          snapshots.locked_at,
+          challengers.forecast_id AS challenger_forecast_id,
+          challengers.challenger_key,
+          challengers.schema_version AS challenger_schema_version,
+          challengers.algorithm_version AS challenger_algorithm_version,
+          challengers.status AS challenger_status,
+          challengers.locked_at AS challenger_locked_at,
+          challengers.history_max_result_id AS challenger_history_max_result_id,
+          challengers.training_through_forecast_id
+            AS challenger_training_through_forecast_id,
+          challengers.training_through_result_id
+            AS challenger_training_through_result_id,
+          challenger_training_settlements.round_result_id
+            AS challenger_expected_training_result_id,
+          challengers.training_count AS challenger_training_count,
+          challengers.predicted_number AS challenger_predicted_number,
+          challengers.score AS challenger_score,
+          challengers.snapshot_json AS challenger_snapshot_json,
+          challengers.created_at AS challenger_created_at,
+          leaders.forecast_id AS leader_forecast_id,
+          leaders.schema_version AS leader_schema_version,
+          leaders.algorithm_version AS leader_algorithm_version,
+          leaders.status AS leader_status,
+          leaders.locked_at AS leader_locked_at,
+          leaders.history_max_result_id AS leader_history_max_result_id,
+          leaders.training_through_forecast_id
+            AS leader_training_through_forecast_id,
+          leaders.training_through_result_id
+            AS leader_training_through_result_id,
+          leader_training_settlements.round_result_id
+            AS leader_expected_training_result_id,
+          leaders.training_count AS leader_training_count,
+          leaders.predicted_number AS leader_predicted_number,
+          leaders.score AS leader_score,
+          leaders.snapshot_json AS leader_snapshot_json,
+          leaders.created_at AS leader_created_at,
+          settlements.round_result_id,
+          settlements.actual_number,
+          settlements.settled_at,
+          settlements.created_at AS settlement_created_at
+        FROM round_forecasts AS forecasts
+        JOIN forecast_snapshots AS snapshots ON snapshots.id = forecasts.snapshot_id
+        LEFT JOIN forecast_predictive_challenger_snapshots AS challengers
+          ON challengers.forecast_id = forecasts.id
+          AND challengers.challenger_key = ?
+          AND challengers.algorithm_version = ?
+        LEFT JOIN forecast_settlements AS challenger_training_settlements
+          ON challenger_training_settlements.forecast_id =
+            challengers.training_through_forecast_id
+        LEFT JOIN forecast_predictive_leader_snapshots AS leaders
+          ON leaders.forecast_id = forecasts.id
+          AND leaders.algorithm_version = ?
+        LEFT JOIN forecast_settlements AS leader_training_settlements
+          ON leader_training_settlements.forecast_id =
+            leaders.training_through_forecast_id
+        LEFT JOIN forecast_settlements AS settlements
+          ON settlements.forecast_id = forecasts.id
+        WHERE snapshots.source = ?
+          AND snapshots.instrument = ?
+          AND forecasts.id >= ?
+        ORDER BY forecasts.id DESC
+        LIMIT ?
+      `)
+      .all(
+        PREDICTIVE_LEADER_V6_CHALLENGER_KEY,
+        LEARNED_LEADER_V6_ALGORITHM_VERSION,
+        LEARNED_LEADER_ALGORITHM_VERSION,
+        source,
+        instrument,
+        firstForecastId,
+        PREDICTIVE_LEADER_V6_METRIC_WINDOW_LIMIT,
+      )
+      .reverse();
+  }
+
+  #predictiveLeaderV6CohortCounts(source, instrument, firstForecastId) {
+    const rows = this.sqlite
+      .prepare(`
+        SELECT snapshots.horizon_seconds, COUNT(*) AS eligible_count
+        FROM round_forecasts AS forecasts
+        JOIN forecast_snapshots AS snapshots ON snapshots.id = forecasts.snapshot_id
+        WHERE snapshots.source = ?
+          AND snapshots.instrument = ?
+          AND forecasts.id >= ?
+        GROUP BY snapshots.horizon_seconds
+        ORDER BY snapshots.horizon_seconds
+      `)
+      .all(source, instrument, firstForecastId);
+    const byHorizon = new Map(rows.map((row) => [
+      Number(row.horizon_seconds),
+      Number(row.eligible_count),
+    ]));
+    return {
+      total: [...byHorizon.values()].reduce((sum, count) => sum + count, 0),
+      byHorizon,
+    };
+  }
+
+  getPredictiveLeaderChallengerState(
+    source = "buleto",
+    instrument = "default",
+  ) {
+    this.#assertOpen();
+    const safeSource = asNonEmptyText(source, undefined, "source");
+    const safeInstrument = asNonEmptyText(instrument, undefined, "instrument");
+    const cohort = this.sqlite
+      .prepare(`
+        SELECT *
+        FROM predictive_leader_challenger_cohorts
+        WHERE challenger_key = ?
+      `)
+      .get(PREDICTIVE_LEADER_V6_CHALLENGER_KEY);
+    const config = deserializeJson(cohort?.config_json);
+    if (
+      !cohort
+      || Number(cohort.schema_version) !== LEARNED_LEADER_V6_SCHEMA_VERSION
+      || cohort.algorithm_version !== LEARNED_LEADER_V6_ALGORITHM_VERSION
+      || cohort.mode !== "prospective-shadow"
+      || !Number.isSafeInteger(Number(cohort.first_forecast_id))
+      || Number(cohort.first_forecast_id) < 1
+      || !Number.isFinite(Date.parse(cohort.started_at))
+      || JSON.stringify(config) !== JSON.stringify(LEARNED_LEADER_V6_DEFAULTS)
+    ) throw new Error("predictive leader v6 challenger cohort is invalid");
+
+    const firstForecastId = Number(cohort.first_forecast_id);
+    const cohortCounts = this.#predictiveLeaderV6CohortCounts(
+      safeSource,
+      safeInstrument,
+      firstForecastId,
+    );
+    const rows = this.#predictiveLeaderV6MetricRows(
+      safeSource,
+      safeInstrument,
+      firstForecastId,
+    );
+    const latestRow = rows.at(-1) ?? null;
+    const latestChallenger = latestRow
+      ? mapForecastPredictiveLeaderV6(latestRow)
+      : null;
+    const latestChampion = latestRow
+      ? mapForecastPredictiveLeader(latestRow)
+      : null;
+    const latest = latestRow
+      ? {
+          forecastId: Number(latestRow.forecast_id),
+          roundId: latestRow.external_round_id,
+          horizonSeconds: Number(latestRow.horizon_seconds),
+          leadSeconds: Number(latestRow.lead_time_ms) / 1_000,
+          lockedAt: latestRow.locked_at,
+          bettingClosesAt: latestRow.betting_closes_at,
+          roundEndsAt: latestRow.round_ends_at,
+          challenger: latestChallenger,
+          champion: latestChampion,
+          settlement: latestRow.actual_number == null
+            ? null
+            : {
+                resultId: Number(latestRow.round_result_id),
+                actualNumber: Number(latestRow.actual_number),
+                settledAt: latestRow.settled_at,
+                createdAt: latestRow.settlement_created_at,
+              },
+        }
+      : null;
+    return {
+      schemaVersion: 1,
+      challengerKey: PREDICTIVE_LEADER_V6_CHALLENGER_KEY,
+      algorithmVersion: LEARNED_LEADER_V6_ALGORITHM_VERSION,
+      championAlgorithmVersion: LEARNED_LEADER_ALGORITHM_VERSION,
+      mode: "prospective-shadow",
+      executionEnabled: false,
+      advisoryOnly: true,
+      source: safeSource,
+      instrument: safeInstrument,
+      cohort: {
+        firstForecastId: Number(cohort.first_forecast_id),
+        startedAt: cohort.started_at,
+        config,
+      },
+      latest,
+      metrics: mapPredictiveLeaderV6Metrics(rows, cohort, {
+        cohortEligibleForecastCount: cohortCounts.total,
+        cohortHorizonCounts: cohortCounts.byHorizon,
+      }),
+    };
   }
 
   #predictiveLeaderAccountState(source, instrument) {
