@@ -232,6 +232,44 @@ test(
       assert.equal(leaderPost.headers.get("cache-control"), "no-store");
       assert.deepEqual(await leaderPost.json(), { error: "Метод не разрешён" });
 
+      const hitBreakdownResponse = await fetch(
+        `${baseUrl}/api/predictive-leader/hit-breakdown`,
+      );
+      assert.equal(hitBreakdownResponse.status, 200, logs());
+      assert.match(
+        hitBreakdownResponse.headers.get("content-type") ?? "",
+        /^application\/json\b/,
+      );
+      assert.equal(hitBreakdownResponse.headers.get("cache-control"), "no-store");
+      const hitBreakdown = await hitBreakdownResponse.json();
+      assert.equal(hitBreakdown.schemaVersion, 1);
+      assert.equal(hitBreakdown.algorithmVersion, LEARNED_LEADER_ALGORITHM_VERSION);
+      assert.equal(hitBreakdown.mode, "observation");
+      assert.equal(hitBreakdown.executionEnabled, false);
+      assert.equal(hitBreakdown.advisoryOnly, true);
+      assert.equal(hitBreakdown.source, SOURCE);
+      assert.equal(hitBreakdown.instrument, INSTRUMENT);
+      assert.equal(hitBreakdown.scope, "all-valid-settled-v5-forecasts");
+      assert.equal(hitBreakdown.integrity.status, "ok");
+      assert.equal(hitBreakdown.totals.settledCount, 0);
+      assert.equal(hitBreakdown.items.length, 37);
+      assert.equal(new Date(hitBreakdown.serverTime).toISOString(), hitBreakdown.serverTime);
+
+      const hitBreakdownHead = await fetch(
+        `${baseUrl}/api/predictive-leader/hit-breakdown`,
+        { method: "HEAD" },
+      );
+      assert.equal(hitBreakdownHead.status, 200, logs());
+      assert.equal(hitBreakdownHead.headers.get("cache-control"), "no-store");
+      assert.equal(await hitBreakdownHead.text(), "");
+
+      const hitBreakdownPost = await fetch(
+        `${baseUrl}/api/predictive-leader/hit-breakdown`,
+        { method: "POST" },
+      );
+      assert.equal(hitBreakdownPost.status, 405, logs());
+      assert.deepEqual(await hitBreakdownPost.json(), { error: "Метод не разрешён" });
+
       const response = await fetch(`${baseUrl}/api/virtual-bettor`);
       assert.equal(response.status, 200, logs());
       assert.match(response.headers.get("content-type") ?? "", /^application\/json\b/);

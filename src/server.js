@@ -391,6 +391,19 @@ function predictiveLeaderChallengersForApi() {
   };
 }
 
+function predictiveLeaderHitBreakdownForApi() {
+  const source = 'buleto';
+  const instrument = config.instrument;
+  const breakdown = cachedDatabaseRead(
+    `predictive-leader-hit-breakdown:${source}:${instrument}`,
+    () => db.getPredictiveLeaderHitBreakdown(source, instrument),
+  );
+  return {
+    ...breakdown,
+    serverTime: new Date().toISOString(),
+  };
+}
+
 function clampLimit(rawValue, fallback, max) {
   if (rawValue === null || rawValue === '') return fallback;
   const value = Number(rawValue);
@@ -528,6 +541,11 @@ const server = createServer((request, response) => {
 
     if (pathname === '/api/predictive-leader/challengers') {
       sendJson(response, 200, predictiveLeaderChallengersForApi());
+      return;
+    }
+
+    if (pathname === '/api/predictive-leader/hit-breakdown') {
+      sendJson(response, 200, predictiveLeaderHitBreakdownForApi());
       return;
     }
 

@@ -4050,6 +4050,184 @@ function mapPredictiveLeaderMetrics(rows) {
   };
 }
 
+function mapPredictiveLeaderHitEntry(row) {
+  const leader = mapForecastPredictiveLeader(row);
+  return {
+    forecastId: Number(row.forecast_id),
+    horizonSeconds: Number(row.horizon_seconds),
+    leader: leader === null
+      ? null
+      : {
+          status: leader.status,
+          forecastId: leader.forecastId,
+          lockedAt: leader.lockedAt,
+          leaderNumber: leader.leaderNumber,
+          evaluation: leader.evaluation === null
+            ? null
+            : {
+                actualNumber: leader.evaluation.actualNumber,
+                top1Hit: leader.evaluation.top1Hit,
+                settledAt: leader.evaluation.settledAt,
+              },
+        },
+  };
+}
+
+function mapPredictiveLeaderHitBreakdown(entries, source, instrument) {
+  const validEntries = entries.filter(({ leader }) => leader !== null);
+  const readyEntries = validEntries.filter(({ leader }) => leader.status === "ready");
+  const unavailableCount = validEntries.reduce(
+    (total, { leader }) => total + Number(leader.status === "unavailable"),
+    0,
+  );
+  const settledEntries = readyEntries.filter(({ leader }) => leader.evaluation !== null);
+  const pendingCount = readyEntries.length - settledEntries.length;
+  const buckets = new Map(ROULETTE_NUMBERS.map((number) => [number, {
+    number,
+    predictionCount: 0,
+    actualCount: 0,
+    hitCount: 0,
+  }]));
+
+  for (const { leader } of settledEntries) {
+    const predictedNumber = Number(leader.leaderNumber);
+    const actualNumber = Number(leader.evaluation.actualNumber);
+    const predictedBucket = buckets.get(predictedNumber);
+    const actualBucket = buckets.get(actualNumber);
+    if (!predictedBucket || !actualBucket) {
+      throw new Error("predictive leader hit breakdown contains an invalid roulette number");
+    }
+    predictedBucket.predictionCount += 1;
+    actualBucket.actualCount += 1;
+    if (leader.evaluation.top1Hit) predictedBucket.hitCount += 1;
+  }
+
+  const settledCount = settledEntries.length;
+  const hitCount = settledEntries.reduce(
+    (total, { leader }) => total + Number(leader.evaluation.top1Hit),
+    0,
+  );
+  const ratio = (numerator, denominator) => (
+    denominator > 0 ? numerator / denominator : null
+  );
+  const items = [...buckets.values()]
+    .map((bucket) => ({
+      number: bucket.number,
+      predictionCount: bucket.predictionCount,
+      predictionRate: ratio(bucket.predictionCount, settledCount),
+      actualCount: bucket.actualCount,
+      actualRate: ratio(bucket.actualCount, settledCount),
+      hitCount: bucket.hitCount,
+      missCount: bucket.predictionCount - bucket.hitCount,
+      shareOfAllHits: ratio(bucket.hitCount, hitCount),
+      hitRateWhenPredicted: ratio(bucket.hitCount, bucket.predictionCount),
+      hitRateWhenPredictedWilson95: wilsonInterval(
+        bucket.hitCount,
+        bucket.predictionCount,
+      ),
+      recognitionRateWhenActual: ratio(bucket.hitCount, bucket.actualCount),
+      recognitionRateWhenActualWilson95: wilsonInterval(
+        bucket.hitCount,
+        bucket.actualCount,
+      ),
+    }))
+    .sort((left, right) => (
+      right.hitCount - left.hitCount
+      || (right.hitRateWhenPredicted ?? -1) - (left.hitRateWhenPredicted ?? -1)
+      || right.predictionCount - left.predictionCount
+      || left.number - right.number
+    ));
+
+  const predictionCount = items.reduce((total, item) => total + item.predictionCount, 0);
+  const actualCount = items.reduce((total, item) => total + item.actualCount, 0);
+  const itemHitCount = items.reduce((total, item) => total + item.hitCount, 0);
+  const validCount = validEntries.length;
+  const invalidCount = entries.length - validCount;
+  const itemNumbers = new Set(items.map((item) => item.number));
+  const rateFields = items.flatMap((item) => [
+    item.predictionRate,
+    item.actualRate,
+    item.shareOfAllHits,
+    item.hitRateWhenPredicted,
+    item.recognitionRateWhenActual,
+  ]);
+  if (
+    items.length !== ROULETTE_NUMBERS.length
+    || itemNumbers.size !== ROULETTE_NUMBERS.length
+    || ROULETTE_NUMBERS.some((number) => !itemNumbers.has(number))
+    || predictionCount !== settledCount
+    || actualCount !== settledCount
+    || itemHitCount !== hitCount
+    || items.some((item) => (
+      item.hitCount > item.predictionCount
+      || item.hitCount > item.actualCount
+      || item.missCount !== item.predictionCount - item.hitCount
+    ))
+    || rateFields.some((rate) => (
+      rate !== null && (!Number.isFinite(rate) || rate < 0 || rate > 1)
+    ))
+    || readyEntries.length !== settledCount + pendingCount
+    || validCount !== readyEntries.length + unavailableCount
+    || entries.length !== validCount + invalidCount
+  ) {
+    throw new Error("predictive leader hit breakdown invariants failed");
+  }
+
+  const settledLeaders = settledEntries.map(({ leader }) => leader);
+  const settledAt = settledEntries
+    .map(({ leader }) => leader.evaluation.settledAt)
+    .sort();
+  const horizonSeconds = [...new Set(settledEntries.map((entry) => (
+    entry.horizonSeconds
+  )))]
+    .filter((value) => Number.isSafeInteger(value) && value > 0)
+    .sort((left, right) => left - right);
+
+  return {
+    schemaVersion: 1,
+    algorithmVersion: LEARNED_LEADER_ALGORITHM_VERSION,
+    mode: "observation",
+    executionEnabled: false,
+    advisoryOnly: true,
+    source,
+    instrument,
+    scope: "all-valid-settled-v5-forecasts",
+    integrity: {
+      status: invalidCount === 0 ? "ok" : "degraded",
+      storedCount: entries.length,
+      validCount,
+      invalidCount,
+      readyCount: readyEntries.length,
+      unavailableCount,
+      settledCount,
+      pendingCount,
+    },
+    period: {
+      firstForecastId: settledLeaders[0]?.forecastId ?? null,
+      lastForecastId: settledLeaders.at(-1)?.forecastId ?? null,
+      firstLockedAt: settledLeaders[0]?.lockedAt ?? null,
+      lastLockedAt: settledLeaders.at(-1)?.lockedAt ?? null,
+      firstSettledAt: settledAt[0] ?? null,
+      lastSettledAt: settledAt.at(-1) ?? null,
+    },
+    horizonSeconds,
+    totals: {
+      settledCount,
+      hitCount,
+      missCount: settledCount - hitCount,
+      hitRate: ratio(hitCount, settledCount),
+      hitRateWilson95: wilsonInterval(hitCount, settledCount),
+    },
+    sort: [
+      "hitCount:desc",
+      "hitRateWhenPredicted:desc:nulls-last",
+      "predictionCount:desc",
+      "number:asc",
+    ],
+    items,
+  };
+}
+
 function mapPrecloseForecast(row) {
   if (!row) return null;
   const rawRankedNumbers = deserializeJson(row.ranked_numbers_json);
@@ -4262,6 +4440,7 @@ export class RouletteDatabase {
     this.trajectoryAdaptiveValidationCache = new Map();
     this.trajectoryAdaptiveValidationCacheHits = 0;
     this.trajectoryAdaptiveValidationCacheMisses = 0;
+    this.predictiveLeaderHitBreakdownCache = new Map();
     this.closed = false;
     this.sqlite = new DatabaseSync(path);
 
@@ -12354,6 +12533,156 @@ export class RouletteDatabase {
       );
   }
 
+  #predictiveLeaderHitBreakdownRows(
+    source,
+    instrument,
+    { forecastIds = null } = {},
+  ) {
+    let cursorClause = "";
+    let cursorValues = [];
+    if (forecastIds !== null) {
+      if (!Array.isArray(forecastIds)) {
+        throw new TypeError("forecastIds must be an array");
+      }
+      const safeForecastIds = [...new Set(forecastIds.map(Number))]
+        .filter((id) => Number.isSafeInteger(id) && id > 0)
+        .sort((left, right) => left - right);
+      if (safeForecastIds.length === 0) return [];
+      cursorClause = `
+        AND leaders.forecast_id IN (
+          SELECT CAST(value AS INTEGER) FROM json_each(?)
+        )
+      `;
+      cursorValues = [JSON.stringify(safeForecastIds)];
+    }
+
+    return this.sqlite
+      .prepare(`
+        SELECT
+          forecasts.id AS forecast_id,
+          snapshots.horizon_seconds,
+          snapshots.locked_at,
+          leaders.forecast_id AS leader_forecast_id,
+          leaders.schema_version AS leader_schema_version,
+          leaders.algorithm_version AS leader_algorithm_version,
+          leaders.status AS leader_status,
+          leaders.locked_at AS leader_locked_at,
+          leaders.history_max_result_id AS leader_history_max_result_id,
+          leaders.training_through_forecast_id
+            AS leader_training_through_forecast_id,
+          leaders.training_through_result_id
+            AS leader_training_through_result_id,
+          leader_training_settlements.round_result_id
+            AS leader_expected_training_result_id,
+          leaders.training_count AS leader_training_count,
+          leaders.predicted_number AS leader_predicted_number,
+          leaders.score AS leader_score,
+          leaders.snapshot_json AS leader_snapshot_json,
+          leaders.created_at AS leader_created_at,
+          settlements.round_result_id,
+          settlements.actual_number,
+          settlements.settled_at,
+          settlements.created_at AS settlement_created_at
+        FROM forecast_predictive_leader_snapshots AS leaders
+        JOIN round_forecasts AS forecasts ON forecasts.id = leaders.forecast_id
+        JOIN forecast_snapshots AS snapshots ON snapshots.id = forecasts.snapshot_id
+        LEFT JOIN forecast_settlements AS settlements
+          ON settlements.forecast_id = forecasts.id
+        LEFT JOIN forecast_settlements AS leader_training_settlements
+          ON leader_training_settlements.forecast_id =
+            leaders.training_through_forecast_id
+        WHERE snapshots.source = ?
+          AND snapshots.instrument = ?
+          AND leaders.schema_version = ?
+          AND leaders.algorithm_version = ?
+          ${cursorClause}
+        ORDER BY leaders.forecast_id
+      `)
+      .all(
+        source,
+        instrument,
+        LEARNED_LEADER_SCHEMA_VERSION,
+        LEARNED_LEADER_ALGORITHM_VERSION,
+        ...cursorValues,
+      );
+  }
+
+  #predictiveLeaderHitBreakdownIds(source, instrument) {
+    return this.sqlite
+      .prepare(`
+        SELECT leaders.forecast_id
+        FROM forecast_predictive_leader_snapshots AS leaders
+        JOIN round_forecasts AS forecasts ON forecasts.id = leaders.forecast_id
+        JOIN forecast_snapshots AS snapshots ON snapshots.id = forecasts.snapshot_id
+        WHERE snapshots.source = ?
+          AND snapshots.instrument = ?
+          AND leaders.schema_version = ?
+          AND leaders.algorithm_version = ?
+        ORDER BY leaders.forecast_id
+      `)
+      .all(
+        source,
+        instrument,
+        LEARNED_LEADER_SCHEMA_VERSION,
+        LEARNED_LEADER_ALGORITHM_VERSION,
+      )
+      .map((row) => Number(row.forecast_id));
+  }
+
+  getPredictiveLeaderHitBreakdown(
+    source = "buleto",
+    instrument = "default",
+  ) {
+    this.#assertOpen();
+    const safeSource = asNonEmptyText(source, undefined, "source");
+    const safeInstrument = asNonEmptyText(instrument, undefined, "instrument");
+    const cacheKey = JSON.stringify([
+      safeSource,
+      safeInstrument,
+      LEARNED_LEADER_ALGORITHM_VERSION,
+    ]);
+    let cached = this.predictiveLeaderHitBreakdownCache.get(cacheKey);
+    const storeRows = (rows) => {
+      for (const row of rows) {
+        const entry = mapPredictiveLeaderHitEntry(row);
+        cached.entries.set(entry.forecastId, entry);
+      }
+    };
+
+    if (!cached) {
+      cached = { entries: new Map() };
+      storeRows(this.#predictiveLeaderHitBreakdownRows(
+        safeSource,
+        safeInstrument,
+      ));
+      this.predictiveLeaderHitBreakdownCache.set(cacheKey, cached);
+    } else {
+      const storedForecastIds = this.#predictiveLeaderHitBreakdownIds(
+        safeSource,
+        safeInstrument,
+      );
+      const storedForecastIdSet = new Set(storedForecastIds);
+      for (const forecastId of cached.entries.keys()) {
+        if (!storedForecastIdSet.has(forecastId)) cached.entries.delete(forecastId);
+      }
+      const pendingForecastIds = [...cached.entries.values()]
+        .filter(({ leader }) => leader?.status === "ready" && leader.evaluation === null)
+        .map(({ forecastId }) => forecastId);
+      const missingForecastIds = storedForecastIds.filter(
+        (forecastId) => !cached.entries.has(forecastId),
+      );
+      storeRows(this.#predictiveLeaderHitBreakdownRows(
+        safeSource,
+        safeInstrument,
+        { forecastIds: [...new Set([...pendingForecastIds, ...missingForecastIds])] },
+      ));
+    }
+
+    const entries = [...cached.entries.values()]
+      .sort((left, right) => left.forecastId - right.forecastId);
+    return mapPredictiveLeaderHitBreakdown(entries, safeSource, safeInstrument);
+  }
+
   #predictiveLeaderV6MetricRows(source, instrument, firstForecastId) {
     return this.sqlite
       .prepare(`
@@ -13748,6 +14077,7 @@ export class RouletteDatabase {
     }
     this.sqlite.close();
     this.trajectoryAdaptiveValidationCache.clear();
+    this.predictiveLeaderHitBreakdownCache.clear();
     this.closed = true;
   }
 }
