@@ -281,6 +281,8 @@ import {
     cycleComparisonError: false,
     stateLoaded: false,
     stateError: false,
+    precloseForecastLoaded: false,
+    precloseForecastError: false,
     predictiveLeaderSnapshot: null,
     predictiveLeaderLoaded: false,
     predictiveLeaderError: false,
@@ -307,6 +309,7 @@ import {
     lastSyncAt: null,
     refreshing: false,
     refreshQueued: false,
+    refreshQueuedNotify: false,
     refreshTimer: null,
     eventSource: null,
     lastRenderedResultKey: null,
@@ -1208,142 +1211,249 @@ import {
   async function refreshAll({ notify = false } = {}) {
     if (store.refreshing) {
       store.refreshQueued = true;
+      store.refreshQueuedNotify ||= notify;
       return;
     }
 
     window.clearTimeout(store.refreshTimer);
     store.refreshTimer = null;
     store.refreshing = true;
-    elements.refreshButton.classList.add("is-loading");
-    elements.refreshButton.disabled = true;
-    elements.main.setAttribute("aria-busy", "true");
-
-    const requests = await Promise.allSettled([
-      fetchJson("/api/state"),
-      fetchJson("/api/results?limit=80"),
-      fetchJson("/api/cycles?limit=10"),
-      fetchJson("/api/sequences?limit=50"),
-      fetchJson("/api/pairs"),
-      fetchJson("/api/forecasts/hits?limit=20"),
-      fetchJson("/api/cycle-comparison"),
-      fetchJson("/api/predictive-leader"),
-      fetchJson("/api/trajectory-direction/challenger")
-    ]);
-
+    const showGlobalBusy = notify || !store.hasCompletedInitialRender;
+    if (showGlobalBusy) {
+      elements.refreshButton.classList.add("is-loading");
+      elements.refreshButton.disabled = true;
+      elements.main.setAttribute("aria-busy", "true");
+    }
     let successfulRequests = 0;
+    const requestCount = 10;
+    const settledFetch = async (url) => {
+      try {
+        return { status: "fulfilled", value: await fetchJson(url) };
+      } catch (reason) {
+        return { status: "rejected", reason };
+      }
+    };
 
-    if (requests[0].status === "fulfilled") {
-      store.state = requests[0].value;
-      store.stateLoaded = true;
-      store.stateError = false;
-      captureServerClock(store.state?.serverTime);
-      successfulRequests += 1;
-    } else {
-      store.stateError = true;
-    }
-    if (requests[1].status === "fulfilled") {
-      store.results = extractItems(requests[1].value);
-      store.resultsLoaded = true;
-      store.resultsError = false;
-      successfulRequests += 1;
-    } else {
-      store.resultsError = true;
-    }
-    if (requests[2].status === "fulfilled") {
-      store.cycles = extractItems(requests[2].value);
-      successfulRequests += 1;
-    }
-    if (requests[3].status === "fulfilled") {
-      store.triples = extractItems(requests[3].value);
-      store.triplesHasMore = requests[3].value?.hasMore === true;
-      store.triplesLoaded = true;
-      store.triplesError = false;
-      successfulRequests += 1;
-    } else {
-      store.triplesError = true;
-    }
-    if (requests[4].status === "fulfilled") {
-      store.pairs = extractItems(requests[4].value);
-      store.followerHitCurve = requests[4].value?.top5HitByHorizon ?? null;
-      store.pairsLoaded = true;
-      store.pairsError = false;
-      successfulRequests += 1;
-    } else {
-      store.pairsError = true;
-    }
-    if (requests[5].status === "fulfilled") {
-      store.forecastHits = extractItems(requests[5].value);
-      store.forecastHitsHasMore = requests[5].value?.hasMore === true;
-      store.forecastHitsLoaded = true;
-      store.forecastHitsError = false;
-      successfulRequests += 1;
-    } else {
-      store.forecastHitsError = true;
-    }
-    if (requests[6].status === "fulfilled") {
-      store.cycleComparison = requests[6].value;
-      store.cycleComparisonLoaded = true;
-      store.cycleComparisonError = false;
-      successfulRequests += 1;
-    } else {
-      store.cycleComparisonError = true;
-    }
-    if (requests[7].status === "fulfilled") {
-      const snapshot = normalizePredictiveLeaderApiSnapshot(requests[7].value);
-      const account = snapshot?.account === null
-        ? null
-        : normalizedPredictiveLeaderAccount(snapshot?.account);
-      store.predictiveLeaderLoaded = true;
-      if (snapshot && (snapshot.account === null || account)) {
-        store.predictiveLeaderSnapshot = { ...snapshot, account };
-        store.predictiveLeaderError = false;
-        store.predictiveLeaderRequiresFreshSnapshot = false;
-        captureServerClock(snapshot.serverTime);
+    try {
+      let renderingFailure = null;
+      const renderAvailableData = () => {
+        try {
+          renderAll();
+        } catch (error) {
+          renderingFailure ??= error;
+        }
+      };
+
+      // The lightweight state is the critical path. Render it before starting
+      // archival reads so a full forecast audit cannot hold the dashboard.
+      const stateRequest = await settledFetch("/api/state/core");
+      if (stateRequest.status === "fulfilled") {
+        const retainedPrecloseForecast = store.state?.precloseForecast;
+        store.state = retainedPrecloseForecast
+          ? { ...stateRequest.value, precloseForecast: retainedPrecloseForecast }
+          : stateRequest.value;
+        store.stateLoaded = true;
+        store.stateError = false;
+        captureServerClock(store.state?.serverTime);
         successfulRequests += 1;
+        store.lastSyncAt = new Date();
       } else {
-        store.predictiveLeaderSnapshot = null;
-        store.predictiveLeaderError = true;
+        store.stateError = true;
+        if (!store.hasCompletedInitialRender) {
+          try {
+            renderFetchFailure();
+          } catch (error) {
+            renderingFailure ??= error;
+          }
+          setConnection("error", "Основной API недоступен");
+          elements.refreshButton.classList.remove("is-loading");
+          elements.refreshButton.disabled = false;
+          elements.main.removeAttribute("aria-busy");
+        }
       }
-    } else {
-      store.predictiveLeaderSnapshot = null;
-      store.predictiveLeaderLoaded = true;
-      store.predictiveLeaderError = true;
-    }
-    if (requests[8].status === "fulfilled") {
-      store.trajectoryDirectionChallengerLoaded = true;
-      if (normalizedTrajectoryDirectionChallenger(requests[8].value)) {
-        store.trajectoryDirectionChallengerSnapshot = requests[8].value;
-        store.trajectoryDirectionChallengerError = false;
-        successfulRequests += 1;
+      if (stateRequest.status === "fulfilled" || store.hasCompletedInitialRender) {
+        renderAvailableData();
+      }
+
+      const optionalRequests = [
+        {
+          url: "/api/results?limit=80",
+          apply(payload) {
+            store.results = extractItems(payload);
+            store.resultsLoaded = true;
+            store.resultsError = false;
+            return true;
+          },
+          fail() { store.resultsError = true; },
+        },
+        {
+          url: "/api/cycles?limit=10",
+          apply(payload) {
+            store.cycles = extractItems(payload);
+            return true;
+          },
+          fail() {},
+        },
+        {
+          url: "/api/sequences?limit=50",
+          apply(payload) {
+            store.triples = extractItems(payload);
+            store.triplesHasMore = payload?.hasMore === true;
+            store.triplesLoaded = true;
+            store.triplesError = false;
+            return true;
+          },
+          fail() { store.triplesError = true; },
+        },
+        {
+          url: "/api/pairs",
+          apply(payload) {
+            store.pairs = extractItems(payload);
+            store.followerHitCurve = payload?.top5HitByHorizon ?? null;
+            store.pairsLoaded = true;
+            store.pairsError = false;
+            return true;
+          },
+          fail() { store.pairsError = true; },
+        },
+        {
+          url: "/api/forecasts/hits?limit=20",
+          apply(payload) {
+            store.forecastHits = extractItems(payload);
+            store.forecastHitsHasMore = payload?.hasMore === true;
+            store.forecastHitsLoaded = true;
+            store.forecastHitsError = false;
+            return true;
+          },
+          fail() { store.forecastHitsError = true; },
+        },
+        {
+          url: "/api/cycle-comparison",
+          apply(payload) {
+            store.cycleComparison = payload;
+            store.cycleComparisonLoaded = true;
+            store.cycleComparisonError = false;
+            return true;
+          },
+          fail() { store.cycleComparisonError = true; },
+        },
+        {
+          url: "/api/predictive-leader",
+          apply(payload) {
+            const snapshot = normalizePredictiveLeaderApiSnapshot(payload);
+            const account = snapshot?.account === null
+              ? null
+              : normalizedPredictiveLeaderAccount(snapshot?.account);
+            store.predictiveLeaderLoaded = true;
+            if (!snapshot || (snapshot.account !== null && !account)) {
+              store.predictiveLeaderSnapshot = null;
+              store.predictiveLeaderError = true;
+              return false;
+            }
+            store.predictiveLeaderSnapshot = { ...snapshot, account };
+            store.predictiveLeaderError = false;
+            store.predictiveLeaderRequiresFreshSnapshot = false;
+            captureServerClock(snapshot.serverTime);
+            return true;
+          },
+          fail() {
+            store.predictiveLeaderSnapshot = null;
+            store.predictiveLeaderLoaded = true;
+            store.predictiveLeaderError = true;
+          },
+        },
+        {
+          url: "/api/trajectory-direction/challenger",
+          apply(payload) {
+            store.trajectoryDirectionChallengerLoaded = true;
+            if (!normalizedTrajectoryDirectionChallenger(payload)) {
+              store.trajectoryDirectionChallengerSnapshot = null;
+              store.trajectoryDirectionChallengerError = true;
+              return false;
+            }
+            store.trajectoryDirectionChallengerSnapshot = payload;
+            store.trajectoryDirectionChallengerError = false;
+            return true;
+          },
+          fail() {
+            store.trajectoryDirectionChallengerSnapshot = null;
+            store.trajectoryDirectionChallengerLoaded = true;
+            store.trajectoryDirectionChallengerError = true;
+          },
+        },
+        {
+          url: "/api/forecasts",
+          deferUntilLightweightDispatch: true,
+          apply(payload) {
+            store.precloseForecastLoaded = true;
+            if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+              store.precloseForecastError = true;
+              return false;
+            }
+            store.state = {
+              ...(store.state ?? {}),
+              precloseForecast: payload,
+            };
+            store.precloseForecastError = false;
+            return true;
+          },
+          fail() {
+            store.precloseForecastLoaded = true;
+            store.precloseForecastError = true;
+          },
+        },
+      ];
+
+      const optionalTasks = optionalRequests.map(async (request) => {
+        if (request.deferUntilLightweightDispatch) await Promise.resolve();
+        const result = await settledFetch(request.url);
+        const accepted = result.status === "fulfilled"
+          ? request.apply(result.value)
+          : (request.fail(), false);
+        if (accepted) {
+          successfulRequests += 1;
+          store.lastSyncAt = new Date();
+        }
+        // Each optional source settles independently. A slow archive read no
+        // longer withholds faster leader/challenger/results updates.
+        if (accepted || store.hasCompletedInitialRender) renderAvailableData();
+      });
+      const optionalOutcomes = await Promise.allSettled(optionalTasks);
+      const optionalFailure = optionalOutcomes.find(
+        (outcome) => outcome.status === "rejected",
+      );
+      if (optionalFailure) throw optionalFailure.reason;
+      if (renderingFailure) throw renderingFailure;
+
+      if (successfulRequests > 0) {
+        if (notify) {
+          announce(successfulRequests === requestCount
+            ? "Данные обновлены"
+            : "Данные обновлены частично");
+        }
+        if (!store.eventSource || store.eventSource.readyState !== EventSource.OPEN) {
+          const complete = successfulRequests === requestCount;
+          setConnection(
+            complete ? "connecting" : "error",
+            complete ? "API доступен" : "Данные получены частично",
+          );
+        }
       } else {
-        store.trajectoryDirectionChallengerSnapshot = null;
-        store.trajectoryDirectionChallengerError = true;
+        renderFetchFailure();
+        setConnection("error", "API недоступен");
+        if (notify) announce("Не удалось обновить данные");
       }
-    } else {
-      store.trajectoryDirectionChallengerSnapshot = null;
-      store.trajectoryDirectionChallengerLoaded = true;
-      store.trajectoryDirectionChallengerError = true;
+    } catch (error) {
+      console.error("[dashboard] refresh failed", error);
+      setConnection("error", "Ошибка обновления");
+      if (notify) announce("Не удалось полностью обновить данные");
+    } finally {
+      store.refreshing = false;
+      elements.refreshButton.classList.remove("is-loading");
+      elements.refreshButton.disabled = false;
+      elements.main.removeAttribute("aria-busy");
+      scheduleQueuedRefresh();
     }
-
-    if (successfulRequests > 0) {
-      store.lastSyncAt = new Date();
-      renderAll();
-      if (notify) announce(successfulRequests === requests.length ? "Данные обновлены" : "Данные обновлены частично");
-      if (!store.eventSource || store.eventSource.readyState !== EventSource.OPEN) {
-        setConnection(successfulRequests === requests.length ? "connecting" : "error", successfulRequests === requests.length ? "API доступен" : "Данные получены частично");
-      }
-    } else {
-      renderFetchFailure();
-      setConnection("error", "API недоступен");
-      if (notify) announce("Не удалось обновить данные");
-    }
-
-    store.refreshing = false;
-    elements.refreshButton.classList.remove("is-loading");
-    elements.refreshButton.disabled = false;
-    elements.main.removeAttribute("aria-busy");
-
-    scheduleQueuedRefresh();
   }
 
   function latestResultForRender() {
@@ -2340,7 +2450,7 @@ import {
       elements.trajectoryShadowBadge.textContent = "Не обновлено";
       setTextIfChanged(
         elements.trajectoryShadowObserved,
-        "Фактическая диаграмма текущего раунда недоступна: /api/state не обновился.",
+        "Фактическая диаграмма текущего раунда недоступна: архив прогноза не обновился.",
       );
       elements.trajectoryShadowObserved.title = "";
       setTextIfChanged(
@@ -2349,7 +2459,7 @@ import {
       );
       setTextIfChanged(
         elements.trajectoryShadowShares,
-        "Архивное основание прогноза недоступно до свежего ответа /api/state.",
+        "Архивное основание прогноза недоступно до свежего ответа сервера.",
       );
       setTextIfChanged(
         elements.trajectoryShadowNumberArea,
@@ -3666,7 +3776,16 @@ import {
     );
   }
 
-  function renderPrecloseTrajectoryMetrics(trajectoryMetrics, { failed = false } = {}) {
+  function renderPrecloseTrajectoryMetrics(
+    trajectoryMetrics,
+    { failed = false, loading = false } = {},
+  ) {
+    if (loading) {
+      elements.precloseSampleCount.textContent = "—";
+      elements.precloseSampleCount.title = "Загружаем статистику Rank‑37.";
+      elements.precloseTop3Rate.textContent = "Загрузка…";
+      return;
+    }
     if (failed) {
       elements.precloseSampleCount.textContent = "—";
       elements.precloseSampleCount.title = "Статистика Rank‑37 не обновлена.";
@@ -3693,6 +3812,8 @@ import {
     const forecastState = stateAvailable
       ? store.state?.precloseForecast || null
       : null;
+    const forecastFailed = store.stateError || store.precloseForecastError === true;
+    const forecastLoading = store.precloseForecastLoaded === false;
     const latest = forecastState?.latest || null;
     const currentRound = stateAvailable
       ? store.state?.collector?.currentRound || null
@@ -3706,6 +3827,7 @@ import {
       ? null
       : Math.max(0, Math.ceil((closesMs - nowMs) / 1_000));
     const matchesCurrent = stateAvailable
+      && !forecastFailed
       && latest !== null
       && currentRoundId !== null
       && latestRoundId === currentRoundId;
@@ -3718,12 +3840,15 @@ import {
     const trajectoryMetrics = normalizedTrajectoryMetrics(
       forecastState?.trajectoryMetrics,
     );
-    renderPrecloseTrajectoryMetrics(trajectoryMetrics, { failed: store.stateError });
+    renderPrecloseTrajectoryMetrics(trajectoryMetrics, {
+      failed: forecastFailed,
+      loading: forecastLoading,
+    });
     renderPrecloseComparison(matchesCurrent ? latest : null, trajectory, shadow);
     renderTrajectoryShadow(
       matchesCurrent ? latest?.trajectoryShadow : null,
       forecastState?.trajectoryMetrics,
-      { failed: store.stateError },
+      { failed: forecastFailed },
     );
     renderTrajectoryDirectionChallenger(
       store.trajectoryDirectionChallengerSnapshot,
@@ -3740,27 +3865,44 @@ import {
         createElement(
           "li",
           "empty-state",
-          store.stateError
+          forecastFailed
             ? "Актуальный прогноз скрыт: состояние сервера не обновилось."
+            : forecastLoading
+              ? "Загружаем зафиксированный прогноз отдельно от основного экрана."
             : "Прогноз этого раунда ещё не зафиксирован.",
         ),
       );
       elements.precloseLivePrice.textContent = "—";
       elements.precloseProjectedPrice.textContent = "—";
 
-      if (store.stateError) {
+      if (forecastFailed) {
         elements.precloseRanking.setAttribute("aria-busy", "false");
         elements.precloseComparison.dataset.state = "unavailable";
         elements.precloseComparison.setAttribute("aria-busy", "false");
         elements.precloseComparisonBadge.textContent = "Не обновлено";
         setTextIfChanged(
           elements.precloseComparisonStatus,
-          "Rank‑37 скрыт до свежего ответа /api/state.",
+          "Rank‑37 скрыт до свежего ответа сервера с архивом прогнозов.",
         );
         elements.preclosePanel.dataset.state = "error";
         elements.precloseBadge.textContent = "Не обновлено";
-        elements.precloseStatus.textContent = "Не удалось подтвердить текущий раунд через /api/state. Старый Rank‑37 и старое направление скрыты.";
+        elements.precloseStatus.textContent = "Не удалось обновить основной экран или архив прогноза. Старый Rank‑37 и старое направление скрыты.";
         elements.precloseTiming.textContent = "Запрос будет повторён автоматически; отсчёт по старому раунду остановлен.";
+        return;
+      }
+
+      if (forecastLoading) {
+        elements.precloseComparison.dataset.state = "loading";
+        elements.precloseComparison.setAttribute("aria-busy", "true");
+        elements.precloseComparisonBadge.textContent = "Загрузка…";
+        setTextIfChanged(
+          elements.precloseComparisonStatus,
+          "Основной экран уже доступен; полный архив Rank‑37 загружается отдельно.",
+        );
+        elements.preclosePanel.dataset.state = "loading";
+        elements.precloseBadge.textContent = "Загрузка…";
+        elements.precloseStatus.textContent = "Получаем зафиксированный прогноз текущего раунда.";
+        elements.precloseTiming.textContent = "Тяжёлый аудит истории больше не задерживает основной экран.";
         return;
       }
 
@@ -7300,6 +7442,10 @@ import {
   }
 
   function scheduleRefresh() {
+    if (store.refreshing) {
+      store.refreshQueued = true;
+      return;
+    }
     window.clearTimeout(store.refreshTimer);
     store.refreshTimer = window.setTimeout(() => {
       store.refreshTimer = null;
@@ -7310,7 +7456,13 @@ import {
   function scheduleQueuedRefresh() {
     if (!store.refreshQueued) return;
     store.refreshQueued = false;
-    scheduleRefresh();
+    const notify = store.refreshQueuedNotify;
+    store.refreshQueuedNotify = false;
+    window.clearTimeout(store.refreshTimer);
+    store.refreshTimer = window.setTimeout(() => {
+      store.refreshTimer = null;
+      refreshAll({ notify });
+    }, REFRESH_DEBOUNCE_MS);
   }
 
   function connectEventStream() {
@@ -7337,6 +7489,7 @@ import {
       } catch {
         reason = "";
       }
+      if (reason === "connected") return;
       if (reason === "gap") announce("Обнаружен пропуск в истории результатов");
       scheduleRefresh();
     });

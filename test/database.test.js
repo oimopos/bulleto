@@ -3934,7 +3934,7 @@ test("predictive leader failure cannot roll back the forecast or trajectory shad
     database.sqlite.exec("DROP TRIGGER reject_predictive_leader");
     assert.deepEqual(
       database.recordPrecloseForecast(precloseForecast("leader-isolated")),
-      { inserted: false, roundId: "leader-isolated" },
+      { inserted: false, roundId: "leader-isolated", repaired: true },
     );
     assert.equal(
       database.sqlite

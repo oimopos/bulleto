@@ -119,10 +119,19 @@ db.reconcilePredictiveLeaderAccount('buleto', config.instrument);
 const DATABASE_WRITE_UPDATE_REASONS = new Set([
   'gap',
   'results',
-  'forecast',
   'forecast-settled',
   'predictive-leader-account',
 ]);
+const FORECAST_DATABASE_READ_CACHE_KEYS = new Set([
+  'dashboard-api-state',
+  'preclose-forecast-state',
+  'predictive-leader-state',
+  'predictive-leader-challengers-state',
+]);
+const FORECAST_DATABASE_READ_CACHE_KEY_PREFIXES = [
+  'trajectory-direction-challenger-state:',
+  'predictive-leader-hit-breakdown:',
+];
 const MAX_DATABASE_READ_CACHE_ENTRIES = 32;
 const databaseReadCache = new Map();
 let databaseReadGeneration = 0;
@@ -148,6 +157,23 @@ function cachedDatabaseRead(key, read) {
 function invalidateDatabaseReadCache() {
   databaseReadGeneration += 1;
   databaseReadCache.clear();
+}
+
+function invalidateForecastDatabaseReads() {
+  for (const key of databaseReadCache.keys()) {
+    if (
+      FORECAST_DATABASE_READ_CACHE_KEYS.has(key)
+      || FORECAST_DATABASE_READ_CACHE_KEY_PREFIXES.some(
+        (prefix) => key.startsWith(prefix),
+      )
+    ) {
+      databaseReadCache.delete(key);
+    }
+  }
+}
+
+function forecastOutcomeChanged(outcome) {
+  return outcome?.inserted === true || outcome?.repaired === true;
 }
 
 function securityHeaders(extra = {}) {
@@ -177,7 +203,9 @@ function sendJson(response, statusCode, body) {
 }
 
 function broadcastUpdate(reason) {
-  if (DATABASE_WRITE_UPDATE_REASONS.has(reason)) {
+  if (reason === 'forecast') {
+    invalidateForecastDatabaseReads();
+  } else if (DATABASE_WRITE_UPDATE_REASONS.has(reason)) {
     invalidateDatabaseReadCache();
   }
   const chunk = `event: update\ndata: ${JSON.stringify({ reason, at: new Date().toISOString() })}\n\n`;
@@ -285,8 +313,8 @@ function latestResultFromDatabase() {
   );
 }
 
-function databaseStateForApi() {
-  return cachedDatabaseRead('dashboard-api-state', () => {
+function databaseCoreStateForApi() {
+  return cachedDatabaseRead('dashboard-api-core-state', () => {
     const state = dashboardDatabaseState();
     const totals = state.stats ?? state.totals ?? {};
     const incidents = state.warnings ?? state.recentIncidents ?? [];
@@ -307,7 +335,6 @@ function databaseStateForApi() {
       tripleFollowerSignal: tripleFollowerSignalFromDatabase(),
       followerTop5Tracker: followerTop5TrackerFromDatabase(),
       virtualBettor: virtualBettorStateFromDatabase(),
-      precloseForecast: precloseForecastStateFromDatabase(),
       stats: {
         totalResults: totals.totalResults ?? totals.results ?? 0,
         completedCycles: totals.completedCycles ?? 0,
@@ -321,6 +348,22 @@ function databaseStateForApi() {
       })),
     };
   });
+}
+
+function databaseStateForApi() {
+  return cachedDatabaseRead('dashboard-api-state', () => ({
+    ...databaseCoreStateForApi(),
+    precloseForecast: precloseForecastStateFromDatabase(),
+  }));
+}
+
+function dashboardCoreState() {
+  return {
+    ...databaseCoreStateForApi(),
+    collector: collector.getStatus(),
+    pipelinePending: resultPipeline.getPendingCounts(),
+    serverTime: new Date().toISOString(),
+  };
 }
 
 function dashboardState() {
@@ -490,6 +533,11 @@ const server = createServer((request, response) => {
         return;
       }
       openEventStream(request, response);
+      return;
+    }
+
+    if (pathname === '/api/state/core') {
+      sendJson(response, 200, dashboardCoreState());
       return;
     }
 
@@ -954,9 +1002,9 @@ collector.on('preclose-forecast', (forecast) => {
         `[forecast] locked round ${outcome.roundId} before betting close`,
       );
     }
-    // An idempotent retry can repair a missing trajectory/leader/challenger
-    // child row even when the primary forecast already existed.
-    broadcastUpdate('forecast');
+    // Repeated factor messages can emit the same pre-close attempt many times.
+    // Only durable primary/child changes invalidate heavy read snapshots.
+    if (forecastOutcomeChanged(outcome)) broadcastUpdate('forecast');
   } catch (error) {
     console.error('[forecast] persistence failed; waiting for the next pre-close tick', error);
   }

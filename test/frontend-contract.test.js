@@ -34,12 +34,14 @@ test("every app DOM reference exists exactly once in the dashboard", () => {
 });
 
 test("dashboard keeps the exact read-only fetch URL list", () => {
-  const fetchUrls = [...app.matchAll(/fetchJson\("([^"]+)"\)/g)].map(
-    (match) => match[1],
-  );
+  const stateUrls = [...app.matchAll(/settledFetch\("([^"]+)"\)/g)]
+    .map((match) => match[1]);
+  const optionalUrls = [...app.matchAll(/\burl: "(\/api\/[^"]+)"/g)]
+    .map((match) => match[1]);
+  const fetchUrls = [...stateUrls, ...optionalUrls];
 
   assert.deepEqual(fetchUrls, [
-    "/api/state",
+    "/api/state/core",
     "/api/results?limit=80",
     "/api/cycles?limit=10",
     "/api/sequences?limit=50",
@@ -48,11 +50,12 @@ test("dashboard keeps the exact read-only fetch URL list", () => {
     "/api/cycle-comparison",
     "/api/predictive-leader",
     "/api/trajectory-direction/challenger",
+    "/api/forecasts",
   ]);
   assert.equal(
     [...app.matchAll(/\bfetchJson\(/g)].length,
-    fetchUrls.length + 1,
-    "the helper definition plus the exact literal GET calls are the only fetchJson uses",
+    2,
+    "one helper definition and one settled dispatcher are the only fetchJson uses",
   );
 });
 
@@ -72,8 +75,10 @@ test("partial refresh marks cached dashboard state stale before rendering fresh 
     resultsError: false,
     refreshing: false,
     refreshQueued: false,
+    refreshQueuedNotify: false,
     refreshTimer: 7,
     eventSource: null,
+    hasCompletedInitialRender: true,
   };
   const classList = { add() {}, remove() {} };
   const elements = {
@@ -114,7 +119,8 @@ test("partial refresh marks cached dashboard state stale before rendering fresh 
   assert.equal(store.resultsLoaded, true);
   assert.equal(store.resultsError, false);
   assert.deepEqual(store.results, [{ id: "fresh" }]);
-  assert.deepEqual(rendered, [{ state: staleState, stateError: true }]);
+  assert.equal(rendered.length, 10, "core and nine optional outcomes render independently");
+  assert.ok(rendered.every(({ state, stateError }) => state === staleState && stateError));
 });
 
 test("trajectory challenger endpoint failure stays isolated from dashboard state", async () => {
@@ -134,7 +140,7 @@ test("trajectory challenger endpoint failure stays isolated from dashboard state
     main: { setAttribute() {}, removeAttribute() {} },
   };
   const fetchJson = async (url) => {
-    if (url === "/api/state") return { serverTime: null, collector: { currentRound: null } };
+    if (url === "/api/state/core") return { serverTime: null, collector: { currentRound: null } };
     throw new Error(`failed ${url}`);
   };
   const build = new Function(
@@ -164,9 +170,380 @@ test("trajectory challenger endpoint failure stays isolated from dashboard state
   await refreshAll();
 
   assert.equal(store.stateError, false);
+  assert.equal(store.precloseForecastLoaded, true);
+  assert.equal(store.precloseForecastError, true);
   assert.equal(store.trajectoryDirectionChallengerLoaded, true);
   assert.equal(store.trajectoryDirectionChallengerError, true);
   assert.equal(store.trajectoryDirectionChallengerSnapshot, null);
+});
+
+test("a failed forecast audit hides a retained same-round Rank-37", () => {
+  const functionStart = app.indexOf("  function renderPrecloseForecast() {");
+  const functionEnd = app.indexOf("  function renderCollector", functionStart);
+  const elements = {
+    precloseRanking: { setAttribute() {}, replaceChildren() {} },
+    precloseLivePrice: { textContent: "stale" },
+    precloseProjectedPrice: { textContent: "stale" },
+    precloseComparison: { dataset: {}, setAttribute() {} },
+    precloseComparisonBadge: { textContent: "" },
+    precloseComparisonStatus: { textContent: "" },
+    preclosePanel: { dataset: {} },
+    precloseBadge: { textContent: "" },
+    precloseStatus: { textContent: "" },
+    precloseTiming: { textContent: "" },
+  };
+  const store = {
+    state: {
+      collector: { currentRound: { id: "same-round" } },
+      precloseForecast: {
+        latest: {
+          roundId: "same-round",
+          trajectoryShadow: { direction: "up" },
+        },
+      },
+    },
+    stateError: false,
+    precloseForecastLoaded: true,
+    precloseForecastError: true,
+    trajectoryDirectionChallengerSnapshot: null,
+    trajectoryDirectionChallengerError: false,
+    trajectoryDirectionChallengerLoaded: true,
+  };
+  let comparisonForecast = "not-called";
+  let metricOptions = null;
+  let shadowOptions = null;
+  const build = new Function(
+    "store",
+    "elements",
+    "parseDate",
+    "currentTimeMs",
+    "normalizedTrajectoryMetrics",
+    "renderPrecloseTrajectoryMetrics",
+    "renderPrecloseComparison",
+    "renderTrajectoryShadow",
+    "renderTrajectoryDirectionChallenger",
+    "createElement",
+    "setTextIfChanged",
+    `"use strict"; ${app.slice(functionStart, functionEnd)}; return renderPrecloseForecast;`,
+  );
+  const render = build(
+    store,
+    elements,
+    () => null,
+    () => Date.now(),
+    () => null,
+    (_metrics, options) => { metricOptions = options; },
+    (latest) => { comparisonForecast = latest; },
+    (_shadow, _metrics, options) => { shadowOptions = options; },
+    () => {},
+    () => ({}),
+    (element, value) => { element.textContent = value; },
+  );
+
+  render();
+
+  assert.equal(comparisonForecast, null, "retained forecast must not render after audit failure");
+  assert.equal(metricOptions.failed, true);
+  assert.equal(shadowOptions.failed, true);
+  assert.equal(elements.preclosePanel.dataset.state, "error");
+  assert.equal(elements.precloseBadge.textContent, "Не обновлено");
+  assert.match(elements.precloseStatus.textContent, /Старый Rank‑37.*скрыты/);
+});
+
+test("a full initial API outage renders the explicit failure state", async () => {
+  const functionStart = app.indexOf("  async function refreshAll({ notify = false } = {}) {");
+  const functionEnd = app.indexOf("\n\n  function latestResultForRender", functionStart);
+  const store = {
+    state: null,
+    stateLoaded: false,
+    stateError: false,
+    refreshing: false,
+    refreshQueued: false,
+    refreshQueuedNotify: false,
+    refreshTimer: null,
+    eventSource: null,
+    hasCompletedInitialRender: false,
+  };
+  const pending = [];
+  let busyRemoved = 0;
+  const elements = {
+    refreshButton: { classList: { add() {}, remove() {} }, disabled: false },
+    main: { setAttribute() {}, removeAttribute() { busyRemoved += 1; } },
+  };
+  let renders = 0;
+  const failureCompleted = [];
+  const build = new Function(
+    "window",
+    "store",
+    "elements",
+    "fetchJson",
+    "renderAll",
+    "renderFetchFailure",
+    "setConnection",
+    "scheduleQueuedRefresh",
+    `"use strict"; ${app.slice(functionStart, functionEnd)}; return refreshAll;`,
+  );
+  const refreshAll = build(
+    { clearTimeout() {} },
+    store,
+    elements,
+    (url) => {
+      if (url === "/api/state/core") return Promise.reject(new Error("offline"));
+      return new Promise((resolve, reject) => pending.push({ resolve, reject }));
+    },
+    () => {
+      renders += 1;
+      store.hasCompletedInitialRender = true;
+    },
+    () => { failureCompleted.push(store.hasCompletedInitialRender); },
+    () => {},
+    () => {},
+  );
+
+  const refresh = refreshAll();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(failureCompleted, [false], "core failure must render before optional timeouts");
+  assert.equal(busyRemoved, 1, "the initial loading state must end after the core failure");
+  assert.equal(store.refreshing, true, "optional recovery may continue after the visible error");
+  assert.equal(pending.length, 9);
+
+  pending.forEach(({ reject }) => reject(new Error("offline")));
+  await refresh;
+
+  assert.equal(renders, 0, "failed sources must not turn placeholders into empty data");
+  assert.ok(failureCompleted.every((completed) => completed === false));
+  assert.equal(store.stateError, true);
+});
+
+test("core state renders before any optional endpoint settles", async () => {
+  const functionStart = app.indexOf("  async function refreshAll({ notify = false } = {}) {");
+  const functionEnd = app.indexOf("\n\n  function latestResultForRender", functionStart);
+  const sequence = [];
+  const pending = [];
+  const store = {
+    state: null,
+    stateLoaded: false,
+    stateError: false,
+    refreshing: false,
+    refreshQueued: false,
+    refreshQueuedNotify: false,
+    refreshTimer: null,
+    eventSource: null,
+    hasCompletedInitialRender: false,
+  };
+  const elements = {
+    refreshButton: { classList: { add() {}, remove() {} }, disabled: false },
+    main: { setAttribute() {}, removeAttribute() {} },
+  };
+  const fetchJson = (url) => {
+    sequence.push(`fetch:${url}`);
+    if (url === "/api/state/core") {
+      return Promise.resolve({ serverTime: null, collector: { currentRound: { id: "fresh" } } });
+    }
+    return new Promise((resolve, reject) => pending.push({ resolve, reject }));
+  };
+  const build = new Function(
+    "window",
+    "store",
+    "elements",
+    "fetchJson",
+    "extractItems",
+    "renderAll",
+    "setConnection",
+    "scheduleQueuedRefresh",
+    "captureServerClock",
+    `"use strict"; ${app.slice(functionStart, functionEnd)}; return refreshAll;`,
+  );
+  const refreshAll = build(
+    { clearTimeout() {} },
+    store,
+    elements,
+    fetchJson,
+    () => [],
+    () => {
+      sequence.push("render");
+      store.hasCompletedInitialRender = true;
+    },
+    () => {},
+    () => {},
+    () => {},
+  );
+
+  const refresh = refreshAll();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const firstRender = sequence.indexOf("render");
+  const firstOptionalFetch = sequence.findIndex(
+    (entry) => entry.startsWith("fetch:/api/") && entry !== "fetch:/api/state/core",
+  );
+  assert.ok(firstRender > sequence.indexOf("fetch:/api/state/core"));
+  assert.ok(firstRender < firstOptionalFetch, "core must render before optional reads start");
+  assert.equal(
+    sequence.at(-1),
+    "fetch:/api/forecasts",
+    "the synchronous full-history audit must be dispatched after lightweight reads",
+  );
+  assert.equal(store.state.collector.currentRound.id, "fresh");
+  assert.equal(store.refreshing, true, "optional reads may continue in the background");
+
+  pending.forEach(({ reject }) => reject(new Error("optional unavailable")));
+  await refresh;
+  assert.equal(store.refreshing, false);
+});
+
+test("background refresh avoids global busy state and refresh cleanup survives renderer failure", async () => {
+  const functionStart = app.indexOf("  async function refreshAll({ notify = false } = {}) {");
+  const functionEnd = app.indexOf("\n\n  function latestResultForRender", functionStart);
+  const build = new Function(
+    "window",
+    "store",
+    "elements",
+    "fetchJson",
+    "extractItems",
+    "renderAll",
+    "setConnection",
+    "scheduleQueuedRefresh",
+    "captureServerClock",
+    "console",
+    `"use strict"; ${app.slice(functionStart, functionEnd)}; return refreshAll;`,
+  );
+  const makeHarness = ({ completed, throws }) => {
+    const calls = {
+      add: 0,
+      remove: 0,
+      setBusy: 0,
+      removeBusy: 0,
+      queued: 0,
+      urls: [],
+    };
+    const store = {
+      state: null,
+      stateLoaded: false,
+      stateError: false,
+      refreshing: false,
+      refreshQueued: false,
+      refreshQueuedNotify: false,
+      refreshTimer: null,
+      eventSource: null,
+      hasCompletedInitialRender: completed,
+    };
+    const elements = {
+      refreshButton: {
+        classList: {
+          add() { calls.add += 1; },
+          remove() { calls.remove += 1; },
+        },
+        disabled: false,
+      },
+      main: {
+        setAttribute() { calls.setBusy += 1; },
+        removeAttribute() { calls.removeBusy += 1; },
+      },
+    };
+    const refreshAll = build(
+      { clearTimeout() {} },
+      store,
+      elements,
+      async (url) => {
+        calls.urls.push(url);
+        if (url === "/api/state/core") return { serverTime: null };
+        throw new Error("optional unavailable");
+      },
+      () => [],
+      () => {
+        if (throws) throw new Error("renderer failed");
+      },
+      () => {},
+      () => { calls.queued += 1; },
+      () => {},
+      { error() {} },
+    );
+    return { refreshAll, store, elements, calls };
+  };
+
+  const background = makeHarness({ completed: true, throws: false });
+  await background.refreshAll();
+  assert.equal(background.calls.add, 0);
+  assert.equal(background.calls.setBusy, 0);
+  assert.equal(background.store.refreshing, false);
+
+  const failing = makeHarness({ completed: false, throws: true });
+  await failing.refreshAll();
+  assert.equal(failing.store.refreshing, false);
+  assert.equal(failing.elements.refreshButton.disabled, false);
+  assert.equal(failing.calls.remove, 1);
+  assert.equal(failing.calls.removeBusy, 1);
+  assert.equal(failing.calls.queued, 1);
+  assert.equal(failing.calls.urls.length, 10, "one broken renderer cannot cancel independent API reads");
+});
+
+test("SSE connected is ignored and refresh storms coalesce while a refresh is active", () => {
+  const connectStart = app.indexOf("  function connectEventStream() {");
+  const connectEnd = app.indexOf("  elements.refreshButton.addEventListener", connectStart);
+  const listeners = {};
+  let scheduled = 0;
+  class FakeEventSource {
+    static OPEN = 1;
+    static CLOSED = 2;
+    constructor() { this.readyState = FakeEventSource.OPEN; }
+    addEventListener(name, listener) { listeners[name] = listener; }
+    close() {}
+  }
+  const connect = new Function(
+    "window",
+    "store",
+    "setConnection",
+    "EventSource",
+    "scheduleRefresh",
+    "announce",
+    "renderCombinedPick",
+    `"use strict"; ${app.slice(connectStart, connectEnd)}; return connectEventStream;`,
+  )(
+    { EventSource: FakeEventSource },
+    { eventSource: null, predictiveLeaderRequiresFreshSnapshot: false },
+    () => {},
+    FakeEventSource,
+    () => { scheduled += 1; },
+    () => {},
+    () => {},
+  );
+  connect();
+  listeners.update({ data: JSON.stringify({ reason: "connected" }) });
+  assert.equal(scheduled, 0);
+  listeners.update({ data: JSON.stringify({ reason: "results" }) });
+  assert.equal(scheduled, 1);
+
+  const scheduleStart = app.indexOf("  function scheduleRefresh() {");
+  const scheduleEnd = app.indexOf("  function connectEventStream()", scheduleStart);
+  let timers = 0;
+  const stormStore = {
+    refreshing: true,
+    refreshQueued: false,
+    refreshQueuedNotify: false,
+    refreshTimer: null,
+  };
+  const schedulers = new Function(
+    "window",
+    "store",
+    "REFRESH_DEBOUNCE_MS",
+    `"use strict"; ${app.slice(scheduleStart, scheduleEnd)}; return { scheduleRefresh, scheduleQueuedRefresh };`,
+  )(
+    {
+      clearTimeout() {},
+      setTimeout() { timers += 1; return timers; },
+    },
+    stormStore,
+    180,
+  );
+  schedulers.scheduleRefresh();
+  schedulers.scheduleRefresh();
+  schedulers.scheduleRefresh();
+  assert.equal(stormStore.refreshQueued, true);
+  assert.equal(timers, 0);
+  stormStore.refreshing = false;
+  schedulers.scheduleQueuedRefresh();
+  assert.equal(timers, 1, "one trailing refresh represents the whole SSE burst");
 });
 
 test("latest result selection distinguishes a fresh results response from two stale caches", () => {
@@ -259,8 +636,8 @@ test("dashboard wires predictive leader loading and SSE invalidation fail-closed
   const refreshEnd = app.indexOf("function renderFetchFailure", refreshStart);
   const refresh = app.slice(refreshStart, refreshEnd);
   assert.ok(refreshStart >= 0 && refreshEnd > refreshStart);
-  assert.match(refresh, /fetchJson\("\/api\/predictive-leader"\)/);
-  assert.match(refresh, /normalizePredictiveLeaderApiSnapshot\(requests\[7\]\.value\)/);
+  assert.match(refresh, /url: "\/api\/predictive-leader"/);
+  assert.match(refresh, /normalizePredictiveLeaderApiSnapshot\(payload\)/);
   assert.match(refresh, /normalizedPredictiveLeaderAccount\(snapshot\?\.account\)/);
   assert.match(refresh, /store\.predictiveLeaderLoaded = true/);
   assert.match(refresh, /store\.predictiveLeaderError = true/);
@@ -272,6 +649,8 @@ test("dashboard wires predictive leader loading and SSE invalidation fail-closed
   assert.ok(eventErrorStart >= 0 && eventErrorEnd > eventErrorStart);
   assert.match(eventError, /store\.predictiveLeaderRequiresFreshSnapshot = true/);
   assert.match(eventError, /renderCombinedPick\(\)/);
+  assert.match(app, /if \(reason === "connected"\) return/);
+  assert.match(app, /if \(store\.refreshing\) \{\s*store\.refreshQueued = true;\s*return;/);
 });
 
 test("combined leader is the first dashboard block and renders exactly one number", () => {
@@ -304,7 +683,7 @@ test("combined leader is the first dashboard block and renders exactly one numbe
   assert.match(block, /эвристический ранговый индекс, не вероятность и не гарантия преимущества/);
   assert.match(block, /Давность, виртуальная цель, невыпавшие числа, survivor и исторический аналог остаются только наблюдением/);
   assert.match(block, /1 из 37 \(≈2,7%\)/);
-  assert.match(html, /<script type="module" src="\/app\.js\?v=46"><\/script>/);
+  assert.match(html, /<script type="module" src="\/app\.js\?v=48"><\/script>/);
 
   assert.match(app, /from "\.\/combined-number\.js\?v=7"/);
   assert.match(app, /normalizePredictiveLeaderApiSnapshot/);
@@ -610,7 +989,7 @@ test("trajectory shadow is prospective and exposes the full Rank-37 contract", (
   assert.match(app, /график неполный/);
   assert.match(
     app,
-    /renderTrajectoryShadow\(\s*matchesCurrent \? latest\?\.trajectoryShadow : null,\s*forecastState\?\.trajectoryMetrics,\s*\{ failed: store\.stateError \},\s*\)/,
+    /renderTrajectoryShadow\(\s*matchesCurrent \? latest\?\.trajectoryShadow : null,\s*forecastState\?\.trajectoryMetrics,\s*\{ failed: forecastFailed \},\s*\)/,
   );
   assert.match(app, /shadow\.isAdaptive\s*\? shadow\.displayRange\?\.cells \?\? \[\]/);
   assert.match(app, /value\.modelVersion !== TRAJECTORY_SHADOW_ADAPTIVE_VERSION/);
@@ -1433,7 +1812,7 @@ test("warm next-round forecast exposes a strict 5-percent walk-forward contract"
   assert.match(html, /id="follower-dynamic-next-title"[^>]*>[^<]*≥5%/);
   assert.match(html, /id="follower-dynamic-next-note"[^>]*>[\s\S]*?5%/);
   assert.match(html, /styles\.css\?v=31/);
-  assert.match(html, /app\.js\?v=46/);
+  assert.match(html, /app\.js\?v=48/);
   assert.match(styles, /\.follower-dynamic-next\s*\{/);
   assert.match(styles, /\.follower-warm-current\s*\{/);
   assert.match(styles, /\.follower-warm-picks\s*\{/);
@@ -1618,7 +1997,7 @@ test("full-cycle comparison block stays hidden while preserving every renderer t
 test("cycle analogue uses the fixed 20-draw contract and renders the entire archive tail", () => {
   assert.match(app, /const CYCLE_COMPARISON_ANCHOR_DRAWS = 20/);
   assert.match(app, /const CYCLE_COMPARISON_ALGORITHM_VERSION = "cycle-analogue-prefix-v1"/);
-  assert.match(app, /fetchJson\("\/api\/cycle-comparison"\)/);
+  assert.match(app, /url: "\/api\/cycle-comparison"/);
   assert.match(app, /value\.schemaVersion !== 1/);
   assert.match(app, /value\.algorithmVersion !== CYCLE_COMPARISON_ALGORITHM_VERSION/);
   assert.match(app, /value\.interpretation !== "descriptive-not-predictive"/);
@@ -1661,7 +2040,7 @@ test("cycle comparison language is descriptive, responsive, and cache-busted", (
   assert.match(block, /не предсказывает следующее число/);
   assert.doesNotMatch(block, /должн/iu);
   assert.match(html, /href="\/styles\.css\?v=31"/);
-  assert.match(html, /src="\/app\.js\?v=46"/);
+  assert.match(html, /src="\/app\.js\?v=48"/);
   assert.match(styles, /\.cycle-sequence-list\s*\{[\s\S]*?repeat\(auto-fill, minmax\(50px, 1fr\)\)/);
   assert.match(
     styles,

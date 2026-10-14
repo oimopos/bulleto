@@ -12479,11 +12479,13 @@ export class RouletteDatabase {
       }
     }
 
+    let repairedChild = false;
     try {
-      this.#recordPredictiveLeaderSnapshot(
+      const leaderOutcome = this.#recordPredictiveLeaderSnapshot(
         primaryOutcome.forecastId,
         trajectoryShadow,
       );
+      repairedChild ||= leaderOutcome?.inserted === true;
     } catch (error) {
       emitLog(
         this.logger,
@@ -12500,10 +12502,11 @@ export class RouletteDatabase {
     }
 
     try {
-      this.#recordPredictiveLeaderV6ChallengerSnapshot(
+      const v6Outcome = this.#recordPredictiveLeaderV6ChallengerSnapshot(
         primaryOutcome.forecastId,
         trajectoryShadow,
       );
+      repairedChild ||= v6Outcome?.inserted === true;
     } catch (error) {
       emitLog(
         this.logger,
@@ -12521,9 +12524,10 @@ export class RouletteDatabase {
     }
 
     try {
-      this.#recordTrajectoryDirectionChallengerSnapshot(
+      const directionOutcome = this.#recordTrajectoryDirectionChallengerSnapshot(
         primaryOutcome.forecastId,
       );
+      repairedChild ||= directionOutcome?.inserted === true;
     } catch (error) {
       if (
         !(error instanceof RangeError) ||
@@ -12545,7 +12549,11 @@ export class RouletteDatabase {
       }
     }
 
-    return { inserted: primaryOutcome.inserted, roundId: externalRoundId };
+    return {
+      inserted: primaryOutcome.inserted,
+      roundId: externalRoundId,
+      ...(!primaryOutcome.inserted && repairedChild ? { repaired: true } : {}),
+    };
   }
 
   settlePredictiveLeaderAccount(source = "buleto", instrument = "default") {

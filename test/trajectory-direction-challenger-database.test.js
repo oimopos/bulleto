@@ -161,17 +161,27 @@ test("a challenger insert failure preserves primary, v2, and leaders and retry f
 
     database.sqlite.exec("DROP TRIGGER fail_direction_challenger_insert");
     clockMs = BASE_MS + 56_000;
-    assert.equal(database.recordPrecloseForecast(attempt).inserted, false);
+    assert.deepEqual(database.recordPrecloseForecast(attempt), {
+      inserted: false,
+      roundId: "retry",
+    });
     assert.equal(database.sqlite.prepare(
       "SELECT COUNT(*) AS count FROM forecast_trajectory_direction_challenger_snapshots",
     ).get().count, 0);
     clockMs = BASE_MS + 52_000;
-    assert.equal(database.recordPrecloseForecast(attempt).inserted, false);
+    assert.deepEqual(database.recordPrecloseForecast(attempt), {
+      inserted: false,
+      roundId: "retry",
+      repaired: true,
+    });
     const frozen = database.sqlite.prepare(`
       SELECT snapshot_json
       FROM forecast_trajectory_direction_challenger_snapshots
     `).get().snapshot_json;
-    assert.equal(database.recordPrecloseForecast(attempt).inserted, false);
+    assert.deepEqual(database.recordPrecloseForecast(attempt), {
+      inserted: false,
+      roundId: "retry",
+    });
     assert.equal(database.sqlite.prepare(`
       SELECT COUNT(*) AS count
       FROM forecast_trajectory_direction_challenger_snapshots

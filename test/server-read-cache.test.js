@@ -28,6 +28,7 @@ function cacheHarness() {
           broadcastUpdate,
           cachedDatabaseRead,
           invalidateDatabaseReadCache,
+          invalidateForecastDatabaseReads,
           generation: () => databaseReadGeneration,
           keys: () => [...databaseReadCache.keys()],
           size: () => databaseReadCache.size,
@@ -75,7 +76,6 @@ test("cache invalidates only for persisted database update reasons", () => {
   for (const reason of [
     "gap",
     "results",
-    "forecast",
     "forecast-settled",
     "predictive-leader-account",
   ]) {
@@ -84,7 +84,57 @@ test("cache invalidates only for persisted database update reasons", () => {
     assert.equal(cache.generation(), generation + 1, `${reason} must invalidate DB snapshots`);
     assert.equal(cache.cachedDatabaseRead("state", read).revision, reads);
   }
-  assert.equal(reads, 6);
+  assert.equal(reads, 5);
+
+  const generation = cache.generation();
+  const unrelated = cache.cachedDatabaseRead("number-stats", () => ({ stable: true }));
+  const core = cache.cachedDatabaseRead("dashboard-api-core-state", () => ({ stable: true }));
+  cache.cachedDatabaseRead("dashboard-api-state", () => ({ forecast: 1 }));
+  cache.cachedDatabaseRead(
+    "trajectory-direction-challenger-state:buleto:XPM/RUB",
+    () => ({ forecast: 1 }),
+  );
+  cache.broadcastUpdate("forecast");
+  assert.equal(cache.generation(), generation);
+  assert.strictEqual(
+    cache.cachedDatabaseRead("number-stats", () => ({ stable: false })),
+    unrelated,
+  );
+  assert.strictEqual(
+    cache.cachedDatabaseRead("dashboard-api-core-state", () => ({ stable: false })),
+    core,
+  );
+  assert.deepEqual(
+    cache.cachedDatabaseRead("dashboard-api-state", () => ({ forecast: 2 })),
+    { forecast: 2 },
+  );
+  assert.deepEqual(
+    cache.cachedDatabaseRead(
+      "trajectory-direction-challenger-state:buleto:XPM/RUB",
+      () => ({ forecast: 2 }),
+    ),
+    { forecast: 2 },
+  );
+});
+
+test("idempotent pre-close retries refresh readers only after a durable change", () => {
+  const changed = new Function(
+    `${functionSource("forecastOutcomeChanged")}; return forecastOutcomeChanged;`,
+  )();
+
+  assert.equal(changed({ inserted: true, roundId: "1" }), true);
+  assert.equal(changed({ inserted: false, repaired: true, roundId: "1" }), true);
+  assert.equal(changed({ inserted: false, roundId: "1" }), false);
+  assert.equal(changed(null), false);
+
+  const listenerStart = server.indexOf("collector.on('preclose-forecast'");
+  const listenerEnd = server.indexOf("collector.on('round'", listenerStart);
+  const listener = server.slice(listenerStart, listenerEnd);
+  assert.match(
+    listener,
+    /if \(forecastOutcomeChanged\(outcome\)\) broadcastUpdate\('forecast'\)/,
+  );
+  assert.doesNotMatch(listener, /\n\s*broadcastUpdate\('forecast'\);/);
 });
 
 test("read cache is bounded and keeps recently used snapshots", () => {
@@ -101,10 +151,16 @@ test("read cache is bounded and keeps recently used snapshots", () => {
   assert.equal(cache.keys().includes("key-1"), false);
 });
 
-test("heavy forecast state is shared and startup never performs a full warmup", () => {
+test("dashboard core excludes the full forecast audit while legacy state keeps it", () => {
+  const coreStateStart = server.indexOf("function databaseCoreStateForApi()");
+  const coreStateEnd = server.indexOf("function databaseStateForApi()", coreStateStart);
+  const coreState = server.slice(coreStateStart, coreStateEnd);
   const databaseStateStart = server.indexOf("function databaseStateForApi()");
-  const databaseStateEnd = server.indexOf("function dashboardState()", databaseStateStart);
+  const databaseStateEnd = server.indexOf("function dashboardCoreState()", databaseStateStart);
   const databaseState = server.slice(databaseStateStart, databaseStateEnd);
+  const coreRouteStart = server.indexOf("if (pathname === '/api/state/core')");
+  const coreRouteEnd = server.indexOf("if (pathname === '/api/state')", coreRouteStart);
+  const coreRoute = server.slice(coreRouteStart, coreRouteEnd);
   const forecastsRouteStart = server.indexOf("if (pathname === '/api/forecasts')");
   const forecastsRouteEnd = server.indexOf(
     "if (pathname === '/api/predictive-leader')",
@@ -113,7 +169,10 @@ test("heavy forecast state is shared and startup never performs a full warmup", 
   const forecastsRoute = server.slice(forecastsRouteStart, forecastsRouteEnd);
 
   assert.doesNotMatch(server, /db\.warmPrecloseForecastValidation\(/);
+  assert.match(coreState, /'dashboard-api-core-state'/);
+  assert.doesNotMatch(coreState, /precloseForecast|getPrecloseForecastState/);
   assert.match(databaseState, /precloseForecast: precloseForecastStateFromDatabase\(\)/);
+  assert.match(coreRoute, /sendJson\(response, 200, dashboardCoreState\(\)\)/);
   assert.match(forecastsRoute, /precloseForecastStateFromDatabase\(\)/);
   assert.match(server, /limit === 80[\s\S]*?'recent-results:default'/);
   assert.match(server, /limit === 20[\s\S]*?'preclose-forecast-hits:default'/);
