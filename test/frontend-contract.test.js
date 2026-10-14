@@ -677,15 +677,12 @@ test("combined leader is the first dashboard block and renders exactly one numbe
   assert.match(block, /id="combined-pick-number"/);
   assert.doesNotMatch(block, /<(?:ol|ul)\b/);
   assert.match(block, /Актуальные прогнозные сигналы · один итог/);
-  assert.match(block, /Сервер заранее фиксирует полные распределения/);
-  assert.match(block, /Семейные веса начинают с 50\/50 и меняются только по прошлым завершённым общим снимкам/);
-  assert.match(block, /текущий результат в расчёт не попадает/);
-  assert.match(block, /эвристический ранговый индекс, не вероятность и не гарантия преимущества/);
-  assert.match(block, /Давность, виртуальная цель, невыпавшие числа, survivor и исторический аналог остаются только наблюдением/);
-  assert.match(block, /1 из 37 \(≈2,7%\)/);
-  assert.match(html, /<script type="module" src="\/app\.js\?v=48"><\/script>/);
+  assert.match(block, /Команда BET закрыта/);
+  assert.match(block, /1 000 проспективных прогнозов/);
+  assert.match(block, /нижнюю границу Wilson 95% выше случайной базы 1\/37/);
+  assert.match(html, /<script type="module" src="\/app\.js\?v=49"><\/script>/);
 
-  assert.match(app, /from "\.\/combined-number\.js\?v=7"/);
+  assert.match(app, /from "\.\/combined-number\.js\?v=8"/);
   assert.match(app, /normalizePredictiveLeaderApiSnapshot/);
   assert.match(app, /predictiveLeaderNumberContext/);
   assert.match(combinedNumber, /export function normalizePredictiveLeaderApiSnapshot\(value\)/);
@@ -740,12 +737,12 @@ test("combined leader is the first dashboard block and renders exactly one numbe
   assert.ok(renderStart >= 0 && renderEnd > renderStart);
   assert.match(renderBlock, /const \{ snapshot \} = context/);
   assert.match(renderBlock, /const \{ model, metrics, number \} = snapshot/);
-  assert.match(renderBlock, /зафиксировано сервером до результата/);
+  assert.match(renderBlock, /BET-допуск подтверждён/);
   assert.match(renderBlock, /обучение \$\{model\.trainingCount\}/);
   assert.match(renderBlock, /вес цены/);
   assert.match(renderBlock, /истории/);
-  assert.match(renderBlock, /Top‑1/);
-  assert.match(renderBlock, /улучшение не гарантируется/);
+  assert.match(renderBlock, /нижняя 95% граница/);
+  assert.match(renderBlock, /WAIT — кандидат виден для наблюдения/);
   assert.doesNotMatch(renderBlock, /combineNumberRankings|leaderMass|score|вероятност/);
   assert.doesNotMatch(app, /\bcombineNumberRankings\b|\bcombinedTripleFollowerRanking\b/);
   assert.match(styles, /\.combined-pick\s*\{/);
@@ -785,15 +782,14 @@ test("predictive leader account is an independent strict paper simulation", () =
   assert.equal([...block.matchAll(/<output\b/g)].length, 1);
   assert.equal([...accountBlock.matchAll(/<output\b/g)].length, 0);
   assert.equal([...accountBlock.matchAll(/<dd\b/g)].length, 4);
-  assert.match(accountBlock, /Проспективная симуляция · один лидер/);
-  assert.match(accountBlock, /Виртуальный счёт лестницы/);
+  assert.match(accountBlock, /Эталонная симуляция · без допуска BET/);
+  assert.match(accountBlock, /Бумажный счёт лидера/);
   assert.match(accountBlock, /Текущий счёт/);
   assert.match(accountBlock, /Попадания \/ промахи/);
   assert.match(accountBlock, /Наблюдаемая частота попаданий/);
   assert.match(accountBlock, /Следующая ставка/);
-  assert.match(accountBlock, /Старт 1 000, ставка и шаг 10, максимум 2 500/);
-  assert.match(accountBlock, /Частота — прошлое наблюдение, не вероятность следующего результата/);
-  assert.match(accountBlock, /виртуальная \(«бумажная»\) симуляция; реальных ставок и действий нет/i);
+  assert.match(accountBlock, /безусловный бумажный эталон для оценки лидера/);
+  assert.match(accountBlock, /Используйте для решения только отдельное действие BET/);
 
   assert.match(app, /const PREDICTIVE_LEADER_ACCOUNT_SCHEMA_VERSION = 1/);
   assert.match(
@@ -1812,7 +1808,7 @@ test("warm next-round forecast exposes a strict 5-percent walk-forward contract"
   assert.match(html, /id="follower-dynamic-next-title"[^>]*>[^<]*≥5%/);
   assert.match(html, /id="follower-dynamic-next-note"[^>]*>[\s\S]*?5%/);
   assert.match(html, /styles\.css\?v=31/);
-  assert.match(html, /app\.js\?v=48/);
+  assert.match(html, /app\.js\?v=49/);
   assert.match(styles, /\.follower-dynamic-next\s*\{/);
   assert.match(styles, /\.follower-warm-current\s*\{/);
   assert.match(styles, /\.follower-warm-picks\s*\{/);
@@ -2040,7 +2036,7 @@ test("cycle comparison language is descriptive, responsive, and cache-busted", (
   assert.match(block, /не предсказывает следующее число/);
   assert.doesNotMatch(block, /должн/iu);
   assert.match(html, /href="\/styles\.css\?v=31"/);
-  assert.match(html, /src="\/app\.js\?v=48"/);
+  assert.match(html, /src="\/app\.js\?v=49"/);
   assert.match(styles, /\.cycle-sequence-list\s*\{[\s\S]*?repeat\(auto-fill, minmax\(50px, 1fr\)\)/);
   assert.match(
     styles,

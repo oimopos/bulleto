@@ -81,6 +81,10 @@ import {
   settlePredictiveLeaderBet,
 } from "./predictive-leader-account.js";
 import {
+  assessPredictiveLeaderQualityGate,
+  wilsonInterval,
+} from "./predictive-leader-quality-gate.js";
+import {
   CYCLE_ANALOGUE_ALGORITHM_VERSION,
   CYCLE_ANALOGUE_ANCHOR_DRAW_COUNT,
   selectCycleAnalogue,
@@ -3931,21 +3935,6 @@ function mapForecastPredictiveLeaderV6(row) {
   };
 }
 
-function wilsonInterval(hitCount, sampleSize, z = 1.959963984540054) {
-  if (!Number.isSafeInteger(sampleSize) || sampleSize <= 0) return null;
-  const rate = hitCount / sampleSize;
-  const denominator = 1 + (z ** 2) / sampleSize;
-  const center = (rate + (z ** 2) / (2 * sampleSize)) / denominator;
-  const radius = z * Math.sqrt(
-    (rate * (1 - rate) / sampleSize) + (z ** 2) / (4 * sampleSize ** 2),
-  ) / denominator;
-  return {
-    confidence: 0.95,
-    lower: Math.max(0, center - radius),
-    upper: Math.min(1, center + radius),
-  };
-}
-
 function mean(values) {
   return values.length === 0
     ? null
@@ -4184,9 +4173,11 @@ function mapPredictiveLeaderV6Metrics(rows, cohort, {
 }
 
 function mapPredictiveLeaderMetrics(rows) {
-  const leaders = rows
-    .map(mapForecastPredictiveLeader)
-    .filter((leader) => leader?.status === "ready");
+  const mapped = rows.map(mapForecastPredictiveLeader);
+  const leaders = mapped.filter((leader) => leader?.status === "ready");
+  const rawReadyCount = rows.filter(
+    (row) => row.leader_status === "ready",
+  ).length;
   const settled = leaders.filter((leader) => leader.evaluation !== null);
   const top1Hits = settled.reduce(
     (total, leader) => total + Number(leader.evaluation.top1Hit),
@@ -4215,6 +4206,10 @@ function mapPredictiveLeaderMetrics(rows) {
     uniformBrierLoss: LEARNED_LEADER_UNIFORM_BRIER_LOSS,
     beatsUniform:
       meanBrierLoss === null ? null : meanBrierLoss < LEARNED_LEADER_UNIFORM_BRIER_LOSS,
+    qualityGate: assessPredictiveLeaderQualityGate(
+      leaders,
+      rawReadyCount - leaders.length,
+    ),
   };
 }
 

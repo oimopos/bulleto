@@ -8,6 +8,7 @@ import { DatabaseSync } from "node:sqlite";
 import { createDatabase } from "../src/database.js";
 import { buildLearnedLeaderDecision } from "../src/learned-leader.js";
 import { buildLearnedLeaderV6Decision } from "../src/learned-leader-v6.js";
+import { assessPredictiveLeaderQualityGate } from "../src/predictive-leader-quality-gate.js";
 
 const BASE_TIME = Date.parse("2026-09-21T00:00:00.000Z");
 
@@ -959,6 +960,7 @@ test("pre-close forecasts enforce the five-second lock boundary and fresh factor
       meanBrierLoss: null,
       uniformBrierLoss: 18 / 37,
       beatsUniform: null,
+      qualityGate: assessPredictiveLeaderQualityGate([]),
     });
     assert.equal(
       database.sqlite
@@ -1111,6 +1113,7 @@ test("predictive leader is frozen before outcome, settles independently, and rem
       meanBrierLoss: null,
       uniformBrierLoss: 18 / 37,
       beatsUniform: null,
+      qualityGate: assessPredictiveLeaderQualityGate([{ evaluation: null }]),
     });
     let challengerState = database.getPredictiveLeaderChallengerState(
       "buleto",

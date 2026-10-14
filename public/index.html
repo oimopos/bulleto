@@ -8,7 +8,7 @@
     <meta name="description" content="Онлайн-монитор результатов рулетки и циклов исключения чисел от 0 до 36">
     <title>Круг 37 — монитор результатов</title>
     <link rel="stylesheet" href="/styles.css?v=31">
-    <script type="module" src="/app.js?v=48"></script>
+    <script type="module" src="/app.js?v=49"></script>
   </head>
   <body>
     <a class="skip-link" href="#main-content">Перейти к содержимому</a>
@@ -51,18 +51,18 @@
           <p class="eyebrow">Актуальные прогнозные сигналы · один итог</p>
           <p class="combined-pick__title" id="combined-pick-title">Одно число по прогнозным блокам</p>
           <p class="combined-pick__status" id="combined-pick-status" role="status" aria-live="polite" aria-atomic="true">Загружаем решение, зафиксированное сервером до результата.</p>
-          <p class="combined-pick__note" id="combined-pick-note">Сервер заранее фиксирует полные распределения ценовой траектории и условной истории, объединяет их в две семьи и выводит ровно одно число. Семейные веса начинают с 50/50 и меняются только по прошлым завершённым общим снимкам; текущий результат в расчёт не попадает. Давность, виртуальная цель, невыпавшие числа, survivor и исторический аналог остаются только наблюдением. Это эвристический ранговый индекс, не вероятность и не гарантия преимущества. Базовый шанс отдельного числа — 1 из 37 (≈2,7%).</p>
+          <p class="combined-pick__note" id="combined-pick-note">Сервер заранее фиксирует полные распределения ценовой траектории и условной истории, объединяет их в две семьи и выводит одного лидера-кандидата. Команда BET закрыта, пока первая фиксированная когорта из 1 000 проспективных прогнозов не покажет нижнюю границу Wilson 95% выше случайной базы 1/37. До подтверждения показывается WAIT; сам кандидат не является рекомендацией. Тест не гарантирует следующий результат.</p>
         </div>
         <div class="combined-pick__result">
-          <span class="combined-pick__label">Одно число</span>
+          <span class="combined-pick__label">Лидер-кандидат</span>
           <output class="result-ball result-ball--empty combined-pick__number" id="combined-pick-number" aria-label="Сводное число пока не рассчитано">—</output>
           <span class="combined-pick__sources" id="combined-pick-sources">Ожидаем данные</span>
         </div>
         <section class="combined-pick-account" id="combined-pick-account" data-state="loading" aria-labelledby="combined-pick-account-title" aria-describedby="combined-pick-account-note" aria-busy="true">
           <div class="combined-pick-account__header">
             <div>
-              <p class="eyebrow">Проспективная симуляция · один лидер</p>
-              <h3 id="combined-pick-account-title">Виртуальный счёт лестницы</h3>
+              <p class="eyebrow">Эталонная симуляция · без допуска BET</p>
+              <h3 id="combined-pick-account-title">Бумажный счёт лидера</h3>
             </div>
             <span class="combined-pick-account__status" id="combined-pick-account-status" role="status" aria-live="polite" aria-atomic="true">Загрузка…</span>
           </div>
@@ -88,7 +88,7 @@
               <small id="combined-pick-account-ladder">ступень — · серия —</small>
             </div>
           </dl>
-          <p class="combined-pick-account__note" id="combined-pick-account-note">На каждое заранее сохранённое число фиксируется только условная ставка. Старт 1 000, ставка и шаг 10, максимум 2 500; выплата ×36 включает возврат. Попадание сбрасывает лестницу. Частота — прошлое наблюдение, не вероятность следующего результата. Это виртуальная («бумажная») симуляция; реальных ставок и действий нет.</p>
+          <p class="combined-pick-account__note" id="combined-pick-account-note">Это безусловный бумажный эталон для оценки лидера, а не разрешённый сигнал: он может считать виртуальные ставки и до прохождения quality gate. Используйте для решения только отдельное действие BET в /api/predictive-leader; до подтверждения там будет WAIT. Реальных ставок и действий нет.</p>
         </section>
       </section>
 

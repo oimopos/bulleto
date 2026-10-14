@@ -7,7 +7,7 @@ import {
   combinedTrajectorySignals,
   normalizePredictiveLeaderApiSnapshot,
   predictiveLeaderNumberContext,
-} from "./combined-number.js?v=7";
+} from "./combined-number.js?v=8";
 
 (() => {
   "use strict";
@@ -3502,6 +3502,35 @@ import {
     };
 
     if (context.state !== "ready") {
+      if (
+        context.state === "waiting"
+        && context.reason === "confidence_not_proven"
+        && context.snapshot
+      ) {
+        const { candidateNumber, metrics } = context.snapshot;
+        const gate = metrics?.qualityGate;
+        elements.combinedPick.dataset.state = "waiting";
+        elements.combinedPick.setAttribute("aria-busy", "false");
+        elements.combinedPickNumber.className =
+          `result-ball combined-pick__number ${rouletteColorClass(candidateNumber)}`;
+        elements.combinedPickNumber.textContent = String(candidateNumber);
+        elements.combinedPickNumber.setAttribute(
+          "aria-label",
+          `Неквалифицированный кандидат: число ${candidateNumber}, ставок нет`,
+        );
+        setTextIfChanged(
+          elements.combinedPickStatus,
+          "WAIT — кандидат виден для наблюдения, но допуск к ставке не подтверждён.",
+        );
+        const qualificationText = gate.lowerBound === null
+          ? `${gate.hitCount}/${gate.sampleSize} попаданий · граница пока не рассчитана`
+          : `${gate.hitCount}/${gate.sampleSize} попаданий · нижняя 95% граница ${trajectoryShadowShareFormatter.format(gate.lowerBound)}`;
+        setTextIfChanged(
+          elements.combinedPickSources,
+          `Кандидат ${candidateNumber} · проверка ${gate.sampleSize}/${gate.requiredSampleSize} · ${qualificationText} · база 1/37`,
+        );
+        return;
+      }
       const messages = {
         loading: "Загружаем зафиксированное решение текущего раунда.",
         error: "Свежие данные недоступны — число скрыто.",
@@ -3535,18 +3564,16 @@ import {
 
     setTextIfChanged(
       elements.combinedPickStatus,
-      model.learningStatus === "cold_start"
-        ? "Число зафиксировано сервером до результата. Холодный старт: веса ещё стянуты к 50/50; улучшение не гарантируется."
-        : "Число зафиксировано сервером до результата. Веса рассчитаны только по прошлым завершённым общим снимкам; улучшение не гарантируется.",
+      "BET-допуск подтверждён на фиксированной проспективной когорте; это всё ещё не гарантия следующего результата.",
     );
     const priceWeight = model.learnedFamilyWeights.price;
     const historyWeight = model.learnedFamilyWeights["conditional-history"];
     const currentFamilyText = model.familyCount === 1
       ? ` · в этом lock доступна только ${model.activeFamilyWeights.price === 1 ? "цена" : "условная история"}`
       : "";
-    const metricText = metrics?.settledCount > 0
-      ? ` · Top‑1 ${metrics.top1Hits}/${metrics.settledCount} (${trajectoryShadowShareFormatter.format(metrics.top1Rate)})`
-      : "";
+    const gate = metrics.qualityGate;
+    const metricText =
+      ` · контроль Top‑1 ${gate.hitCount}/${gate.sampleSize} · нижняя 95% граница ${trajectoryShadowShareFormatter.format(gate.lowerBound)}`;
     setTextIfChanged(
       elements.combinedPickSources,
       `${model.sourceCount} ${pluralForm(model.sourceCount, "источник", "источника", "источников")} · ${model.familyCount} ${pluralForm(model.familyCount, "семья", "семьи", "семей")} · обучение ${model.trainingCount} · обучаемый вес цены ${trajectoryShadowShareFormatter.format(priceWeight)} · истории ${trajectoryShadowShareFormatter.format(historyWeight)}${currentFamilyText}${metricText}`,

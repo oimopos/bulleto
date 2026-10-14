@@ -10,8 +10,12 @@ import {
   PREDICTIVE_LEADER_ACCOUNT_STRATEGY_VERSION,
   nextPredictiveLeaderStake,
 } from './predictive-leader-account.js';
+import {
+  PREDICTIVE_LEADER_QUALITY_GATE,
+  wilsonInterval,
+} from './predictive-leader-quality-gate.js';
 
-export const PREDICTIVE_LEADER_API_SCHEMA_VERSION = 1;
+export const PREDICTIVE_LEADER_API_SCHEMA_VERSION = 2;
 
 const SUM_TOLERANCE = 1e-9;
 
@@ -83,6 +87,13 @@ const ACCOUNT_REASONS_BY_STATUS = Object.freeze({
   pending: new Set(['bet_frozen']),
   exhausted: new Set(['bankroll_exhausted']),
 });
+const QUALITY_GATE_STATUSES = Object.freeze({
+  collecting: 'insufficient_sample',
+  pending: 'cohort_pending',
+  rejected: 'not_above_baseline',
+  confirmed: 'confirmed',
+  invalid: 'invalid_evaluation',
+});
 
 function integrityIsCurrent(state) {
   const warnings = Array.isArray(state?.warnings) ? state.warnings : [];
@@ -129,6 +140,95 @@ function metricsForApi(value) {
   const meanBrierLoss = value.meanBrierLoss;
   const uniformBrierLoss = value.uniformBrierLoss;
   const beatsUniform = value.beatsUniform;
+  const qualityGate = value.qualityGate;
+  if (
+    !isPlainObject(qualityGate)
+    || qualityGate.version !== PREDICTIVE_LEADER_QUALITY_GATE.version
+    || qualityGate.requiredSampleSize
+      !== PREDICTIVE_LEADER_QUALITY_GATE.requiredSampleSize
+    || qualityGate.baselineRate !== PREDICTIVE_LEADER_QUALITY_GATE.baselineRate
+    || qualityGate.confidenceLevel
+      !== PREDICTIVE_LEADER_QUALITY_GATE.confidenceLevel
+    || !Object.hasOwn(QUALITY_GATE_STATUSES, qualityGate.status)
+    || qualityGate.reason !== QUALITY_GATE_STATUSES[qualityGate.status]
+    || typeof qualityGate.eligible !== 'boolean'
+    || qualityGate.eligible !== (qualityGate.status === 'confirmed')
+  ) {
+    return null;
+  }
+  const cohortSize = safeInteger(qualityGate.cohortSize);
+  const sampleSize = safeInteger(qualityGate.sampleSize);
+  const hitCount = safeInteger(qualityGate.hitCount);
+  const expectedSampleSize = Math.min(
+    cohortSize ?? 0,
+    PREDICTIVE_LEADER_QUALITY_GATE.requiredSampleSize,
+  );
+  if (
+    cohortSize === null
+    || cohortSize > PREDICTIVE_LEADER_QUALITY_GATE.requiredSampleSize
+    || sampleSize === null
+    || sampleSize > cohortSize
+    || hitCount === null
+    || hitCount > sampleSize
+    || sampleSize > settledCount
+    || hitCount > top1Hits
+    || (qualityGate.status === 'collecting' && (
+      cohortSize >= PREDICTIVE_LEADER_QUALITY_GATE.requiredSampleSize
+      || sampleSize > expectedSampleSize
+    ))
+    || (qualityGate.status === 'pending' && (
+      cohortSize !== PREDICTIVE_LEADER_QUALITY_GATE.requiredSampleSize
+      || sampleSize >= cohortSize
+    ))
+    || (['rejected', 'confirmed'].includes(qualityGate.status) && (
+      cohortSize !== PREDICTIVE_LEADER_QUALITY_GATE.requiredSampleSize
+      || sampleSize !== cohortSize
+    ))
+    || (qualityGate.status === 'invalid' && (
+      sampleSize > cohortSize
+    ))
+  ) {
+    return null;
+  }
+  const hitRate = qualityGate.hitRate;
+  const lowerBound = qualityGate.lowerBound;
+  const gateInterval = ['rejected', 'confirmed'].includes(qualityGate.status)
+    && cohortSize === PREDICTIVE_LEADER_QUALITY_GATE.requiredSampleSize
+    ? wilsonInterval(hitCount, sampleSize)
+    : null;
+  if (
+    (sampleSize === 0 && hitRate !== null)
+    || (sampleSize > 0 && (
+      typeof hitRate !== 'number'
+      || !Number.isFinite(hitRate)
+      || Math.abs(hitRate - hitCount / sampleSize) > SUM_TOLERANCE
+    ))
+    || (gateInterval === null && lowerBound !== null)
+    || (gateInterval !== null && (
+      typeof lowerBound !== 'number'
+      || !Number.isFinite(lowerBound)
+      || Math.abs(lowerBound - gateInterval.lower) > SUM_TOLERANCE
+      || qualityGate.eligible
+        !== (gateInterval.lower > PREDICTIVE_LEADER_QUALITY_GATE.baselineRate)
+    ))
+    || (qualityGate.status === 'invalid' && lowerBound !== null)
+  ) {
+    return null;
+  }
+  const normalizedQualityGate = {
+    version: qualityGate.version,
+    status: qualityGate.status,
+    reason: qualityGate.reason,
+    eligible: qualityGate.eligible,
+    requiredSampleSize: qualityGate.requiredSampleSize,
+    cohortSize,
+    sampleSize,
+    hitCount,
+    hitRate,
+    baselineRate: qualityGate.baselineRate,
+    confidenceLevel: qualityGate.confidenceLevel,
+    lowerBound,
+  };
   if (
     (settledCount === 0 && (
       top1Rate !== null
@@ -162,6 +262,7 @@ function metricsForApi(value) {
     meanBrierLoss,
     uniformBrierLoss,
     beatsUniform,
+    qualityGate: normalizedQualityGate,
   };
 }
 
@@ -550,7 +651,9 @@ function baseResponse({
     serverTime,
     status: 'waiting',
     reason: 'state_unavailable',
+    action: 'WAIT',
     number: null,
+    candidateNumber: null,
     forecast: null,
     model: null,
     account,
@@ -711,6 +814,12 @@ export function predictiveLeaderSnapshotForApi({
   if (!forecastRoundMatches) {
     return withStatus(base, 'paused', 'forecast_round_mismatch', { forecast });
   }
+  if (Date.parse(serverTime) < Date.parse(forecastLockedAt)) {
+    return withStatus(base, 'paused', 'forecast_invalid', { forecast });
+  }
+  if (Date.parse(serverTime) >= Date.parse(bettingClosesAt)) {
+    return withStatus(base, 'waiting', 'betting_closed', { forecast });
+  }
   if (latestForecast.settlement !== null) {
     return withStatus(base, 'waiting', 'forecast_settled', { forecast });
   }
@@ -744,19 +853,34 @@ export function predictiveLeaderSnapshotForApi({
       ([family, weight]) => [family, weight],
     ),
   );
+  const model = {
+    sourceCount: leader.sourceCount,
+    familyCount: leader.familyCount,
+    activeFamilies: Object.keys(activeFamilyWeights),
+    activeFamilyWeights,
+    learningVersion: leader.learning.version,
+    learningStatus: leader.learning.status,
+    trainingCount: leader.learning.trainingCount,
+    learnedFamilyWeights,
+    tieBreakApplied: leader.tieBreakApplied,
+  };
+  if (metrics?.qualityGate?.eligible !== true) {
+    if (!metrics?.qualityGate) {
+      return withStatus(base, 'waiting', 'quality_metrics_unavailable', {
+        forecast,
+      });
+    }
+    return withStatus(base, 'waiting', 'confidence_not_proven', {
+      candidateNumber: number,
+      forecast,
+      model,
+    });
+  }
   return withStatus(base, 'ready', 'ready', {
+    action: 'BET',
     number,
+    candidateNumber: number,
     forecast,
-    model: {
-      sourceCount: leader.sourceCount,
-      familyCount: leader.familyCount,
-      activeFamilies: Object.keys(activeFamilyWeights),
-      activeFamilyWeights,
-      learningVersion: leader.learning.version,
-      learningStatus: leader.learning.status,
-      trainingCount: leader.learning.trainingCount,
-      learnedFamilyWeights,
-      tieBreakApplied: leader.tieBreakApplied,
-    },
+    model,
   });
 }
