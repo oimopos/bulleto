@@ -425,7 +425,7 @@ test("schema contains all persistence tables", () => {
       "virtual_bet_sessions",
       "virtual_bets",
     ]);
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 23);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 24);
     assert.equal(
       database.sqlite
         .prepare("SELECT COUNT(*) AS count FROM predictive_leader_account_ladder_resets")
@@ -503,8 +503,8 @@ test("schema contains all persistence tables", () => {
   }
 });
 
-test("version 23 adds Top-5 deposits without removing retained v20-v22 tables", () => {
-  const directory = mkdtempSync(join(tmpdir(), "roulette-v23-retained-"));
+test("version 24 keeps the Top-5 deposit and retained v20-v22 tables", () => {
+  const directory = mkdtempSync(join(tmpdir(), "roulette-v24-retained-"));
   const path = join(directory, "tracker.sqlite");
   let database = createDatabase({ path });
   try {
@@ -532,7 +532,7 @@ test("version 23 adds Top-5 deposits without removing retained v20-v22 tables", 
     database = createDatabase({ path });
     assert.equal(
       database.sqlite.prepare("PRAGMA user_version").get().user_version,
-      23,
+      24,
     );
     assert.equal(
       database.sqlite
@@ -554,6 +554,52 @@ test("version 23 adds Top-5 deposits without removing retained v20-v22 tables", 
     }
   } finally {
     if (!database.closed) database.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("version 24 repairs stale stream state before accepting another result", () => {
+  const directory = mkdtempSync(join(tmpdir(), "roulette-v24-stream-state-"));
+  const path = join(directory, "tracker.sqlite");
+  let database = createDatabase({ path });
+  try {
+    database.ingestBatch([
+      event(1, "v24-stream-left", 0, { externalRoundId: "v24-1" }),
+    ]);
+    database.ingestBatchAfterGap(
+      {
+        source: "buleto",
+        instrument: "PRIMECOIN(XPM)/RUB",
+        reason: "round-result-not-confirmed-by-snapshot",
+        incidentKey: "v24-stream-gap",
+        detectedAt: iso(BASE_TIME + 5_000),
+      },
+      [event(2, "v24-stream-right", 10, { externalRoundId: "v24-2" })],
+    );
+    database.sqlite.exec(`
+      UPDATE stream_state SET continuity_epoch = 0;
+      PRAGMA user_version = 23;
+    `);
+    database.close();
+
+    database = createDatabase({ path });
+    assert.equal(
+      Number(database.sqlite.prepare("SELECT continuity_epoch FROM stream_state").get().continuity_epoch),
+      1,
+    );
+    database.ingestBatch([
+      event(3, "v24-stream-next", 20, { externalRoundId: "v24-3" }),
+    ]);
+    assert.deepEqual(
+      database.sqlite
+        .prepare("SELECT continuity_epoch FROM round_results ORDER BY id")
+        .all()
+        .map((row) => Number(row.continuity_epoch)),
+      [0, 1, 1],
+    );
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 24);
+  } finally {
+    database.close();
     rmSync(directory, { recursive: true, force: true });
   }
 });
@@ -693,7 +739,7 @@ test("version 13 creates one live follower tracker at the current tail", () => {
       "buleto",
       "PRIMECOIN(XPM)/RUB",
     );
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 23);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 24);
     assert.equal(migrated.status, "armed");
     assert.equal(migrated.currentSession.sourceNumber, 9);
     assert.deepEqual(migrated.currentSession.fixedNumbers, [5, 4, 3, 2, 1]);
@@ -4134,7 +4180,7 @@ test("versions 11 and 12 do not backfill derived snapshots for version 10 foreca
       path,
       clock: () => new Date(BASE_TIME + 52_000),
     });
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 23);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 24);
     assert.equal(
       Number(
         database.sqlite
@@ -4213,7 +4259,7 @@ test("version 12 does not backfill consensus for legacy version 11 forecasts", (
       path,
       clock: () => new Date(BASE_TIME + 52_000),
     });
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 23);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 24);
     assert.equal(
       database.sqlite
         .prepare("SELECT COUNT(*) AS count FROM forecast_consensus_snapshots")
@@ -4275,7 +4321,7 @@ test("version 14 migration preserves a legacy Borda consensus row exactly", () =
       clock: () => new Date(BASE_TIME + 52_000),
     });
 
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 23);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 24);
     const migratedRow = {
       ...database.sqlite.prepare("SELECT * FROM forecast_consensus_snapshots").get(),
     };
@@ -4329,7 +4375,7 @@ test("versions 15 through 19 add empty prospective tables without backfilling le
       path,
       clock: () => new Date(BASE_TIME + 52_000),
     });
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 23);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 24);
     assert.equal(
       database.sqlite.prepare("SELECT COUNT(*) AS count FROM round_trajectories").get()
         .count,
@@ -4425,7 +4471,7 @@ test("version 17 never backfills an existing version 16 leader into the paper ac
       path,
       clock: () => new Date(BASE_TIME + 52_000),
     });
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 23);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 24);
     assert.equal(
       database.sqlite
         .prepare("SELECT COUNT(*) AS count FROM forecast_predictive_leader_snapshots")
@@ -4576,7 +4622,7 @@ test("version 18 preserves version 17 bet rows and adds nullable void audit fiel
       path,
       clock: () => new Date(clockMs),
     });
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 23);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 24);
     const after = database.sqlite
       .prepare("SELECT * FROM predictive_leader_account_bets ORDER BY forecast_id")
       .all();
@@ -4950,7 +4996,7 @@ test("version 5 history is backfilled into continuity epochs before migration co
 
   const database = createDatabase({ path });
   try {
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 23);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 24);
     assert.deepEqual(
       database.sqlite
         .prepare("SELECT continuity_epoch FROM round_results ORDER BY settled_at, id")
@@ -5010,7 +5056,7 @@ test("version 9 reconciles a proven contiguous shutdown boundary without deletin
 
     database = createDatabase({ path, gapThresholdSeconds: 135 });
     const state = database.getDashboardState();
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 23);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 24);
     assert.equal(state.totals.results, 5, "raw results are never recreated or deleted");
     assert.equal(state.totals.cycles, 1);
     assert.equal(state.totals.invalidCycles, 0);
@@ -7239,7 +7285,7 @@ test("v7 paper history initializes v8 bankroll with all known net results exactl
       "buleto",
       "PRIMECOIN(XPM)/RUB",
     );
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 23);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 24);
     assert.equal(state.testBank.initialBalance, 87_700);
     assert.equal(state.testBank.currentBalance, 87_910);
     assert.equal(state.testBank.netResult, 210);

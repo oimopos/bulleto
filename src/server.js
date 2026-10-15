@@ -59,6 +59,11 @@ const config = {
   reconnectMinMs: integerEnv('RECONNECT_MIN_MS', 1_000, { min: 100, max: 60_000 }),
   reconnectMaxMs: integerEnv('RECONNECT_MAX_MS', 30_000, { min: 1_000, max: 600_000 }),
   staleAfterMs: integerEnv('STALE_AFTER_MS', 180_000, { min: 30_000, max: 3_600_000 }),
+  trajectoryValidationWarmupBatchSize: integerEnv(
+    'TRAJECTORY_VALIDATION_WARMUP_BATCH_SIZE',
+    32,
+    { min: 1, max: 1_000 },
+  ),
   virtualStartingBalance: integerEnv('VIRTUAL_STARTING_BALANCE', 87_700, {
     min: 0,
     max: Number.MAX_SAFE_INTEGER,
@@ -128,20 +133,43 @@ db.settlePrecloseForecasts('buleto', config.instrument);
 db.settlePredictiveLeaderAccount('buleto', config.instrument);
 db.applyPredictiveLeaderAccountReset('buleto', config.instrument);
 db.reconcilePredictiveLeaderAccount('buleto', config.instrument);
-const trajectoryValidationWarmStartedAt = Date.now();
-try {
-  const warmed = db.warmPrecloseForecastValidation('buleto', config.instrument);
-  const durationMs = Date.now() - trajectoryValidationWarmStartedAt;
-  console.info(
-    `[trajectory] validation cache warmed: ${warmed.validCount}/${warmed.checkedCount} valid; `
-      + `cacheSize=${warmed.cacheSize}; hits=${warmed.hits}; `
-      + `misses=${warmed.misses}; durationMs=${durationMs}`,
-  );
-} catch (error) {
-  console.error('[trajectory] validation cache warm-up failed; continuing cold', error);
-}
 
 const sseClients = new Set();
+const startupState = {
+  trajectoryValidation: 'pending',
+  attemptCount: 0,
+  checkedCount: 0,
+  validCount: 0,
+  batchCount: 0,
+  startedAt: null,
+  completedAt: null,
+  nextRetryAt: null,
+  updatedAt: new Date().toISOString(),
+  error: null,
+};
+const trajectoryValidationWarmupAbortController = new AbortController();
+let trajectoryValidationWarmupImmediate = null;
+let trajectoryValidationWarmupPromise = null;
+let trajectoryValidationWarmupRetryTimer = null;
+
+function startupStateForApi() {
+  return {
+    trajectoryValidation: startupState.trajectoryValidation,
+    attemptCount: startupState.attemptCount,
+    checkedCount: startupState.checkedCount,
+    validCount: startupState.validCount,
+    batchCount: startupState.batchCount,
+    startedAt: startupState.startedAt,
+    completedAt: startupState.completedAt,
+    nextRetryAt: startupState.nextRetryAt,
+    updatedAt: startupState.updatedAt,
+    error: startupState.error,
+  };
+}
+
+function trajectoryValidationIsWarming() {
+  return startupState.trajectoryValidation !== 'ready';
+}
 
 function securityHeaders(extra = {}) {
   return {
@@ -156,7 +184,7 @@ function securityHeaders(extra = {}) {
   };
 }
 
-function sendJson(response, statusCode, body) {
+function sendJson(response, statusCode, body, extraHeaders = {}) {
   const payload = JSON.stringify(body);
   response.writeHead(
     statusCode,
@@ -164,9 +192,26 @@ function sendJson(response, statusCode, body) {
       'Cache-Control': 'no-store',
       'Content-Type': 'application/json; charset=utf-8',
       'Content-Length': Buffer.byteLength(payload),
+      ...extraHeaders,
     }),
   );
   response.end(payload);
+}
+
+function sendStartupWarming(response) {
+  sendJson(
+    response,
+    503,
+    {
+      ok: false,
+      status: 'warming',
+      reason: 'startup_warming',
+      retryAfterMs: 1_000,
+      startup: startupStateForApi(),
+      serverTime: new Date().toISOString(),
+    },
+    { 'Retry-After': '1' },
+  );
 }
 
 function broadcastUpdate(reason) {
@@ -178,6 +223,122 @@ function broadcastUpdate(reason) {
       sseClients.delete(response);
     }
   }
+}
+
+async function runTrajectoryValidationWarmup() {
+  if (
+    trajectoryValidationWarmupPromise !== null
+    || startupState.trajectoryValidation === 'ready'
+    || trajectoryValidationWarmupAbortController.signal.aborted
+  ) {
+    return trajectoryValidationWarmupPromise;
+  }
+
+  const startedAtMs = Date.now();
+  const startedAt = new Date(startedAtMs).toISOString();
+  const attemptCount = startupState.attemptCount + 1;
+  Object.assign(startupState, {
+    trajectoryValidation: 'warming',
+    attemptCount,
+    checkedCount: 0,
+    validCount: 0,
+    batchCount: 0,
+    startedAt,
+    completedAt: null,
+    nextRetryAt: null,
+    updatedAt: startedAt,
+    error: null,
+  });
+
+  const operation = (async () => {
+    try {
+      const warmed = await db.warmPrecloseForecastValidationIncrementally(
+        'buleto',
+        config.instrument,
+        {
+          batchSize: config.trajectoryValidationWarmupBatchSize,
+          signal: trajectoryValidationWarmupAbortController.signal,
+          onProgress(progress) {
+            Object.assign(startupState, {
+              checkedCount: progress.checkedCount,
+              validCount: progress.validCount,
+              batchCount: progress.batchCount,
+              updatedAt: new Date().toISOString(),
+            });
+          },
+        },
+      );
+      if (warmed.aborted || trajectoryValidationWarmupAbortController.signal.aborted) {
+        return;
+      }
+
+      const completedAt = new Date().toISOString();
+      Object.assign(startupState, {
+        trajectoryValidation: 'ready',
+        checkedCount: warmed.checkedCount,
+        validCount: warmed.validCount,
+        batchCount: warmed.batchCount,
+        completedAt,
+        nextRetryAt: null,
+        updatedAt: completedAt,
+        error: null,
+      });
+      console.info(
+        `[trajectory] validation cache warmed: ${warmed.validCount}/${warmed.checkedCount} valid; `
+          + `batches=${warmed.batchCount}; cacheSize=${warmed.cacheSize}; `
+          + `hits=${warmed.hits}; misses=${warmed.misses}; `
+          + `durationMs=${Date.now() - startedAtMs}`,
+      );
+      broadcastUpdate('startup-ready');
+    } catch (error) {
+      if (trajectoryValidationWarmupAbortController.signal.aborted) return;
+      const failedAt = new Date().toISOString();
+      const retryDelayMs = Math.min(30_000, 1_000 * (2 ** Math.min(attemptCount - 1, 5)));
+      const nextRetryAt = new Date(Date.now() + retryDelayMs).toISOString();
+      Object.assign(startupState, {
+        trajectoryValidation: 'failed',
+        completedAt: failedAt,
+        nextRetryAt,
+        updatedAt: failedAt,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      console.error(
+        `[trajectory] incremental validation cache warm-up failed; retrying in ${retryDelayMs}ms`,
+        error,
+      );
+      clearTimeout(trajectoryValidationWarmupRetryTimer);
+      trajectoryValidationWarmupRetryTimer = setTimeout(() => {
+        trajectoryValidationWarmupRetryTimer = null;
+        scheduleTrajectoryValidationWarmup();
+      }, retryDelayMs);
+      trajectoryValidationWarmupRetryTimer.unref?.();
+      broadcastUpdate('startup-retry');
+    }
+  })();
+
+  trajectoryValidationWarmupPromise = operation;
+  try {
+    await operation;
+  } finally {
+    if (trajectoryValidationWarmupPromise === operation) {
+      trajectoryValidationWarmupPromise = null;
+    }
+  }
+}
+
+function scheduleTrajectoryValidationWarmup() {
+  if (
+    trajectoryValidationWarmupImmediate !== null
+    || trajectoryValidationWarmupPromise !== null
+    || startupState.trajectoryValidation === 'ready'
+    || trajectoryValidationWarmupAbortController.signal.aborted
+  ) {
+    return;
+  }
+  trajectoryValidationWarmupImmediate = setImmediate(() => {
+    trajectoryValidationWarmupImmediate = null;
+    void runTrajectoryValidationWarmup();
+  });
 }
 
 function openEventStream(request, response) {
@@ -394,6 +555,10 @@ const server = createServer((request, response) => {
     }
 
     if (pathname === '/api/state') {
+      if (trajectoryValidationIsWarming()) {
+        sendStartupWarming(response);
+        return;
+      }
       sendJson(response, 200, dashboardState());
       return;
     }
@@ -433,6 +598,10 @@ const server = createServer((request, response) => {
     }
 
     if (pathname === '/api/forecasts') {
+      if (trajectoryValidationIsWarming()) {
+        sendStartupWarming(response);
+        return;
+      }
       sendJson(
         response,
         200,
@@ -442,7 +611,18 @@ const server = createServer((request, response) => {
     }
 
     if (pathname === '/api/predictive-leader') {
-      sendJson(response, 200, predictiveLeaderForApi());
+      sendJson(
+        response,
+        200,
+        trajectoryValidationIsWarming()
+          ? predictiveLeaderSnapshotForApi({
+              state: null,
+              source: 'buleto',
+              instrument: config.instrument,
+              now: new Date(),
+            })
+          : predictiveLeaderForApi(),
+      );
       return;
     }
 
@@ -517,6 +697,7 @@ const server = createServer((request, response) => {
       sendJson(response, 200, {
         ok: true,
         database: 'ready',
+        startup: startupStateForApi(),
         time: new Date().toISOString(),
       });
       return;
@@ -841,6 +1022,7 @@ server.listen(config.port, config.host, () => {
   console.info(`[server] dashboard: http://${config.host}:${config.port}`);
   console.info(`[server] database: ${config.databasePath}`);
   if (config.collectorEnabled) collector.start();
+  scheduleTrajectoryValidationWarmup();
 });
 
 let shuttingDown = false;
@@ -848,6 +1030,11 @@ function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
   console.info(`[server] ${signal}: shutting down`);
+  trajectoryValidationWarmupAbortController.abort();
+  clearImmediate(trajectoryValidationWarmupImmediate);
+  trajectoryValidationWarmupImmediate = null;
+  clearTimeout(trajectoryValidationWarmupRetryTimer);
+  trajectoryValidationWarmupRetryTimer = null;
   try {
     collector.flushPendingForShutdown();
   } catch (error) {

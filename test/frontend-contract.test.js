@@ -63,7 +63,7 @@ test("server exposes a separate read-only predictive leader GET", () => {
   assert.ok(viewStart >= 0 && viewEnd > viewStart);
   assert.match(
     server,
-    /if \(pathname === '\/api\/predictive-leader'\) \{[\s\S]*?sendJson\(response, 200, predictiveLeaderForApi\(\)\)/,
+    /if \(pathname === '\/api\/predictive-leader'\) \{[\s\S]*?trajectoryValidationIsWarming\(\)[\s\S]*?state: null[\s\S]*?: predictiveLeaderForApi\(\)/,
   );
   assert.match(view, /db\.getPredictiveLeaderReadState\(source, instrument\)/);
   assert.match(view, /predictiveLeaderSnapshotForApi\(\{/);
@@ -92,17 +92,28 @@ test("predictive leader read path excludes dashboard and trajectory metric work"
   );
 });
 
-test("server warms trajectory validation after recovery and before listen", () => {
+test("server schedules incremental trajectory validation only after listen", () => {
   const recovery = server.indexOf("db.reconcilePredictiveLeaderAccount(");
-  const warm = server.indexOf("db.warmPrecloseForecastValidation(");
-  const warmEnd = server.indexOf("const sseClients", warm);
-  const listen = server.indexOf("server.listen(");
-  const warmBlock = server.slice(recovery, warmEnd);
+  const startupBoundary = server.indexOf("const sseClients", recovery);
+  const listen = server.lastIndexOf("server.listen(");
+  const shutdown = server.indexOf("let shuttingDown", listen);
+  const initialization = server.slice(recovery, startupBoundary);
+  const listenBlock = server.slice(listen, shutdown);
 
-  assert.ok(recovery >= 0 && warm > recovery && warmEnd > warm);
-  assert.ok(listen > warmEnd);
-  assert.match(warmBlock, /try \{[\s\S]*?warmPrecloseForecastValidation/);
-  assert.match(warmBlock, /catch \(error\) \{[\s\S]*?continuing cold/);
+  assert.ok(recovery >= 0 && startupBoundary > recovery);
+  assert.ok(listen > startupBoundary && shutdown > listen);
+  assert.doesNotMatch(
+    initialization,
+    /warmPrecloseForecastValidation(?:Incrementally)?\s*\(/,
+  );
+  assert.match(
+    server,
+    /await db\.warmPrecloseForecastValidationIncrementally\(/,
+  );
+  assert.match(
+    listenBlock,
+    /collector\.start\(\)[\s\S]*scheduleTrajectoryValidationWarmup\(\)/,
+  );
 });
 
 test("dashboard wires predictive leader loading and SSE invalidation fail-closed", () => {
@@ -115,14 +126,142 @@ test("dashboard wires predictive leader loading and SSE invalidation fail-closed
   assert.match(refresh, /normalizedPredictiveLeaderAccount\(snapshot\?\.account\)/);
   assert.match(refresh, /store\.predictiveLeaderLoaded = true/);
   assert.match(refresh, /store\.predictiveLeaderError = true/);
-  assert.match(refresh, /store\.predictiveLeaderRequiresFreshSnapshot = false/);
+  assert.match(
+    refresh,
+    /store\.predictiveLeaderRequiresFreshSnapshot = !liveSnapshotIsCurrent/,
+  );
+  assert.match(refresh, /const eventRevisionAtRequest = store\.eventRevision/);
+  assert.match(
+    refresh,
+    /store\.eventRevision === eventRevisionAtRequest/,
+    "an SSE update during a request must keep the response stale",
+  );
 
   const eventErrorStart = app.indexOf('source.addEventListener("error"');
   const eventErrorEnd = app.indexOf("});", eventErrorStart);
   const eventError = app.slice(eventErrorStart, eventErrorEnd);
   assert.ok(eventErrorStart >= 0 && eventErrorEnd > eventErrorStart);
-  assert.match(eventError, /store\.predictiveLeaderRequiresFreshSnapshot = true/);
-  assert.match(eventError, /renderCombinedPick\(\)/);
+  assert.match(eventError, /invalidateLiveSnapshots\(\)/);
+});
+
+test("dashboard polling retries partial or failed refreshes with one bounded exponential timer", () => {
+  assert.match(app, /const REFRESH_RETRY_BASE_MS = 2_000/);
+  assert.match(app, /const REFRESH_RETRY_MAX_MS = 30_000/);
+  assert.match(app, /const REFRESH_RETRY_JITTER_RATIO = 0\.2/);
+
+  const delayStart = app.indexOf("function refreshRetryDelayMs(failureCount)");
+  const delayEnd = app.indexOf("function schedulePollingRefresh", delayStart);
+  const delayBlock = app.slice(delayStart, delayEnd);
+  assert.ok(delayStart >= 0 && delayEnd > delayStart);
+  assert.match(delayBlock, /2 \*\* exponent/);
+  assert.match(delayBlock, /Math\.random\(\)/);
+  assert.match(delayBlock, /Math\.min\([\s\S]*?REFRESH_RETRY_MAX_MS/);
+
+  const schedulerStart = delayEnd;
+  const schedulerEnd = app.indexOf("function stateSnapshotIsStale", schedulerStart);
+  const schedulerBlock = app.slice(schedulerStart, schedulerEnd);
+  assert.match(schedulerBlock, /clearRefreshTimer\(\)/);
+  assert.match(schedulerBlock, /store\.refreshFailureCount/);
+  assert.match(schedulerBlock, /window\.setTimeout\([\s\S]*?refreshAll\(\)/);
+
+  const eventSchedulerStart = app.indexOf("function scheduleRefresh()");
+  const eventSchedulerEnd = app.indexOf("function invalidateLiveSnapshots", eventSchedulerStart);
+  const eventScheduler = app.slice(eventSchedulerStart, eventSchedulerEnd);
+  assert.match(eventScheduler, /if \(store\.refreshing\)/);
+  assert.match(eventScheduler, /store\.refreshQueued = true/);
+  assert.match(eventScheduler, /return;/);
+
+  const refreshStart = app.indexOf("async function refreshAll");
+  const refreshEnd = app.indexOf("function renderFetchFailure", refreshStart);
+  const refreshBlock = app.slice(refreshStart, refreshEnd);
+  assert.match(
+    refreshBlock,
+    /retry: successfulRequests < requests\.length[\s\S]*?\|\| store\.stateRequiresFreshSnapshot[\s\S]*?\|\| store\.predictiveLeaderRequiresFreshSnapshot/,
+  );
+
+  const bootStart = app.indexOf("initializeFollowerSource();");
+  const bootBlock = app.slice(bootStart);
+  assert.match(bootBlock, /connectEventStream\(\);[\s\S]*?refreshAll\(\);/);
+  assert.doesNotMatch(
+    bootBlock,
+    /setInterval\(\(\) => refreshAll\(\), REFRESH_INTERVAL_MS\)/,
+    "a fixed polling interval must not race the retry timer",
+  );
+});
+
+test("temporary API or SSE loss hides every actionable stale virtual bet", () => {
+  assert.match(
+    app,
+    /function stateSnapshotIsStale\(\) \{\s*return store\.stateError \|\| store\.stateRequiresFreshSnapshot;/,
+  );
+
+  const eventErrorStart = app.indexOf('source.addEventListener("error"');
+  const eventErrorEnd = app.indexOf("});", eventErrorStart);
+  const eventError = app.slice(eventErrorStart, eventErrorEnd);
+  assert.match(eventError, /invalidateLiveSnapshots\(\)/);
+  assert.match(eventError, /const hadFreshSnapshot = !store\.predictiveLeaderRequiresFreshSnapshot/);
+  assert.match(eventError, /\|\| !store\.stateRequiresFreshSnapshot/);
+  assert.match(eventError, /invalidateLiveSnapshots\(\)/);
+  assert.match(eventError, /if \(hadFreshSnapshot\) scheduleRefresh\(\)/);
+
+  const invalidationStart = app.indexOf("function invalidateLiveSnapshots()");
+  const invalidationEnd = app.indexOf("function connectEventStream", invalidationStart);
+  const invalidation = app.slice(invalidationStart, invalidationEnd);
+  assert.match(invalidation, /store\.eventRevision \+= 1/);
+  assert.match(invalidation, /store\.stateRequiresFreshSnapshot = true/);
+  assert.match(invalidation, /renderPredictiveLeaderAccount\(\)/);
+  assert.match(invalidation, /renderFollowerTop5Tracker\(/);
+  assert.match(invalidation, /renderVirtualBettor\(/);
+  assert.match(invalidation, /renderPrecloseForecast\(\)/);
+  assert.match(invalidation, /renderFollowerHitCurve\(\)/);
+
+  const accountContextStart = app.indexOf("function currentPredictiveLeaderAccountContext()");
+  const accountContextEnd = app.indexOf("function renderPredictiveLeaderAccount", accountContextStart);
+  const accountContext = app.slice(accountContextStart, accountContextEnd);
+  assert.match(
+    accountContext,
+    /predictiveLeaderRequiresFreshSnapshot\) return \{ state: "stale" \}/,
+  );
+
+  const gatedStart = app.indexOf("function renderFollowerLiveGatedAccount");
+  const gatedEnd = app.indexOf("function renderFollowerLiveUnavailable", gatedStart);
+  const gatedBlock = app.slice(gatedStart, gatedEnd);
+  assert.match(gatedBlock, /stale \? "—" : `по \$\{formatRiskAmount\(account\.nextStakePerNumber\)\}`/);
+  assert.match(gatedBlock, /билет скрыт до свежего снимка/);
+
+  const trackerStart = app.indexOf("function renderFollowerTop5Tracker");
+  const trackerEnd = app.indexOf("function normalizedFollowerHistoricalAccount", trackerStart);
+  const trackerBlock = app.slice(trackerStart, trackerEnd);
+  assert.match(trackerBlock, /const stale = stateSnapshotIsStale\(\)/);
+  assert.match(trackerBlock, /if \(stale\) \{[\s\S]*?renderFollowerLiveFixedNumbers\(null\);[\s\S]*?return;/);
+
+  const virtualBankStart = app.indexOf("function renderVirtualBank");
+  const virtualBankEnd = app.indexOf("function setVirtualNumberBall", virtualBankStart);
+  const virtualBankBlock = app.slice(virtualBankStart, virtualBankEnd);
+  assert.match(virtualBankBlock, /virtualBankNext\.textContent = stale \|\| nextStake === null/);
+
+  const virtualStart = app.indexOf("function renderVirtualBettor");
+  const virtualEnd = app.indexOf("function parseDate", virtualStart);
+  const virtualBlock = app.slice(virtualStart, virtualEnd);
+  assert.match(virtualBlock, /virtualSession\.hidden = stale \|\| !hasSession/);
+
+  const precloseStart = app.indexOf("function renderPrecloseForecast");
+  const precloseEnd = app.indexOf("function renderCollector", precloseStart);
+  const precloseBlock = app.slice(precloseStart, precloseEnd);
+  assert.match(precloseBlock, /const stale = stateSnapshotIsStale\(\)/);
+  assert.match(precloseBlock, /const matchesCurrent = !stale/);
+  assert.match(precloseBlock, /текущий прогноз скрыт/);
+
+  const warmStart = app.indexOf("function renderFollowerDynamicNext");
+  const warmEnd = app.indexOf("function renderFollowerHitCurve", warmStart);
+  const warmBlock = app.slice(warmStart, warmEnd);
+  assert.match(warmBlock, /store\.pairsError \|\| stateSnapshotIsStale\(\)/);
+  assert.match(warmBlock, /renderFollowerWarmCurrent\(stale \? null : signal\)/);
+
+  const warmAccountStart = app.indexOf("function renderFollowerWarmHistoricalAccount");
+  const warmAccountEnd = app.indexOf("function renderFollowerDynamicNext", warmAccountStart);
+  const warmAccountBlock = app.slice(warmAccountStart, warmAccountEnd);
+  assert.match(warmAccountBlock, /if \(stale\) \{[\s\S]*?текущие числа и размер следующего виртуального билета скрыты/);
 });
 
 test("combined leader is the first dashboard block and renders exactly one number", () => {
@@ -155,7 +294,7 @@ test("combined leader is the first dashboard block and renders exactly one numbe
   assert.match(block, /эвристический ранговый индекс, не вероятность и не гарантия преимущества/);
   assert.match(block, /Давность, виртуальная цель, невыпавшие числа, survivor и исторический аналог остаются только наблюдением/);
   assert.match(block, /1 из 37 \(≈2,7%\)/);
-  assert.match(html, /<script type="module" src="\/app\.js\?v=44"><\/script>/);
+  assert.match(html, /<script type="module" src="\/app\.js\?v=45"><\/script>/);
 
   assert.match(app, /from "\.\/combined-number\.js\?v=7"/);
   assert.match(app, /normalizePredictiveLeaderApiSnapshot/);
@@ -945,7 +1084,7 @@ test("warm next-round forecast exposes a strict 5-percent walk-forward contract"
   assert.match(html, /id="follower-dynamic-next-title"[^>]*>[^<]*≥5%/);
   assert.match(html, /id="follower-dynamic-next-note"[^>]*>[\s\S]*?5%/);
   assert.match(html, /styles\.css\?v=30/);
-  assert.match(html, /app\.js\?v=44/);
+  assert.match(html, /app\.js\?v=45/);
   assert.match(styles, /\.follower-dynamic-next\s*\{/);
   assert.match(styles, /\.follower-warm-current\s*\{/);
   assert.match(styles, /\.follower-warm-picks\s*\{/);
@@ -1193,7 +1332,7 @@ test("cycle comparison language is descriptive, responsive, and cache-busted", (
   assert.match(block, /не предсказывает следующее число/);
   assert.doesNotMatch(block, /должн/iu);
   assert.match(html, /href="\/styles\.css\?v=30"/);
-  assert.match(html, /src="\/app\.js\?v=44"/);
+  assert.match(html, /src="\/app\.js\?v=45"/);
   assert.match(styles, /\.cycle-sequence-list\s*\{[\s\S]*?repeat\(auto-fill, minmax\(50px, 1fr\)\)/);
   assert.match(
     styles,

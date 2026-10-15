@@ -318,6 +318,21 @@ Render проверяет процесс через `/api/live`. Этот endpoi
 состояние внешнего WebSocket-потока. Поэтому краткое переподключение к Buleto не
 запускает лишний цикл перезапусков сервиса.
 
+HTTP listener запускается до тяжёлой проверки сохранённых trajectory-снимков.
+Проверка выполняется небольшими порциями в фоне, а её состояние доступно в
+`/api/live` как `startup.trajectoryValidation`. Пока проверка не завершена,
+`/api/state` и `/api/forecasts` отвечают контролируемым `503` с
+`Retry-After: 1`, а `/api/predictive-leader` остаётся доступным, но возвращает
+`number: null`. Панель повторяет запросы с ограниченным exponential backoff и
+не показывает старые активные числа или виртуальные билеты как свежие.
+
+Подключённый persistent disk сохраняет SQLite, но отключает zero-downtime deploy
+Render: во время замены единственного instance всё ещё возможно короткое окно
+gateway `502`. Эта версия сокращает окно запуска и не допускает долгой блокировки
+health-check. Полностью убрать deploy-induced `502` можно только после переноса
+на внешнюю PostgreSQL, разделения API и collector worker и удаления локального
+диска; такой cutover требует отдельного backup живой базы и платных ресурсов.
+
 В образ включён согласованный snapshot `seed/buleto.sqlite` с накопленной
 публичной историей результатов и состоянием виртуальной симуляции. При первом
 запуске он копируется на постоянный диск, только если
@@ -369,6 +384,7 @@ npm.cmd run backup -- ./data/buleto.sqlite ./seed/buleto.sqlite
 | `VIRTUAL_STARTING_BALANCE` | `87700` | Стартовый банк виртуальной симуляции |
 | `GAP_THRESHOLD_SECONDS` | `135` | Порог обнаружения пропуска |
 | `STALE_AFTER_MS` | `180000` | Переподключение при тишине |
+| `TRAJECTORY_VALIDATION_WARMUP_BATCH_SIZE` | `32` | Размер одной неблокирующей порции фоновой проверки trajectory-снимков |
 
 ## HTTP API
 
@@ -399,7 +415,7 @@ npm.cmd run backup -- ./data/buleto.sqlite ./seed/buleto.sqlite
   `currentAction.would_bet` — архивное решение стратегии; только отдельный endpoint
   переводит его в live-команду `BET` после проверки синхронизации и окна.
 - `GET /api/events` — Server-Sent Events для мгновенного обновления панели.
-- `GET /api/live` — liveness-проверка процесса для Docker/Render.
+- `GET /api/live` — liveness-проверка процесса для Docker/Render и состояние фонового startup-прогрева.
 - `GET /api/health` — состояние процесса, базы и внешнего сборщика.
 
 Сокращённый пример ответа `GET /api/virtual-bettor`:

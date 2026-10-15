@@ -74,6 +74,7 @@ const ROUND_TRAJECTORY_SCHEMA_VERSION = 1;
 const TRAJECTORY_SHADOW_SCHEMA_VERSION = 1;
 const TRAJECTORY_SHADOW_CANDIDATE_LIMIT = 500;
 const TRAJECTORY_SHADOW_LEARNING_LIMIT = 500;
+const TRAJECTORY_SHADOW_LEARNING_CANDIDATE_LIMIT = 1_000;
 const TRAJECTORY_PREFIX_EDGE_TOLERANCE_MS = 5_000;
 const TRAJECTORY_NUMBER_AREA_VERSION = "trajectory-number-area-v1";
 const TRAJECTORY_DISPLAY_RANGE_VERSION = "trajectory-display-range-v1";
@@ -3961,6 +3962,8 @@ export class RouletteDatabase {
     this.trajectoryAdaptiveValidationCache = new Map();
     this.trajectoryAdaptiveValidationCacheHits = 0;
     this.trajectoryAdaptiveValidationCacheMisses = 0;
+    this.trajectoryAdaptiveValidationWarmupPromise = null;
+    this.trajectoryAdaptiveValidationWarmupKey = null;
     this.closed = false;
     this.sqlite = new DatabaseSync(path);
 
@@ -4187,14 +4190,6 @@ export class RouletteDatabase {
         continuity_epoch INTEGER NOT NULL DEFAULT 0 CHECK (continuity_epoch >= 0),
         PRIMARY KEY (source, instrument)
       );
-      DROP INDEX IF EXISTS round_results_external_round_idx;
-      CREATE UNIQUE INDEX round_results_external_round_idx
-        ON round_results(source, instrument, external_round_id)
-        WHERE external_round_id IS NOT NULL;
-      DROP INDEX IF EXISTS incidents_key_idx;
-      CREATE UNIQUE INDEX incidents_key_idx
-        ON incidents(source, instrument, incident_key)
-        WHERE incident_key IS NOT NULL;
       CREATE INDEX IF NOT EXISTS round_results_number_history_idx
         ON round_results(source, instrument, result_number, settled_at DESC);
       CREATE INDEX IF NOT EXISTS round_results_stream_time_idx
@@ -4205,15 +4200,6 @@ export class RouletteDatabase {
 
     if (addedContinuityEpoch || startingVersion < 6) {
       this.#backfillContinuityEpochs();
-    } else {
-      this.sqlite.exec(`
-        INSERT INTO stream_state (source, instrument, continuity_epoch)
-        SELECT source, instrument, MAX(continuity_epoch)
-        FROM round_results
-        GROUP BY source, instrument
-        ON CONFLICT(source, instrument) DO UPDATE SET
-          continuity_epoch = MAX(stream_state.continuity_epoch, excluded.continuity_epoch)
-      `);
     }
     this.sqlite.exec(`
       BEGIN IMMEDIATE;
@@ -4350,6 +4336,7 @@ export class RouletteDatabase {
       throw error;
     }
 
+    this.#repairStartupInvariantsV24(startingVersion);
     this.#migrateContinuityReconciliationV9();
     this.#migratePrecloseForecastsV10();
     this.#migrateForecastPairSnapshotsV11();
@@ -4362,6 +4349,7 @@ export class RouletteDatabase {
     this.#migratePredictiveLeaderAccountVoidV18();
     this.#migratePredictiveLeaderAccountLadderResetV19(startingVersion);
     this.#migrateFollowerTop5GatedAccountDepositsV23();
+    this.#finalizeSchemaVersionV24(startingVersion);
   }
 
   #migratePrecloseForecastsV10() {
@@ -5486,6 +5474,81 @@ export class RouletteDatabase {
       PRAGMA user_version = 23;
       COMMIT;
     `);
+  }
+
+  #repairStartupInvariantsV24(startingVersion) {
+    if (startingVersion >= 24) return;
+
+    const normalizeIndexSql = (value) => String(value ?? "")
+      .toLowerCase()
+      .replace(/["'`\[\]]/g, "")
+      .replace(/\s+/g, "")
+      .replace(/;/g, "");
+    const indexSql = this.sqlite
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?");
+    const expectedRoundIndex = normalizeIndexSql(`
+      CREATE UNIQUE INDEX round_results_external_round_idx
+      ON round_results(source, instrument, external_round_id)
+      WHERE external_round_id IS NOT NULL
+    `);
+    const expectedIncidentIndex = normalizeIndexSql(`
+      CREATE UNIQUE INDEX incidents_key_idx
+      ON incidents(source, instrument, incident_key)
+      WHERE incident_key IS NOT NULL
+    `);
+    const rebuildRoundIndex = normalizeIndexSql(
+      indexSql.get("round_results_external_round_idx")?.sql,
+    ) !== expectedRoundIndex;
+    const rebuildIncidentIndex = normalizeIndexSql(
+      indexSql.get("incidents_key_idx")?.sql,
+    ) !== expectedIncidentIndex;
+    const indexMigrationSql = [
+      rebuildRoundIndex
+        ? `
+          DROP INDEX IF EXISTS round_results_external_round_idx;
+          CREATE UNIQUE INDEX round_results_external_round_idx
+            ON round_results(source, instrument, external_round_id)
+            WHERE external_round_id IS NOT NULL;
+        `
+        : "",
+      rebuildIncidentIndex
+        ? `
+          DROP INDEX IF EXISTS incidents_key_idx;
+          CREATE UNIQUE INDEX incidents_key_idx
+            ON incidents(source, instrument, incident_key)
+            WHERE incident_key IS NOT NULL;
+        `
+        : "",
+    ].join("\n");
+
+    this.sqlite.exec("BEGIN IMMEDIATE");
+    try {
+      this.sqlite.exec(`
+        ${indexMigrationSql}
+
+        INSERT INTO stream_state (source, instrument, continuity_epoch)
+        SELECT source, instrument, MAX(continuity_epoch)
+        FROM round_results
+        GROUP BY source, instrument
+        ON CONFLICT(source, instrument) DO UPDATE SET
+          continuity_epoch = MAX(stream_state.continuity_epoch, excluded.continuity_epoch);
+
+        COMMIT;
+      `);
+    } catch (error) {
+      try {
+        this.sqlite.exec("ROLLBACK");
+      } catch {
+        // Preserve the migration error.
+      }
+      throw error;
+    }
+  }
+
+  #finalizeSchemaVersionV24(startingVersion) {
+    // Earlier idempotent migrations in this legacy chain write their own
+    // version numbers. Preserve a newer compatible database version.
+    this.sqlite.exec(`PRAGMA user_version = ${Math.max(24, startingVersion)}`);
   }
 
   #migrateContinuityReconciliationV9() {
@@ -9174,14 +9237,24 @@ export class RouletteDatabase {
       });
     }
 
-    const learningCandidates = this.sqlite
-      .prepare(`
+    const learningCandidateStatement = this.sqlite.prepare(`
         SELECT
           shadows.forecast_id,
+          shadows.status AS shadow_status,
+          shadows.cutoff_at AS shadow_cutoff_at,
           shadows.lock_price,
           shadows.median_cell_width,
+          shadows.direction,
+          shadows.probabilities_json,
+          shadows.expected_delta_cell_widths,
+          shadows.sample_json,
+          shadows.nearest_ids_json,
+          shadows.parameters_json,
+          shadows.current_prefix_json,
           shadows.integration_json,
           snapshots.locked_at,
+          snapshots.current_price AS snapshot_current_price,
+          snapshots.cells_json AS snapshot_cells_json,
           settlements.created_at AS settlement_created_at,
           results.price AS result_price,
           results.settled_at AS result_settled_at,
@@ -9206,23 +9279,6 @@ export class RouletteDatabase {
           AND snapshots.instrument = ?
           AND shadows.model_version = ?
           AND shadows.status = 'ready'
-          AND trajectory_adaptive_snapshot_valid_v2(
-            shadows.status,
-            shadows.cutoff_at,
-            snapshots.locked_at,
-            shadows.lock_price,
-            snapshots.current_price,
-            shadows.median_cell_width,
-            shadows.direction,
-            shadows.probabilities_json,
-            shadows.expected_delta_cell_widths,
-            shadows.sample_json,
-            shadows.nearest_ids_json,
-            shadows.parameters_json,
-            shadows.current_prefix_json,
-            shadows.integration_json,
-            snapshots.cells_json
-          ) = 1
           AND shadows.created_at < ?
           AND shadows.cutoff_at < ?
           AND forecasts.created_at < ?
@@ -9235,22 +9291,44 @@ export class RouletteDatabase {
           AND results.created_at < ?
         ORDER BY completed_at DESC, results.id DESC, shadows.forecast_id DESC
         LIMIT ?
-      `)
-      .all(
-        source,
-        instrument,
-        TRAJECTORY_SHADOW_ADAPTIVE_VERSION,
-        lockedAt,
-        lockedAt,
-        lockedAt,
-        lockedAt,
-        lockedAt,
-        lockedAt,
-        lockedAt,
-        lockedAt,
-        lockedAt,
-        TRAJECTORY_SHADOW_LEARNING_LIMIT,
+      `);
+    const rawLearningCandidates = learningCandidateStatement.all(
+      source,
+      instrument,
+      TRAJECTORY_SHADOW_ADAPTIVE_VERSION,
+      lockedAt,
+      lockedAt,
+      lockedAt,
+      lockedAt,
+      lockedAt,
+      lockedAt,
+      lockedAt,
+      lockedAt,
+      lockedAt,
+      TRAJECTORY_SHADOW_LEARNING_CANDIDATE_LIMIT,
+    );
+    const learningCandidates = [];
+    for (const candidate of rawLearningCandidates) {
+      const valid = this.#validAdaptiveTrajectorySnapshotSql(
+        candidate.shadow_status,
+        candidate.shadow_cutoff_at,
+        candidate.locked_at,
+        candidate.lock_price,
+        candidate.snapshot_current_price,
+        candidate.median_cell_width,
+        candidate.direction,
+        candidate.probabilities_json,
+        candidate.expected_delta_cell_widths,
+        candidate.sample_json,
+        candidate.nearest_ids_json,
+        candidate.parameters_json,
+        candidate.current_prefix_json,
+        candidate.integration_json,
+        candidate.snapshot_cells_json,
       );
+      if (valid === 1) learningCandidates.push(candidate);
+      if (learningCandidates.length >= TRAJECTORY_SHADOW_LEARNING_LIMIT) break;
+    }
     const learningRows = [];
     let excludedLearningRowCount = 0;
     for (const candidate of learningCandidates) {
@@ -12194,6 +12272,172 @@ export class RouletteDatabase {
       cacheSize: this.trajectoryAdaptiveValidationCache.size,
       hits: this.trajectoryAdaptiveValidationCacheHits,
       misses: this.trajectoryAdaptiveValidationCacheMisses,
+    };
+  }
+
+  async warmPrecloseForecastValidationIncrementally(
+    source = "buleto",
+    instrument = "default",
+    {
+      batchSize = 32,
+      yieldControl = () => new Promise((resolve) => setImmediate(resolve)),
+      onProgress = null,
+      signal = null,
+    } = {},
+  ) {
+    this.#assertOpen();
+    if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > 1_000) {
+      throw new RangeError("batchSize must be an integer between 1 and 1000");
+    }
+    if (typeof yieldControl !== "function") {
+      throw new TypeError("yieldControl must be a function");
+    }
+    if (onProgress !== null && typeof onProgress !== "function") {
+      throw new TypeError("onProgress must be a function or null");
+    }
+
+    const safeSource = asNonEmptyText(source, undefined, "source");
+    const safeInstrument = asNonEmptyText(instrument, undefined, "instrument");
+    const warmupKey = `${safeSource}\u0000${safeInstrument}`;
+    if (this.trajectoryAdaptiveValidationWarmupPromise !== null) {
+      if (this.trajectoryAdaptiveValidationWarmupKey === warmupKey) {
+        return this.trajectoryAdaptiveValidationWarmupPromise;
+      }
+      try {
+        await this.trajectoryAdaptiveValidationWarmupPromise;
+      } catch {
+        // A different stream still gets its own attempt after the active one.
+      }
+      this.#assertOpen();
+      return this.warmPrecloseForecastValidationIncrementally(
+        safeSource,
+        safeInstrument,
+        { batchSize, yieldControl, onProgress, signal },
+      );
+    }
+    const operation = this.#runPrecloseForecastValidationWarmup({
+      safeSource,
+      safeInstrument,
+      batchSize,
+      yieldControl,
+      onProgress,
+      signal,
+    });
+    this.trajectoryAdaptiveValidationWarmupPromise = operation;
+    this.trajectoryAdaptiveValidationWarmupKey = warmupKey;
+    try {
+      return await operation;
+    } finally {
+      if (this.trajectoryAdaptiveValidationWarmupPromise === operation) {
+        this.trajectoryAdaptiveValidationWarmupPromise = null;
+        this.trajectoryAdaptiveValidationWarmupKey = null;
+      }
+    }
+  }
+
+  async #runPrecloseForecastValidationWarmup({
+    safeSource,
+    safeInstrument,
+    batchSize,
+    yieldControl,
+    onProgress,
+    signal,
+  }) {
+    const statement = this.sqlite.prepare(`
+      SELECT
+        trajectory_shadows.forecast_id,
+        trajectory_shadows.status,
+        trajectory_shadows.cutoff_at,
+        snapshots.locked_at AS snapshot_locked_at,
+        trajectory_shadows.lock_price,
+        snapshots.current_price AS snapshot_current_price,
+        trajectory_shadows.median_cell_width,
+        trajectory_shadows.direction,
+        trajectory_shadows.probabilities_json,
+        trajectory_shadows.expected_delta_cell_widths,
+        trajectory_shadows.sample_json,
+        trajectory_shadows.nearest_ids_json,
+        trajectory_shadows.parameters_json,
+        trajectory_shadows.current_prefix_json,
+        trajectory_shadows.integration_json,
+        snapshots.cells_json
+      FROM forecast_trajectory_shadows AS trajectory_shadows
+      JOIN round_forecasts AS forecasts
+        ON forecasts.id = trajectory_shadows.forecast_id
+      JOIN forecast_snapshots AS snapshots
+        ON snapshots.id = forecasts.snapshot_id
+      WHERE snapshots.source = ?
+        AND snapshots.instrument = ?
+        AND trajectory_shadows.model_version = ?
+        AND trajectory_shadows.status = 'ready'
+        AND trajectory_shadows.forecast_id < ?
+      ORDER BY trajectory_shadows.forecast_id DESC
+      LIMIT ?
+    `);
+    let checkedCount = 0;
+    let validCount = 0;
+    let batchCount = 0;
+    let beforeForecastId = Number.MAX_SAFE_INTEGER;
+    while (signal?.aborted !== true) {
+      const rows = statement.all(
+        safeSource,
+        safeInstrument,
+        TRAJECTORY_SHADOW_ADAPTIVE_VERSION,
+        beforeForecastId,
+        batchSize,
+      );
+      if (rows.length === 0) break;
+
+      for (const row of rows) {
+        validCount += Number(this.#validAdaptiveTrajectorySnapshotSql(
+          row.status,
+          row.cutoff_at,
+          row.snapshot_locked_at,
+          row.lock_price,
+          row.snapshot_current_price,
+          row.median_cell_width,
+          row.direction,
+          row.probabilities_json,
+          row.expected_delta_cell_widths,
+          row.sample_json,
+          row.nearest_ids_json,
+          row.parameters_json,
+          row.current_prefix_json,
+          row.integration_json,
+          row.cells_json,
+        ));
+      }
+
+      checkedCount += rows.length;
+      batchCount += 1;
+      beforeForecastId = Number(rows.at(-1).forecast_id);
+      const progress = {
+        checkedCount,
+        validCount,
+        batchCount,
+        cacheSize: this.trajectoryAdaptiveValidationCache.size,
+        hits: this.trajectoryAdaptiveValidationCacheHits,
+        misses: this.trajectoryAdaptiveValidationCacheMisses,
+        aborted: false,
+      };
+      try {
+        onProgress?.(progress);
+      } catch {
+        // Progress reporting must never change validation semantics.
+      }
+      if (rows.length < batchSize || signal?.aborted === true) break;
+      await yieldControl();
+      this.#assertOpen();
+    }
+
+    return {
+      checkedCount,
+      validCount,
+      batchCount,
+      cacheSize: this.trajectoryAdaptiveValidationCache.size,
+      hits: this.trajectoryAdaptiveValidationCacheHits,
+      misses: this.trajectoryAdaptiveValidationCacheMisses,
+      aborted: signal?.aborted === true,
     };
   }
 

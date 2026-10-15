@@ -15,6 +15,9 @@ import {
   const RED_NUMBERS = new Set([1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36]);
   const ALL_NUMBERS = Array.from({ length: 37 }, (_, number) => number);
   const REFRESH_INTERVAL_MS = 45_000;
+  const REFRESH_RETRY_BASE_MS = 2_000;
+  const REFRESH_RETRY_MAX_MS = 30_000;
+  const REFRESH_RETRY_JITTER_RATIO = 0.2;
   const AGE_UPDATE_INTERVAL_MS = 30_000;
   const PRECLOSE_CAPTURE_MAX_LEAD_MS = 15_000;
   const FOLLOWER_COLLAPSED_LIMIT = 5;
@@ -275,7 +278,7 @@ import {
     predictiveLeaderSnapshot: null,
     predictiveLeaderLoaded: false,
     predictiveLeaderError: false,
-    predictiveLeaderRequiresFreshSnapshot: false,
+    predictiveLeaderRequiresFreshSnapshot: true,
     triples: [],
     triplesLoaded: false,
     triplesError: false,
@@ -296,7 +299,10 @@ import {
     refreshing: false,
     refreshQueued: false,
     refreshTimer: null,
+    refreshFailureCount: 0,
     eventSource: null,
+    eventRevision: 0,
+    stateRequiresFreshSnapshot: true,
     lastRenderedResultKey: null,
     hasCompletedInitialRender: false,
     serverClockMs: null,
@@ -469,6 +475,7 @@ import {
     safeSimulation = false,
     topStatus = ""
   } = {}) {
+    const stale = stateSnapshotIsStale();
     const resetValues = () => {
       elements.virtualBankInitial.textContent = "—";
       elements.virtualBankCurrent.textContent = "—";
@@ -493,9 +500,9 @@ import {
     };
 
     if (!virtualAvailable) {
-      if (!store.stateLoaded && !store.stateError) {
+      if (!store.stateLoaded && !stale) {
         showUnavailable("loading", "Загрузка…", "Получаем состояние виртуального банка.", true);
-      } else if (store.stateError) {
+      } else if (stale) {
         showUnavailable(
           "error",
           "Недоступно",
@@ -518,9 +525,9 @@ import {
 
     if (!testBank || typeof testBank !== "object") {
       showUnavailable(
-        store.stateError ? "stale" : "error",
-        store.stateError ? "Не обновлено" : "Нет данных банка",
-        store.stateError
+        stale ? "stale" : "error",
+        stale ? "Не обновлено" : "Нет данных банка",
+        stale
           ? "Состояние не обновлено, а последнее полученное состояние виртуального банка отсутствует."
           : "Сервер не передал testBank. Виртуальные суммы не вычисляются в браузере."
       );
@@ -568,7 +575,6 @@ import {
       return;
     }
 
-    const stale = store.stateError;
     let state = exhausted ? "exhausted" : dataComplete ? "running" : "gap";
     if (stale && !exhausted) state = "stale";
     elements.virtualBank.dataset.state = state;
@@ -592,11 +598,13 @@ import {
     else if (netResult < 0) elements.virtualBankPnlCard.classList.add("is-loss");
     elements.virtualBankCurrentCard.classList.toggle("is-exhausted", exhausted);
 
-    elements.virtualBankNext.textContent = nextStake === null
+    elements.virtualBankNext.textContent = stale || nextStake === null
       ? "—"
       : formatVirtualAmount(nextStake);
     elements.virtualBankNextCard.classList.remove("is-available", "is-unavailable");
-    if (exhausted || canAffordNext === false) {
+    if (stale) {
+      elements.virtualBankNextState.textContent = "Ожидаем свежий снимок";
+    } else if (exhausted || canAffordNext === false) {
       elements.virtualBankNextState.textContent = "Недоступен";
       elements.virtualBankNextCard.classList.add("is-unavailable");
     } else if (waitingForTarget && nextStake !== null) {
@@ -616,7 +624,9 @@ import {
     setVirtualTime(elements.virtualBankExhaustedAt, exhaustedAt);
 
     let message;
-    if (exhausted) {
+    if (stale) {
+      message = "Свежий снимок API временно недоступен. Исторический баланс помечен как не обновлённый, а следующий виртуальный шаг скрыт.";
+    } else if (exhausted) {
       const nextText = nextStake === null
         ? "Следующий виртуальный шаг больше недоступен"
         : `Следующий виртуальный шаг ${formatVirtualAmount(nextStake)} недоступен при остатке ${formatVirtualAmount(currentBalance)}`;
@@ -643,9 +653,6 @@ import {
 
     if (!dataComplete) {
       message += " В истории есть разрыв: баланс и P&L учитывают только подтверждённые сохранённые шаги.";
-    }
-    if (stale) {
-      message = `Не удалось обновить состояние; показаны последние полученные значения. ${message}`;
     }
     setTextIfChanged(elements.virtualBankMessage, message);
   }
@@ -794,6 +801,7 @@ import {
   }
 
   function renderVirtualBettor(virtualBettor) {
+    const stale = stateSnapshotIsStale();
     const available = virtualBettor && typeof virtualBettor === "object";
     const safeSimulation = available
       && virtualBettor.mode === "simulation"
@@ -805,21 +813,21 @@ import {
     });
 
     if (!available) {
-      const missingFromState = store.stateLoaded && !store.stateError;
-      elements.virtualPanel.dataset.state = store.stateError || missingFromState ? "error" : "loading";
-      elements.virtualStatusBadge.textContent = store.stateError
+      const missingFromState = store.stateLoaded && !stale;
+      elements.virtualPanel.dataset.state = stale || missingFromState ? "error" : "loading";
+      elements.virtualStatusBadge.textContent = stale
         ? "Недоступно"
         : missingFromState
           ? "Нет данных"
           : "Загрузка…";
-      elements.virtualStatusTitle.textContent = store.stateError
+      elements.virtualStatusTitle.textContent = stale
         ? "Не удалось получить состояние симуляции"
         : missingFromState
           ? "Сервер не передал состояние автотеста"
           : "Получаем состояние…";
       setTextIfChanged(
         elements.virtualStatusCopy,
-        store.stateError
+        stale
           ? "Расчёты не обновлены. Панель повторит запрос автоматически; реальных действий по-прежнему нет."
           : missingFromState
             ? "В ответе /api/state пока нет virtualBettor. Панель остаётся только информационной и повторит запрос автоматически."
@@ -833,7 +841,7 @@ import {
       elements.virtualCandidate.hidden = true;
       elements.virtualSession.hidden = true;
       renderVirtualModel(null);
-      renderVirtualHistory([], store.stateError
+      renderVirtualHistory([], stale
         ? "История симуляции сейчас недоступна."
         : missingFromState
           ? "История симуляции ещё не передана сервером."
@@ -883,8 +891,8 @@ import {
     const sessionHasGap = isGapInvalidStatus(activeSession?.status);
     const hasSession = activeSession !== null && targetNumber !== null;
     const progressRounds = hasSession ? triggerRounds : candidateRounds;
-    const stalePrefix = store.stateError
-      ? "Не удалось обновить состояние; показаны последние полученные данные. "
+    const stalePrefix = stale
+      ? "Не удалось обновить состояние; текущая цель и следующий шаг скрыты. "
       : "";
 
     let panelState = rawStatus;
@@ -923,7 +931,7 @@ import {
         : `Цель — число ${targetNumber}. Она заморожена и не меняется до завершения этой виртуальной сессии.`;
     }
 
-    if (store.stateError && panelState !== "invalid") {
+    if (stale && panelState !== "invalid") {
       if (panelState !== "exhausted") panelState = "stale";
       badge = `Не обновлено · ${badge.toLowerCase()}`;
     }
@@ -951,7 +959,7 @@ import {
         : `${progressRounds} из требуемых ${triggerThreshold} сохранённых раундов`
     );
 
-    const showCandidate = !hasSession && candidateNumber !== null && candidateRounds !== null;
+    const showCandidate = !stale && !hasSession && candidateNumber !== null && candidateRounds !== null;
     elements.virtualCandidate.hidden = !showCandidate;
     if (showCandidate) {
       setVirtualNumberBall(elements.virtualCandidateNumber, candidateNumber, "virtual-candidate__number");
@@ -971,8 +979,8 @@ import {
       elements.virtualCandidate.removeAttribute("aria-label");
     }
 
-    elements.virtualSession.hidden = !hasSession;
-    if (hasSession) {
+    elements.virtualSession.hidden = stale || !hasSession;
+    if (hasSession && !stale) {
       if (activeSession.id !== null && activeSession.id !== undefined) {
         elements.virtualSession.dataset.sessionId = String(activeSession.id);
       } else {
@@ -1188,6 +1196,48 @@ import {
     }
   }
 
+  function clearRefreshTimer() {
+    if (store.refreshTimer === null) return;
+    window.clearTimeout(store.refreshTimer);
+    store.refreshTimer = null;
+  }
+
+  function refreshRetryDelayMs(failureCount) {
+    const exponent = Math.min(Math.max(0, failureCount - 1), 10);
+    const exponentialDelay = Math.min(
+      REFRESH_RETRY_MAX_MS,
+      REFRESH_RETRY_BASE_MS * (2 ** exponent),
+    );
+    const jitter = exponentialDelay * REFRESH_RETRY_JITTER_RATIO * Math.random();
+    return Math.max(1_000, Math.min(
+      REFRESH_RETRY_MAX_MS,
+      Math.round(exponentialDelay - jitter),
+    ));
+  }
+
+  function schedulePollingRefresh({ retry = false } = {}) {
+    clearRefreshTimer();
+    store.refreshFailureCount = retry
+      ? Math.min(store.refreshFailureCount + 1, 11)
+      : 0;
+    const delay = retry
+      ? refreshRetryDelayMs(store.refreshFailureCount)
+      : REFRESH_INTERVAL_MS;
+    store.refreshTimer = window.setTimeout(() => {
+      store.refreshTimer = null;
+      refreshAll();
+    }, delay);
+  }
+
+  function stateSnapshotIsStale() {
+    return store.stateError || store.stateRequiresFreshSnapshot;
+  }
+
+  function eventStreamIsOpen() {
+    return "EventSource" in window
+      && store.eventSource?.readyState === window.EventSource.OPEN;
+  }
+
   function extractItems(payload) {
     if (Array.isArray(payload)) return payload;
     return Array.isArray(payload?.items) ? payload.items : [];
@@ -1199,7 +1249,10 @@ import {
       return;
     }
 
+    clearRefreshTimer();
     store.refreshing = true;
+    const eventSourceAtRequest = store.eventSource;
+    const eventRevisionAtRequest = store.eventRevision;
     elements.refreshButton.classList.add("is-loading");
     elements.refreshButton.disabled = true;
     elements.main.setAttribute("aria-busy", "true");
@@ -1216,15 +1269,20 @@ import {
     ]);
 
     let successfulRequests = 0;
+    const liveSnapshotIsCurrent = eventStreamIsOpen()
+      && store.eventSource === eventSourceAtRequest
+      && store.eventRevision === eventRevisionAtRequest;
 
     if (requests[0].status === "fulfilled") {
       store.state = requests[0].value;
       store.stateLoaded = true;
       store.stateError = false;
+      store.stateRequiresFreshSnapshot = !liveSnapshotIsCurrent;
       captureServerClock(store.state?.serverTime);
       successfulRequests += 1;
     } else {
       store.stateError = true;
+      store.stateRequiresFreshSnapshot = true;
     }
     if (requests[1].status === "fulfilled") {
       store.results = extractItems(requests[1].value);
@@ -1278,17 +1336,19 @@ import {
       if (snapshot && (snapshot.account === null || account)) {
         store.predictiveLeaderSnapshot = { ...snapshot, account };
         store.predictiveLeaderError = false;
-        store.predictiveLeaderRequiresFreshSnapshot = false;
+        store.predictiveLeaderRequiresFreshSnapshot = !liveSnapshotIsCurrent;
         captureServerClock(snapshot.serverTime);
         successfulRequests += 1;
       } else {
         store.predictiveLeaderSnapshot = null;
         store.predictiveLeaderError = true;
+        store.predictiveLeaderRequiresFreshSnapshot = true;
       }
     } else {
       store.predictiveLeaderSnapshot = null;
       store.predictiveLeaderLoaded = true;
       store.predictiveLeaderError = true;
+      store.predictiveLeaderRequiresFreshSnapshot = true;
     }
 
     if (successfulRequests > 0) {
@@ -1312,7 +1372,13 @@ import {
     if (store.refreshQueued) {
       store.refreshQueued = false;
       refreshAll();
+      return;
     }
+    schedulePollingRefresh({
+      retry: successfulRequests < requests.length
+        || store.stateRequiresFreshSnapshot
+        || store.predictiveLeaderRequiresFreshSnapshot,
+    });
   }
 
   function renderFetchFailure() {
@@ -2797,6 +2863,7 @@ import {
   function currentPredictiveLeaderAccountContext() {
     if (store.predictiveLeaderError) return { state: "error" };
     if (!store.predictiveLeaderLoaded) return { state: "loading" };
+    if (store.predictiveLeaderRequiresFreshSnapshot) return { state: "stale" };
     const account = store.predictiveLeaderSnapshot?.account ?? null;
     return account ? { state: "ready", account } : { state: "unavailable" };
   }
@@ -2809,6 +2876,7 @@ import {
       const messages = {
         loading: "Загрузка…",
         error: "Свежий снимок счёта недоступен",
+        stale: "Счёт и ставка скрыты до свежего снимка",
         unavailable: "Контракт счёта не подтверждён",
       };
       elements.combinedPickAccount.dataset.state = context.state;
@@ -3196,6 +3264,7 @@ import {
   }
 
   function renderPrecloseForecast() {
+    const stale = stateSnapshotIsStale();
     const forecastState = store.state?.precloseForecast || null;
     const latest = forecastState?.latest || null;
     const currentRound = store.state?.collector?.currentRound || null;
@@ -3207,7 +3276,8 @@ import {
     const secondsUntilClose = closesMs === null
       ? null
       : Math.max(0, Math.ceil((closesMs - nowMs) / 1_000));
-    const matchesCurrent = latest !== null
+    const matchesCurrent = !stale
+      && latest !== null
       && currentRoundId !== null
       && latestRoundId === currentRoundId;
     const shadow = matchesCurrent
@@ -3245,6 +3315,14 @@ import {
       );
       elements.precloseLivePrice.textContent = "—";
       elements.precloseProjectedPrice.textContent = "—";
+
+      if (stale) {
+        elements.preclosePanel.dataset.state = "stale";
+        elements.precloseBadge.textContent = "Не обновлено";
+        elements.precloseStatus.textContent = "Свежий снимок API временно недоступен — текущий прогноз скрыт.";
+        elements.precloseTiming.textContent = "Историческая статистика оставлена для аудита; активные числа появятся после восстановления live‑связи.";
+        return;
+      }
 
       if (closesMs === null || currentRoundId === null) {
         elements.preclosePanel.dataset.state = "waiting";
@@ -5205,11 +5283,13 @@ import {
     );
     setTextIfChanged(
       elements.followerLiveAccountStake,
-      `по ${formatRiskAmount(account.nextStakePerNumber)}`
+      stale ? "—" : `по ${formatRiskAmount(account.nextStakePerNumber)}`
     );
     setTextIfChanged(
       elements.followerLiveAccountTicket,
-      `5 чисел · полный билет ${formatRiskAmount(account.nextRoundCost)}`
+      stale
+        ? "билет скрыт до свежего снимка"
+        : `5 чисел · полный билет ${formatRiskAmount(account.nextRoundCost)}`
     );
 
     const evidenceText = action.cumulativeRate === null
@@ -5241,7 +5321,7 @@ import {
     setTextIfChanged(
       elements.followerLiveAccountGate,
       stale
-        ? `Данные не обновлены: новый виртуальный билет приостановлен. Последнее подтверждённое состояние — ${gateText}`
+        ? "Свежий снимок API временно недоступен: новый виртуальный билет и его числа скрыты. Исторические итоги ниже оставлены только для аудита."
         : gateText
     );
 
@@ -5280,15 +5360,15 @@ import {
     renderFollowerLiveLastHit(null);
     renderFollowerLiveGatedAccount(null, {
       loading: state === "loading",
-      failed: state === "error" && store.stateError
+      failed: state === "error" && stateSnapshotIsStale()
     });
   }
 
   function renderFollowerTop5Tracker(value) {
     if (!value) {
-      if (!store.stateLoaded && !store.stateError) {
+      if (!store.stateLoaded && !stateSnapshotIsStale()) {
         renderFollowerLiveUnavailable("loading", "Загрузка…", "Получаем состояние live‑тестирования.", true);
-      } else if (store.stateError) {
+      } else if (stateSnapshotIsStale()) {
         renderFollowerLiveUnavailable("error", "Ошибка загрузки", "Не удалось получить состояние live‑тестирования. Повторим автоматически.");
       } else {
         renderFollowerLiveUnavailable("error", "Нет данных", "Сервер не передал состояние live‑тестирования.");
@@ -5306,12 +5386,27 @@ import {
       return;
     }
 
-    const stale = store.stateError;
+    const stale = stateSnapshotIsStale();
     const staleSuffix = stale ? " · не обновлено" : "";
     elements.followerLive.dataset.state = stale ? "stale" : tracker.status;
     elements.followerLive.setAttribute("aria-busy", "false");
     renderFollowerLiveLastHit(tracker.lastCompletedSession);
     renderFollowerLiveGatedAccount(tracker.gatedAccount, { stale });
+
+    if (stale) {
+      setTextIfChanged(elements.followerLiveStatus, "Не обновлено · билет скрыт");
+      setTextIfChanged(elements.followerLiveSource, "—");
+      setTextIfChanged(elements.followerLiveCurrentAttempt, "—");
+      setTextIfChanged(elements.followerLiveAttemptSummary, "Ждём свежий снимок API");
+      setTextIfChanged(
+        elements.followerLiveLockMeta,
+        "Последняя зафиксированная пятёрка не показывается как активный билет, пока API не подтвердит актуальное состояние."
+      );
+      renderFollowerLiveFixedNumbers(null);
+      renderFollowerLiveAttempts(null);
+      renderFollowerLiveHistory(null);
+      return;
+    }
 
     if (!tracker.currentSession) {
       setTextIfChanged(elements.followerLiveSource, "—");
@@ -5523,7 +5618,9 @@ import {
 
     const action = account.currentAction;
     let actionText;
-    if (action.action === "would_bet") {
+    if (stale) {
+      actionText = "Свежий снимок API временно недоступен: текущие числа и размер следующего виртуального билета скрыты.";
+    } else if (action.action === "would_bet") {
       actionText = `На текущем срезе: по ${formatRiskAmount(action.stakePerNumber)} на каждое из чисел ${action.targetNumbers.join(", ")} · полный билет ${formatRiskAmount(action.totalStake)}.`;
     } else if (action.reason === "bankroll_exhausted") {
       const stoppedAt = account.exhaustedAt
@@ -5596,7 +5693,7 @@ import {
       return;
     }
 
-    const stale = store.pairsError;
+    const stale = store.pairsError || stateSnapshotIsStale();
     const signal = warm.currentSignal;
     elements.followerDynamicNext.dataset.state = stale ? "stale" : signal.status;
     elements.followerDynamicNext.setAttribute("aria-busy", "false");
@@ -5611,7 +5708,7 @@ import {
       elements.followerDynamicNextStatus,
       `${statusLabels[signal.status]}${stale ? " · не обновлено" : ""}`
     );
-    renderFollowerWarmCurrent(signal);
+    renderFollowerWarmCurrent(stale ? null : signal);
     renderFollowerWarmHistoricalAccount(warm.historicalAccount, { stale });
     setValues({
       hits: riskAmountFormatter.format(warm.hitCount),
@@ -6837,8 +6934,27 @@ import {
   }
 
   function scheduleRefresh() {
-    window.clearTimeout(store.refreshTimer);
-    store.refreshTimer = window.setTimeout(() => refreshAll(), 180);
+    clearRefreshTimer();
+    if (store.refreshing) {
+      store.refreshQueued = true;
+      return;
+    }
+    store.refreshTimer = window.setTimeout(() => {
+      store.refreshTimer = null;
+      refreshAll();
+    }, 180);
+  }
+
+  function invalidateLiveSnapshots() {
+    store.eventRevision += 1;
+    store.predictiveLeaderRequiresFreshSnapshot = true;
+    store.stateRequiresFreshSnapshot = true;
+    renderCombinedPick();
+    renderPredictiveLeaderAccount();
+    renderPrecloseForecast();
+    renderFollowerHitCurve();
+    renderFollowerTop5Tracker(store.state?.followerTop5Tracker || null);
+    renderVirtualBettor(store.state?.virtualBettor || null);
   }
 
   function connectEventStream() {
@@ -6855,7 +6971,8 @@ import {
 
     source.addEventListener("open", () => {
       setConnection("online", "Онлайн");
-      if (store.predictiveLeaderRequiresFreshSnapshot) scheduleRefresh();
+      invalidateLiveSnapshots();
+      scheduleRefresh();
     });
 
     source.addEventListener("update", (event) => {
@@ -6866,15 +6983,21 @@ import {
         reason = "";
       }
       if (reason === "gap") announce("Обнаружен пропуск в истории результатов");
+      invalidateLiveSnapshots();
       scheduleRefresh();
     });
 
-    source.addEventListener("message", scheduleRefresh);
+    source.addEventListener("message", () => {
+      invalidateLiveSnapshots();
+      scheduleRefresh();
+    });
 
     source.addEventListener("error", () => {
       if (store.eventSource !== source) return;
-      store.predictiveLeaderRequiresFreshSnapshot = true;
-      renderCombinedPick();
+      const hadFreshSnapshot = !store.predictiveLeaderRequiresFreshSnapshot
+        || !store.stateRequiresFreshSnapshot;
+      invalidateLiveSnapshots();
+      if (hadFreshSnapshot) scheduleRefresh();
       if (source.readyState === EventSource.CLOSED) {
         setConnection("offline", "Эфир отключён");
       } else {
@@ -6909,14 +7032,16 @@ import {
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") refreshAll();
   });
-  window.addEventListener("beforeunload", () => store.eventSource?.close());
+  window.addEventListener("beforeunload", () => {
+    clearRefreshTimer();
+    store.eventSource?.close();
+  });
 
   initializeFollowerSource();
   renderNumberGrid(null);
   renderRiskCalculator();
   connectEventStream();
   refreshAll();
-  window.setInterval(() => refreshAll(), REFRESH_INTERVAL_MS);
   window.setInterval(() => {
     if (store.stateLoaded) renderPrecloseForecast();
   }, 1_000);

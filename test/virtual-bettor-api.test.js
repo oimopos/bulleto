@@ -63,7 +63,13 @@ async function waitUntilReady(baseUrl, child, logs) {
       const response = await fetch(`${baseUrl}/api/live`, {
         signal: AbortSignal.timeout(500),
       });
-      if (response.ok) return;
+      if (response.ok) {
+        const payload = await response.json();
+        const trajectoryValidation =
+          payload?.startup?.trajectoryValidation?.status
+          ?? payload?.startup?.trajectoryValidation;
+        if (trajectoryValidation === "ready") return;
+      }
     } catch {
       // The listener may not have bound its port yet.
     }

@@ -270,7 +270,13 @@ async function waitUntilReady(baseUrl, child, logs) {
       const response = await fetch(`${baseUrl}/api/live`, {
         signal: AbortSignal.timeout(1_000),
       });
-      if (response.ok) return;
+      if (response.ok) {
+        const payload = await response.json();
+        const trajectoryValidation =
+          payload?.startup?.trajectoryValidation?.status
+          ?? payload?.startup?.trajectoryValidation;
+        if (trajectoryValidation === "ready") return;
+      }
     } catch {
       // The child has not bound its port yet.
     }
@@ -477,17 +483,55 @@ test(
         logger: quietLogger,
       });
 
-      const firstWarm = database.warmPrecloseForecastValidation(
+      let releaseWarmupBatch;
+      let warmupYieldCount = 0;
+      let warmupSettled = false;
+      const warmupProgress = [];
+      const firstWarmPromise = database.warmPrecloseForecastValidationIncrementally(
         SOURCE,
         INSTRUMENT,
+        {
+          batchSize: 1,
+          yieldControl: () => new Promise((resolve) => {
+            warmupYieldCount += 1;
+            releaseWarmupBatch = resolve;
+          }),
+          onProgress: (progress) => warmupProgress.push(progress),
+        },
       );
+      void firstWarmPromise.then(() => {
+        warmupSettled = true;
+      });
+      const otherStreamWarmPromise = database.warmPrecloseForecastValidationIncrementally(
+        SOURCE,
+        `${INSTRUMENT}-other`,
+        { batchSize: 1 },
+      );
+      await Promise.resolve();
+      assert.equal(warmupYieldCount, 1);
+      assert.equal(warmupSettled, false, "a full batch must yield before continuing");
+      assert.deepEqual(
+        warmupProgress.map(({ checkedCount, validCount, batchCount }) => ({
+          checkedCount,
+          validCount,
+          batchCount,
+        })),
+        [{ checkedCount: 1, validCount: 1, batchCount: 1 }],
+      );
+      releaseWarmupBatch();
+      const firstWarm = await firstWarmPromise;
+      const otherStreamWarm = await otherStreamWarmPromise;
       assert.deepEqual(firstWarm, {
         checkedCount: 1,
         validCount: 1,
+        batchCount: 1,
         cacheSize: 1,
         hits: 0,
         misses: 1,
+        aborted: false,
       });
+      assert.equal(otherStreamWarm.checkedCount, 0);
+      assert.equal(otherStreamWarm.validCount, 0);
       assert.deepEqual(
         database.warmPrecloseForecastValidation(SOURCE, INSTRUMENT),
         {

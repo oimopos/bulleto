@@ -38,3 +38,5 @@ services:
         value: "30000"
       - key: STALE_AFTER_MS
         value: "180000"
+      - key: TRAJECTORY_VALIDATION_WARMUP_BATCH_SIZE
+        value: "32"
