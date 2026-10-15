@@ -49,6 +49,43 @@ function sameInstant(left, right) {
     && leftMilliseconds === rightMilliseconds;
 }
 
+function predictiveLeaderModelForApi(leader) {
+  return {
+    sourceCount: leader.sourceCount,
+    familyCount: leader.familyCount,
+    activeFamilies: Object.keys(leader.familyWeights),
+    activeFamilyWeights: Object.fromEntries(
+      Object.entries(leader.familyWeights).map(([family, weight]) => [family, weight]),
+    ),
+    learningVersion: leader.learning.version,
+    learningStatus: leader.learning.status,
+    trainingCount: leader.learning.trainingCount,
+    learnedFamilyWeights: Object.fromEntries(
+      Object.entries(leader.learning.familyWeights).map(
+        ([family, weight]) => [family, weight],
+      ),
+    ),
+    tieBreakApplied: leader.tieBreakApplied,
+  };
+}
+
+function frozenPredictiveLeader(latestForecast, forecastId, forecastLockedAt) {
+  const storedLeader = latestForecast.predictiveLeader;
+  if (storedLeader === null || storedLeader === undefined) return null;
+
+  const leader = normalizeLearnedLeaderDecision(storedLeader);
+  if (
+    !leader
+    || safeInteger(storedLeader.forecastId, { minimum: 1 }) !== forecastId
+    || !sameInstant(leader.lockedAt, forecastLockedAt)
+    || leader.status !== 'ready'
+  ) {
+    return null;
+  }
+  const number = safeRouletteNumber(leader.leaderNumber);
+  return number === null ? null : { leader, number };
+}
+
 function strictInteger(value, { minimum = 0 } = {}) {
   return Number.isSafeInteger(value) && value >= minimum ? value : null;
 }
@@ -811,17 +848,37 @@ export function predictiveLeaderSnapshotForApi({
     bettingClosesAt,
     roundEndsAt,
   };
+  const frozen = frozenPredictiveLeader(
+    latestForecast,
+    forecastId,
+    forecastLockedAt,
+  );
+  const observation = frozen
+    ? {
+        candidateNumber: frozen.number,
+        model: predictiveLeaderModelForApi(frozen.leader),
+      }
+    : {};
   if (!forecastRoundMatches) {
-    return withStatus(base, 'paused', 'forecast_round_mismatch', { forecast });
+    return withStatus(base, 'paused', 'forecast_round_mismatch', {
+      forecast,
+      ...observation,
+    });
   }
   if (Date.parse(serverTime) < Date.parse(forecastLockedAt)) {
     return withStatus(base, 'paused', 'forecast_invalid', { forecast });
   }
   if (Date.parse(serverTime) >= Date.parse(bettingClosesAt)) {
-    return withStatus(base, 'waiting', 'betting_closed', { forecast });
+    return withStatus(base, 'waiting', 'betting_closed', {
+      forecast,
+      ...observation,
+    });
   }
   if (latestForecast.settlement !== null) {
-    return withStatus(base, 'waiting', 'forecast_settled', { forecast });
+    return withStatus(base, 'waiting', 'forecast_settled', {
+      forecast,
+      ...observation,
+    });
   }
 
   const storedLeader = latestForecast.predictiveLeader;
@@ -845,25 +902,7 @@ export function predictiveLeaderSnapshotForApi({
     return withStatus(base, 'paused', 'leader_invalid', { forecast });
   }
 
-  const activeFamilyWeights = Object.fromEntries(
-    Object.entries(leader.familyWeights).map(([family, weight]) => [family, weight]),
-  );
-  const learnedFamilyWeights = Object.fromEntries(
-    Object.entries(leader.learning.familyWeights).map(
-      ([family, weight]) => [family, weight],
-    ),
-  );
-  const model = {
-    sourceCount: leader.sourceCount,
-    familyCount: leader.familyCount,
-    activeFamilies: Object.keys(activeFamilyWeights),
-    activeFamilyWeights,
-    learningVersion: leader.learning.version,
-    learningStatus: leader.learning.status,
-    trainingCount: leader.learning.trainingCount,
-    learnedFamilyWeights,
-    tieBreakApplied: leader.tieBreakApplied,
-  };
+  const model = predictiveLeaderModelForApi(leader);
   if (metrics?.qualityGate?.eligible !== true) {
     if (!metrics?.qualityGate) {
       return withStatus(base, 'waiting', 'quality_metrics_unavailable', {

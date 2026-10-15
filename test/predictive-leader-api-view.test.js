@@ -406,7 +406,7 @@ test('separate predictive leader GET view exposes exactly one fresh number', () 
   );
 });
 
-test('predictive leader GET view fails closed instead of returning a stale number', () => {
+test('predictive leader GET never authorizes stale candidates', () => {
   const unavailableDecision = buildLearnedLeaderDecision({
     sources: [],
     lockedAt: LOCKED_AT,
@@ -460,6 +460,7 @@ test('predictive leader GET view fails closed instead of returning a stale numbe
     {
       status: 'paused',
       reason: 'forecast_round_mismatch',
+      candidateNumber: 7,
       mutate(state) {
         state.precloseForecast.latest.roundId = '102';
       },
@@ -467,6 +468,7 @@ test('predictive leader GET view fails closed instead of returning a stale numbe
     {
       status: 'waiting',
       reason: 'forecast_settled',
+      candidateNumber: 7,
       mutate(state) {
         state.precloseForecast.latest.settlement = { actualNumber: 7 };
       },
@@ -474,6 +476,7 @@ test('predictive leader GET view fails closed instead of returning a stale numbe
     {
       status: 'waiting',
       reason: 'betting_closed',
+      candidateNumber: 7,
       mutate(state) {
         state.precloseForecast.latest.bettingClosesAt = SERVER_TIME;
       },
@@ -512,8 +515,8 @@ test('predictive leader GET view fails closed instead of returning a stale numbe
     assert.equal(payload.reason, scenario.reason);
     assert.equal(payload.action, 'WAIT');
     assert.equal(payload.number, null);
-    assert.equal(payload.candidateNumber, null);
-    assert.equal(payload.model, null);
+    assert.equal(payload.candidateNumber, scenario.candidateNumber ?? null);
+    assert.equal(payload.model !== null, scenario.candidateNumber !== undefined);
     assert.deepEqual(payload.account, pendingAccount());
   }
 });

@@ -3540,11 +3540,16 @@ import {
     if (context.state !== "ready") {
       if (
         context.state === "waiting"
-        && context.reason === "confidence_not_proven"
         && context.snapshot
+        && context.snapshot.candidateNumber !== null
       ) {
         const { candidateNumber, metrics } = context.snapshot;
         const gate = metrics?.qualityGate;
+        const staleCandidate = [
+          "forecast_round_mismatch",
+          "forecast_settled",
+          "betting_closed",
+        ].includes(context.reason);
         elements.combinedPick.dataset.state = "waiting";
         elements.combinedPick.setAttribute("aria-busy", "false");
         elements.combinedPickNumber.className =
@@ -3552,18 +3557,26 @@ import {
         elements.combinedPickNumber.textContent = String(candidateNumber);
         elements.combinedPickNumber.setAttribute(
           "aria-label",
-          `Неквалифицированный кандидат: число ${candidateNumber}, ставок нет`,
+          staleCandidate
+            ? `Последний кандидат прошлого или закрытого раунда: число ${candidateNumber}, не ставить`
+            : `Неквалифицированный кандидат: число ${candidateNumber}, ставок нет`,
         );
         setTextIfChanged(
           elements.combinedPickStatus,
-          "WAIT — кандидат виден для наблюдения, но допуск к ставке не подтверждён.",
+          staleCandidate
+            ? `WAIT — последний кандидат раунда ${context.snapshot.forecast.roundId}; раунд уже сменился или ставки закрыты. Не использовать для ставки.`
+            : "WAIT — кандидат виден для наблюдения, но допуск к ставке не подтверждён.",
         );
-        const qualificationText = gate.lowerBound === null
-          ? `${gate.hitCount}/${gate.sampleSize} попаданий · граница пока не рассчитана`
-          : `${gate.hitCount}/${gate.sampleSize} попаданий · нижняя 95% граница ${trajectoryShadowShareFormatter.format(gate.lowerBound)}`;
+        const qualificationText = !gate
+          ? "проверка качества недоступна"
+          : gate.lowerBound === null
+            ? `${gate.hitCount}/${gate.sampleSize} попаданий · граница пока не рассчитана`
+            : `${gate.hitCount}/${gate.sampleSize} попаданий · нижняя 95% граница ${trajectoryShadowShareFormatter.format(gate.lowerBound)}`;
         setTextIfChanged(
           elements.combinedPickSources,
-          `Кандидат ${candidateNumber} · проверка ${gate.sampleSize}/${gate.requiredSampleSize} · ${qualificationText} · база 1/37`,
+          staleCandidate
+            ? `Последний кандидат раунда ${context.snapshot.forecast.roundId} · ${qualificationText} · WAIT, не для ставки`
+            : `Кандидат ${candidateNumber} · проверка ${gate.sampleSize}/${gate.requiredSampleSize} · ${qualificationText} · база 1/37`,
         );
         return;
       }

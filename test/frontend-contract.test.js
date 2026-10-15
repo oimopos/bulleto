@@ -589,16 +589,20 @@ test("server exposes a separate read-only predictive leader GET", () => {
   const viewStart = server.indexOf("function predictiveLeaderForApi()");
   const viewEnd = server.indexOf("function clampLimit", viewStart);
   const view = server.slice(viewStart, viewEnd);
+  const stateStart = server.indexOf("function predictiveLeaderSnapshotForState(");
+  const stateEnd = server.indexOf("function recordPredictiveLeaderSignalIfBet(", stateStart);
+  const snapshotState = server.slice(stateStart, stateEnd);
 
   assert.ok(viewStart >= 0 && viewEnd > viewStart);
+  assert.ok(stateStart >= 0 && stateEnd > stateStart);
   assert.match(
     server,
     /if \(pathname === '\/api\/predictive-leader'\) \{[\s\S]*?sendJson\(response, 200, predictiveLeaderForApi\(\)\)/,
   );
   assert.match(view, /db\.getPredictiveLeaderReadState\(source, instrument\)/);
-  assert.match(view, /predictiveLeaderSnapshotForApi\(\{/);
-  assert.match(view, /collector: collector\.getStatus\(\)/);
-  assert.match(view, /pipelinePending: resultPipeline\.getPendingCounts\(\)/);
+  assert.match(view, /predictiveLeaderSnapshotForState\(/);
+  assert.match(snapshotState, /collector: collector\.getStatus\(\)/);
+  assert.match(snapshotState, /pipelinePending: resultPipeline\.getPendingCounts\(\)/);
   assert.doesNotMatch(view, /dashboardState|getDashboardState|getPrecloseForecastState/);
 });
 

@@ -263,6 +263,35 @@ test("predictive leader API preserves an observation-only candidate while action
   }).snapshot.candidateNumber, 7);
 });
 
+test("predictive leader preserves stale candidates as WAIT-only observations", () => {
+  for (const reason of [
+    "forecast_round_mismatch",
+    "forecast_settled",
+    "betting_closed",
+  ]) {
+    const stale = predictiveLeaderApiSnapshot();
+    stale.status = reason === "forecast_round_mismatch" ? "paused" : "waiting";
+    stale.reason = reason;
+    stale.action = "WAIT";
+    stale.number = null;
+    stale.candidateNumber = 7;
+    if (reason === "forecast_round_mismatch") {
+      stale.freshness.forecastRoundMatches = false;
+    } else {
+      stale.serverTime = stale.forecast.bettingClosesAt;
+    }
+
+    const normalized = normalizePredictiveLeaderApiSnapshot(stale);
+    assert.equal(normalized?.candidateNumber, 7, reason);
+    assert.equal(normalized?.number, null, reason);
+    assert.equal(normalized?.action, "WAIT", reason);
+    assert.equal(predictiveLeaderNumberContext({
+      loaded: true,
+      snapshot: normalized,
+    }).snapshot.candidateNumber, 7, reason);
+  }
+});
+
 test("predictive leader first-fetch error cannot remain stuck on loading", () => {
   const ready = normalizePredictiveLeaderApiSnapshot(predictiveLeaderApiSnapshot());
   assert.deepEqual(predictiveLeaderNumberContext({

@@ -51,6 +51,11 @@ const PREDICTIVE_LEADER_REASONS_WITH_FORECAST = new Set([
   "quality_metrics_unavailable",
   "leader_invalid",
 ]);
+const PREDICTIVE_LEADER_STALE_CANDIDATE_REASONS = new Set([
+  "forecast_round_mismatch",
+  "forecast_settled",
+  "betting_closed",
+]);
 export const TRAJECTORY_RANK37_EVIDENCE_MASS_THRESHOLD =
   SCORE_EPSILON / 0.95;
 
@@ -407,10 +412,13 @@ export function normalizePredictiveLeaderApiSnapshot(value) {
 
   if (value.status !== "ready") {
     const confidenceWait = value.reason === "confidence_not_proven";
-    const candidateNumber = confidenceWait
+    const staleCandidate = PREDICTIVE_LEADER_STALE_CANDIDATE_REASONS
+      .has(value.reason);
+    const mayExposeCandidate = confidenceWait || staleCandidate;
+    const candidateNumber = mayExposeCandidate
       ? safeRouletteNumber(value.candidateNumber)
       : null;
-    const model = confidenceWait
+    const model = mayExposeCandidate
       ? normalizedPredictiveLeaderModel(value.model)
       : null;
     if (
@@ -421,7 +429,17 @@ export function normalizePredictiveLeaderApiSnapshot(value) {
         || metrics.qualityGate.eligible === true
       ))
       || (confidenceWait && (candidateNumber === null || !model))
-      || (!confidenceWait && (
+      || (staleCandidate && value.candidateNumber !== null && (
+        candidateNumber === null || !model
+      ))
+      || (staleCandidate && value.candidateNumber === null && value.model !== null)
+      || (value.reason === "forecast_round_mismatch"
+        && candidateNumber !== null
+        && freshness.forecastRoundMatches !== false)
+      || (value.reason === "betting_closed"
+        && candidateNumber !== null
+        && Date.parse(value.serverTime) < Date.parse(forecast.bettingClosesAt))
+      || (!mayExposeCandidate && (
         value.candidateNumber !== null || value.model !== null
       ))
     ) return null;
@@ -511,6 +529,9 @@ export function predictiveLeaderNumberContext({
   if (snapshot.status === "ready") return { state: "ready", snapshot };
   return snapshot.reason === "confidence_not_proven"
     ? { state: snapshot.status, reason: snapshot.reason, snapshot }
+    : PREDICTIVE_LEADER_STALE_CANDIDATE_REASONS.has(snapshot.reason)
+      && snapshot.candidateNumber !== null
+      ? { state: "waiting", reason: snapshot.reason, snapshot }
     : { state: snapshot.status, reason: snapshot.reason };
 }
 
