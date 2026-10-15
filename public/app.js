@@ -7,7 +7,7 @@ import {
   combinedTrajectorySignals,
   normalizePredictiveLeaderApiSnapshot,
   predictiveLeaderNumberContext,
-} from "./combined-number.js?v=10";
+} from "./combined-number.js?v=7";
 
 (() => {
   "use strict";
@@ -15,7 +15,6 @@ import {
   const RED_NUMBERS = new Set([1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36]);
   const ALL_NUMBERS = Array.from({ length: 37 }, (_, number) => number);
   const REFRESH_INTERVAL_MS = 45_000;
-  const REFRESH_DEBOUNCE_MS = 180;
   const AGE_UPDATE_INTERVAL_MS = 30_000;
   const PRECLOSE_CAPTURE_MAX_LEAD_MS = 15_000;
   const FOLLOWER_COLLAPSED_LIMIT = 5;
@@ -30,10 +29,6 @@ import {
   const TRAJECTORY_DISPLAY_RANGE_VERSION = "trajectory-display-range-v1";
   const TRAJECTORY_DISPLAY_RANGE_POLICY = "q50-centered-contiguous-max6-v1";
   const TRAJECTORY_NUMBER_AREA_MAX_DISPLAY_CELLS = 6;
-  const TRAJECTORY_DIRECTION_CHALLENGER_SCHEMA_VERSION = 1;
-  const TRAJECTORY_DIRECTION_CHALLENGER_KEY = "structural-center-v1";
-  const TRAJECTORY_DIRECTION_CHALLENGER_MODEL = "trajectory-direction-structural-v1";
-  const TRAJECTORY_DIRECTION_CHALLENGER_MODE = "prospective-shadow";
   const TRAJECTORY_SHADOW_REQUIRED_HISTORY = 30;
   const TRAJECTORY_SHADOW_REQUIRED_NEIGHBORS = 10;
   const LEARNED_LEADER_SCHEMA_VERSION = 1;
@@ -77,11 +72,18 @@ import {
     combinedPickNumber: document.getElementById("combined-pick-number"),
     combinedPickStatus: document.getElementById("combined-pick-status"),
     combinedPickSources: document.getElementById("combined-pick-sources"),
-    signalAccount: document.getElementById("signal-account"),
-    signalAccountStatus: document.getElementById("signal-account-status"),
-    signalAccountBalance: document.getElementById("signal-account-balance"),
-    signalAccountRecord: document.getElementById("signal-account-record"),
-    signalAccountPending: document.getElementById("signal-account-pending"),
+    combinedPickAccount: document.getElementById("combined-pick-account"),
+    combinedPickAccountStatus: document.getElementById("combined-pick-account-status"),
+    combinedPickAccountBalanceCard: document.getElementById("combined-pick-account-balance-card"),
+    combinedPickAccountBalance: document.getElementById("combined-pick-account-balance"),
+    combinedPickAccountProfit: document.getElementById("combined-pick-account-profit"),
+    combinedPickAccountRecord: document.getElementById("combined-pick-account-record"),
+    combinedPickAccountSettled: document.getElementById("combined-pick-account-settled"),
+    combinedPickAccountRate: document.getElementById("combined-pick-account-rate"),
+    combinedPickAccountRateDetail: document.getElementById("combined-pick-account-rate-detail"),
+    combinedPickAccountStakeLabel: document.getElementById("combined-pick-account-stake-label"),
+    combinedPickAccountStake: document.getElementById("combined-pick-account-stake"),
+    combinedPickAccountLadder: document.getElementById("combined-pick-account-ladder"),
     lastNumber: document.getElementById("last-number"),
     lastTime: document.getElementById("last-time"),
     lastPrice: document.getElementById("last-price"),
@@ -101,14 +103,16 @@ import {
     precloseComparisonWarning: document.getElementById("preclose-comparison-warning"),
     trajectoryShadowPanel: document.getElementById("trajectory-shadow-panel"),
     trajectoryShadowBadge: document.getElementById("trajectory-shadow-badge"),
-    trajectoryShadowObserved: document.getElementById("trajectory-shadow-observed"),
     trajectoryShadowStatus: document.getElementById("trajectory-shadow-status"),
     trajectoryShadowShares: document.getElementById("trajectory-shadow-shares"),
     trajectoryShadowNumberArea: document.getElementById("trajectory-shadow-number-area"),
     trajectoryShadowTraining: document.getElementById("trajectory-shadow-training"),
     trajectoryShadowRangeMetrics: document.getElementById("trajectory-shadow-range-metrics"),
     trajectoryShadowSample: document.getElementById("trajectory-shadow-sample"),
-    trajectoryDirectionChallenger: document.getElementById("trajectory-direction-challenger"),
+    precloseHitHistory: document.getElementById("preclose-hit-history"),
+    precloseHitHistoryCount: document.getElementById("preclose-hit-history-count"),
+    precloseHitHistoryList: document.getElementById("preclose-hit-history-list"),
+    precloseHitHistoryStatus: document.getElementById("preclose-hit-history-status"),
     followerPanel: document.getElementById("follower-panel"),
     followerTitle: document.getElementById("follower-title"),
     followerLive: document.getElementById("follower-live-tracker"),
@@ -262,23 +266,16 @@ import {
   const store = {
     state: null,
     results: [],
-    resultsLoaded: false,
-    resultsError: false,
     cycles: [],
     cycleComparison: null,
     cycleComparisonLoaded: false,
     cycleComparisonError: false,
     stateLoaded: false,
     stateError: false,
-    precloseForecastLoaded: false,
-    precloseForecastError: false,
     predictiveLeaderSnapshot: null,
     predictiveLeaderLoaded: false,
     predictiveLeaderError: false,
     predictiveLeaderRequiresFreshSnapshot: false,
-    trajectoryDirectionChallengerSnapshot: null,
-    trajectoryDirectionChallengerLoaded: false,
-    trajectoryDirectionChallengerError: false,
     triples: [],
     triplesLoaded: false,
     triplesError: false,
@@ -288,13 +285,16 @@ import {
     followerHitCurve: null,
     pairsLoaded: false,
     pairsError: false,
+    forecastHits: [],
+    forecastHitsLoaded: false,
+    forecastHitsError: false,
+    forecastHitsHasMore: false,
     followerSourceNumber: null,
     followerSourceLocked: false,
     followerVisibleCount: FOLLOWER_COLLAPSED_LIMIT,
     lastSyncAt: null,
     refreshing: false,
     refreshQueued: false,
-    refreshQueuedNotify: false,
     refreshTimer: null,
     eventSource: null,
     lastRenderedResultKey: null,
@@ -1196,268 +1196,128 @@ import {
   async function refreshAll({ notify = false } = {}) {
     if (store.refreshing) {
       store.refreshQueued = true;
-      store.refreshQueuedNotify ||= notify;
       return;
     }
 
-    window.clearTimeout(store.refreshTimer);
-    store.refreshTimer = null;
     store.refreshing = true;
-    const showGlobalBusy = notify || !store.hasCompletedInitialRender;
-    if (showGlobalBusy) {
-      elements.refreshButton.classList.add("is-loading");
-      elements.refreshButton.disabled = true;
-      elements.main.setAttribute("aria-busy", "true");
-    }
+    elements.refreshButton.classList.add("is-loading");
+    elements.refreshButton.disabled = true;
+    elements.main.setAttribute("aria-busy", "true");
+
+    const requests = await Promise.allSettled([
+      fetchJson("/api/state"),
+      fetchJson("/api/results?limit=80"),
+      fetchJson("/api/cycles?limit=10"),
+      fetchJson("/api/sequences?limit=50"),
+      fetchJson("/api/pairs"),
+      fetchJson("/api/forecasts/hits?limit=20"),
+      fetchJson("/api/cycle-comparison"),
+      fetchJson("/api/predictive-leader")
+    ]);
+
     let successfulRequests = 0;
-    const requestCount = 9;
-    const settledFetch = async (url) => {
-      try {
-        return { status: "fulfilled", value: await fetchJson(url) };
-      } catch (reason) {
-        return { status: "rejected", reason };
-      }
-    };
 
-    try {
-      let renderingFailure = null;
-      const renderAvailableData = () => {
-        try {
-          renderAll();
-        } catch (error) {
-          renderingFailure ??= error;
-        }
-      };
-
-      // The lightweight state is the critical path. Render it before starting
-      // archival reads so a full forecast audit cannot hold the dashboard.
-      const stateRequest = await settledFetch("/api/state/core");
-      if (stateRequest.status === "fulfilled") {
-        const retainedPrecloseForecast = store.state?.precloseForecast;
-        store.state = retainedPrecloseForecast
-          ? { ...stateRequest.value, precloseForecast: retainedPrecloseForecast }
-          : stateRequest.value;
-        store.stateLoaded = true;
-        store.stateError = false;
-        captureServerClock(store.state?.serverTime);
-        successfulRequests += 1;
-        store.lastSyncAt = new Date();
-      } else {
-        store.stateError = true;
-        if (!store.hasCompletedInitialRender) {
-          try {
-            renderFetchFailure();
-          } catch (error) {
-            renderingFailure ??= error;
-          }
-          setConnection("error", "Основной API недоступен");
-          elements.refreshButton.classList.remove("is-loading");
-          elements.refreshButton.disabled = false;
-          elements.main.removeAttribute("aria-busy");
-        }
-      }
-      if (stateRequest.status === "fulfilled" || store.hasCompletedInitialRender) {
-        renderAvailableData();
-      }
-
-      const optionalRequests = [
-        {
-          url: "/api/results?limit=80",
-          apply(payload) {
-            store.results = extractItems(payload);
-            store.resultsLoaded = true;
-            store.resultsError = false;
-            return true;
-          },
-          fail() { store.resultsError = true; },
-        },
-        {
-          url: "/api/cycles?limit=10",
-          apply(payload) {
-            store.cycles = extractItems(payload);
-            return true;
-          },
-          fail() {},
-        },
-        {
-          url: "/api/sequences?limit=50",
-          apply(payload) {
-            store.triples = extractItems(payload);
-            store.triplesHasMore = payload?.hasMore === true;
-            store.triplesLoaded = true;
-            store.triplesError = false;
-            return true;
-          },
-          fail() { store.triplesError = true; },
-        },
-        {
-          url: "/api/pairs",
-          apply(payload) {
-            store.pairs = extractItems(payload);
-            store.followerHitCurve = payload?.top5HitByHorizon ?? null;
-            store.pairsLoaded = true;
-            store.pairsError = false;
-            return true;
-          },
-          fail() { store.pairsError = true; },
-        },
-        {
-          url: "/api/cycle-comparison",
-          apply(payload) {
-            store.cycleComparison = payload;
-            store.cycleComparisonLoaded = true;
-            store.cycleComparisonError = false;
-            return true;
-          },
-          fail() { store.cycleComparisonError = true; },
-        },
-        {
-          url: "/api/predictive-leader",
-          apply(payload) {
-            const snapshot = normalizePredictiveLeaderApiSnapshot(payload);
-            const account = snapshot?.account === null
-              ? null
-              : normalizedPredictiveLeaderAccount(snapshot?.account);
-            const signalAccount = normalizedPredictiveLeaderSignalAccount(
-              snapshot?.signalAccount,
-            );
-            store.predictiveLeaderLoaded = true;
-            if (
-              !snapshot
-              || (snapshot.account !== null && !account)
-              || !signalAccount
-            ) {
-              store.predictiveLeaderSnapshot = null;
-              store.predictiveLeaderError = true;
-              return false;
-            }
-            store.predictiveLeaderSnapshot = { ...snapshot, account, signalAccount };
-            store.predictiveLeaderError = false;
-            store.predictiveLeaderRequiresFreshSnapshot = false;
-            captureServerClock(snapshot.serverTime);
-            return true;
-          },
-          fail() {
-            store.predictiveLeaderSnapshot = null;
-            store.predictiveLeaderLoaded = true;
-            store.predictiveLeaderError = true;
-          },
-        },
-        {
-          url: "/api/trajectory-direction/challenger",
-          apply(payload) {
-            store.trajectoryDirectionChallengerLoaded = true;
-            if (!normalizedTrajectoryDirectionChallenger(payload)) {
-              store.trajectoryDirectionChallengerSnapshot = null;
-              store.trajectoryDirectionChallengerError = true;
-              return false;
-            }
-            store.trajectoryDirectionChallengerSnapshot = payload;
-            store.trajectoryDirectionChallengerError = false;
-            return true;
-          },
-          fail() {
-            store.trajectoryDirectionChallengerSnapshot = null;
-            store.trajectoryDirectionChallengerLoaded = true;
-            store.trajectoryDirectionChallengerError = true;
-          },
-        },
-        {
-          url: "/api/forecasts",
-          deferUntilLightweightDispatch: true,
-          apply(payload) {
-            store.precloseForecastLoaded = true;
-            if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
-              store.precloseForecastError = true;
-              return false;
-            }
-            store.state = {
-              ...(store.state ?? {}),
-              precloseForecast: payload,
-            };
-            store.precloseForecastError = false;
-            return true;
-          },
-          fail() {
-            store.precloseForecastLoaded = true;
-            store.precloseForecastError = true;
-          },
-        },
-      ];
-
-      const optionalTasks = optionalRequests.map(async (request) => {
-        if (request.deferUntilLightweightDispatch) await Promise.resolve();
-        const result = await settledFetch(request.url);
-        const accepted = result.status === "fulfilled"
-          ? request.apply(result.value)
-          : (request.fail(), false);
-        if (accepted) {
-          successfulRequests += 1;
-          store.lastSyncAt = new Date();
-        }
-        // Each optional source settles independently. A slow archive read no
-        // longer withholds faster leader/challenger/results updates.
-        if (accepted || store.hasCompletedInitialRender) renderAvailableData();
-      });
-      const optionalOutcomes = await Promise.allSettled(optionalTasks);
-      const optionalFailure = optionalOutcomes.find(
-        (outcome) => outcome.status === "rejected",
-      );
-      if (optionalFailure) throw optionalFailure.reason;
-      if (renderingFailure) throw renderingFailure;
-
-      if (successfulRequests > 0) {
-        if (notify) {
-          announce(successfulRequests === requestCount
-            ? "Данные обновлены"
-            : "Данные обновлены частично");
-        }
-        if (!store.eventSource || store.eventSource.readyState !== EventSource.OPEN) {
-          const complete = successfulRequests === requestCount;
-          setConnection(
-            complete ? "connecting" : "error",
-            complete ? "API доступен" : "Данные получены частично",
-          );
-        }
-      } else {
-        renderFetchFailure();
-        setConnection("error", "API недоступен");
-        if (notify) announce("Не удалось обновить данные");
-      }
-    } catch (error) {
-      console.error("[dashboard] refresh failed", error);
-      setConnection("error", "Ошибка обновления");
-      if (notify) announce("Не удалось полностью обновить данные");
-    } finally {
-      store.refreshing = false;
-      elements.refreshButton.classList.remove("is-loading");
-      elements.refreshButton.disabled = false;
-      elements.main.removeAttribute("aria-busy");
-      scheduleQueuedRefresh();
+    if (requests[0].status === "fulfilled") {
+      store.state = requests[0].value;
+      store.stateLoaded = true;
+      store.stateError = false;
+      captureServerClock(store.state?.serverTime);
+      successfulRequests += 1;
+    } else {
+      store.stateError = true;
     }
-  }
+    if (requests[1].status === "fulfilled") {
+      store.results = extractItems(requests[1].value);
+      successfulRequests += 1;
+    }
+    if (requests[2].status === "fulfilled") {
+      store.cycles = extractItems(requests[2].value);
+      successfulRequests += 1;
+    }
+    if (requests[3].status === "fulfilled") {
+      store.triples = extractItems(requests[3].value);
+      store.triplesHasMore = requests[3].value?.hasMore === true;
+      store.triplesLoaded = true;
+      store.triplesError = false;
+      successfulRequests += 1;
+    } else {
+      store.triplesError = true;
+    }
+    if (requests[4].status === "fulfilled") {
+      store.pairs = extractItems(requests[4].value);
+      store.followerHitCurve = requests[4].value?.top5HitByHorizon ?? null;
+      store.pairsLoaded = true;
+      store.pairsError = false;
+      successfulRequests += 1;
+    } else {
+      store.pairsError = true;
+    }
+    if (requests[5].status === "fulfilled") {
+      store.forecastHits = extractItems(requests[5].value);
+      store.forecastHitsHasMore = requests[5].value?.hasMore === true;
+      store.forecastHitsLoaded = true;
+      store.forecastHitsError = false;
+      successfulRequests += 1;
+    } else {
+      store.forecastHitsError = true;
+    }
+    if (requests[6].status === "fulfilled") {
+      store.cycleComparison = requests[6].value;
+      store.cycleComparisonLoaded = true;
+      store.cycleComparisonError = false;
+      successfulRequests += 1;
+    } else {
+      store.cycleComparisonError = true;
+    }
+    if (requests[7].status === "fulfilled") {
+      const snapshot = normalizePredictiveLeaderApiSnapshot(requests[7].value);
+      const account = snapshot?.account === null
+        ? null
+        : normalizedPredictiveLeaderAccount(snapshot?.account);
+      store.predictiveLeaderLoaded = true;
+      if (snapshot && (snapshot.account === null || account)) {
+        store.predictiveLeaderSnapshot = { ...snapshot, account };
+        store.predictiveLeaderError = false;
+        store.predictiveLeaderRequiresFreshSnapshot = false;
+        captureServerClock(snapshot.serverTime);
+        successfulRequests += 1;
+      } else {
+        store.predictiveLeaderSnapshot = null;
+        store.predictiveLeaderError = true;
+      }
+    } else {
+      store.predictiveLeaderSnapshot = null;
+      store.predictiveLeaderLoaded = true;
+      store.predictiveLeaderError = true;
+    }
 
-  function latestResultForRender() {
-    const stateResult = store.state?.latestResult || null;
-    const resultsResult = store.results[0] || null;
-    if (!store.stateError) return stateResult || resultsResult;
-    if (store.resultsLoaded && !store.resultsError) return resultsResult;
-    if (!stateResult || !resultsResult) return stateResult || resultsResult;
+    if (successfulRequests > 0) {
+      store.lastSyncAt = new Date();
+      renderAll();
+      if (notify) announce(successfulRequests === requests.length ? "Данные обновлены" : "Данные обновлены частично");
+      if (!store.eventSource || store.eventSource.readyState !== EventSource.OPEN) {
+        setConnection(successfulRequests === requests.length ? "connecting" : "error", successfulRequests === requests.length ? "API доступен" : "Данные получены частично");
+      }
+    } else {
+      renderFetchFailure();
+      setConnection("error", "API недоступен");
+      if (notify) announce("Не удалось обновить данные");
+    }
 
-    const timestamp = (result) => {
-      const value = Date.parse(result?.settledAt || result?.observedAt || "");
-      return Number.isFinite(value) ? value : null;
-    };
-    const stateTime = timestamp(stateResult);
-    const resultsTime = timestamp(resultsResult);
-    if (stateTime === null || resultsTime === null) return stateResult;
-    return resultsTime > stateTime ? resultsResult : stateResult;
+    store.refreshing = false;
+    elements.refreshButton.classList.remove("is-loading");
+    elements.refreshButton.disabled = false;
+    elements.main.removeAttribute("aria-busy");
+
+    if (store.refreshQueued) {
+      store.refreshQueued = false;
+      refreshAll();
+    }
   }
 
   function renderFetchFailure() {
     renderCombinedPick();
-    renderPredictiveLeaderSignalAccount();
-    renderPrecloseForecast();
+    renderPredictiveLeaderAccount();
     if (!store.hasCompletedInitialRender) {
       elements.resultsBody.replaceChildren(emptyTableRow("Не удалось загрузить результаты. Повторим попытку автоматически."));
       elements.cyclesList.replaceChildren(createElement("li", "empty-state", "Не удалось загрузить архив циклов."));
@@ -1478,22 +1338,24 @@ import {
       elements.boardNote.textContent = "Не удалось получить состояние активного цикла.";
     }
     if (store.hasCompletedInitialRender) {
-      renderFollowers(latestResultForRender());
+      renderFollowers(store.state?.latestResult || store.results[0] || null);
     }
     renderFollowerTop5Tracker(store.state?.followerTop5Tracker || null);
     renderFollowerHitCurve();
+    renderForecastHitHistory();
     renderVirtualBettor(store.state?.virtualBettor || null);
     renderCycleComparison(store.cycleComparison);
   }
 
   function renderAll() {
-    const latestResult = latestResultForRender();
+    const latestResult = store.state?.latestResult || store.results[0] || null;
     renderCollector(store.state?.collector);
     renderGapWarning(store.state);
     renderCombinedPick();
-    renderPredictiveLeaderSignalAccount();
+    renderPredictiveLeaderAccount();
     renderLatestResult(latestResult);
     renderPrecloseForecast();
+    renderForecastHitHistory();
     renderFollowerTop5Tracker(store.state?.followerTop5Tracker || null);
     renderFollowers(latestResult);
     renderOverdueNumbers();
@@ -1539,85 +1401,6 @@ import {
       return null;
     }
     return { wireCell, number };
-  }
-
-  function normalizedTrajectoryObservedChange(value) {
-    const prefix = value?.currentPrefix;
-    const parameters = value?.parameters;
-    const cutoffMs = Date.parse(value?.cutoffAt);
-    const lockPrice = value?.lockPrice;
-    const medianCellWidth = value?.medianCellWidth;
-    const flatThresholdCellWidths = parameters?.flatThresholdCellWidths;
-    if (
-      !Array.isArray(prefix)
-      || prefix.length < 3
-      || !Number.isFinite(cutoffMs)
-      || typeof lockPrice !== "number"
-      || !Number.isFinite(lockPrice)
-      || typeof medianCellWidth !== "number"
-      || !Number.isFinite(medianCellWidth)
-      || medianCellWidth <= 0
-      || typeof flatThresholdCellWidths !== "number"
-      || !Number.isFinite(flatThresholdCellWidths)
-      || flatThresholdCellWidths < 0
-    ) {
-      return null;
-    }
-
-    let previousAtMs = null;
-    const points = [];
-    for (const point of prefix) {
-      const atMs = Date.parse(point?.at);
-      const price = point?.price;
-      if (
-        !point
-        || typeof point !== "object"
-        || Array.isArray(point)
-        || !Number.isFinite(atMs)
-        || atMs > cutoffMs
-        || (previousAtMs !== null && atMs <= previousAtMs)
-        || typeof price !== "number"
-        || !Number.isFinite(price)
-      ) {
-        return null;
-      }
-      previousAtMs = atMs;
-      points.push({ at: point.at, atMs, price });
-    }
-
-    const first = points[0];
-    const last = points.at(-1);
-    const priceTolerance = 1e-9 * Math.max(
-      1,
-      Math.abs(last.price),
-      Math.abs(lockPrice),
-    );
-    if (
-      last.atMs <= first.atMs
-      || Math.abs(last.price - lockPrice) > priceTolerance
-    ) {
-      return null;
-    }
-
-    const delta = last.price - first.price;
-    const deltaCellWidths = delta / medianCellWidth;
-    if (!Number.isFinite(deltaCellWidths)) return null;
-    const direction = deltaCellWidths > flatThresholdCellWidths
-      ? "up"
-      : deltaCellWidths < -flatThresholdCellWidths
-        ? "down"
-        : "flat";
-    return {
-      direction,
-      startPrice: first.price,
-      endPrice: last.price,
-      firstAt: first.at,
-      lastAt: last.at,
-      pointCount: points.length,
-      delta,
-      deltaCellWidths,
-      flatThresholdCellWidths
-    };
   }
 
   function normalizedTrajectoryNumberArea(value) {
@@ -1937,10 +1720,6 @@ import {
       return null;
     }
     if (isAdaptive && status !== "insufficient_current" && !adaptive) return null;
-    const observedChange = status === "insufficient_current"
-      ? null
-      : normalizedTrajectoryObservedChange(value);
-    if (status !== "insufficient_current" && !observedChange) return null;
 
     if (status === "insufficient_current") {
       if (
@@ -1958,7 +1737,6 @@ import {
         status,
         direction: null,
         probabilities: null,
-        observedChange: null,
         sample: null,
         numberArea: null,
         displayRange: null,
@@ -2007,7 +1785,6 @@ import {
         status,
         direction: null,
         probabilities: null,
-        observedChange,
         sample,
         numberArea: null,
         displayRange: null,
@@ -2032,7 +1809,6 @@ import {
         status,
         direction: null,
         probabilities: null,
-        observedChange,
         sample,
         numberArea: null,
         displayRange: null,
@@ -2085,297 +1861,12 @@ import {
       status,
       direction,
       probabilities: shares,
-      observedChange,
       sample,
       numberArea,
       displayRange,
       numberRanking: value.numberRanking ?? null,
       evaluation
     };
-  }
-
-  function normalizedTrajectoryDirectionChallengerMetrics(value) {
-    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-    const countKeys = [
-      "eligibleCount",
-      "storedCount",
-      "validStoredCount",
-      "selectedCount",
-      "unselectedCount",
-      "unavailableCount",
-      "evaluatedSelected",
-      "settledSelected",
-      "pendingSelected",
-      "ungradableSelected",
-      "hits",
-      "invalidStoredCount"
-    ];
-    if (countKeys.some(
-      (key) => !Number.isSafeInteger(value[key]) || value[key] < 0,
-    )) return null;
-
-    const rateMatches = (rate, numerator, denominator) => {
-      if (denominator === 0) return rate === null;
-      return typeof rate === "number"
-        && Number.isFinite(rate)
-        && rate >= 0
-        && rate <= 1
-        && Math.abs(rate - (numerator / denominator)) <= 1e-9;
-    };
-    const paired = value.paired;
-    const pairedCountKeys = [
-      "count",
-      "challengerHits",
-      "championHits",
-      "bothHit",
-      "challengerOnly",
-      "championOnly",
-      "bothWrong",
-      "discordantCount"
-    ];
-    if (
-      value.eligibleCount < value.storedCount
-      || value.storedCount < value.validStoredCount
-      || value.validStoredCount !== (
-        value.selectedCount + value.unselectedCount + value.unavailableCount
-      )
-      || value.settledSelected !== (
-        value.evaluatedSelected + value.ungradableSelected
-      )
-      || value.selectedCount !== value.pendingSelected + value.settledSelected
-      || value.hits > value.evaluatedSelected
-      || value.invalidStoredCount !== value.storedCount - value.validStoredCount
-      || !rateMatches(
-        value.decisionCoverage,
-        value.selectedCount,
-        value.validStoredCount,
-      )
-      || !rateMatches(
-        value.selectiveAccuracy,
-        value.hits,
-        value.evaluatedSelected,
-      )
-      || !paired
-      || typeof paired !== "object"
-      || Array.isArray(paired)
-      || pairedCountKeys.some(
-        (key) => !Number.isSafeInteger(paired[key]) || paired[key] < 0,
-      )
-      || paired.count > value.evaluatedSelected
-      || paired.count !== (
-        paired.bothHit
-        + paired.challengerOnly
-        + paired.championOnly
-        + paired.bothWrong
-      )
-      || paired.challengerHits !== paired.bothHit + paired.challengerOnly
-      || paired.championHits !== paired.bothHit + paired.championOnly
-      || paired.discordantCount !== paired.challengerOnly + paired.championOnly
-      || !rateMatches(paired.challengerRate, paired.challengerHits, paired.count)
-      || !rateMatches(paired.championRate, paired.championHits, paired.count)
-      || (paired.count === 0
-        ? paired.uplift !== null
-        : typeof paired.uplift !== "number"
-          || !Number.isFinite(paired.uplift)
-          || Math.abs(
-            paired.uplift
-              - ((paired.challengerHits - paired.championHits) / paired.count),
-          ) > 1e-9)
-    ) return null;
-
-    const window = value.window;
-    if (
-      !window
-      || typeof window !== "object"
-      || Array.isArray(window)
-      || !Number.isSafeInteger(window.limit)
-      || window.limit < 1
-      || window.eligibleCount !== value.eligibleCount
-      || window.storedCount !== value.storedCount
-      || window.validStoredCount !== value.validStoredCount
-      || !Number.isSafeInteger(window.totalEligibleCount)
-      || window.totalEligibleCount < window.eligibleCount
-      || !Number.isSafeInteger(window.totalStoredCount)
-      || window.totalStoredCount < window.storedCount
-      || window.totalStoredCount > window.totalEligibleCount
-      || window.truncated !== (window.totalEligibleCount > window.eligibleCount)
-    ) return null;
-
-    return {
-      validStoredCount: value.validStoredCount,
-      selectedCount: value.selectedCount,
-      evaluatedSelected: value.evaluatedSelected,
-      settledSelected: value.settledSelected,
-      pendingSelected: value.pendingSelected,
-      ungradableSelected: value.ungradableSelected,
-      hits: value.hits,
-      selectiveAccuracy: value.selectiveAccuracy,
-      decisionCoverage: value.decisionCoverage,
-      paired: {
-        count: paired.count,
-        challengerHits: paired.challengerHits,
-        championHits: paired.championHits,
-        challengerRate: paired.challengerRate,
-        championRate: paired.championRate
-      }
-    };
-  }
-
-  function normalizedTrajectoryDirectionChallenger(value) {
-    if (
-      !value
-      || typeof value !== "object"
-      || Array.isArray(value)
-      || value.schemaVersion !== TRAJECTORY_DIRECTION_CHALLENGER_SCHEMA_VERSION
-      || value.challengerKey !== TRAJECTORY_DIRECTION_CHALLENGER_KEY
-      || value.modelVersion !== TRAJECTORY_DIRECTION_CHALLENGER_MODEL
-      || value.championModelVersion !== TRAJECTORY_SHADOW_ADAPTIVE_VERSION
-      || value.mode !== TRAJECTORY_DIRECTION_CHALLENGER_MODE
-      || value.advisoryOnly !== true
-      || value.executionEnabled !== false
-    ) return null;
-
-    const metrics = normalizedTrajectoryDirectionChallengerMetrics(value.metrics);
-    if (!metrics) return null;
-    if (value.latest === null) return { latest: null, metrics };
-    const latest = value.latest;
-    if (
-      !latest
-      || typeof latest !== "object"
-      || Array.isArray(latest)
-      || latest.roundId === null
-      || latest.roundId === undefined
-    ) return null;
-
-    let challenger = null;
-    if (latest.challenger !== null) {
-      const candidate = latest.challenger;
-      if (
-        !candidate
-        || typeof candidate !== "object"
-        || Array.isArray(candidate)
-        || candidate.schemaVersion !== TRAJECTORY_DIRECTION_CHALLENGER_SCHEMA_VERSION
-        || candidate.challengerKey !== TRAJECTORY_DIRECTION_CHALLENGER_KEY
-        || candidate.modelVersion !== TRAJECTORY_DIRECTION_CHALLENGER_MODEL
-        || candidate.probabilities !== null
-        || !["ready", "unselected", "unavailable"].includes(candidate.status)
-      ) return null;
-      if (
-        candidate.status === "ready"
-        && (
-          !["up", "down"].includes(candidate.direction)
-          || candidate.reason !== null
-          || candidate.selection?.eligible !== true
-        )
-      ) return null;
-      if (
-        candidate.status === "unselected"
-        && (
-          candidate.direction !== null
-          || ![
-            "start_within_center_band",
-            "lock_within_center_band",
-            "center_side_changed"
-          ].includes(candidate.reason)
-          || candidate.selection?.eligible !== false
-        )
-      ) return null;
-      if (
-        candidate.status === "unavailable"
-        && (
-          candidate.direction !== null
-          || typeof candidate.reason !== "string"
-          || candidate.reason.length === 0
-          || candidate.selection?.eligible !== false
-        )
-      ) return null;
-      challenger = {
-        status: candidate.status,
-        reason: candidate.reason,
-        direction: candidate.direction
-      };
-    }
-
-    return {
-      latest: {
-        roundId: String(latest.roundId),
-        challenger
-      },
-      metrics
-    };
-  }
-
-  function trajectoryDirectionChallengerMetricsText(metrics) {
-    const coverage = metrics.validStoredCount > 0
-      ? ` · отбор ${metrics.selectedCount}/${metrics.validStoredCount} (${trajectoryShadowShareFormatter.format(metrics.decisionCoverage)})`
-      : "";
-    if (metrics.evaluatedSelected === 0) {
-      return `Собираем проспективную выборку${coverage}.`;
-    }
-    const accuracy = `Проспективно: ${metrics.hits}/${metrics.evaluatedSelected} (${trajectoryShadowShareFormatter.format(metrics.selectiveAccuracy)})${coverage}.`;
-    if (metrics.paired.count === 0) return accuracy;
-    const paired = metrics.paired;
-    return `${accuracy} Пары с Adaptive v2: альтернатива ${paired.challengerHits}/${paired.count} (${trajectoryShadowShareFormatter.format(paired.challengerRate)}), Adaptive v2 ${paired.championHits}/${paired.count} (${trajectoryShadowShareFormatter.format(paired.championRate)}).`;
-  }
-
-  function renderTrajectoryDirectionChallenger(
-    value,
-    currentRoundId,
-    { failed = false, loading = false } = {},
-  ) {
-    if (failed) {
-      setTextIfChanged(
-        elements.trajectoryDirectionChallenger,
-        "Проверяемая альтернатива скрыта: её данные не обновились. Adaptive v2 остаётся основным прогнозом.",
-      );
-      return;
-    }
-    if (loading) {
-      setTextIfChanged(
-        elements.trajectoryDirectionChallenger,
-        "Получаем проверяемую альтернативу. Adaptive v2 остаётся основным прогнозом.",
-      );
-      return;
-    }
-
-    const normalized = normalizedTrajectoryDirectionChallenger(value);
-    const matchesCurrent = normalized?.latest !== null
-      && normalized?.latest !== undefined
-      && currentRoundId !== null
-      && String(currentRoundId) === normalized.latest.roundId;
-    if (!normalized || !matchesCurrent || !normalized.latest.challenger) {
-      setTextIfChanged(
-        elements.trajectoryDirectionChallenger,
-        "Проверяемая альтернатива для текущего раунда ещё не зафиксирована. Adaptive v2 остаётся основным прогнозом.",
-      );
-      return;
-    }
-
-    const challenger = normalized.latest.challenger;
-    const metricsText = trajectoryDirectionChallengerMetricsText(normalized.metrics);
-    if (challenger.status === "ready") {
-      setTextIfChanged(
-        elements.trajectoryDirectionChallenger,
-        `Проверяемая альтернатива: ${TRAJECTORY_SHADOW_DIRECTION_LABELS[challenger.direction]}. Не заменяет Adaptive v2; вероятность не рассчитана. ${metricsText}`,
-      );
-      return;
-    }
-    if (challenger.status === "unselected") {
-      const reasons = {
-        start_within_center_band: "старт был в центральной зоне",
-        lock_within_center_band: "lock оказался в центральной зоне",
-        center_side_changed: "между стартом и lock цена пересекла центр"
-      };
-      setTextIfChanged(
-        elements.trajectoryDirectionChallenger,
-        `Проверяемая альтернатива не выбрана: ${reasons[challenger.reason]}. Adaptive v2 не заменён. ${metricsText}`,
-      );
-      return;
-    }
-    setTextIfChanged(
-      elements.trajectoryDirectionChallenger,
-      `Проверяемая альтернатива недоступна для этого снимка. Adaptive v2 не заменён. ${metricsText}`,
-    );
   }
 
   function trajectoryNumberAreaLabel(point) {
@@ -2412,61 +1903,10 @@ import {
     return `ПРОГНОЗ УЧАСТКА: ОТ ${from} ДО ${to}`;
   }
 
-  function trajectoryObservedChangeText(change) {
-    if (!change) {
-      return "Подтверждённое общее изменение диаграммы до lock недоступно.";
-    }
-    const pointLabel = pluralForm(change.pointCount, "точка", "точки", "точек");
-    return `Общее изменение до lock: ${TRAJECTORY_SHADOW_DIRECTION_LABELS[change.direction]} · ${formatPrice(change.startPrice)} → ${formatPrice(change.endPrice)} · ${change.pointCount} ${pointLabel}; последняя точка ${formatDateTime(change.lastAt)}.`;
-  }
-
-  function renderTrajectoryShadow(value, metricsValue, { failed = false } = {}) {
+  function renderTrajectoryShadow(value, metricsValue) {
     const shadow = normalizedTrajectoryShadow(value);
     const metrics = normalizedTrajectoryMetrics(metricsValue);
     elements.trajectoryShadowPanel.setAttribute("aria-busy", "false");
-
-    if (failed) {
-      elements.trajectoryShadowBadge.textContent = "Не обновлено";
-      setTextIfChanged(
-        elements.trajectoryShadowObserved,
-        "Фактическая диаграмма текущего раунда недоступна: архив прогноза не обновился.",
-      );
-      elements.trajectoryShadowObserved.title = "";
-      setTextIfChanged(
-        elements.trajectoryShadowStatus,
-        "Прогноз lock → ed скрыт, чтобы старое направление не выглядело текущим. Запрос будет повторён автоматически.",
-      );
-      setTextIfChanged(
-        elements.trajectoryShadowShares,
-        "Архивное основание прогноза недоступно до свежего ответа сервера.",
-      );
-      setTextIfChanged(
-        elements.trajectoryShadowNumberArea,
-        "ПРОГНОЗ УЧАСТКА: ДАННЫЕ НЕ ОБНОВЛЕНЫ",
-      );
-      setTextIfChanged(
-        elements.trajectoryShadowTraining,
-        "Обучение: данные временно недоступны.",
-      );
-      setTextIfChanged(
-        elements.trajectoryShadowRangeMetrics,
-        "Участок и Rank‑37: данные временно недоступны.",
-      );
-      elements.trajectoryShadowRangeMetrics.title = "";
-      setTextIfChanged(
-        elements.trajectoryShadowSample,
-        "Снимок появится только после подтверждения актуального раунда сервером.",
-      );
-      return;
-    }
-
-    setTextIfChanged(
-      elements.trajectoryShadowObserved,
-      trajectoryObservedChangeText(shadow?.observedChange),
-    );
-    elements.trajectoryShadowObserved.title = shadow?.observedChange
-      ? `Смещение первой → последней точки: ${shadow.observedChange.deltaCellWidths.toFixed(2).replace(".", ",")} ширины полосы; порог «без заметного движения»: ±${shadow.observedChange.flatThresholdCellWidths.toFixed(2).replace(".", ",")}.`
-      : "";
 
     if (shadow?.isAdaptive && shadow.adaptive) {
       const trainingCount = shadow.adaptive.trainingCount;
@@ -2512,11 +1952,11 @@ import {
       elements.trajectoryShadowBadge.textContent = "Снимка нет";
       setTextIfChanged(
         elements.trajectoryShadowStatus,
-        "Прогноз lock → ed для текущего раунда ещё не опубликован; полный рейтинг 37 чисел пока не формируется.",
+        "Adaptive-снимок для текущего раунда ещё не опубликован; полный рейтинг 37 чисел пока не формируется.",
       );
       setTextIfChanged(
         elements.trajectoryShadowShares,
-        "Архивное основание прогноза: вверх — · вниз — · без движения —.",
+        "Доли похожих завершённых траекторий: вверх — · вниз — · без движения —.",
       );
       setTextIfChanged(
         elements.trajectoryShadowNumberArea,
@@ -2534,7 +1974,7 @@ import {
       elements.trajectoryShadowBadge.textContent = `${modelLabel} · график неполный`;
       setTextIfChanged(
         elements.trajectoryShadowStatus,
-        "Прогноз lock → ed не рассчитывается: текущая диаграмма началась не от старта раунда, содержит разрыв или не дошла до точки фиксации.",
+        "Направление не рассчитывается: текущая траектория началась не от старта раунда, содержит разрыв или не дошла до точки фиксации.",
       );
       setTextIfChanged(
         elements.trajectoryShadowShares,
@@ -2556,7 +1996,7 @@ import {
       elements.trajectoryShadowBadge.textContent = `${modelLabel} · сбор ${sample.eligibleCount}/${sample.requiredHistory}`;
       setTextIfChanged(
         elements.trajectoryShadowStatus,
-        "Прогноз lock → ed не рассчитывается: накапливается prospective-история полных завершённых раундов.",
+        "Направление не рассчитывается: накапливается prospective-история полных завершённых раундов.",
       );
       setTextIfChanged(
         elements.trajectoryShadowShares,
@@ -2577,7 +2017,7 @@ import {
       elements.trajectoryShadowBadge.textContent = `${modelLabel} · соседи ${sample.withinDistanceCount}/${sample.requiredNeighbors}`;
       setTextIfChanged(
         elements.trajectoryShadowStatus,
-        "Прогноз lock → ed не рассчитывается: пока недостаточно завершённых траекторий с похожей формой.",
+        "Направление не рассчитывается: пока недостаточно завершённых траекторий с похожей формой.",
       );
       setTextIfChanged(
         elements.trajectoryShadowShares,
@@ -2594,16 +2034,16 @@ import {
       return;
     }
 
-    elements.trajectoryShadowBadge.textContent = `${modelLabel} · прогноз`;
+    elements.trajectoryShadowBadge.textContent = `${modelLabel} · наблюдение`;
     setTextIfChanged(
       elements.trajectoryShadowStatus,
-      `Прогнозируемый класс отдельного движения после lock → ed: ${TRAJECTORY_SHADOW_DIRECTION_LABELS[shadow.direction]}. Это не описание уже построенной диаграммы до lock; направления могут не совпадать.`,
+      `Наблюдательное направление цены от последней доступной точки перед forecast lock до финального ed: ${TRAJECTORY_SHADOW_DIRECTION_LABELS[shadow.direction]}. Точка может быть не старше 5 секунд; исход shadow для этого раунда ещё не валидирован.`,
     );
     setTextIfChanged(
       elements.trajectoryShadowShares,
       shadow.isAdaptive
-        ? `Архивное основание прогноза: вверх ${trajectoryShadowShareFormatter.format(shadow.probabilities.up)} · вниз ${trajectoryShadowShareFormatter.format(shadow.probabilities.down)} · без движения ${trajectoryShadowShareFormatter.format(shadow.probabilities.flat)}.`
-        : `Архивное основание прогноза по похожим траекториям: вверх ${trajectoryShadowShareFormatter.format(shadow.probabilities.up)} · вниз ${trajectoryShadowShareFormatter.format(shadow.probabilities.down)} · без движения ${trajectoryShadowShareFormatter.format(shadow.probabilities.flat)}.`,
+        ? `Взвешенные архивные доли направлений: вверх ${trajectoryShadowShareFormatter.format(shadow.probabilities.up)} · вниз ${trajectoryShadowShareFormatter.format(shadow.probabilities.down)} · без движения ${trajectoryShadowShareFormatter.format(shadow.probabilities.flat)}.`
+        : `Доли похожих завершённых траекторий: вверх ${trajectoryShadowShareFormatter.format(shadow.probabilities.up)} · вниз ${trajectoryShadowShareFormatter.format(shadow.probabilities.down)} · без движения ${trajectoryShadowShareFormatter.format(shadow.probabilities.flat)}.`,
     );
     setTextIfChanged(
       elements.trajectoryShadowNumberArea,
@@ -3354,167 +2794,110 @@ import {
     };
   }
 
-  function normalizedPredictiveLeaderSignalAccount(value) {
-    if (
-      !isPlainRecord(value)
-      || value.schemaVersion !== 1
-      || value.mode !== "confirmed-bet-signals"
-      || value.initialBalance !== 1_000
-      || value.stake !== 10
-      || value.grossPayoutMultiplier !== 36
-      || !["running", "pending", "exhausted"].includes(value.status)
-    ) return null;
-    const integerFields = [
-      "currentBalance",
-      "profit",
-      "betCount",
-      "settledCount",
-      "pendingCount",
-      "voidCount",
-      "hitCount",
-      "missCount",
-      "totalStaked",
-      "totalGrossPayout",
-    ];
-    if (
-      integerFields.some((field) => !Number.isSafeInteger(value[field]))
-      || value.currentBalance < 0
-      || value.pendingCount > 1
-      || value.betCount !== value.settledCount + value.pendingCount + value.voidCount
-      || value.settledCount !== value.hitCount + value.missCount
-      || value.totalStaked % value.stake !== 0
-      || value.totalGrossPayout % (value.stake * value.grossPayoutMultiplier) !== 0
-      || value.currentBalance !== value.initialBalance
-        - value.totalStaked + value.totalGrossPayout
-      || value.profit !== value.currentBalance - value.initialBalance
-      || (value.settledCount === 0 && value.hitRate !== null)
-      || (value.settledCount > 0 && (
-        typeof value.hitRate !== "number"
-        || !Number.isFinite(value.hitRate)
-        || Math.abs(value.hitRate - value.hitCount / value.settledCount) > 1e-9
-      ))
-    ) return null;
+  function currentPredictiveLeaderAccountContext() {
+    if (store.predictiveLeaderError) return { state: "error" };
+    if (!store.predictiveLeaderLoaded) return { state: "loading" };
+    const account = store.predictiveLeaderSnapshot?.account ?? null;
+    return account ? { state: "ready", account } : { state: "unavailable" };
+  }
 
-    let pendingBet = null;
-    if (value.pendingBet !== null) {
-      if (
-        !isPlainRecord(value.pendingBet)
-        || !Number.isSafeInteger(value.pendingBet.forecastId)
-        || value.pendingBet.forecastId <= 0
-        || !isStrictRouletteNumber(value.pendingBet.targetNumber)
-        || value.pendingBet.stake !== value.stake
-        || !strictTimestamp(value.pendingBet.placedAt)
-      ) return null;
-      pendingBet = { ...value.pendingBet };
+  function renderPredictiveLeaderAccount() {
+    const context = currentPredictiveLeaderAccountContext();
+    elements.combinedPickAccountBalanceCard.classList.remove("is-positive", "is-loss");
+
+    if (context.state !== "ready") {
+      const messages = {
+        loading: "Загрузка…",
+        error: "Свежий снимок счёта недоступен",
+        unavailable: "Контракт счёта не подтверждён",
+      };
+      elements.combinedPickAccount.dataset.state = context.state;
+      elements.combinedPickAccount.setAttribute("aria-busy", String(context.state === "loading"));
+      setTextIfChanged(
+        elements.combinedPickAccountStatus,
+        messages[context.state] || messages.unavailable,
+      );
+      setTextIfChanged(elements.combinedPickAccountBalance, "—");
+      setTextIfChanged(elements.combinedPickAccountProfit, "старт 1 000 · результат —");
+      setTextIfChanged(elements.combinedPickAccountRecord, "— / —");
+      setTextIfChanged(elements.combinedPickAccountSettled, "завершено —");
+      setTextIfChanged(elements.combinedPickAccountRate, "—");
+      setTextIfChanged(
+        elements.combinedPickAccountRateDetail,
+        "по завершённым · не вероятность; база 1/37 ≈2,7%",
+      );
+      setTextIfChanged(elements.combinedPickAccountStakeLabel, "Следующая ставка");
+      setTextIfChanged(elements.combinedPickAccountStake, "—");
+      setTextIfChanged(elements.combinedPickAccountLadder, "ступень — · серия —");
+      return;
     }
-    if ((pendingBet !== null) !== (value.pendingCount === 1)) return null;
-    const latestOutcome = value.latestOutcome;
-    if (
-      (latestOutcome !== null && (
-        !isPlainRecord(latestOutcome)
-        || !Number.isSafeInteger(latestOutcome.forecastId)
-        || !isStrictRouletteNumber(latestOutcome.targetNumber)
-        || !isStrictRouletteNumber(latestOutcome.resultNumber)
-        || !["hit", "miss"].includes(latestOutcome.outcome)
-        || (latestOutcome.outcome === "hit")
-          !== (latestOutcome.targetNumber === latestOutcome.resultNumber)
-        || latestOutcome.stake !== value.stake
-        || !Number.isSafeInteger(latestOutcome.balanceAfter)
-        || !strictTimestamp(latestOutcome.occurredAt)
-      ))
-      || (value.settledCount > 0) !== (latestOutcome !== null)
-    ) return null;
-    const latestVoid = value.latestVoid;
-    if (
-      latestVoid !== null && (
-        !isPlainRecord(latestVoid)
-        || !Number.isSafeInteger(latestVoid.forecastId)
-        || !isStrictRouletteNumber(latestVoid.targetNumber)
-        || !strictTimestamp(latestVoid.voidedAt)
-      )
-    ) return null;
-    if (
-      (value.voidCount > 0) !== (latestVoid !== null)
-      || (value.betCount === 0 && (
-        value.currentBalance !== value.initialBalance
-        || value.startedAt !== null
-        || value.updatedAt !== null
-      ))
-      || (value.betCount > 0 && (
-        !strictTimestamp(value.startedAt)
-        || !strictTimestamp(value.updatedAt)
-      ))
-    ) return null;
-    return {
-      status: value.status,
-      initialBalance: value.initialBalance,
-      currentBalance: value.currentBalance,
-      profit: value.profit,
-      stake: value.stake,
-      betCount: value.betCount,
-      settledCount: value.settledCount,
-      pendingCount: value.pendingCount,
-      voidCount: value.voidCount,
-      hitCount: value.hitCount,
-      missCount: value.missCount,
-      hitRate: value.hitRate,
-      pendingBet,
-      latestOutcome: latestOutcome ? { ...latestOutcome } : null,
-      latestVoid: latestVoid ? { ...latestVoid } : null,
-    };
+
+    const { account } = context;
+    elements.combinedPickAccount.dataset.state = account.status;
+    elements.combinedPickAccount.setAttribute("aria-busy", "false");
+    const statusText = account.status === "pending"
+      ? `Условная ставка ${formatRiskAmount(account.pendingBet.stake)} на число ${account.pendingBet.targetNumber} зафиксирована до результата`
+      : account.status === "exhausted"
+        ? `Стоп · не хватает ${formatRiskAmount(account.shortfall)}`
+        : account.latestVoid
+          ? "Последняя ставка аннулирована из-за разрыва данных · ждём следующий лидер"
+          : account.reason === "waiting_first_frozen_leader"
+            ? "Пока без завершённых прогнозов"
+            : "Рассчитан · ждём следующий зафиксированный лидер";
+    setTextIfChanged(elements.combinedPickAccountStatus, statusText);
+    setTextIfChanged(
+      elements.combinedPickAccountBalance,
+      formatRiskAmount(account.currentBalance),
+    );
+    setTextIfChanged(
+      elements.combinedPickAccountProfit,
+      `старт ${formatRiskAmount(account.initialBalance)} · результат ${formatSignedRiskAmount(account.profit)}`,
+    );
+    if (account.profit > 0) elements.combinedPickAccountBalanceCard.classList.add("is-positive");
+    if (account.profit < 0) elements.combinedPickAccountBalanceCard.classList.add("is-loss");
+
+    setTextIfChanged(
+      elements.combinedPickAccountRecord,
+      `${formatRiskAmount(account.hitCount)} / ${formatRiskAmount(account.missCount)}`,
+    );
+    const pendingText = account.pendingCount === 1 ? " · 1 ждёт результата" : "";
+    const voidText = account.voidCount > 0
+      ? ` · ${formatRiskAmount(account.voidCount)} аннулировано из-за разрыва`
+      : "";
+    setTextIfChanged(
+      elements.combinedPickAccountSettled,
+      `${formatRiskAmount(account.settledCount)} ${pluralForm(account.settledCount, "завершён", "завершено", "завершено")}${pendingText}${voidText}`,
+    );
+    setTextIfChanged(
+      elements.combinedPickAccountRate,
+      account.hitRate === null ? "—" : trajectoryShadowShareFormatter.format(account.hitRate),
+    );
+    setTextIfChanged(
+      elements.combinedPickAccountRateDetail,
+      account.settledCount > 0
+        ? `${formatRiskAmount(account.hitCount)} из ${formatRiskAmount(account.settledCount)} · не вероятность; база 1/37 ≈2,7%`
+        : "нет завершённых · не вероятность; база 1/37 ≈2,7%",
+    );
+
+    setTextIfChanged(
+      elements.combinedPickAccountStakeLabel,
+      account.status === "pending"
+        ? "Текущая ставка"
+        : account.status === "exhausted"
+          ? "Требуемая ставка"
+          : "Следующая ставка",
+    );
+    setTextIfChanged(elements.combinedPickAccountStake, formatRiskAmount(account.nextStake));
+    const ladderLevel = account.nextStake / account.model.stakeStep;
+    setTextIfChanged(
+      elements.combinedPickAccountLadder,
+      `ступень №${formatRiskAmount(ladderLevel)} · серия ${formatRiskAmount(account.ladder.missCount)} ${pluralForm(account.ladder.missCount, "промах", "промаха", "промахов")} · накоплено ${formatRiskAmount(account.ladder.totalLoss)}`,
+    );
   }
 
   function currentPriceTrajectorySignals(latestForecast) {
     const shadow = normalizedTrajectoryShadow(latestForecast?.trajectoryShadow);
     return combinedTrajectorySignals(shadow);
-  }
-
-  function renderPredictiveLeaderSignalAccount() {
-    const account = store.predictiveLeaderSnapshot?.signalAccount ?? null;
-    if (!account || store.predictiveLeaderError) {
-      elements.signalAccount.dataset.state = store.predictiveLeaderLoaded
-        ? "error"
-        : "loading";
-      elements.signalAccount.setAttribute(
-        "aria-busy",
-        String(!store.predictiveLeaderLoaded),
-      );
-      setTextIfChanged(elements.signalAccountStatus, store.predictiveLeaderLoaded
-        ? "Баланс сигналов BET сейчас недоступен"
-        : "Загрузка баланса…");
-      setTextIfChanged(elements.signalAccountBalance, "—");
-      setTextIfChanged(elements.signalAccountRecord, "—");
-      setTextIfChanged(elements.signalAccountPending, "Нет подтверждённых данных");
-      return;
-    }
-
-    elements.signalAccount.dataset.state = account.status;
-    elements.signalAccount.setAttribute("aria-busy", "false");
-    const pending = account.pendingBet;
-    setTextIfChanged(
-      elements.signalAccountStatus,
-      pending
-        ? `BET подтверждён · число ${pending.targetNumber} ждёт результата`
-        : account.status === "exhausted"
-          ? "Виртуальный счёт исчерпан"
-          : "Открытой ставки нет · учитываются только сигналы BET",
-    );
-    setTextIfChanged(
-      elements.signalAccountBalance,
-      `${formatRiskAmount(account.currentBalance)} · ${formatSignedRiskAmount(account.profit)}`,
-    );
-    setTextIfChanged(
-      elements.signalAccountRecord,
-      `${formatRiskAmount(account.hitCount)} / ${formatRiskAmount(account.missCount)} · ${formatRiskAmount(account.betCount)} сигналов`,
-    );
-    setTextIfChanged(
-      elements.signalAccountPending,
-      pending
-        ? `Подтверждённый BET: ${formatRiskAmount(pending.stake)} на число ${pending.targetNumber}`
-        : account.latestOutcome
-          ? `Последний сигнал: ${account.latestOutcome.targetNumber} → ${account.latestOutcome.resultNumber} · ${account.latestOutcome.outcome === "hit" ? "попадание" : "промах"}`
-          : "Ожидаем первый подтверждённый BET",
-    );
   }
 
   function currentCombinedNumberContext() {
@@ -3538,48 +2921,6 @@ import {
     };
 
     if (context.state !== "ready") {
-      if (
-        context.state === "waiting"
-        && context.snapshot
-        && context.snapshot.candidateNumber !== null
-      ) {
-        const { candidateNumber, metrics } = context.snapshot;
-        const gate = metrics?.qualityGate;
-        const staleCandidate = [
-          "forecast_round_mismatch",
-          "forecast_settled",
-          "betting_closed",
-        ].includes(context.reason);
-        elements.combinedPick.dataset.state = "waiting";
-        elements.combinedPick.setAttribute("aria-busy", "false");
-        elements.combinedPickNumber.className =
-          `result-ball combined-pick__number ${rouletteColorClass(candidateNumber)}`;
-        elements.combinedPickNumber.textContent = String(candidateNumber);
-        elements.combinedPickNumber.setAttribute(
-          "aria-label",
-          staleCandidate
-            ? `Последний кандидат прошлого или закрытого раунда: число ${candidateNumber}, не ставить`
-            : `Неквалифицированный кандидат: число ${candidateNumber}, ставок нет`,
-        );
-        setTextIfChanged(
-          elements.combinedPickStatus,
-          staleCandidate
-            ? `WAIT — последний кандидат раунда ${context.snapshot.forecast.roundId}; раунд уже сменился или ставки закрыты. Не использовать для ставки.`
-            : "WAIT — кандидат виден для наблюдения, но допуск к ставке не подтверждён.",
-        );
-        const qualificationText = !gate
-          ? "проверка качества недоступна"
-          : gate.lowerBound === null
-            ? `${gate.hitCount}/${gate.sampleSize} попаданий · граница пока не рассчитана`
-            : `${gate.hitCount}/${gate.sampleSize} попаданий · нижняя 95% граница ${trajectoryShadowShareFormatter.format(gate.lowerBound)}`;
-        setTextIfChanged(
-          elements.combinedPickSources,
-          staleCandidate
-            ? `Последний кандидат раунда ${context.snapshot.forecast.roundId} · ${qualificationText} · WAIT, не для ставки`
-            : `Кандидат ${candidateNumber} · проверка ${gate.sampleSize}/${gate.requiredSampleSize} · ${qualificationText} · база 1/37`,
-        );
-        return;
-      }
       const messages = {
         loading: "Загружаем зафиксированное решение текущего раунда.",
         error: "Свежие данные недоступны — число скрыто.",
@@ -3613,16 +2954,18 @@ import {
 
     setTextIfChanged(
       elements.combinedPickStatus,
-      "BET-допуск подтверждён на фиксированной проспективной когорте; это всё ещё не гарантия следующего результата.",
+      model.learningStatus === "cold_start"
+        ? "Число зафиксировано сервером до результата. Холодный старт: веса ещё стянуты к 50/50; улучшение не гарантируется."
+        : "Число зафиксировано сервером до результата. Веса рассчитаны только по прошлым завершённым общим снимкам; улучшение не гарантируется.",
     );
     const priceWeight = model.learnedFamilyWeights.price;
     const historyWeight = model.learnedFamilyWeights["conditional-history"];
     const currentFamilyText = model.familyCount === 1
       ? ` · в этом lock доступна только ${model.activeFamilyWeights.price === 1 ? "цена" : "условная история"}`
       : "";
-    const gate = metrics.qualityGate;
-    const metricText =
-      ` · контроль Top‑1 ${gate.hitCount}/${gate.sampleSize} · нижняя 95% граница ${trajectoryShadowShareFormatter.format(gate.lowerBound)}`;
+    const metricText = metrics?.settledCount > 0
+      ? ` · Top‑1 ${metrics.top1Hits}/${metrics.settledCount} (${trajectoryShadowShareFormatter.format(metrics.top1Rate)})`
+      : "";
     setTextIfChanged(
       elements.combinedPickSources,
       `${model.sourceCount} ${pluralForm(model.sourceCount, "источник", "источника", "источников")} · ${model.familyCount} ${pluralForm(model.familyCount, "семья", "семьи", "семей")} · обучение ${model.trainingCount} · обучаемый вес цены ${trajectoryShadowShareFormatter.format(priceWeight)} · истории ${trajectoryShadowShareFormatter.format(historyWeight)}${currentFamilyText}${metricText}`,
@@ -3666,48 +3009,196 @@ import {
     elements.precloseComparison.title = `Rank‑37 зафиксирован по срезу ${formatDateTime(latest.lockedAt, { alwaysShowDate: true })}`;
   }
 
-  function renderPrecloseTrajectoryMetrics(
-    trajectoryMetrics,
-    { failed = false, loading = false } = {},
-  ) {
-    if (loading) {
-      elements.precloseSampleCount.textContent = "—";
-      elements.precloseSampleCount.title = "Загружаем статистику Rank‑37.";
-      elements.precloseTop3Rate.textContent = "Загрузка…";
-      return;
+  function normalizeForecastHit(value) {
+    const rankedNumbers = Array.isArray(value?.rankedNumbers)
+      ? value.rankedNumbers.map(asRouletteNumber)
+      : [];
+    const actualNumber = asRouletteNumber(value?.actualNumber);
+
+    if (
+      rankedNumbers.length !== 3
+      || rankedNumbers.some((number) => number === null)
+      || new Set(rankedNumbers).size !== 3
+      || actualNumber === null
+      || !rankedNumbers.includes(actualNumber)
+    ) {
+      return null;
     }
-    if (failed) {
-      elements.precloseSampleCount.textContent = "—";
-      elements.precloseSampleCount.title = "Статистика Rank‑37 не обновлена.";
-      elements.precloseTop3Rate.textContent = "Не обновлено";
+
+    return {
+      roundId: value?.roundId,
+      rankedNumbers,
+      actualNumber,
+      lockedAt: value?.lockedAt,
+      settledAt: value?.settledAt,
+      modelVersion: value?.modelVersion
+    };
+  }
+
+  function forecastHitPick(number, rank, actualNumber) {
+    const isHit = number === actualNumber;
+    const item = createElement("li", `preclose-hit-card__pick${isHit ? " is-hit" : ""}`);
+    const rankLabel = createElement("span", "preclose-hit-card__rank", `#${rank}`);
+    rankLabel.setAttribute("aria-hidden", "true");
+
+    const ball = createElement(
+      "span",
+      `preclose-hit-card__number ${rouletteColorClass(number)}`,
+      number,
+    );
+    ball.setAttribute("aria-hidden", "true");
+
+    item.append(
+      rankLabel,
+      ball,
+      createElement("span", "sr-only", `${rank} место: число ${number}, ${rouletteColorLabel(number)}${isHit ? ", совпало с результатом" : ""}`),
+    );
+    return item;
+  }
+
+  function forecastHitCard(hit) {
+    const card = createElement("li", "preclose-hit-card");
+    const sequence = createElement("div", "preclose-hit-card__sequence");
+    const ranking = createElement("ol", "preclose-hit-card__ranking");
+    ranking.setAttribute("aria-label", "Зафиксированный архивный top-3 start-price-v2");
+    hit.rankedNumbers.forEach((number, index) => {
+      ranking.appendChild(forecastHitPick(number, index + 1, hit.actualNumber));
+    });
+
+    const arrow = createElement("span", "preclose-hit-card__arrow", "→");
+    arrow.setAttribute("aria-hidden", "true");
+
+    const outcome = createElement("div", "preclose-hit-card__outcome");
+    const outcomeLabel = createElement("span", "preclose-hit-card__outcome-label", "выпало");
+    const actualBall = createElement(
+      "span",
+      `preclose-hit-card__actual ${rouletteColorClass(hit.actualNumber)}`,
+      hit.actualNumber,
+    );
+    actualBall.setAttribute("aria-hidden", "true");
+    outcome.append(
+      outcomeLabel,
+      actualBall,
+      createElement("span", "sr-only", `Выпало число ${hit.actualNumber}, ${rouletteColorLabel(hit.actualNumber)}; попадание подтверждено`),
+    );
+
+    sequence.append(ranking, arrow, outcome);
+
+    const meta = createElement("p", "preclose-hit-card__meta");
+    const fullRoundId = hit.roundId === null || hit.roundId === undefined || hit.roundId === ""
+      ? ""
+      : String(hit.roundId);
+    const round = createElement("span", "preclose-hit-card__round", `Раунд ${compactId(hit.roundId)}`);
+    if (fullRoundId) round.title = `Раунд ${fullRoundId}`;
+    meta.appendChild(round);
+
+    const eventAt = hit.settledAt || hit.lockedAt;
+    const eventDate = parseDate(eventAt);
+    if (eventDate) {
+      const time = createElement("time", "preclose-hit-card__time", formatDateTime(eventDate, { alwaysShowDate: true }));
+      const fullDate = new Intl.DateTimeFormat("ru-RU", {
+        dateStyle: "long",
+        timeStyle: "medium"
+      }).format(eventDate);
+      time.dateTime = eventDate.toISOString();
+      time.title = fullDate;
+      time.setAttribute("aria-label", `${hit.settledAt ? "Результат зафиксирован" : "Прогноз зафиксирован"}: ${fullDate}`);
+      meta.appendChild(time);
+    }
+
+    const modelVersion = hit.modelVersion === null || hit.modelVersion === undefined
+      ? ""
+      : String(hit.modelVersion).trim();
+    if (modelVersion) {
+      const model = createElement("span", "preclose-hit-card__model", `Модель ${modelVersion}`);
+      model.title = `Версия модели: ${modelVersion}`;
+      meta.appendChild(model);
+    }
+
+    card.append(sequence, meta);
+    return card;
+  }
+
+  function renderForecastHitHistory() {
+    const history = elements.precloseHitHistory;
+    const list = elements.precloseHitHistoryList;
+
+    if (!store.forecastHitsLoaded) {
+      history.dataset.state = store.forecastHitsError ? "error" : "loading";
+      history.setAttribute("aria-busy", store.forecastHitsError ? "false" : "true");
+      elements.precloseHitHistoryCount.textContent = store.forecastHitsError ? "Ошибка" : "Загрузка…";
+      list.replaceChildren(createElement(
+        "li",
+        "empty-state",
+        store.forecastHitsError
+          ? "Не удалось загрузить историю попаданий."
+          : "Загружаем историю попаданий…",
+      ));
+      setTextIfChanged(
+        elements.precloseHitHistoryStatus,
+        store.forecastHitsError
+          ? "Повторим загрузку автоматически."
+          : "Загружаем архив попаданий прежней модели start-price-v2; эти записи не являются новым Rank‑37.",
+      );
       return;
     }
 
-    const rankedSettledCount = trajectoryMetrics?.rank37SettledCount ?? 0;
-    const rankedPendingCount = trajectoryMetrics?.rank37PendingCount ?? 0;
-    const rankedEvaluatedCount = trajectoryMetrics?.rank37EvaluatedCount ?? 0;
-    const rankedTop3Hits = trajectoryMetrics?.rank37Top3Hits ?? 0;
-    const rankedTop3Rate = trajectoryMetrics?.rank37Top3Rate ?? null;
-    elements.precloseSampleCount.textContent = rankedEvaluatedCount < 100
-      ? `${rankedEvaluatedCount} из 100`
-      : `${rankedEvaluatedCount} проверено`;
-    elements.precloseSampleCount.title = `Rank‑37: завершено ${rankedSettledCount}; ожидают результата ${rankedPendingCount}`;
-    elements.precloseTop3Rate.textContent = rankedEvaluatedCount >= 100 && Number.isFinite(rankedTop3Rate)
-      ? `${rankedTop3Hits} из ${rankedEvaluatedCount} · ${(rankedTop3Rate * 100).toFixed(1).replace(".", ",")}%`
-      : `${rankedTop3Hits} из ${rankedEvaluatedCount} · мало данных`;
+    const hits = store.forecastHits
+      .map(normalizeForecastHit)
+      .filter((item) => item !== null)
+      .slice(0, 20);
+
+    history.setAttribute("aria-busy", "false");
+    if (!hits.length) {
+      history.dataset.state = store.forecastHitsError ? "error" : "empty";
+      elements.precloseHitHistoryCount.textContent = store.forecastHitsError ? "Ошибка" : "0 попаданий";
+      list.replaceChildren(createElement(
+        "li",
+        "empty-state",
+        store.forecastHitsError
+          ? "Не удалось обновить историю попаданий."
+          : "Подтверждённых попаданий архивного top-3 start-price-v2 пока нет.",
+      ));
+      setTextIfChanged(
+        elements.precloseHitHistoryStatus,
+        store.forecastHitsError
+          ? "Повторим загрузку автоматически."
+          : "Первое подтверждённое попадание архивной модели start-price-v2 появится здесь после проверки результата.",
+      );
+      return;
+    }
+
+    const fragment = document.createDocumentFragment();
+    hits.forEach((hit) => fragment.appendChild(forecastHitCard(hit)));
+    list.replaceChildren(fragment);
+
+    const hitLabel = pluralForm(hits.length, "попадание", "попадания", "попаданий");
+    if (store.forecastHitsError) {
+      history.dataset.state = "stale";
+      elements.precloseHitHistoryCount.textContent = `${hits.length} · не обновлено`;
+      setTextIfChanged(
+        elements.precloseHitHistoryStatus,
+        `Показаны последние загруженные ${hits.length} ${hitLabel} архивной модели start-price-v2; свежие данные временно недоступны.`,
+      );
+      return;
+    }
+
+    history.dataset.state = "ready";
+    elements.precloseHitHistoryCount.textContent = store.forecastHitsHasMore
+      ? `${hits.length} последних`
+      : `${hits.length} ${hitLabel}`;
+    setTextIfChanged(
+      elements.precloseHitHistoryStatus,
+      store.forecastHitsHasMore
+        ? `Показаны ${hits.length} последних ${hitLabel} архивной модели start-price-v2; более ранние записи остаются в истории.`
+        : `Показаны все ${hits.length} ${hitLabel} архивной модели start-price-v2 на данный момент.`,
+    );
   }
 
   function renderPrecloseForecast() {
-    const stateAvailable = !store.stateError;
-    const forecastState = stateAvailable
-      ? store.state?.precloseForecast || null
-      : null;
-    const forecastFailed = store.stateError || store.precloseForecastError === true;
-    const forecastLoading = store.precloseForecastLoaded === false;
+    const forecastState = store.state?.precloseForecast || null;
     const latest = forecastState?.latest || null;
-    const currentRound = stateAvailable
-      ? store.state?.collector?.currentRound || null
-      : null;
+    const currentRound = store.state?.collector?.currentRound || null;
     const currentRoundId = currentRound?.id == null ? null : String(currentRound.id);
     const latestRoundId = latest?.roundId == null ? null : String(latest.roundId);
     const closesAt = currentRound?.bettingClosesAt || currentRound?.closesAt || null;
@@ -3716,9 +3207,7 @@ import {
     const secondsUntilClose = closesMs === null
       ? null
       : Math.max(0, Math.ceil((closesMs - nowMs) / 1_000));
-    const matchesCurrent = stateAvailable
-      && !forecastFailed
-      && latest !== null
+    const matchesCurrent = latest !== null
       && currentRoundId !== null
       && latestRoundId === currentRoundId;
     const shadow = matchesCurrent
@@ -3730,71 +3219,32 @@ import {
     const trajectoryMetrics = normalizedTrajectoryMetrics(
       forecastState?.trajectoryMetrics,
     );
-    renderPrecloseTrajectoryMetrics(trajectoryMetrics, {
-      failed: forecastFailed,
-      loading: forecastLoading,
-    });
+    const rankedSettledCount = trajectoryMetrics?.rank37SettledCount ?? 0;
+    const rankedPendingCount = trajectoryMetrics?.rank37PendingCount ?? 0;
+    const rankedEvaluatedCount = trajectoryMetrics?.rank37EvaluatedCount ?? 0;
+    const rankedTop3Hits = trajectoryMetrics?.rank37Top3Hits ?? 0;
+    const rankedTop3Rate = trajectoryMetrics?.rank37Top3Rate ?? null;
+
+    elements.precloseSampleCount.textContent = rankedEvaluatedCount < 100
+      ? `${rankedEvaluatedCount} из 100`
+      : `${rankedEvaluatedCount} проверено`;
+    elements.precloseSampleCount.title = `Rank‑37: завершено ${rankedSettledCount}; ожидают результата ${rankedPendingCount}`;
+    elements.precloseTop3Rate.textContent = rankedEvaluatedCount >= 100 && Number.isFinite(rankedTop3Rate)
+      ? `${rankedTop3Hits} из ${rankedEvaluatedCount} · ${(rankedTop3Rate * 100).toFixed(1).replace(".", ",")}%`
+      : `${rankedTop3Hits} из ${rankedEvaluatedCount} · мало данных`;
     renderPrecloseComparison(matchesCurrent ? latest : null, trajectory, shadow);
     renderTrajectoryShadow(
       matchesCurrent ? latest?.trajectoryShadow : null,
       forecastState?.trajectoryMetrics,
-      { failed: forecastFailed },
-    );
-    renderTrajectoryDirectionChallenger(
-      store.trajectoryDirectionChallengerSnapshot,
-      currentRoundId,
-      {
-        failed: store.stateError || store.trajectoryDirectionChallengerError,
-        loading: !store.trajectoryDirectionChallengerLoaded,
-      },
     );
 
     if (!matchesCurrent) {
       elements.precloseRanking.setAttribute("aria-busy", "true");
       elements.precloseRanking.replaceChildren(
-        createElement(
-          "li",
-          "empty-state",
-          forecastFailed
-            ? "Актуальный прогноз скрыт: состояние сервера не обновилось."
-            : forecastLoading
-              ? "Загружаем зафиксированный прогноз отдельно от основного экрана."
-            : "Прогноз этого раунда ещё не зафиксирован.",
-        ),
+        createElement("li", "empty-state", "Прогноз этого раунда ещё не зафиксирован."),
       );
       elements.precloseLivePrice.textContent = "—";
       elements.precloseProjectedPrice.textContent = "—";
-
-      if (forecastFailed) {
-        elements.precloseRanking.setAttribute("aria-busy", "false");
-        elements.precloseComparison.dataset.state = "unavailable";
-        elements.precloseComparison.setAttribute("aria-busy", "false");
-        elements.precloseComparisonBadge.textContent = "Не обновлено";
-        setTextIfChanged(
-          elements.precloseComparisonStatus,
-          "Rank‑37 скрыт до свежего ответа сервера с архивом прогнозов.",
-        );
-        elements.preclosePanel.dataset.state = "error";
-        elements.precloseBadge.textContent = "Не обновлено";
-        elements.precloseStatus.textContent = "Не удалось обновить основной экран или архив прогноза. Старый Rank‑37 и старое направление скрыты.";
-        elements.precloseTiming.textContent = "Запрос будет повторён автоматически; отсчёт по старому раунду остановлен.";
-        return;
-      }
-
-      if (forecastLoading) {
-        elements.precloseComparison.dataset.state = "loading";
-        elements.precloseComparison.setAttribute("aria-busy", "true");
-        elements.precloseComparisonBadge.textContent = "Загрузка…";
-        setTextIfChanged(
-          elements.precloseComparisonStatus,
-          "Основной экран уже доступен; полный архив Rank‑37 загружается отдельно.",
-        );
-        elements.preclosePanel.dataset.state = "loading";
-        elements.precloseBadge.textContent = "Загрузка…";
-        elements.precloseStatus.textContent = "Получаем зафиксированный прогноз текущего раунда.";
-        elements.precloseTiming.textContent = "Тяжёлый аудит истории больше не задерживает основной экран.";
-        return;
-      }
 
       if (closesMs === null || currentRoundId === null) {
         elements.preclosePanel.dataset.state = "waiting";
@@ -7332,27 +6782,8 @@ import {
   }
 
   function scheduleRefresh() {
-    if (store.refreshing) {
-      store.refreshQueued = true;
-      return;
-    }
     window.clearTimeout(store.refreshTimer);
-    store.refreshTimer = window.setTimeout(() => {
-      store.refreshTimer = null;
-      refreshAll();
-    }, REFRESH_DEBOUNCE_MS);
-  }
-
-  function scheduleQueuedRefresh() {
-    if (!store.refreshQueued) return;
-    store.refreshQueued = false;
-    const notify = store.refreshQueuedNotify;
-    store.refreshQueuedNotify = false;
-    window.clearTimeout(store.refreshTimer);
-    store.refreshTimer = window.setTimeout(() => {
-      store.refreshTimer = null;
-      refreshAll({ notify });
-    }, REFRESH_DEBOUNCE_MS);
+    store.refreshTimer = window.setTimeout(() => refreshAll(), 180);
   }
 
   function connectEventStream() {
@@ -7379,7 +6810,6 @@ import {
       } catch {
         reason = "";
       }
-      if (reason === "connected") return;
       if (reason === "gap") announce("Обнаружен пропуск в истории результатов");
       scheduleRefresh();
     });
@@ -7405,13 +6835,13 @@ import {
     store.followerSourceNumber = sourceNumber;
     store.followerSourceLocked = true;
     store.followerVisibleCount = FOLLOWER_COLLAPSED_LIMIT;
-    renderFollowers(latestResultForRender());
+    renderFollowers(store.state?.latestResult || store.results[0] || null);
   });
   elements.followerToggle.addEventListener("click", () => {
     store.followerVisibleCount = store.followerVisibleCount >= ALL_NUMBERS.length
       ? FOLLOWER_COLLAPSED_LIMIT
       : ALL_NUMBERS.length;
-    renderFollowers(latestResultForRender());
+    renderFollowers(store.state?.latestResult || store.results[0] || null);
   });
   elements.riskRounds.addEventListener("input", renderRiskCalculator);
   elements.triplesToggle.addEventListener("click", () => {

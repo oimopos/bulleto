@@ -7,8 +7,8 @@
     <meta name="color-scheme" content="dark">
     <meta name="description" content="Онлайн-монитор результатов рулетки и циклов исключения чисел от 0 до 36">
     <title>Круг 37 — монитор результатов</title>
-    <link rel="stylesheet" href="/styles.css?v=34">
-    <script type="module" src="/app.js?v=53"></script>
+    <link rel="stylesheet" href="/styles.css?v=30">
+    <script type="module" src="/app.js?v=43"></script>
   </head>
   <body>
     <a class="skip-link" href="#main-content">Перейти к содержимому</a>
@@ -51,35 +51,44 @@
           <p class="eyebrow">Актуальные прогнозные сигналы · один итог</p>
           <p class="combined-pick__title" id="combined-pick-title">Одно число по прогнозным блокам</p>
           <p class="combined-pick__status" id="combined-pick-status" role="status" aria-live="polite" aria-atomic="true">Загружаем решение, зафиксированное сервером до результата.</p>
-          <p class="combined-pick__note" id="combined-pick-note">Сервер заранее фиксирует полные распределения ценовой траектории и условной истории, объединяет их в две семьи и выводит одного лидера-кандидата. Команда BET закрыта, пока первая фиксированная когорта из 1 000 проспективных прогнозов с известным результатом не покажет нижнюю границу Wilson 95% выше случайной базы 1/37; невосстановимые исходы после разрыва пропускаются. До подтверждения показывается WAIT; сам кандидат не является рекомендацией. Тест не гарантирует следующий результат.</p>
+          <p class="combined-pick__note" id="combined-pick-note">Сервер заранее фиксирует полные распределения ценовой траектории и условной истории, объединяет их в две семьи и выводит ровно одно число. Семейные веса начинают с 50/50 и меняются только по прошлым завершённым общим снимкам; текущий результат в расчёт не попадает. Давность, виртуальная цель, невыпавшие числа, survivor и исторический аналог остаются только наблюдением. Это эвристический ранговый индекс, не вероятность и не гарантия преимущества. Базовый шанс отдельного числа — 1 из 37 (≈2,7%).</p>
         </div>
         <div class="combined-pick__result">
-          <span class="combined-pick__label">Лидер-кандидат</span>
+          <span class="combined-pick__label">Одно число</span>
           <output class="result-ball result-ball--empty combined-pick__number" id="combined-pick-number" aria-label="Сводное число пока не рассчитано">—</output>
           <span class="combined-pick__sources" id="combined-pick-sources">Ожидаем данные</span>
         </div>
-        <section class="signal-account" id="signal-account" data-state="loading" aria-label="Виртуальный баланс подтверждённых BET-сигналов" aria-busy="true">
-          <div class="signal-account__heading">
-            <strong>Баланс подтверждённых BET-сигналов</strong>
-            <span id="signal-account-status" role="status" aria-live="polite" aria-atomic="true">Загрузка баланса…</span>
+        <section class="combined-pick-account" id="combined-pick-account" data-state="loading" aria-labelledby="combined-pick-account-title" aria-describedby="combined-pick-account-note" aria-busy="true">
+          <div class="combined-pick-account__header">
+            <div>
+              <p class="eyebrow">Проспективная симуляция · один лидер</p>
+              <h3 id="combined-pick-account-title">Виртуальный счёт лестницы</h3>
+            </div>
+            <span class="combined-pick-account__status" id="combined-pick-account-status" role="status" aria-live="polite" aria-atomic="true">Загрузка…</span>
           </div>
-          <dl class="signal-account__metrics">
-            <div>
-              <dt>Виртуальный баланс</dt>
-              <dd id="signal-account-balance">—</dd>
-              <small>старт 1 000 · фиксированная ставка 10</small>
+          <dl class="combined-pick-account__metrics" aria-label="Показатели виртуального счёта единого лидера">
+            <div class="combined-pick-account__metric" id="combined-pick-account-balance-card">
+              <dt>Текущий счёт</dt>
+              <dd id="combined-pick-account-balance">—</dd>
+              <small id="combined-pick-account-profit">старт 1 000 · результат —</small>
             </div>
-            <div>
+            <div class="combined-pick-account__metric">
               <dt>Попадания / промахи</dt>
-              <dd id="signal-account-record">—</dd>
-              <small>только прогнозы, для которых API выдал BET</small>
+              <dd id="combined-pick-account-record">— / —</dd>
+              <small id="combined-pick-account-settled">завершено —</small>
             </div>
-            <div>
-              <dt>Текущий сигнал</dt>
-              <dd id="signal-account-pending">—</dd>
-              <small>виртуальный учёт · реальные ставки отключены</small>
+            <div class="combined-pick-account__metric">
+              <dt>Наблюдаемая частота попаданий</dt>
+              <dd id="combined-pick-account-rate">—</dd>
+              <small id="combined-pick-account-rate-detail">по завершённым · не вероятность; база 1/37 ≈2,7%</small>
+            </div>
+            <div class="combined-pick-account__metric">
+              <dt id="combined-pick-account-stake-label">Следующая ставка</dt>
+              <dd id="combined-pick-account-stake">—</dd>
+              <small id="combined-pick-account-ladder">ступень — · серия —</small>
             </div>
           </dl>
+          <p class="combined-pick-account__note" id="combined-pick-account-note">На каждое заранее сохранённое число фиксируется только условная ставка. Старт 1 000, ставка и шаг 10, максимум 2 500; выплата ×36 включает возврат. Попадание сбрасывает лестницу. Частота — прошлое наблюдение, не вероятность следующего результата. Это виртуальная («бумажная») симуляция; реальных ставок и действий нет.</p>
         </section>
       </section>
 
@@ -266,35 +275,37 @@
           <p class="preclose-comparison__note" id="preclose-comparison-note">Rank‑37 строится по замороженным движениям похожих завершённых траекторий. Тройка показывается только при ненулевой исходной массе минимум у трёх разных чисел; технический нулевой хвост не влияет на верхнего лидера. Старый <code>start-price-v2</code> не получает отдельного голоса.</p>
         </section>
 
-        <section class="preclose-comparison" id="trajectory-shadow-panel" aria-labelledby="trajectory-shadow-title" aria-describedby="trajectory-shadow-observed trajectory-shadow-status trajectory-direction-challenger trajectory-shadow-shares trajectory-shadow-number-area trajectory-shadow-training trajectory-shadow-range-metrics trajectory-shadow-sample trajectory-shadow-note" aria-busy="true">
+        <section class="preclose-comparison" id="trajectory-shadow-panel" aria-labelledby="trajectory-shadow-title" aria-describedby="trajectory-shadow-status trajectory-shadow-shares trajectory-shadow-number-area trajectory-shadow-training trajectory-shadow-range-metrics trajectory-shadow-sample trajectory-shadow-note" aria-busy="true">
           <div class="preclose-comparison__header">
             <div>
-              <p class="eyebrow">Shadow · факт отдельно от прогноза</p>
-              <h3 id="trajectory-shadow-title">Диаграмма до lock и движение до ed</h3>
+              <p class="eyebrow">Shadow · только наблюдение</p>
+              <h3 id="trajectory-shadow-title">Форма траектории перед lock → ed</h3>
             </div>
             <span class="preclose-comparison__badge" id="trajectory-shadow-badge">Сбор истории</span>
           </div>
-          <dl class="trajectory-shadow__directions">
-            <div>
-              <dt>Факт · сохранённая диаграмма до lock</dt>
-              <dd id="trajectory-shadow-observed">Подтверждённая диаграмма текущего раунда ещё не зафиксирована.</dd>
-            </div>
-            <div>
-              <dt>Прогноз · отдельное движение lock → ed</dt>
-              <dd id="trajectory-shadow-status" role="status" aria-live="polite" aria-atomic="true">Prospective shadow появится после накопления полных завершённых траекторий.</dd>
-            </div>
-            <div class="trajectory-shadow__challenger">
-              <dt>Проверка альтернативы · lock → ed</dt>
-              <dd id="trajectory-direction-challenger" role="status" aria-live="polite" aria-atomic="true">Проверяемая альтернатива для текущего раунда ещё не зафиксирована. Adaptive v2 остаётся основным прогнозом.</dd>
-            </div>
-          </dl>
-          <p class="preclose-comparison__status" id="trajectory-shadow-shares">Архивное основание прогноза: вверх — · вниз — · без движения —.</p>
+          <p class="preclose-comparison__status" id="trajectory-shadow-status" role="status" aria-live="polite" aria-atomic="true">Prospective shadow появится после накопления полных завершённых траекторий.</p>
+          <p class="preclose-comparison__status" id="trajectory-shadow-shares">Доли похожих завершённых траекторий: вверх — · вниз — · без движения —.</p>
           <p class="preclose-comparison__status trajectory-shadow__range" id="trajectory-shadow-number-area" aria-live="polite" aria-atomic="true">ПРОГНОЗ УЧАСТКА: НЕТ ДАННЫХ</p>
           <p class="preclose-comparison__status" id="trajectory-shadow-training">Обучение: — результатов · adaptive-снимок для этого раунда отсутствует.</p>
           <p class="preclose-comparison__status" id="trajectory-shadow-range-metrics" aria-live="polite" aria-atomic="true">Участок: — из — (нет данных) · Adaptive v2, проспективное наблюдение.</p>
           <p class="preclose-comparison__status" id="trajectory-shadow-sample">Полные сопоставимые раунды: —/30; соседи формы: —/10.</p>
-          <p class="preclose-comparison__note" id="trajectory-shadow-note">«Факт» показывает общее изменение первой и последней сохранённых точек уже построенной диаграммы до lock. «Прогноз» относится только к движению от последней доступной точки перед forecast lock (возраст точки не более 5 с) до финальной цены результата <code>ed</code>, которое ещё не было известно в момент lock, а не к текущему наклону и не к следующему тику. Эти направления могут быть противоположными — это не переворот оси. «Без заметного движения» означает изменение не более половины ширины ценовой полосы. Adaptive v2 фиксирует при lock не более 6 соседних ценовых полос вокруг типичного q50 внутри полного коридора q20/q80; legacy KNN v1 восстанавливает такое же компактное окно только для отображения. Основная шкала идёт от 0 сверху к 36 снизу, а нижняя дублирующая нулевая полоса помечается отдельно. Обучение использует только завершённые снимки, известные строго до lock нового снимка. «Участок» и Rank‑37 проверяются только на проспективно зафиксированных Adaptive v2 снимках; архивные доли попаданий не являются вероятностью следующего раунда. В блок «Одно число по прогнозным блокам» Rank‑37 входит с замороженной исходной массой: числа с нулевой массой данных не получают вес из-за технического порядка. Компактный диапазон усредняется с ним внутри одной ценовой группы и не создаёт второй независимый вес.</p>
+          <p class="preclose-comparison__note" id="trajectory-shadow-note">Цель — движение цены от последней доступной точки перед forecast lock (возраст точки не более 5 с) до финальной цены результата <code>ed</code>, а не следующий тик. Adaptive v2 фиксирует при lock не более 6 соседних ценовых полос вокруг типичного q50 внутри полного коридора q20/q80; legacy KNN v1 восстанавливает такое же компактное окно только для отображения. Основная шкала идёт от 0 сверху к 36 снизу, а нижняя дублирующая нулевая полоса помечается отдельно. Обучение использует только завершённые снимки, известные строго до lock нового снимка. «Участок» и Rank‑37 проверяются только на проспективно зафиксированных Adaptive v2 снимках; архивные доли попаданий не являются вероятностью следующего раунда. В блок «Одно число по прогнозным блокам» Rank‑37 входит с замороженной исходной массой: числа с нулевой массой данных не получают вес из-за технического порядка. Компактный диапазон усредняется с ним внутри одной ценовой группы и не создаёт второй независимый вес.</p>
         </section>
+
+        <details class="preclose-hit-history disclosure disclosure--inset" id="preclose-hit-history" data-state="loading" aria-labelledby="preclose-hit-history-title" aria-describedby="preclose-hit-history-status" aria-busy="true">
+          <summary class="preclose-hit-history__header disclosure__summary">
+            <span class="disclosure__copy">
+              <span class="eyebrow">Архив старой модели · наблюдение</span>
+              <span class="disclosure__title disclosure__title--small" id="preclose-hit-history-title" role="heading" aria-level="3">Сохранённые попадания legacy Top‑3</span>
+            </span>
+            <span class="preclose-hit-history__badge" id="preclose-hit-history-count">Загрузка…</span>
+            <span class="disclosure__chevron" aria-hidden="true"></span>
+          </summary>
+          <ol class="preclose-hit-history__list" id="preclose-hit-history-list" tabindex="0" aria-label="Архивные комбинации старого Top-3, в которые попало выпавшее число">
+            <li class="empty-state">Загружаем историю попаданий…</li>
+          </ol>
+          <p class="preclose-hit-history__status" id="preclose-hit-history-status" role="status" aria-live="polite" aria-atomic="true">Загружаем архивные прогнозы старой модели с подтверждённым результатом; они не участвуют в новом Rank‑37 и верхнем лидере.</p>
+        </details>
 
         <p class="preclose-note" id="preclose-note">Для текущего раунда все 37 чисел ранжируются по замороженным до <code>bcd</code> распределениям движений похожих завершённых траекторий; в панели показаны только первые три места полного Rank‑37. Ранговая масса — не вероятность и не доказанное преимущество. Старый статичный <code>start-price-v2</code> остаётся служебным архивом и не получает веса ни в новом списке, ни в верхнем едином лидере. Случайная база для заранее выбранной тройки — 3 из 37 (≈8,1%). Это эксперимент, не рекомендация для ставки и не обещание выигрыша.</p>
       </section>

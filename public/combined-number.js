@@ -4,7 +4,7 @@ export const TRAJECTORY_RANK37_BASIS =
   "adaptive-weighted-neighbor-delta-to-current-bands";
 export const TRAJECTORY_RANK37_MIN_TRAINING_COUNT = 30;
 export const TRAJECTORY_RANK37_MIN_EVIDENCE_CANDIDATES = 3;
-export const PREDICTIVE_LEADER_API_SCHEMA_VERSION = 3;
+export const PREDICTIVE_LEADER_API_SCHEMA_VERSION = 1;
 export const PREDICTIVE_LEADER_API_ALGORITHM_VERSION =
   "learned-predictive-family-index-v5";
 export const PREDICTIVE_LEADER_API_LEARNING_VERSION =
@@ -21,11 +21,8 @@ const PREDICTIVE_LEADER_REASONS = Object.freeze({
     "cursor_unavailable",
     "forecast_unavailable",
     "forecast_settled",
-    "betting_closed",
     "leader_not_frozen",
     "no_valid_family",
-    "confidence_not_proven",
-    "quality_metrics_unavailable",
   ]),
   paused: new Set([
     "integrity_gap",
@@ -44,17 +41,9 @@ const PREDICTIVE_LEADER_REASONS_WITH_FORECAST = new Set([
   "ready",
   "forecast_round_mismatch",
   "forecast_settled",
-  "betting_closed",
   "leader_not_frozen",
   "no_valid_family",
-  "confidence_not_proven",
-  "quality_metrics_unavailable",
   "leader_invalid",
-]);
-const PREDICTIVE_LEADER_STALE_CANDIDATE_REASONS = new Set([
-  "forecast_round_mismatch",
-  "forecast_settled",
-  "betting_closed",
 ]);
 export const TRAJECTORY_RANK37_EVIDENCE_MASS_THRESHOLD =
   SCORE_EPSILON / 0.95;
@@ -179,7 +168,6 @@ function normalizedPredictiveLeaderApiMetrics(value) {
     return undefined;
   }
   const { top1Rate, meanBrierLoss, uniformBrierLoss, beatsUniform } = value;
-  const qualityGate = value.qualityGate;
   if (
     typeof uniformBrierLoss !== "number"
     || !Number.isFinite(uniformBrierLoss)
@@ -202,86 +190,6 @@ function normalizedPredictiveLeaderApiMetrics(value) {
   ) {
     return undefined;
   }
-  if (
-    !isPlainRecord(qualityGate)
-    || qualityGate.version !== "top1-first-settled-cohort-wilson95-v2"
-    || !["collecting", "pending", "rejected", "confirmed", "invalid"]
-      .includes(qualityGate.status)
-    || typeof qualityGate.eligible !== "boolean"
-    || qualityGate.eligible !== (qualityGate.status === "confirmed")
-    || !Number.isSafeInteger(qualityGate.requiredSampleSize)
-    || qualityGate.requiredSampleSize !== 1_000
-    || !Number.isSafeInteger(qualityGate.cohortSize)
-    || qualityGate.cohortSize < 0
-    || qualityGate.cohortSize > qualityGate.requiredSampleSize
-    || !Number.isSafeInteger(qualityGate.sampleSize)
-    || qualityGate.sampleSize < 0
-    || qualityGate.sampleSize > qualityGate.cohortSize
-    || qualityGate.sampleSize > settledCount
-    || !Number.isSafeInteger(qualityGate.hitCount)
-    || qualityGate.hitCount < 0
-    || qualityGate.hitCount > qualityGate.sampleSize
-    || qualityGate.hitCount > top1Hits
-    || qualityGate.baselineRate !== 1 / 37
-    || qualityGate.confidenceLevel !== 0.95
-    || !(
-      qualityGate.hitRate === null
-      || (
-        typeof qualityGate.hitRate === "number"
-        && Number.isFinite(qualityGate.hitRate)
-        && Math.abs(
-          qualityGate.hitRate - qualityGate.hitCount / qualityGate.sampleSize,
-        ) <= PREDICTIVE_LEADER_SUM_TOLERANCE
-      )
-    )
-    || !(
-      qualityGate.lowerBound === null
-      || (
-        typeof qualityGate.lowerBound === "number"
-        && Number.isFinite(qualityGate.lowerBound)
-        && qualityGate.lowerBound >= 0
-        && qualityGate.lowerBound <= 1
-      )
-    )
-    || (qualityGate.status === "confirmed" && (
-      qualityGate.cohortSize !== qualityGate.requiredSampleSize
-      || qualityGate.sampleSize !== qualityGate.requiredSampleSize
-      || qualityGate.lowerBound === null
-      || qualityGate.lowerBound <= qualityGate.baselineRate
-    ))
-    || (qualityGate.status === "rejected" && (
-      qualityGate.cohortSize !== qualityGate.requiredSampleSize
-      || qualityGate.sampleSize !== qualityGate.requiredSampleSize
-      || qualityGate.lowerBound === null
-      || qualityGate.lowerBound > qualityGate.baselineRate
-    ))
-    || (["rejected", "confirmed"].includes(qualityGate.status)
-      && Math.abs(
-        qualityGate.lowerBound
-          - predictiveLeaderWilsonLowerBound(
-            qualityGate.hitCount,
-            qualityGate.sampleSize,
-          ),
-      ) > PREDICTIVE_LEADER_SUM_TOLERANCE)
-    || (["collecting", "pending", "invalid"].includes(qualityGate.status)
-      && qualityGate.lowerBound !== null)
-    || (qualityGate.status === "collecting"
-      && qualityGate.cohortSize >= qualityGate.requiredSampleSize)
-    || (qualityGate.status === "pending" && (
-      qualityGate.cohortSize !== qualityGate.requiredSampleSize
-      || qualityGate.sampleSize >= qualityGate.cohortSize
-    ))
-    || qualityGate.reason !== ({
-      collecting: "insufficient_sample",
-      pending: "cohort_pending",
-      rejected: "not_above_baseline",
-      confirmed: "confirmed",
-      invalid: "invalid_evaluation",
-    })[qualityGate.status]
-    || (qualityGate.sampleSize === 0 && qualityGate.hitRate !== null)
-  ) {
-    return undefined;
-  }
   return {
     readyCount,
     settledCount,
@@ -291,7 +199,6 @@ function normalizedPredictiveLeaderApiMetrics(value) {
     meanBrierLoss,
     uniformBrierLoss,
     beatsUniform,
-    qualityGate: { ...qualityGate },
   };
 }
 
@@ -390,7 +297,6 @@ export function normalizePredictiveLeaderApiSnapshot(value) {
     || nullableInstant(value.serverTime) === undefined
     || !PREDICTIVE_LEADER_REASONS[value.status]?.has(value.reason)
     || (value.account !== null && !isPlainRecord(value.account))
-    || !isPlainRecord(value.signalAccount)
   ) {
     return null;
   }
@@ -411,38 +317,7 @@ export function normalizePredictiveLeaderApiSnapshot(value) {
   }
 
   if (value.status !== "ready") {
-    const confidenceWait = value.reason === "confidence_not_proven";
-    const staleCandidate = PREDICTIVE_LEADER_STALE_CANDIDATE_REASONS
-      .has(value.reason);
-    const mayExposeCandidate = confidenceWait || staleCandidate;
-    const candidateNumber = mayExposeCandidate
-      ? safeRouletteNumber(value.candidateNumber)
-      : null;
-    const model = mayExposeCandidate
-      ? normalizedPredictiveLeaderModel(value.model)
-      : null;
-    if (
-      value.action !== "WAIT"
-      || value.number !== null
-      || (confidenceWait && (
-        !metrics?.qualityGate
-        || metrics.qualityGate.eligible === true
-      ))
-      || (confidenceWait && (candidateNumber === null || !model))
-      || (staleCandidate && value.candidateNumber !== null && (
-        candidateNumber === null || !model
-      ))
-      || (staleCandidate && value.candidateNumber === null && value.model !== null)
-      || (value.reason === "forecast_round_mismatch"
-        && candidateNumber !== null
-        && freshness.forecastRoundMatches !== false)
-      || (value.reason === "betting_closed"
-        && candidateNumber !== null
-        && Date.parse(value.serverTime) < Date.parse(forecast.bettingClosesAt))
-      || (!mayExposeCandidate && (
-        value.candidateNumber !== null || value.model !== null
-      ))
-    ) return null;
+    if (value.number !== null || value.model !== null) return null;
     return {
       schemaVersion: value.schemaVersion,
       algorithmVersion: value.algorithmVersion,
@@ -454,27 +329,20 @@ export function normalizePredictiveLeaderApiSnapshot(value) {
       serverTime: value.serverTime,
       status: value.status,
       reason: value.reason,
-      action: value.action,
       number: null,
-      candidateNumber,
       forecast,
-      model,
+      model: null,
       account: value.account,
-      signalAccount: value.signalAccount,
       metrics,
       freshness,
     };
   }
 
   const number = strictNonNegativeInteger(value.number);
-  const candidateNumber = safeRouletteNumber(value.candidateNumber);
   const model = normalizedPredictiveLeaderModel(value.model);
   if (
-    value.action !== "BET"
-    || number === null
+    number === null
     || number > 36
-    || candidateNumber !== number
-    || metrics?.qualityGate?.eligible !== true
     || !model
     || freshness.currentRoundId === null
     || !freshness.resultCursorMatches
@@ -500,13 +368,10 @@ export function normalizePredictiveLeaderApiSnapshot(value) {
     serverTime: value.serverTime,
     status: value.status,
     reason: value.reason,
-    action: value.action,
     number,
-    candidateNumber,
     forecast,
     model,
     account: value.account,
-    signalAccount: value.signalAccount,
     metrics,
     freshness,
   };
@@ -526,12 +391,8 @@ export function predictiveLeaderNumberContext({
   if (!snapshot || !["ready", "waiting", "paused"].includes(snapshot.status)) {
     return { state: "error" };
   }
-  if (snapshot.status === "ready") return { state: "ready", snapshot };
-  return snapshot.reason === "confidence_not_proven"
-    ? { state: snapshot.status, reason: snapshot.reason, snapshot }
-    : PREDICTIVE_LEADER_STALE_CANDIDATE_REASONS.has(snapshot.reason)
-      && snapshot.candidateNumber !== null
-      ? { state: "waiting", reason: snapshot.reason, snapshot }
+  return snapshot.status === "ready"
+    ? { state: "ready", snapshot }
     : { state: snapshot.status, reason: snapshot.reason };
 }
 
@@ -553,18 +414,6 @@ function sameEntityId(left, right) {
     && right !== null
     && right !== undefined
     && String(left) === String(right);
-}
-
-function predictiveLeaderWilsonLowerBound(hitCount, sampleSize) {
-  if (!Number.isSafeInteger(sampleSize) || sampleSize <= 0) return null;
-  const z = 1.959963984540054;
-  const rate = hitCount / sampleSize;
-  const denominator = 1 + (z ** 2) / sampleSize;
-  const center = (rate + (z ** 2) / (2 * sampleSize)) / denominator;
-  const radius = z * Math.sqrt(
-    (rate * (1 - rate) / sampleSize) + (z ** 2) / (4 * sampleSize ** 2),
-  ) / denominator;
-  return Math.max(0, center - radius);
 }
 
 function validInstant(value) {

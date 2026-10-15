@@ -2005,7 +2005,7 @@ test("version 12 history upgrades by arming only its latest tail without backfil
 
     database = createDatabase({ path });
     const state = trackerState(database);
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 22);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 19);
     assert.equal(state.status, "armed");
     assert.equal(state.currentSession.anchor.number, 9);
     assert.equal(state.currentSession.attemptCount, 0);
@@ -2089,9 +2089,8 @@ test("state API and frontend share the persisted tracker and all-points contract
 
   assert.match(
     server,
-    /function followerTop5TrackerFromDatabase\(\)[\s\S]*?db\.getFollowerTop5TrackerState\('buleto',\s*config\.instrument\)/,
+    /followerTop5Tracker:\s*db\.getFollowerTop5TrackerState\('buleto',\s*config\.instrument\)/,
   );
-  assert.match(server, /followerTop5Tracker:\s*followerTop5TrackerFromDatabase\(\)/);
   assert.match(app, /followerTop5Tracker/);
   assert.match(app, /follower-top5-live-v1/);
   assert.match(app, /persisted-batch-aware/);

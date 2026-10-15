@@ -112,71 +112,23 @@ const resultPipeline = new ResultPipeline({
 // no credentials, browser automation, payment access, or Buleto write calls.
 db.initializeVirtualBettor('buleto', config.instrument);
 db.settlePrecloseForecasts('buleto', config.instrument);
-db.settlePredictiveLeaderSignals('buleto', config.instrument);
 db.settlePredictiveLeaderAccount('buleto', config.instrument);
 db.applyPredictiveLeaderAccountReset('buleto', config.instrument);
 db.reconcilePredictiveLeaderAccount('buleto', config.instrument);
+const trajectoryValidationWarmStartedAt = Date.now();
+try {
+  const warmed = db.warmPrecloseForecastValidation('buleto', config.instrument);
+  const durationMs = Date.now() - trajectoryValidationWarmStartedAt;
+  console.info(
+    `[trajectory] validation cache warmed: ${warmed.validCount}/${warmed.checkedCount} valid; `
+      + `cacheSize=${warmed.cacheSize}; hits=${warmed.hits}; `
+      + `misses=${warmed.misses}; durationMs=${durationMs}`,
+  );
+} catch (error) {
+  console.error('[trajectory] validation cache warm-up failed; continuing cold', error);
+}
 
-const DATABASE_WRITE_UPDATE_REASONS = new Set([
-  'gap',
-  'results',
-  'forecast-settled',
-  'predictive-leader-account',
-  'predictive-leader-signal-account',
-]);
-const FORECAST_DATABASE_READ_CACHE_KEYS = new Set([
-  'dashboard-api-state',
-  'preclose-forecast-state',
-  'predictive-leader-state',
-  'predictive-leader-challengers-state',
-]);
-const FORECAST_DATABASE_READ_CACHE_KEY_PREFIXES = [
-  'trajectory-direction-challenger-state:',
-  'predictive-leader-hit-breakdown:',
-];
-const MAX_DATABASE_READ_CACHE_ENTRIES = 32;
-const databaseReadCache = new Map();
-let databaseReadGeneration = 0;
 const sseClients = new Set();
-
-function cachedDatabaseRead(key, read) {
-  const cached = databaseReadCache.get(key);
-  if (cached?.generation === databaseReadGeneration) {
-    databaseReadCache.delete(key);
-    databaseReadCache.set(key, cached);
-    return cached.value;
-  }
-
-  const value = read();
-  if (databaseReadCache.size >= MAX_DATABASE_READ_CACHE_ENTRIES) {
-    const oldestKey = databaseReadCache.keys().next().value;
-    databaseReadCache.delete(oldestKey);
-  }
-  databaseReadCache.set(key, { generation: databaseReadGeneration, value });
-  return value;
-}
-
-function invalidateDatabaseReadCache() {
-  databaseReadGeneration += 1;
-  databaseReadCache.clear();
-}
-
-function invalidateForecastDatabaseReads() {
-  for (const key of databaseReadCache.keys()) {
-    if (
-      FORECAST_DATABASE_READ_CACHE_KEYS.has(key)
-      || FORECAST_DATABASE_READ_CACHE_KEY_PREFIXES.some(
-        (prefix) => key.startsWith(prefix),
-      )
-    ) {
-      databaseReadCache.delete(key);
-    }
-  }
-}
-
-function forecastOutcomeChanged(outcome) {
-  return outcome?.inserted === true || outcome?.repaired === true;
-}
 
 function securityHeaders(extra = {}) {
   return {
@@ -205,11 +157,6 @@ function sendJson(response, statusCode, body) {
 }
 
 function broadcastUpdate(reason) {
-  if (reason === 'forecast') {
-    invalidateForecastDatabaseReads();
-  } else if (DATABASE_WRITE_UPDATE_REASONS.has(reason)) {
-    invalidateDatabaseReadCache();
-  }
   const chunk = `event: update\ndata: ${JSON.stringify({ reason, at: new Date().toISOString() })}\n\n`;
   for (const response of sseClients) {
     try {
@@ -266,105 +213,42 @@ function cycleForApi(cycle) {
   };
 }
 
-function dashboardDatabaseState() {
-  return cachedDatabaseRead(
-    'dashboard-state',
-    () => db.getDashboardState(),
-  );
-}
-
-function numberStatsFromDatabase() {
-  return cachedDatabaseRead(
-    'number-stats',
-    () => db.getNumberStats('buleto', config.instrument),
-  );
-}
-
-function tripleFollowerSignalFromDatabase() {
-  return cachedDatabaseRead(
-    'triple-follower-signal',
-    () => db.getCurrentTripleFollowerSignal('buleto', config.instrument),
-  );
-}
-
-function followerTop5TrackerFromDatabase() {
-  return cachedDatabaseRead(
-    'follower-top5-tracker',
-    () => db.getFollowerTop5TrackerState('buleto', config.instrument),
-  );
-}
-
-function virtualBettorStateFromDatabase() {
-  return cachedDatabaseRead(
-    'virtual-bettor-state',
-    () => db.getVirtualBettorState('buleto', config.instrument),
-  );
-}
-
-function precloseForecastStateFromDatabase() {
-  return cachedDatabaseRead(
-    'preclose-forecast-state',
-    () => db.getPrecloseForecastState('buleto', config.instrument),
-  );
-}
-
-function latestResultFromDatabase() {
-  return cachedDatabaseRead(
-    'latest-result',
-    () => db.getLatestResult('buleto', config.instrument),
-  );
-}
-
-function databaseCoreStateForApi() {
-  return cachedDatabaseRead('dashboard-api-core-state', () => {
-    const state = dashboardDatabaseState();
-    const totals = state.stats ?? state.totals ?? {};
-    const incidents = state.warnings ?? state.recentIncidents ?? [];
-    const latestCompletedCycle = cycleForApi(state.latestCompletedCycle);
-    const latestCycle = cycleForApi(state.latestCycle);
-    return {
-      ...state,
-      // После определения survivor цикл уже terminal. До следующего результата
-      // продолжаем показывать его на главном поле, а не пустые 37 клеток.
-      activeCycle:
-        cycleForApi(state.activeCycle) ??
-        (latestCycle?.status === 'completed' ? latestCycle : null),
-      activeCycles: (state.activeCycles ?? []).map(cycleForApi),
-      latestCycle,
-      latestCompletedCycle,
-      latestResult: resultForApi(state.latestResult),
-      numberStats: numberStatsFromDatabase(),
-      tripleFollowerSignal: tripleFollowerSignalFromDatabase(),
-      followerTop5Tracker: followerTop5TrackerFromDatabase(),
-      virtualBettor: virtualBettorStateFromDatabase(),
-      stats: {
-        totalResults: totals.totalResults ?? totals.results ?? 0,
-        completedCycles: totals.completedCycles ?? 0,
-        totalCycles: totals.totalCycles ?? totals.cycles ?? 0,
-        incidents: totals.incidents ?? 0,
-      },
-      warnings: incidents.map((incident) => ({
-        ...incident,
-        type: incident.type ?? incident.kind ?? 'warning',
-        occurredAt: incident.occurredAt ?? incident.detectedAt ?? incident.createdAt ?? null,
-      })),
-    };
-  });
-}
-
 function databaseStateForApi() {
-  return cachedDatabaseRead('dashboard-api-state', () => ({
-    ...databaseCoreStateForApi(),
-    precloseForecast: precloseForecastStateFromDatabase(),
-  }));
-}
-
-function dashboardCoreState() {
+  const state = db.getDashboardState();
+  const totals = state.stats ?? state.totals ?? {};
+  const incidents = state.warnings ?? state.recentIncidents ?? [];
+  const latestCompletedCycle = cycleForApi(state.latestCompletedCycle);
+  const latestCycle = cycleForApi(state.latestCycle);
   return {
-    ...databaseCoreStateForApi(),
-    collector: collector.getStatus(),
-    pipelinePending: resultPipeline.getPendingCounts(),
-    serverTime: new Date().toISOString(),
+    ...state,
+    // После определения survivor цикл уже terminal. До следующего результата
+    // продолжаем показывать его на главном поле, а не пустые 37 клеток.
+    activeCycle:
+      cycleForApi(state.activeCycle) ??
+      (latestCycle?.status === 'completed' ? latestCycle : null),
+    activeCycles: (state.activeCycles ?? []).map(cycleForApi),
+    latestCycle,
+    latestCompletedCycle,
+    latestResult: resultForApi(state.latestResult),
+    numberStats: db.getNumberStats('buleto', config.instrument),
+    tripleFollowerSignal: db.getCurrentTripleFollowerSignal(
+      'buleto',
+      config.instrument,
+    ),
+    followerTop5Tracker: db.getFollowerTop5TrackerState('buleto', config.instrument),
+    virtualBettor: db.getVirtualBettorState('buleto', config.instrument),
+    precloseForecast: db.getPrecloseForecastState('buleto', config.instrument),
+    stats: {
+      totalResults: totals.totalResults ?? totals.results ?? 0,
+      completedCycles: totals.completedCycles ?? 0,
+      totalCycles: totals.totalCycles ?? totals.cycles ?? 0,
+      incidents: totals.incidents ?? 0,
+    },
+    warnings: incidents.map((incident) => ({
+      ...incident,
+      type: incident.type ?? incident.kind ?? 'warning',
+      occurredAt: incident.occurredAt ?? incident.detectedAt ?? incident.createdAt ?? null,
+    })),
   };
 }
 
@@ -378,11 +262,11 @@ function dashboardState() {
 }
 
 function virtualBettorForApi() {
-  const state = virtualBettorStateFromDatabase();
+  const state = db.getVirtualBettorState('buleto', config.instrument);
   const now = new Date();
   return virtualBettorSnapshotForApi({
     state,
-    latestResult: latestResultFromDatabase(),
+    latestResult: db.getLatestResult('buleto', config.instrument),
     collectorState: collector.getStatus(),
     now,
   });
@@ -391,11 +275,11 @@ function virtualBettorForApi() {
 function followerTop5GatedForApi() {
   const source = 'buleto';
   const instrument = config.instrument;
-  const trackerState = followerTop5TrackerFromDatabase();
+  const trackerState = db.getFollowerTop5TrackerState(source, instrument);
   return followerTop5GatedSnapshotForApi({
     trackerState,
     collectorState: collector.getStatus(),
-    latestResult: latestResultFromDatabase(),
+    latestResult: db.getLatestResult(source, instrument),
     pipelinePending: resultPipeline.getPendingCounts(),
     source,
     instrument,
@@ -403,7 +287,10 @@ function followerTop5GatedForApi() {
   });
 }
 
-function predictiveLeaderSnapshotForState(state, source, instrument, now = new Date()) {
+function predictiveLeaderForApi() {
+  const source = 'buleto';
+  const instrument = config.instrument;
+  const state = db.getPredictiveLeaderReadState(source, instrument);
   return predictiveLeaderSnapshotForApi({
     state: {
       ...state,
@@ -413,90 +300,8 @@ function predictiveLeaderSnapshotForState(state, source, instrument, now = new D
     },
     source,
     instrument,
-    now,
+    now: new Date(),
   });
-}
-
-function recordPredictiveLeaderSignalIfBet(snapshot, source, instrument) {
-  if (snapshot.action === 'BET') {
-    db.recordPredictiveLeaderSignal({
-      source,
-      instrument,
-      forecastId: snapshot.forecast.id,
-      targetNumber: snapshot.number,
-      authorizedAt: snapshot.serverTime,
-    });
-  }
-}
-
-function predictiveLeaderForApi() {
-  const source = 'buleto';
-  const instrument = config.instrument;
-  const state = cachedDatabaseRead(
-    'predictive-leader-state',
-    () => db.getPredictiveLeaderReadState(source, instrument),
-  );
-  const snapshot = predictiveLeaderSnapshotForState(
-    state,
-    source,
-    instrument,
-  );
-  recordPredictiveLeaderSignalIfBet(snapshot, source, instrument);
-  return {
-    ...snapshot,
-    signalAccount: db.getPredictiveLeaderSignalAccount(source, instrument),
-  };
-}
-
-function capturePredictiveLeaderSignalForForecast() {
-  const source = 'buleto';
-  const instrument = config.instrument;
-  const state = db.getPredictiveLeaderReadState(source, instrument);
-  const snapshot = predictiveLeaderSnapshotForState(
-    state,
-    source,
-    instrument,
-  );
-  recordPredictiveLeaderSignalIfBet(snapshot, source, instrument);
-}
-
-function predictiveLeaderChallengersForApi() {
-  const source = 'buleto';
-  const instrument = config.instrument;
-  const state = cachedDatabaseRead(
-    'predictive-leader-challengers-state',
-    () => db.getPredictiveLeaderChallengerState(source, instrument),
-  );
-  return {
-    ...state,
-    serverTime: new Date().toISOString(),
-  };
-}
-
-function trajectoryDirectionChallengerForApi() {
-  const source = 'buleto';
-  const instrument = config.instrument;
-  const state = cachedDatabaseRead(
-    `trajectory-direction-challenger-state:${source}:${instrument}`,
-    () => db.getTrajectoryDirectionChallengerState(source, instrument),
-  );
-  return {
-    ...state,
-    serverTime: new Date().toISOString(),
-  };
-}
-
-function predictiveLeaderHitBreakdownForApi() {
-  const source = 'buleto';
-  const instrument = config.instrument;
-  const breakdown = cachedDatabaseRead(
-    `predictive-leader-hit-breakdown:${source}:${instrument}`,
-    () => db.getPredictiveLeaderHitBreakdown(source, instrument),
-  );
-  return {
-    ...breakdown,
-    serverTime: new Date().toISOString(),
-  };
 }
 
 function clampLimit(rawValue, fallback, max) {
@@ -575,11 +380,6 @@ const server = createServer((request, response) => {
       return;
     }
 
-    if (pathname === '/api/state/core') {
-      sendJson(response, 200, dashboardCoreState());
-      return;
-    }
-
     if (pathname === '/api/state') {
       sendJson(response, 200, dashboardState());
       return;
@@ -587,41 +387,35 @@ const server = createServer((request, response) => {
 
     if (pathname === '/api/results') {
       const limit = clampLimit(url.searchParams.get('limit'), 80, 1_000);
-      const readItems = () => db.getRecentResults(limit).map(resultForApi);
-      const items = limit === 80
-        ? cachedDatabaseRead('recent-results:default', readItems)
-        : readItems();
-      sendJson(response, 200, { items });
+      sendJson(response, 200, { items: db.getRecentResults(limit).map(resultForApi) });
       return;
     }
 
     if (pathname === '/api/pairs') {
-      const payload = cachedDatabaseRead('pairs-api-response', () => {
-        const source = 'buleto';
-        const instrument = config.instrument;
-        const items = db.getPairStats(source, instrument);
-        const top5HitByHorizon = db.getFollowerTop5HitCurve(source, instrument);
-        const totalResults = numberStatsFromDatabase()
-          .reduce((total, item) => total + item.occurrenceCount, 0);
-        const totalPairOccurrences = items.reduce(
-          (total, item) => total + item.occurrenceCount,
-          0,
-        );
-        return {
-          length: 2,
-          ordered: true,
-          source,
-          instrument,
-          totalResults,
-          totalPairOccurrences,
-          distinctPairCount: items.length,
-          continuitySegmentCount: totalResults - totalPairOccurrences,
-          hasMore: false,
-          top5HitByHorizon,
-          items,
-        };
+      const source = 'buleto';
+      const instrument = config.instrument;
+      const items = db.getPairStats(source, instrument);
+      const top5HitByHorizon = db.getFollowerTop5HitCurve(source, instrument);
+      const totalResults = db
+        .getNumberStats(source, instrument)
+        .reduce((total, item) => total + item.occurrenceCount, 0);
+      const totalPairOccurrences = items.reduce(
+        (total, item) => total + item.occurrenceCount,
+        0,
+      );
+      sendJson(response, 200, {
+        length: 2,
+        ordered: true,
+        source,
+        instrument,
+        totalResults,
+        totalPairOccurrences,
+        distinctPairCount: items.length,
+        continuitySegmentCount: totalResults - totalPairOccurrences,
+        hasMore: false,
+        top5HitByHorizon,
+        items,
       });
-      sendJson(response, 200, payload);
       return;
     }
 
@@ -629,7 +423,7 @@ const server = createServer((request, response) => {
       sendJson(
         response,
         200,
-        precloseForecastStateFromDatabase(),
+        db.getPrecloseForecastState('buleto', config.instrument),
       );
       return;
     }
@@ -639,28 +433,19 @@ const server = createServer((request, response) => {
       return;
     }
 
-    if (pathname === '/api/predictive-leader/challengers') {
-      sendJson(response, 200, predictiveLeaderChallengersForApi());
-      return;
-    }
-
-    if (pathname === '/api/trajectory-direction/challenger') {
-      sendJson(response, 200, trajectoryDirectionChallengerForApi());
-      return;
-    }
-
-    if (pathname === '/api/predictive-leader/hit-breakdown') {
-      sendJson(response, 200, predictiveLeaderHitBreakdownForApi());
+    if (pathname === '/api/forecasts/hits') {
+      const limit = clampLimit(url.searchParams.get('limit'), 20, 100);
+      const matches = db.getPrecloseForecastHits('buleto', config.instrument, limit + 1);
+      sendJson(response, 200, {
+        items: matches.slice(0, limit),
+        hasMore: matches.length > limit,
+      });
       return;
     }
 
     if (pathname === '/api/cycles') {
       const limit = clampLimit(url.searchParams.get('limit'), 10, 100);
-      const readItems = () => db.getCompletedCycles(limit).map(cycleForApi);
-      const items = limit === 10
-        ? cachedDatabaseRead('completed-cycles:default', readItems)
-        : readItems();
-      sendJson(response, 200, { items });
+      sendJson(response, 200, { items: db.getCompletedCycles(limit).map(cycleForApi) });
       return;
     }
 
@@ -686,18 +471,12 @@ const server = createServer((request, response) => {
 
     if (pathname === '/api/sequences') {
       const limit = clampLimit(url.searchParams.get('limit'), 50, 100);
-      const readPayload = () => {
-        const matches = db.getRepeatedTriples('buleto', config.instrument, limit + 1);
-        return {
-          length: 3,
-          items: matches.slice(0, limit),
-          hasMore: matches.length > limit,
-        };
-      };
-      const payload = limit === 50
-        ? cachedDatabaseRead('repeated-triples:default', readPayload)
-        : readPayload();
-      sendJson(response, 200, payload);
+      const matches = db.getRepeatedTriples('buleto', config.instrument, limit + 1);
+      sendJson(response, 200, {
+        length: 3,
+        items: matches.slice(0, limit),
+        hasMore: matches.length > limit,
+      });
       return;
     }
 
@@ -708,14 +487,10 @@ const server = createServer((request, response) => {
 
     if (pathname === '/api/virtual-bettor/sessions') {
       const limit = clampLimit(url.searchParams.get('limit'), 20, 100);
-      const readItems = () => db.getVirtualBetSessions('buleto', config.instrument, limit);
-      const items = limit === 20
-        ? cachedDatabaseRead('virtual-bet-sessions:default', readItems)
-        : readItems();
       sendJson(response, 200, {
         mode: 'simulation',
         executionEnabled: false,
-        items,
+        items: db.getVirtualBetSessions('buleto', config.instrument, limit),
       });
       return;
     }
@@ -882,21 +657,6 @@ function publishPipelineOutcome(outcome) {
     retryError ??= error;
   }
   try {
-    const signalOutcome = db.settlePredictiveLeaderSignals(
-      'buleto',
-      config.instrument,
-    );
-    if (signalOutcome.settled > 0 || signalOutcome.voided > 0) {
-      broadcastUpdate('predictive-leader-signal-account');
-    }
-  } catch (error) {
-    console.error(
-      '[predictive-leader] signal account settlement failed; it will be retried',
-      error,
-    );
-    retryError ??= error;
-  }
-  try {
     const accountOutcome = db.settlePredictiveLeaderAccount(
       'buleto',
       config.instrument,
@@ -1035,18 +795,6 @@ collector.on('preclose-forecast', (forecast) => {
       console.info(
         `[forecast] locked round ${outcome.roundId} before betting close`,
       );
-    }
-    // Repeated factor messages can emit the same pre-close attempt many times.
-    // Only durable primary/child changes invalidate heavy read snapshots.
-    if (forecastOutcomeChanged(outcome)) {
-      try {
-        capturePredictiveLeaderSignalForForecast();
-      } catch (error) {
-        console.error(
-          '[predictive-leader] automatic virtual signal capture failed',
-          error,
-        );
-      }
       broadcastUpdate('forecast');
     }
   } catch (error) {

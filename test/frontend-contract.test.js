@@ -34,575 +34,41 @@ test("every app DOM reference exists exactly once in the dashboard", () => {
 });
 
 test("dashboard keeps the exact read-only fetch URL list", () => {
-  const stateUrls = [...app.matchAll(/settledFetch\("([^"]+)"\)/g)]
-    .map((match) => match[1]);
-  const optionalUrls = [...app.matchAll(/\burl: "(\/api\/[^"]+)"/g)]
-    .map((match) => match[1]);
-  const fetchUrls = [...stateUrls, ...optionalUrls];
+  const fetchUrls = [...app.matchAll(/fetchJson\("([^"]+)"\)/g)].map(
+    (match) => match[1],
+  );
 
   assert.deepEqual(fetchUrls, [
-    "/api/state/core",
+    "/api/state",
     "/api/results?limit=80",
     "/api/cycles?limit=10",
     "/api/sequences?limit=50",
     "/api/pairs",
+    "/api/forecasts/hits?limit=20",
     "/api/cycle-comparison",
     "/api/predictive-leader",
-    "/api/trajectory-direction/challenger",
-    "/api/forecasts",
   ]);
   assert.equal(
     [...app.matchAll(/\bfetchJson\(/g)].length,
-    2,
-    "one helper definition and one settled dispatcher are the only fetchJson uses",
+    fetchUrls.length + 1,
+    "the helper definition plus the exact literal GET calls are the only fetchJson uses",
   );
-});
-
-test("partial refresh marks cached dashboard state stale before rendering fresh side data", async () => {
-  const functionStart = app.indexOf("  async function refreshAll({ notify = false } = {}) {");
-  const functionEnd = app.indexOf("\n\n  function latestResultForRender", functionStart);
-  assert.ok(functionStart >= 0 && functionEnd > functionStart);
-  const staleState = {
-    precloseForecast: { latest: { trajectoryShadow: { direction: "up" } } },
-  };
-  const store = {
-    state: staleState,
-    stateLoaded: true,
-    stateError: false,
-    results: [{ id: "old" }],
-    resultsLoaded: true,
-    resultsError: false,
-    refreshing: false,
-    refreshQueued: false,
-    refreshQueuedNotify: false,
-    refreshTimer: 7,
-    eventSource: null,
-    hasCompletedInitialRender: true,
-  };
-  const classList = { add() {}, remove() {} };
-  const elements = {
-    refreshButton: { classList, disabled: false },
-    main: { setAttribute() {}, removeAttribute() {} },
-  };
-  const rendered = [];
-  const fetchJson = async (url) => {
-    if (url === "/api/results?limit=80") return { items: [{ id: "fresh" }] };
-    throw new Error(`failed ${url}`);
-  };
-  const build = new Function(
-    "window",
-    "store",
-    "elements",
-    "fetchJson",
-    "extractItems",
-    "renderAll",
-    "setConnection",
-    "scheduleQueuedRefresh",
-    `"use strict"; ${app.slice(functionStart, functionEnd)}; return refreshAll;`,
-  );
-  const refreshAll = build(
-    { clearTimeout() {} },
-    store,
-    elements,
-    fetchJson,
-    (payload) => Array.isArray(payload?.items) ? payload.items : [],
-    () => rendered.push({ state: store.state, stateError: store.stateError }),
-    () => {},
-    () => {},
-  );
-
-  await refreshAll();
-
-  assert.equal(store.state, staleState, "last-good state remains available to explicitly stale panels");
-  assert.equal(store.stateError, true);
-  assert.equal(store.resultsLoaded, true);
-  assert.equal(store.resultsError, false);
-  assert.deepEqual(store.results, [{ id: "fresh" }]);
-  assert.equal(rendered.length, 9, "core and eight optional outcomes render independently");
-  assert.ok(rendered.every(({ state, stateError }) => state === staleState && stateError));
-});
-
-test("trajectory challenger endpoint failure stays isolated from dashboard state", async () => {
-  const functionStart = app.indexOf("  async function refreshAll({ notify = false } = {}) {");
-  const functionEnd = app.indexOf("\n\n  function latestResultForRender", functionStart);
-  const store = {
-    state: null,
-    stateLoaded: false,
-    stateError: false,
-    refreshing: false,
-    refreshQueued: false,
-    refreshTimer: null,
-    eventSource: null,
-  };
-  const elements = {
-    refreshButton: { classList: { add() {}, remove() {} }, disabled: false },
-    main: { setAttribute() {}, removeAttribute() {} },
-  };
-  const fetchJson = async (url) => {
-    if (url === "/api/state/core") return { serverTime: null, collector: { currentRound: null } };
-    throw new Error(`failed ${url}`);
-  };
-  const build = new Function(
-    "window",
-    "store",
-    "elements",
-    "fetchJson",
-    "extractItems",
-    "renderAll",
-    "setConnection",
-    "scheduleQueuedRefresh",
-    "captureServerClock",
-    `"use strict"; ${app.slice(functionStart, functionEnd)}; return refreshAll;`,
-  );
-  const refreshAll = build(
-    { clearTimeout() {} },
-    store,
-    elements,
-    fetchJson,
-    () => [],
-    () => {},
-    () => {},
-    () => {},
-    () => {},
-  );
-
-  await refreshAll();
-
-  assert.equal(store.stateError, false);
-  assert.equal(store.precloseForecastLoaded, true);
-  assert.equal(store.precloseForecastError, true);
-  assert.equal(store.trajectoryDirectionChallengerLoaded, true);
-  assert.equal(store.trajectoryDirectionChallengerError, true);
-  assert.equal(store.trajectoryDirectionChallengerSnapshot, null);
-});
-
-test("a failed forecast audit hides a retained same-round Rank-37", () => {
-  const functionStart = app.indexOf("  function renderPrecloseForecast() {");
-  const functionEnd = app.indexOf("  function renderCollector", functionStart);
-  const elements = {
-    precloseRanking: { setAttribute() {}, replaceChildren() {} },
-    precloseLivePrice: { textContent: "stale" },
-    precloseProjectedPrice: { textContent: "stale" },
-    precloseComparison: { dataset: {}, setAttribute() {} },
-    precloseComparisonBadge: { textContent: "" },
-    precloseComparisonStatus: { textContent: "" },
-    preclosePanel: { dataset: {} },
-    precloseBadge: { textContent: "" },
-    precloseStatus: { textContent: "" },
-    precloseTiming: { textContent: "" },
-  };
-  const store = {
-    state: {
-      collector: { currentRound: { id: "same-round" } },
-      precloseForecast: {
-        latest: {
-          roundId: "same-round",
-          trajectoryShadow: { direction: "up" },
-        },
-      },
-    },
-    stateError: false,
-    precloseForecastLoaded: true,
-    precloseForecastError: true,
-    trajectoryDirectionChallengerSnapshot: null,
-    trajectoryDirectionChallengerError: false,
-    trajectoryDirectionChallengerLoaded: true,
-  };
-  let comparisonForecast = "not-called";
-  let metricOptions = null;
-  let shadowOptions = null;
-  const build = new Function(
-    "store",
-    "elements",
-    "parseDate",
-    "currentTimeMs",
-    "normalizedTrajectoryMetrics",
-    "renderPrecloseTrajectoryMetrics",
-    "renderPrecloseComparison",
-    "renderTrajectoryShadow",
-    "renderTrajectoryDirectionChallenger",
-    "createElement",
-    "setTextIfChanged",
-    `"use strict"; ${app.slice(functionStart, functionEnd)}; return renderPrecloseForecast;`,
-  );
-  const render = build(
-    store,
-    elements,
-    () => null,
-    () => Date.now(),
-    () => null,
-    (_metrics, options) => { metricOptions = options; },
-    (latest) => { comparisonForecast = latest; },
-    (_shadow, _metrics, options) => { shadowOptions = options; },
-    () => {},
-    () => ({}),
-    (element, value) => { element.textContent = value; },
-  );
-
-  render();
-
-  assert.equal(comparisonForecast, null, "retained forecast must not render after audit failure");
-  assert.equal(metricOptions.failed, true);
-  assert.equal(shadowOptions.failed, true);
-  assert.equal(elements.preclosePanel.dataset.state, "error");
-  assert.equal(elements.precloseBadge.textContent, "Не обновлено");
-  assert.match(elements.precloseStatus.textContent, /Старый Rank‑37.*скрыты/);
-});
-
-test("a full initial API outage renders the explicit failure state", async () => {
-  const functionStart = app.indexOf("  async function refreshAll({ notify = false } = {}) {");
-  const functionEnd = app.indexOf("\n\n  function latestResultForRender", functionStart);
-  const store = {
-    state: null,
-    stateLoaded: false,
-    stateError: false,
-    refreshing: false,
-    refreshQueued: false,
-    refreshQueuedNotify: false,
-    refreshTimer: null,
-    eventSource: null,
-    hasCompletedInitialRender: false,
-  };
-  const pending = [];
-  let busyRemoved = 0;
-  const elements = {
-    refreshButton: { classList: { add() {}, remove() {} }, disabled: false },
-    main: { setAttribute() {}, removeAttribute() { busyRemoved += 1; } },
-  };
-  let renders = 0;
-  const failureCompleted = [];
-  const build = new Function(
-    "window",
-    "store",
-    "elements",
-    "fetchJson",
-    "renderAll",
-    "renderFetchFailure",
-    "setConnection",
-    "scheduleQueuedRefresh",
-    `"use strict"; ${app.slice(functionStart, functionEnd)}; return refreshAll;`,
-  );
-  const refreshAll = build(
-    { clearTimeout() {} },
-    store,
-    elements,
-    (url) => {
-      if (url === "/api/state/core") return Promise.reject(new Error("offline"));
-      return new Promise((resolve, reject) => pending.push({ resolve, reject }));
-    },
-    () => {
-      renders += 1;
-      store.hasCompletedInitialRender = true;
-    },
-    () => { failureCompleted.push(store.hasCompletedInitialRender); },
-    () => {},
-    () => {},
-  );
-
-  const refresh = refreshAll();
-  await new Promise((resolve) => setImmediate(resolve));
-
-  assert.deepEqual(failureCompleted, [false], "core failure must render before optional timeouts");
-  assert.equal(busyRemoved, 1, "the initial loading state must end after the core failure");
-  assert.equal(store.refreshing, true, "optional recovery may continue after the visible error");
-  assert.equal(pending.length, 8);
-
-  pending.forEach(({ reject }) => reject(new Error("offline")));
-  await refresh;
-
-  assert.equal(renders, 0, "failed sources must not turn placeholders into empty data");
-  assert.ok(failureCompleted.every((completed) => completed === false));
-  assert.equal(store.stateError, true);
-});
-
-test("core state renders before any optional endpoint settles", async () => {
-  const functionStart = app.indexOf("  async function refreshAll({ notify = false } = {}) {");
-  const functionEnd = app.indexOf("\n\n  function latestResultForRender", functionStart);
-  const sequence = [];
-  const pending = [];
-  const store = {
-    state: null,
-    stateLoaded: false,
-    stateError: false,
-    refreshing: false,
-    refreshQueued: false,
-    refreshQueuedNotify: false,
-    refreshTimer: null,
-    eventSource: null,
-    hasCompletedInitialRender: false,
-  };
-  const elements = {
-    refreshButton: { classList: { add() {}, remove() {} }, disabled: false },
-    main: { setAttribute() {}, removeAttribute() {} },
-  };
-  const fetchJson = (url) => {
-    sequence.push(`fetch:${url}`);
-    if (url === "/api/state/core") {
-      return Promise.resolve({ serverTime: null, collector: { currentRound: { id: "fresh" } } });
-    }
-    return new Promise((resolve, reject) => pending.push({ resolve, reject }));
-  };
-  const build = new Function(
-    "window",
-    "store",
-    "elements",
-    "fetchJson",
-    "extractItems",
-    "renderAll",
-    "setConnection",
-    "scheduleQueuedRefresh",
-    "captureServerClock",
-    `"use strict"; ${app.slice(functionStart, functionEnd)}; return refreshAll;`,
-  );
-  const refreshAll = build(
-    { clearTimeout() {} },
-    store,
-    elements,
-    fetchJson,
-    () => [],
-    () => {
-      sequence.push("render");
-      store.hasCompletedInitialRender = true;
-    },
-    () => {},
-    () => {},
-    () => {},
-  );
-
-  const refresh = refreshAll();
-  await new Promise((resolve) => setImmediate(resolve));
-
-  const firstRender = sequence.indexOf("render");
-  const firstOptionalFetch = sequence.findIndex(
-    (entry) => entry.startsWith("fetch:/api/") && entry !== "fetch:/api/state/core",
-  );
-  assert.ok(firstRender > sequence.indexOf("fetch:/api/state/core"));
-  assert.ok(firstRender < firstOptionalFetch, "core must render before optional reads start");
-  assert.equal(
-    sequence.at(-1),
-    "fetch:/api/forecasts",
-    "the synchronous full-history audit must be dispatched after lightweight reads",
-  );
-  assert.equal(store.state.collector.currentRound.id, "fresh");
-  assert.equal(store.refreshing, true, "optional reads may continue in the background");
-
-  pending.forEach(({ reject }) => reject(new Error("optional unavailable")));
-  await refresh;
-  assert.equal(store.refreshing, false);
-});
-
-test("background refresh avoids global busy state and refresh cleanup survives renderer failure", async () => {
-  const functionStart = app.indexOf("  async function refreshAll({ notify = false } = {}) {");
-  const functionEnd = app.indexOf("\n\n  function latestResultForRender", functionStart);
-  const build = new Function(
-    "window",
-    "store",
-    "elements",
-    "fetchJson",
-    "extractItems",
-    "renderAll",
-    "setConnection",
-    "scheduleQueuedRefresh",
-    "captureServerClock",
-    "console",
-    `"use strict"; ${app.slice(functionStart, functionEnd)}; return refreshAll;`,
-  );
-  const makeHarness = ({ completed, throws }) => {
-    const calls = {
-      add: 0,
-      remove: 0,
-      setBusy: 0,
-      removeBusy: 0,
-      queued: 0,
-      urls: [],
-    };
-    const store = {
-      state: null,
-      stateLoaded: false,
-      stateError: false,
-      refreshing: false,
-      refreshQueued: false,
-      refreshQueuedNotify: false,
-      refreshTimer: null,
-      eventSource: null,
-      hasCompletedInitialRender: completed,
-    };
-    const elements = {
-      refreshButton: {
-        classList: {
-          add() { calls.add += 1; },
-          remove() { calls.remove += 1; },
-        },
-        disabled: false,
-      },
-      main: {
-        setAttribute() { calls.setBusy += 1; },
-        removeAttribute() { calls.removeBusy += 1; },
-      },
-    };
-    const refreshAll = build(
-      { clearTimeout() {} },
-      store,
-      elements,
-      async (url) => {
-        calls.urls.push(url);
-        if (url === "/api/state/core") return { serverTime: null };
-        throw new Error("optional unavailable");
-      },
-      () => [],
-      () => {
-        if (throws) throw new Error("renderer failed");
-      },
-      () => {},
-      () => { calls.queued += 1; },
-      () => {},
-      { error() {} },
-    );
-    return { refreshAll, store, elements, calls };
-  };
-
-  const background = makeHarness({ completed: true, throws: false });
-  await background.refreshAll();
-  assert.equal(background.calls.add, 0);
-  assert.equal(background.calls.setBusy, 0);
-  assert.equal(background.store.refreshing, false);
-
-  const failing = makeHarness({ completed: false, throws: true });
-  await failing.refreshAll();
-  assert.equal(failing.store.refreshing, false);
-  assert.equal(failing.elements.refreshButton.disabled, false);
-  assert.equal(failing.calls.remove, 1);
-  assert.equal(failing.calls.removeBusy, 1);
-  assert.equal(failing.calls.queued, 1);
-  assert.equal(failing.calls.urls.length, 9, "one broken renderer cannot cancel independent API reads");
-});
-
-test("SSE connected is ignored and refresh storms coalesce while a refresh is active", () => {
-  const connectStart = app.indexOf("  function connectEventStream() {");
-  const connectEnd = app.indexOf("  elements.refreshButton.addEventListener", connectStart);
-  const listeners = {};
-  let scheduled = 0;
-  class FakeEventSource {
-    static OPEN = 1;
-    static CLOSED = 2;
-    constructor() { this.readyState = FakeEventSource.OPEN; }
-    addEventListener(name, listener) { listeners[name] = listener; }
-    close() {}
-  }
-  const connect = new Function(
-    "window",
-    "store",
-    "setConnection",
-    "EventSource",
-    "scheduleRefresh",
-    "announce",
-    "renderCombinedPick",
-    `"use strict"; ${app.slice(connectStart, connectEnd)}; return connectEventStream;`,
-  )(
-    { EventSource: FakeEventSource },
-    { eventSource: null, predictiveLeaderRequiresFreshSnapshot: false },
-    () => {},
-    FakeEventSource,
-    () => { scheduled += 1; },
-    () => {},
-    () => {},
-  );
-  connect();
-  listeners.update({ data: JSON.stringify({ reason: "connected" }) });
-  assert.equal(scheduled, 0);
-  listeners.update({ data: JSON.stringify({ reason: "results" }) });
-  assert.equal(scheduled, 1);
-
-  const scheduleStart = app.indexOf("  function scheduleRefresh() {");
-  const scheduleEnd = app.indexOf("  function connectEventStream()", scheduleStart);
-  let timers = 0;
-  const stormStore = {
-    refreshing: true,
-    refreshQueued: false,
-    refreshQueuedNotify: false,
-    refreshTimer: null,
-  };
-  const schedulers = new Function(
-    "window",
-    "store",
-    "REFRESH_DEBOUNCE_MS",
-    `"use strict"; ${app.slice(scheduleStart, scheduleEnd)}; return { scheduleRefresh, scheduleQueuedRefresh };`,
-  )(
-    {
-      clearTimeout() {},
-      setTimeout() { timers += 1; return timers; },
-    },
-    stormStore,
-    180,
-  );
-  schedulers.scheduleRefresh();
-  schedulers.scheduleRefresh();
-  schedulers.scheduleRefresh();
-  assert.equal(stormStore.refreshQueued, true);
-  assert.equal(timers, 0);
-  stormStore.refreshing = false;
-  schedulers.scheduleQueuedRefresh();
-  assert.equal(timers, 1, "one trailing refresh represents the whole SSE burst");
-});
-
-test("latest result selection distinguishes a fresh results response from two stale caches", () => {
-  const functionStart = app.indexOf("  function latestResultForRender() {");
-  const functionEnd = app.indexOf("  function renderFetchFailure()", functionStart);
-  assert.ok(functionStart >= 0 && functionEnd > functionStart);
-  const build = new Function(
-    "store",
-    `"use strict"; ${app.slice(functionStart, functionEnd)}; return latestResultForRender;`,
-  );
-  const stateResult = { id: "state", settledAt: "2026-10-14T12:00:20.000Z" };
-  const olderResult = { id: "older", settledAt: "2026-10-14T12:00:10.000Z" };
-  const newerResult = { id: "newer", settledAt: "2026-10-14T12:00:30.000Z" };
-  const pick = (overrides = {}) => build({
-    state: { latestResult: stateResult },
-    stateError: true,
-    results: [olderResult],
-    resultsLoaded: true,
-    resultsError: false,
-    ...overrides,
-  })();
-
-  assert.equal(pick(), olderResult, "a successful /api/results response is authoritative");
-  assert.equal(pick({ results: [] }), null, "a successful empty response stays empty");
-  assert.equal(pick({ resultsError: true }), stateResult, "newer cached state wins after dual failure");
-  assert.equal(
-    pick({ results: [newerResult], resultsError: true }),
-    newerResult,
-    "timestamps resolve two stale caches without rolling the dashboard back",
-  );
-  assert.equal(pick({ stateError: false, results: [newerResult] }), stateResult);
-});
-
-test("a total refresh failure immediately replaces the cached trajectory display", () => {
-  const functionStart = app.indexOf("  function renderFetchFailure() {");
-  const functionEnd = app.indexOf("  function renderAll()", functionStart);
-  assert.ok(functionStart >= 0 && functionEnd > functionStart);
-  const block = app.slice(functionStart, functionEnd);
-
-  assert.match(block, /renderPrecloseForecast\(\)/);
 });
 
 test("server exposes a separate read-only predictive leader GET", () => {
   const viewStart = server.indexOf("function predictiveLeaderForApi()");
   const viewEnd = server.indexOf("function clampLimit", viewStart);
   const view = server.slice(viewStart, viewEnd);
-  const stateStart = server.indexOf("function predictiveLeaderSnapshotForState(");
-  const stateEnd = server.indexOf("function recordPredictiveLeaderSignalIfBet(", stateStart);
-  const snapshotState = server.slice(stateStart, stateEnd);
 
   assert.ok(viewStart >= 0 && viewEnd > viewStart);
-  assert.ok(stateStart >= 0 && stateEnd > stateStart);
   assert.match(
     server,
     /if \(pathname === '\/api\/predictive-leader'\) \{[\s\S]*?sendJson\(response, 200, predictiveLeaderForApi\(\)\)/,
   );
   assert.match(view, /db\.getPredictiveLeaderReadState\(source, instrument\)/);
-  assert.match(view, /predictiveLeaderSnapshotForState\(/);
-  assert.match(snapshotState, /collector: collector\.getStatus\(\)/);
-  assert.match(snapshotState, /pipelinePending: resultPipeline\.getPendingCounts\(\)/);
+  assert.match(view, /predictiveLeaderSnapshotForApi\(\{/);
+  assert.match(view, /collector: collector\.getStatus\(\)/);
+  assert.match(view, /pipelinePending: resultPipeline\.getPendingCounts\(\)/);
   assert.doesNotMatch(view, /dashboardState|getDashboardState|getPrecloseForecastState/);
 });
 
@@ -626,12 +92,17 @@ test("predictive leader read path excludes dashboard and trajectory metric work"
   );
 });
 
-test("server starts without a synchronous full-history validation warmup", () => {
+test("server warms trajectory validation after recovery and before listen", () => {
   const recovery = server.indexOf("db.reconcilePredictiveLeaderAccount(");
+  const warm = server.indexOf("db.warmPrecloseForecastValidation(");
+  const warmEnd = server.indexOf("const sseClients", warm);
   const listen = server.indexOf("server.listen(");
+  const warmBlock = server.slice(recovery, warmEnd);
 
-  assert.ok(recovery >= 0 && listen > recovery);
-  assert.doesNotMatch(server, /db\.warmPrecloseForecastValidation\(/);
+  assert.ok(recovery >= 0 && warm > recovery && warmEnd > warm);
+  assert.ok(listen > warmEnd);
+  assert.match(warmBlock, /try \{[\s\S]*?warmPrecloseForecastValidation/);
+  assert.match(warmBlock, /catch \(error\) \{[\s\S]*?continuing cold/);
 });
 
 test("dashboard wires predictive leader loading and SSE invalidation fail-closed", () => {
@@ -639,8 +110,8 @@ test("dashboard wires predictive leader loading and SSE invalidation fail-closed
   const refreshEnd = app.indexOf("function renderFetchFailure", refreshStart);
   const refresh = app.slice(refreshStart, refreshEnd);
   assert.ok(refreshStart >= 0 && refreshEnd > refreshStart);
-  assert.match(refresh, /url: "\/api\/predictive-leader"/);
-  assert.match(refresh, /normalizePredictiveLeaderApiSnapshot\(payload\)/);
+  assert.match(refresh, /fetchJson\("\/api\/predictive-leader"\)/);
+  assert.match(refresh, /normalizePredictiveLeaderApiSnapshot\(requests\[7\]\.value\)/);
   assert.match(refresh, /normalizedPredictiveLeaderAccount\(snapshot\?\.account\)/);
   assert.match(refresh, /store\.predictiveLeaderLoaded = true/);
   assert.match(refresh, /store\.predictiveLeaderError = true/);
@@ -652,8 +123,6 @@ test("dashboard wires predictive leader loading and SSE invalidation fail-closed
   assert.ok(eventErrorStart >= 0 && eventErrorEnd > eventErrorStart);
   assert.match(eventError, /store\.predictiveLeaderRequiresFreshSnapshot = true/);
   assert.match(eventError, /renderCombinedPick\(\)/);
-  assert.match(app, /if \(reason === "connected"\) return/);
-  assert.match(app, /if \(store\.refreshing\) \{\s*store\.refreshQueued = true;\s*return;/);
 });
 
 test("combined leader is the first dashboard block and renders exactly one number", () => {
@@ -680,12 +149,15 @@ test("combined leader is the first dashboard block and renders exactly one numbe
   assert.match(block, /id="combined-pick-number"/);
   assert.doesNotMatch(block, /<(?:ol|ul)\b/);
   assert.match(block, /Актуальные прогнозные сигналы · один итог/);
-  assert.match(block, /Команда BET закрыта/);
-  assert.match(block, /1 000 проспективных прогнозов/);
-  assert.match(block, /нижнюю границу Wilson 95% выше случайной базы 1\/37/);
-  assert.match(html, /<script type="module" src="\/app\.js\?v=53"><\/script>/);
+  assert.match(block, /Сервер заранее фиксирует полные распределения/);
+  assert.match(block, /Семейные веса начинают с 50\/50 и меняются только по прошлым завершённым общим снимкам/);
+  assert.match(block, /текущий результат в расчёт не попадает/);
+  assert.match(block, /эвристический ранговый индекс, не вероятность и не гарантия преимущества/);
+  assert.match(block, /Давность, виртуальная цель, невыпавшие числа, survivor и исторический аналог остаются только наблюдением/);
+  assert.match(block, /1 из 37 \(≈2,7%\)/);
+  assert.match(html, /<script type="module" src="\/app\.js\?v=43"><\/script>/);
 
-  assert.match(app, /from "\.\/combined-number\.js\?v=10"/);
+  assert.match(app, /from "\.\/combined-number\.js\?v=7"/);
   assert.match(app, /normalizePredictiveLeaderApiSnapshot/);
   assert.match(app, /predictiveLeaderNumberContext/);
   assert.match(combinedNumber, /export function normalizePredictiveLeaderApiSnapshot\(value\)/);
@@ -740,12 +212,12 @@ test("combined leader is the first dashboard block and renders exactly one numbe
   assert.ok(renderStart >= 0 && renderEnd > renderStart);
   assert.match(renderBlock, /const \{ snapshot \} = context/);
   assert.match(renderBlock, /const \{ model, metrics, number \} = snapshot/);
-  assert.match(renderBlock, /BET-допуск подтверждён/);
+  assert.match(renderBlock, /зафиксировано сервером до результата/);
   assert.match(renderBlock, /обучение \$\{model\.trainingCount\}/);
   assert.match(renderBlock, /вес цены/);
   assert.match(renderBlock, /истории/);
-  assert.match(renderBlock, /нижняя 95% граница/);
-  assert.match(renderBlock, /WAIT — кандидат виден для наблюдения/);
+  assert.match(renderBlock, /Top‑1/);
+  assert.match(renderBlock, /улучшение не гарантируется/);
   assert.doesNotMatch(renderBlock, /combineNumberRankings|leaderMass|score|вероятност/);
   assert.doesNotMatch(app, /\bcombineNumberRankings\b|\bcombinedTripleFollowerRanking\b/);
   assert.match(styles, /\.combined-pick\s*\{/);
@@ -756,28 +228,44 @@ test("combined leader is the first dashboard block and renders exactly one numbe
   );
 });
 
-test("dashboard does not display the ungated predictive leader reference simulation", () => {
+test("predictive leader account is an independent strict paper simulation", () => {
+  const accountIds = [
+    "combined-pick-account",
+    "combined-pick-account-status",
+    "combined-pick-account-balance-card",
+    "combined-pick-account-balance",
+    "combined-pick-account-profit",
+    "combined-pick-account-record",
+    "combined-pick-account-settled",
+    "combined-pick-account-rate",
+    "combined-pick-account-rate-detail",
+    "combined-pick-account-stake-label",
+    "combined-pick-account-stake",
+    "combined-pick-account-ladder",
+  ];
+  for (const id of accountIds) {
+    assert.match(html, new RegExp(`\\bid="${id}"`));
+    assert.match(app, new RegExp(`getElementById\\("${id}"\\)`));
+  }
+
   const blockStart = html.indexOf('id="combined-pick"');
   const blockEnd = html.indexOf('class="page-heading"', blockStart);
   const block = html.slice(blockStart, blockEnd);
+  const accountStart = block.indexOf('id="combined-pick-account"');
+  const accountBlock = block.slice(accountStart);
+  assert.ok(accountStart > block.indexOf('id="combined-pick-number"'));
   assert.equal([...block.matchAll(/<output\b/g)].length, 1);
-  assert.doesNotMatch(block, /бумажный счёт|Следующая ставка|Условная ставка/);
-  assert.doesNotMatch(html, /combined-pick-account/);
-  assert.doesNotMatch(app, /combinedPickAccount|renderPredictiveLeaderAccount/);
-  for (const id of [
-    "signal-account",
-    "signal-account-status",
-    "signal-account-balance",
-    "signal-account-record",
-    "signal-account-pending",
-  ]) {
-    assert.equal([...html.matchAll(new RegExp(`\\bid="${id}"`, "g"))].length, 1);
-    assert.match(app, new RegExp(`getElementById\\("${id}"\\)`));
-  }
-  assert.match(block, /Баланс подтверждённых BET-сигналов/);
-  assert.match(block, /только прогнозы, для которых API выдал BET/);
-  assert.match(app, /function renderPredictiveLeaderSignalAccount\(\)/);
-  assert.match(app, /BET подтверждён · число/);
+  assert.equal([...accountBlock.matchAll(/<output\b/g)].length, 0);
+  assert.equal([...accountBlock.matchAll(/<dd\b/g)].length, 4);
+  assert.match(accountBlock, /Проспективная симуляция · один лидер/);
+  assert.match(accountBlock, /Виртуальный счёт лестницы/);
+  assert.match(accountBlock, /Текущий счёт/);
+  assert.match(accountBlock, /Попадания \/ промахи/);
+  assert.match(accountBlock, /Наблюдаемая частота попаданий/);
+  assert.match(accountBlock, /Следующая ставка/);
+  assert.match(accountBlock, /Старт 1 000, ставка и шаг 10, максимум 2 500/);
+  assert.match(accountBlock, /Частота — прошлое наблюдение, не вероятность следующего результата/);
+  assert.match(accountBlock, /виртуальная \(«бумажная»\) симуляция; реальных ставок и действий нет/i);
 
   assert.match(app, /const PREDICTIVE_LEADER_ACCOUNT_SCHEMA_VERSION = 1/);
   assert.match(
@@ -789,7 +277,7 @@ test("dashboard does not display the ungated predictive leader reference simulat
   assert.match(app, /grossPayoutMultiplier: 36[\s\S]*?payoutIncludesStake: true[\s\S]*?netHitMultiplier: 35/);
 
   const normalizerStart = app.indexOf("function normalizedPredictiveLeaderAccount(value)");
-  const normalizerEnd = app.indexOf("function currentPriceTrajectorySignals", normalizerStart);
+  const normalizerEnd = app.indexOf("function currentPredictiveLeaderAccountContext", normalizerStart);
   const normalizer = app.slice(normalizerStart, normalizerEnd);
   assert.ok(normalizerStart >= 0 && normalizerEnd > normalizerStart);
   assert.match(normalizer, /value\.schemaVersion !== PREDICTIVE_LEADER_ACCOUNT_SCHEMA_VERSION/);
@@ -812,8 +300,53 @@ test("dashboard does not display the ungated predictive leader reference simulat
   assert.match(normalizer, /\(value\.status === "pending"\) !== \(pendingBet !== null\)/);
   assert.match(normalizer, /\(value\.status === "exhausted"\) !== !value\.canAffordNext/);
 
+  const contextStart = app.indexOf("function currentPredictiveLeaderAccountContext()");
+  const contextEnd = app.indexOf("function renderPredictiveLeaderAccount", contextStart);
+  const context = app.slice(contextStart, contextEnd);
+  assert.ok(contextStart >= 0 && contextEnd > contextStart);
+  assert.match(context, /store\.predictiveLeaderSnapshot\?\.account/);
+  assert.doesNotMatch(context, /store\.state|precloseForecast/);
   assert.match(app, /normalizedPredictiveLeaderAccount\(snapshot\?\.account\)/);
-  assert.doesNotMatch(styles, /combined-pick-account/);
+  assert.doesNotMatch(context, /currentCombinedNumberContext|predictiveLeaderMetrics|latestForecast/);
+
+  const rendererStart = app.indexOf("function renderPredictiveLeaderAccount()");
+  const rendererEnd = app.indexOf("function currentPriceTrajectorySignals", rendererStart);
+  const renderer = app.slice(rendererStart, rendererEnd);
+  assert.ok(rendererStart >= 0 && rendererEnd > rendererStart);
+  assert.match(renderer, /context\.state !== "ready"/);
+  assert.match(renderer, /combinedPickAccountBalance, "—"/);
+  assert.match(renderer, /account\.currentBalance/);
+  assert.match(renderer, /account\.hitCount/);
+  assert.match(renderer, /account\.missCount/);
+  assert.match(renderer, /trajectoryShadowShareFormatter\.format\(account\.hitRate\)/);
+  assert.match(renderer, /account\.nextStake/);
+  assert.match(renderer, /account\.ladder\.missCount/);
+  assert.match(renderer, /account\.latestVoid/);
+  assert.match(renderer, /account\.voidCount/);
+  assert.match(renderer, /Последняя ставка аннулирована из-за разрыва данных/);
+  assert.match(renderer, /аннулировано из-за разрыва/);
+  assert.match(renderer, /не вероятность/);
+  assert.doesNotMatch(renderer, /вероятность следующего|улучшит|повысит шанс/);
+  assert.ok(
+    [...app.matchAll(/renderPredictiveLeaderAccount\(\)/g)].length >= 3,
+    "account must render on normal and failed refresh paths",
+  );
+
+  assert.match(styles, /\.combined-pick-account\s*\{[\s\S]*?grid-column: 1 \/ -1/);
+  assert.match(
+    styles,
+    /\.combined-pick-account__metrics\s*\{[\s\S]*?grid-template-columns: repeat\(4, minmax\(0, 1fr\)\)/,
+  );
+  const tabletStyles = styles.slice(
+    styles.indexOf("@media (max-width: 680px)"),
+    styles.indexOf("@media (max-width: 430px)"),
+  );
+  const narrowStyles = styles.slice(
+    styles.indexOf("@media (max-width: 360px)"),
+    styles.indexOf("@media (prefers-reduced-motion: reduce)"),
+  );
+  assert.match(tabletStyles, /\.combined-pick-account__metrics\s*\{[\s\S]*?repeat\(2/);
+  assert.match(narrowStyles, /\.combined-pick-account__metrics\s*\{[\s\S]*?minmax\(0, 1fr\)/);
 });
 
 test("experimental forecast shows only the first three places of the full Rank-37", () => {
@@ -846,14 +379,12 @@ test("trajectory shadow is prospective and exposes the full Rank-37 contract", (
   const rendererIds = [
     "trajectory-shadow-panel",
     "trajectory-shadow-badge",
-    "trajectory-shadow-observed",
     "trajectory-shadow-status",
     "trajectory-shadow-shares",
     "trajectory-shadow-number-area",
     "trajectory-shadow-training",
     "trajectory-shadow-range-metrics",
     "trajectory-shadow-sample",
-    "trajectory-direction-challenger",
   ];
   const semanticIds = ["trajectory-shadow-title", "trajectory-shadow-note"];
 
@@ -865,20 +396,14 @@ test("trajectory shadow is prospective and exposes the full Rank-37 contract", (
   }
 
   const blockStart = html.indexOf('id="trajectory-shadow-panel"');
-  const blockEnd = html.indexOf('id="preclose-note"');
+  const blockEnd = html.indexOf('id="preclose-hit-history"');
   const block = html.slice(blockStart, blockEnd);
   assert.ok(blockStart >= 0 && blockEnd > blockStart);
-  assert.match(block, /Shadow · факт отдельно от прогноза/);
-  assert.match(block, /Факт · сохранённая диаграмма до lock/);
-  assert.match(block, /Прогноз · отдельное движение lock → ed/);
-  assert.match(block, /Проверка альтернативы · lock → ed/);
-  assert.match(block, /trajectory-shadow-status trajectory-direction-challenger/);
+  assert.match(block, /Shadow · только наблюдение/);
   assert.match(block, /последней доступной точки перед forecast lock/);
   assert.match(block, /возраст точки не более 5 с/);
-  assert.match(block, /не к текущему наклону и не к следующему тику/);
-  assert.match(block, /направления могут быть противоположными/);
-  assert.match(block, /это не переворот оси/);
-  assert.match(block, /Архивное основание прогноза/);
+  assert.match(block, /а не следующий тик/);
+  assert.match(block, /Доли похожих завершённых траекторий/);
   assert.match(block, /ПРОГНОЗ УЧАСТКА: НЕТ ДАННЫХ/);
   assert.match(block, /не более 6 соседних ценовых полос вокруг типичного q50/);
   assert.match(block, /полного коридора q20\/q80/);
@@ -898,10 +423,6 @@ test("trajectory shadow is prospective and exposes the full Rank-37 contract", (
   assert.match(block, /нулевой массой данных не получают вес/);
   assert.match(block, /не создаёт второй независимый вес/);
   assert.doesNotMatch(block, /roulette-(?:red|green|black)|is-(?:hit|positive|loss)/);
-  assert.doesNotMatch(html, /preclose-hit-history|Сохранённые попадания legacy Top/);
-  assert.doesNotMatch(app, /forecastHits|renderForecastHitHistory|\/api\/forecasts\/hits/);
-  assert.doesNotMatch(server, /\/api\/forecasts\/hits|preclose-forecast-hits/);
-  assert.doesNotMatch(database, /getPrecloseForecastHits|mapPrecloseForecastHit/);
 
   assert.match(app, /const TRAJECTORY_SHADOW_LEGACY_VERSION = "trajectory-shadow-knn-v1"/);
   assert.match(app, /const TRAJECTORY_SHADOW_ADAPTIVE_VERSION = "trajectory-shadow-adaptive-v2"/);
@@ -913,26 +434,21 @@ test("trajectory shadow is prospective and exposes the full Rank-37 contract", (
   assert.match(combinedNumber, /evidenceCandidateCount/);
   assert.match(combinedNumber, /weights: evidenceRawMass\.map/);
   assert.match(app, /const TRAJECTORY_NUMBER_AREA_MAX_DISPLAY_CELLS = 6/);
-  assert.match(app, /const TRAJECTORY_DIRECTION_CHALLENGER_SCHEMA_VERSION = 1/);
-  assert.match(app, /const TRAJECTORY_DIRECTION_CHALLENGER_KEY = "structural-center-v1"/);
-  assert.match(app, /const TRAJECTORY_DIRECTION_CHALLENGER_MODEL = "trajectory-direction-structural-v1"/);
-  assert.match(app, /const TRAJECTORY_DIRECTION_CHALLENGER_MODE = "prospective-shadow"/);
   assert.match(app, /function normalizedTrajectoryNumberArea\(value\)/);
   assert.match(app, /function normalizedTrajectoryDisplayRange\(value, numberArea\)/);
   assert.match(app, /function normalizedTrajectoryAdaptive\(value\)/);
-  assert.match(app, /function normalizedTrajectoryObservedChange\(value\)/);
   assert.match(app, /function normalizedTrajectoryEvaluation\(value, \{ numberArea, displayRange \}\)/);
   assert.match(app, /function normalizedTrajectoryMetrics\(value\)/);
   assert.match(app, /function trajectoryNumberAreaDisplayCells\(area\)/);
   assert.match(app, /function trajectoryShadowDisplayCells\(shadow\)/);
   assert.match(app, /function trajectoryNumberAreaText\(shadow\)/);
   assert.match(app, /function normalizedTrajectoryShadow\(value\)/);
-  assert.match(app, /function renderTrajectoryShadow\(value, metricsValue, \{ failed = false \} = \{\}\)/);
+  assert.match(app, /function renderTrajectoryShadow\(value, metricsValue\)/);
   assert.match(app, /"insufficient_current"/);
   assert.match(app, /график неполный/);
   assert.match(
     app,
-    /renderTrajectoryShadow\(\s*matchesCurrent \? latest\?\.trajectoryShadow : null,\s*forecastState\?\.trajectoryMetrics,\s*\{ failed: forecastFailed \},\s*\)/,
+    /renderTrajectoryShadow\(\s*matchesCurrent \? latest\?\.trajectoryShadow : null,\s*forecastState\?\.trajectoryMetrics,\s*\)/,
   );
   assert.match(app, /shadow\.isAdaptive\s*\? shadow\.displayRange\?\.cells \?\? \[\]/);
   assert.match(app, /value\.modelVersion !== TRAJECTORY_SHADOW_ADAPTIVE_VERSION/);
@@ -947,7 +463,7 @@ test("trajectory shadow is prospective and exposes the full Rank-37 contract", (
   assert.match(app, /Top‑3 \$\{metrics\.rank37Top3Hits\}/);
   assert.match(app, /проспективное наблюдение/);
   assert.match(app, /Полные сопоставимые раунды:/);
-  assert.match(app, /Архивное основание прогноза:/);
+  assert.match(app, /Доли похожих завершённых траекторий:/);
   assert.ok(app.includes("ПРОГНОЗ УЧАСТКА: ОТ ${from} ДО ${to}"));
   assert.match(
     app,
@@ -967,258 +483,7 @@ test("trajectory shadow is prospective and exposes the full Rank-37 contract", (
     /if \(point\.wireCell === 0\) return "0 \(ВЕРХНЯЯ ПОЛОСА\)"/,
   );
   assert.match(styles, /\.trajectory-shadow__range\s*\{[\s\S]*?font-size: clamp\(18px, 4vw, 28px\)/);
-  assert.match(styles, /\.trajectory-shadow__directions > \.trajectory-shadow__challenger\s*\{[\s\S]*?grid-column: 1 \/ -1/);
   assert.doesNotMatch(app, /trajectoryShadowPanel\.(?:dataset|classList)/);
-});
-
-test("trajectory direction challenger is advisory, current-round only, and fail-closed", () => {
-  const functionStart = app.indexOf("  function normalizedTrajectoryDirectionChallengerMetrics(value) {");
-  const functionEnd = app.indexOf("\n\n  function trajectoryNumberAreaLabel(point)", functionStart);
-  assert.ok(functionStart >= 0 && functionEnd > functionStart);
-
-  const target = () => ({ textContent: "" });
-  const elements = { trajectoryDirectionChallenger: target() };
-  const build = new Function(
-    "TRAJECTORY_DIRECTION_CHALLENGER_SCHEMA_VERSION",
-    "TRAJECTORY_DIRECTION_CHALLENGER_KEY",
-    "TRAJECTORY_DIRECTION_CHALLENGER_MODEL",
-    "TRAJECTORY_DIRECTION_CHALLENGER_MODE",
-    "TRAJECTORY_SHADOW_ADAPTIVE_VERSION",
-    "TRAJECTORY_SHADOW_DIRECTION_LABELS",
-    "trajectoryShadowShareFormatter",
-    "elements",
-    "setTextIfChanged",
-    `"use strict"; ${app.slice(functionStart, functionEnd)}; return { normalizedTrajectoryDirectionChallenger, renderTrajectoryDirectionChallenger };`,
-  );
-  const { normalizedTrajectoryDirectionChallenger: normalize, renderTrajectoryDirectionChallenger: render } = build(
-    1,
-    "structural-center-v1",
-    "trajectory-direction-structural-v1",
-    "prospective-shadow",
-    "trajectory-shadow-adaptive-v2",
-    { up: "вверх", down: "вниз", flat: "без движения" },
-    new Intl.NumberFormat("ru-RU", {
-      style: "percent",
-      minimumFractionDigits: 1,
-      maximumFractionDigits: 1,
-    }),
-    elements,
-    (element, value) => { element.textContent = value; },
-  );
-  const metrics = {
-    eligibleCount: 4,
-    storedCount: 4,
-    validStoredCount: 4,
-    selectedCount: 3,
-    unselectedCount: 1,
-    unavailableCount: 0,
-    evaluatedSelected: 2,
-    settledSelected: 2,
-    pendingSelected: 1,
-    ungradableSelected: 0,
-    hits: 1,
-    invalidStoredCount: 0,
-    decisionCoverage: 0.75,
-    selectiveAccuracy: 0.5,
-    paired: {
-      count: 2,
-      challengerHits: 1,
-      championHits: 0,
-      challengerRate: 0.5,
-      championRate: 0,
-      uplift: 0.5,
-      bothHit: 0,
-      challengerOnly: 1,
-      championOnly: 0,
-      bothWrong: 1,
-      discordantCount: 1,
-    },
-    window: {
-      limit: 1_000,
-      eligibleCount: 4,
-      storedCount: 4,
-      validStoredCount: 4,
-      totalEligibleCount: 4,
-      totalStoredCount: 4,
-      truncated: false,
-    },
-  };
-  const ready = {
-    schemaVersion: 1,
-    challengerKey: "structural-center-v1",
-    modelVersion: "trajectory-direction-structural-v1",
-    championModelVersion: "trajectory-shadow-adaptive-v2",
-    mode: "prospective-shadow",
-    advisoryOnly: true,
-    executionEnabled: false,
-    latest: {
-      roundId: "round-42",
-      challenger: {
-        schemaVersion: 1,
-        challengerKey: "structural-center-v1",
-        modelVersion: "trajectory-direction-structural-v1",
-        status: "ready",
-        reason: null,
-        direction: "up",
-        probabilities: null,
-        selection: { eligible: true },
-      },
-      champion: {
-        modelVersion: "trajectory-shadow-adaptive-v2",
-        status: "ready",
-        direction: "down",
-      },
-    },
-    metrics,
-  };
-
-  assert.notEqual(normalize(ready), null);
-  assert.equal(normalize({ ...ready, advisoryOnly: false }), null);
-  assert.equal(normalize({ ...ready, executionEnabled: true }), null);
-  assert.equal(normalize({ ...ready, mode: "observation" }), null);
-
-  const withUngradable = structuredClone(ready);
-  Object.assign(withUngradable.metrics, {
-    evaluatedSelected: 1,
-    settledSelected: 2,
-    pendingSelected: 1,
-    ungradableSelected: 1,
-    hits: 1,
-    selectiveAccuracy: 1,
-    paired: {
-      count: 1,
-      challengerHits: 1,
-      championHits: 0,
-      challengerRate: 1,
-      championRate: 0,
-      uplift: 1,
-      bothHit: 0,
-      challengerOnly: 1,
-      championOnly: 0,
-      bothWrong: 0,
-      discordantCount: 1,
-    },
-  });
-  assert.notEqual(normalize(withUngradable), null);
-  assert.equal(normalize({
-    ...withUngradable,
-    metrics: { ...withUngradable.metrics, settledSelected: 1 },
-  }), null);
-
-  render(ready, "round-42");
-  assert.match(elements.trajectoryDirectionChallenger.textContent, /Проверяемая альтернатива: вверх/);
-  assert.match(elements.trajectoryDirectionChallenger.textContent, /Не заменяет Adaptive v2/);
-  assert.match(elements.trajectoryDirectionChallenger.textContent, /вероятность не рассчитана/);
-  assert.match(elements.trajectoryDirectionChallenger.textContent, /Проспективно: 1\/2 \(50,0\s?%\)/);
-  assert.match(elements.trajectoryDirectionChallenger.textContent, /отбор 3\/4 \(75,0\s?%\)/);
-  assert.match(elements.trajectoryDirectionChallenger.textContent, /Пары с Adaptive v2: альтернатива 1\/2/);
-  assert.doesNotMatch(elements.trajectoryDirectionChallenger.textContent, /альтернатива: вниз/);
-
-  render(ready, "round-43");
-  assert.match(elements.trajectoryDirectionChallenger.textContent, /для текущего раунда ещё не зафиксирована/);
-  assert.doesNotMatch(elements.trajectoryDirectionChallenger.textContent, /1\/2|вверх/);
-
-  for (const [reason, text] of [
-    ["start_within_center_band", /старт был в центральной зоне/],
-    ["lock_within_center_band", /lock оказался в центральной зоне/],
-    ["center_side_changed", /цена пересекла центр/],
-  ]) {
-    const unselected = structuredClone(ready);
-    Object.assign(unselected.latest.challenger, {
-      status: "unselected",
-      reason,
-      direction: null,
-      selection: { eligible: false },
-    });
-    render(unselected, "round-42");
-    assert.match(elements.trajectoryDirectionChallenger.textContent, text);
-    assert.match(elements.trajectoryDirectionChallenger.textContent, /Adaptive v2 не заменён/);
-  }
-
-  const unavailable = structuredClone(ready);
-  Object.assign(unavailable.latest.challenger, {
-    status: "unavailable",
-    reason: "invalid_core",
-    direction: null,
-    selection: { eligible: false },
-  });
-  render(unavailable, "round-42");
-  assert.match(elements.trajectoryDirectionChallenger.textContent, /недоступна для этого снимка/);
-
-  const missing = structuredClone(ready);
-  missing.latest.challenger = null;
-  render(missing, "round-42");
-  assert.match(elements.trajectoryDirectionChallenger.textContent, /ещё не зафиксирована/);
-
-  render(ready, "round-42");
-  render(ready, "round-42", { failed: true });
-  assert.match(elements.trajectoryDirectionChallenger.textContent, /скрыта: её данные не обновились/);
-  assert.doesNotMatch(elements.trajectoryDirectionChallenger.textContent, /1\/2|вверх|75/);
-});
-
-test("trajectory forecast hides every stale value when dashboard state did not refresh", () => {
-  const functionStart = app.indexOf("  function renderTrajectoryShadow(value, metricsValue");
-  const functionEnd = app.indexOf("\n\n  function sameEntityId", functionStart);
-  assert.ok(functionStart >= 0 && functionEnd > functionStart);
-
-  const target = () => ({ textContent: "stale", title: "stale" });
-  const elements = {
-    trajectoryShadowPanel: { setAttribute() {} },
-    trajectoryShadowBadge: target(),
-    trajectoryShadowObserved: target(),
-    trajectoryShadowStatus: target(),
-    trajectoryShadowShares: target(),
-    trajectoryShadowNumberArea: target(),
-    trajectoryShadowTraining: target(),
-    trajectoryShadowRangeMetrics: target(),
-    trajectoryShadowSample: target(),
-  };
-  const build = new Function(
-    "normalizedTrajectoryShadow",
-    "normalizedTrajectoryMetrics",
-    "elements",
-    "setTextIfChanged",
-    `"use strict"; ${app.slice(functionStart, functionEnd)}; return renderTrajectoryShadow;`,
-  );
-  const render = build(
-    () => ({ direction: "up", observedChange: { startPrice: 5.1, endPrice: 5.2 } }),
-    () => ({ rank37Top1Hits: 99 }),
-    elements,
-    (element, value) => { element.textContent = value; },
-  );
-
-  render({ stale: true }, { stale: true }, { failed: true });
-
-  assert.equal(elements.trajectoryShadowBadge.textContent, "Не обновлено");
-  assert.match(elements.trajectoryShadowStatus.textContent, /Прогноз lock → ed скрыт/);
-  assert.equal(
-    elements.trajectoryShadowNumberArea.textContent,
-    "ПРОГНОЗ УЧАСТКА: ДАННЫЕ НЕ ОБНОВЛЕНЫ",
-  );
-  const renderedText = Object.values(elements)
-    .map((element) => element.textContent || "")
-    .join(" ");
-  assert.doesNotMatch(renderedText, /5[,.][12]|вверх|99/);
-});
-
-test("preclose trajectory metrics never turn an API failure into plausible zeroes", () => {
-  const functionStart = app.indexOf("  function renderPrecloseTrajectoryMetrics(");
-  const functionEnd = app.indexOf("  function renderPrecloseForecast()", functionStart);
-  assert.ok(functionStart >= 0 && functionEnd > functionStart);
-  const elements = {
-    precloseSampleCount: { textContent: "0 из 100", title: "stale" },
-    precloseTop3Rate: { textContent: "0 из 0 · мало данных" },
-  };
-  const build = new Function(
-    "elements",
-    `"use strict"; ${app.slice(functionStart, functionEnd)}; return renderPrecloseTrajectoryMetrics;`,
-  );
-
-  build(elements)({ rank37EvaluatedCount: 0, rank37Top3Hits: 0 }, { failed: true });
-
-  assert.equal(elements.precloseSampleCount.textContent, "—");
-  assert.equal(elements.precloseSampleCount.title, "Статистика Rank‑37 не обновлена.");
-  assert.equal(elements.precloseTop3Rate.textContent, "Не обновлено");
 });
 
 test("trajectory number area display keeps at most six cells around q50", () => {
@@ -1330,66 +595,6 @@ test("adaptive trajectory display range accepts only the frozen contiguous max-s
     normalize({ ...range(0, 5), maxCells: "6" }, area(0, 20, 0)),
     null,
   );
-});
-
-test("observed trajectory change is frozen separately from the lock-to-ed forecast", () => {
-  const functionStart = app.indexOf("  function normalizedTrajectoryObservedChange(value) {");
-  const functionEnd = app.indexOf("\n\n  function normalizedTrajectoryNumberArea", functionStart);
-  assert.ok(functionStart >= 0 && functionEnd > functionStart);
-  const normalize = new Function(
-    `"use strict"; ${app.slice(functionStart, functionEnd)}; return normalizedTrajectoryObservedChange;`,
-  )();
-  const point = (second, price) => ({
-    at: `2026-10-14T12:00:${String(second).padStart(2, "0")}.000Z`,
-    price,
-  });
-  const input = (endPrice) => ({
-    cutoffAt: "2026-10-14T12:00:10.000Z",
-    lockPrice: endPrice,
-    medianCellWidth: 0.01,
-    parameters: { flatThresholdCellWidths: 0.5 },
-    currentPrefix: [
-      point(0, 5.2),
-      point(5, 5.21),
-      point(10, endPrice),
-    ],
-  });
-
-  const up = normalize(input(5.23));
-  assert.equal(up.direction, "up");
-  assert.equal(up.startPrice, 5.2);
-  assert.equal(up.endPrice, 5.23);
-  assert.equal(up.pointCount, 3);
-  assert.equal(normalize(input(5.19)).direction, "down");
-  assert.equal(normalize(input(5.204)).direction, "flat");
-  assert.equal(normalize({ ...input(5.23), lockPrice: 5.230000001 }).direction, "up");
-  assert.equal(normalize({ ...input(5.23), lockPrice: 5.24 }), null);
-  const exactBoundary = {
-    cutoffAt: "2026-10-14T12:00:10.000Z",
-    lockPrice: 1.5,
-    medianCellWidth: 1,
-    parameters: { flatThresholdCellWidths: 0.5 },
-    currentPrefix: [point(0, 1), point(5, 1.25), point(10, 1.5)],
-  };
-  assert.equal(normalize(exactBoundary).direction, "flat");
-  assert.equal(normalize({
-    ...exactBoundary,
-    lockPrice: 1,
-    currentPrefix: [point(0, 1.5), point(5, 1.25), point(10, 1)],
-  }).direction, "flat");
-  assert.equal(normalize({ ...input(5.23), currentPrefix: [point(10, 5.23)] }), null);
-  assert.equal(normalize({
-    ...input(5.23),
-    currentPrefix: [point(0, 5.2), point(5, 5.21), point(5, 5.23)],
-  }), null);
-  assert.equal(normalize({
-    ...input(5.23),
-    currentPrefix: [point(0, 5.2), point(10, 5.21), point(5, 5.23)],
-  }), null);
-  assert.equal(normalize({
-    ...input(5.23),
-    currentPrefix: [point(0, 5.2), point(5, 5.21), point(11, 5.23)],
-  }), null);
 });
 
 test("adaptive trajectory metrics fail closed on inconsistent prospective counts", () => {
@@ -1532,17 +737,8 @@ test("trajectory shadow normalizer keeps legacy v1 readable and requires frozen 
   };
   const base = {
     status: "ready",
-    direction: "down",
-    probabilities: { up: 0.3, down: 0.5, flat: 0.2 },
-    cutoffAt: "2026-10-14T12:00:10.000Z",
-    lockPrice: 1,
-    medianCellWidth: 0.1,
-    parameters: { flatThresholdCellWidths: 0.5 },
-    currentPrefix: [
-      { at: "2026-10-14T12:00:00.000Z", price: 0.8 },
-      { at: "2026-10-14T12:00:05.000Z", price: 0.9 },
-      { at: "2026-10-14T12:00:10.000Z", price: 1 },
-    ],
+    direction: "up",
+    probabilities: { up: 0.5, down: 0.3, flat: 0.2 },
     sample,
     numberArea,
     evaluation: null,
@@ -1555,8 +751,6 @@ test("trajectory shadow normalizer keeps legacy v1 readable and requires frozen 
   });
   assert.equal(legacy.isAdaptive, false);
   assert.equal(legacy.displayRange, null);
-  assert.equal(legacy.direction, "down");
-  assert.equal(legacy.observedChange.direction, "up");
 
   const displayRange = {
     version: "trajectory-display-range-v1",
@@ -1576,8 +770,6 @@ test("trajectory shadow normalizer keeps legacy v1 readable and requires frozen 
   const adaptive = normalize(adaptiveInput);
   assert.equal(adaptive.isAdaptive, true);
   assert.equal(adaptive.adaptive.trainingCount, 4);
-  assert.equal(adaptive.direction, "down");
-  assert.equal(adaptive.observedChange.direction, "up");
   assert.deepEqual(adaptive.displayRange.cells, cells);
   const priceLessSettlement = normalize({
     ...adaptiveInput,
@@ -1600,8 +792,6 @@ test("trajectory shadow normalizer keeps legacy v1 readable and requires frozen 
   assert.equal(normalize({ ...adaptiveInput, displayRange: null }), null);
   assert.equal(normalize({ ...adaptiveInput, adaptive: null }), null);
   assert.equal(normalize({ ...adaptiveInput, adaptive: { trainingCount: "4" } }), null);
-  assert.equal(normalize({ ...adaptiveInput, currentPrefix: [] }), null);
-  assert.equal(normalize({ ...adaptiveInput, lockPrice: 1.1 }), null);
 });
 
 test("trajectory evaluation distinguishes both zero bands and leaves missing raw cells ungraded", () => {
@@ -1754,8 +944,8 @@ test("warm next-round forecast exposes a strict 5-percent walk-forward contract"
   );
   assert.match(html, /id="follower-dynamic-next-title"[^>]*>[^<]*≥5%/);
   assert.match(html, /id="follower-dynamic-next-note"[^>]*>[\s\S]*?5%/);
-  assert.match(html, /styles\.css\?v=34/);
-  assert.match(html, /app\.js\?v=53/);
+  assert.match(html, /styles\.css\?v=30/);
+  assert.match(html, /app\.js\?v=43/);
   assert.match(styles, /\.follower-dynamic-next\s*\{/);
   assert.match(styles, /\.follower-warm-current\s*\{/);
   assert.match(styles, /\.follower-warm-picks\s*\{/);
@@ -1940,7 +1130,7 @@ test("full-cycle comparison block stays hidden while preserving every renderer t
 test("cycle analogue uses the fixed 20-draw contract and renders the entire archive tail", () => {
   assert.match(app, /const CYCLE_COMPARISON_ANCHOR_DRAWS = 20/);
   assert.match(app, /const CYCLE_COMPARISON_ALGORITHM_VERSION = "cycle-analogue-prefix-v1"/);
-  assert.match(app, /url: "\/api\/cycle-comparison"/);
+  assert.match(app, /fetchJson\("\/api\/cycle-comparison"\)/);
   assert.match(app, /value\.schemaVersion !== 1/);
   assert.match(app, /value\.algorithmVersion !== CYCLE_COMPARISON_ALGORITHM_VERSION/);
   assert.match(app, /value\.interpretation !== "descriptive-not-predictive"/);
@@ -1982,8 +1172,8 @@ test("cycle comparison language is descriptive, responsive, and cache-busted", (
   assert.match(block, /не прогноз/);
   assert.match(block, /не предсказывает следующее число/);
   assert.doesNotMatch(block, /должн/iu);
-  assert.match(html, /href="\/styles\.css\?v=34"/);
-  assert.match(html, /src="\/app\.js\?v=53"/);
+  assert.match(html, /href="\/styles\.css\?v=30"/);
+  assert.match(html, /src="\/app\.js\?v=43"/);
   assert.match(styles, /\.cycle-sequence-list\s*\{[\s\S]*?repeat\(auto-fill, minmax\(50px, 1fr\)\)/);
   assert.match(
     styles,

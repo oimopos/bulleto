@@ -20,7 +20,6 @@ import {
   TRAJECTORY_RANK37_EVIDENCE_MASS_THRESHOLD,
   TRAJECTORY_RANK37_VERSION,
 } from "../public/combined-number.js";
-import { assessPredictiveLeaderQualityGate } from "../src/predictive-leader-quality-gate.js";
 
 function trajectoryRank37(firstNumber = 32) {
   const order = [
@@ -72,11 +71,6 @@ const FRESH_STATE = Object.freeze({
 });
 
 function predictiveLeaderApiSnapshot() {
-  const qualityGate = assessPredictiveLeaderQualityGate(
-    Array.from({ length: 1_000 }, () => ({
-      evaluation: { top1Hit: true },
-    })),
-  );
   return {
     schemaVersion: PREDICTIVE_LEADER_API_SCHEMA_VERSION,
     algorithmVersion: PREDICTIVE_LEADER_API_ALGORITHM_VERSION,
@@ -88,9 +82,7 @@ function predictiveLeaderApiSnapshot() {
     serverTime: "2026-10-10T10:00:22.000Z",
     status: "ready",
     reason: "ready",
-    action: "BET",
     number: 7,
-    candidateNumber: 7,
     forecast: {
       id: 77,
       roundId: "101",
@@ -116,40 +108,15 @@ function predictiveLeaderApiSnapshot() {
       tieBreakApplied: false,
     },
     account: null,
-    signalAccount: {
-      schemaVersion: 1,
-      mode: "confirmed-bet-signals",
-      initialBalance: 1_000,
-      currentBalance: 1_000,
-      profit: 0,
-      stake: 10,
-      grossPayoutMultiplier: 36,
-      betCount: 0,
-      settledCount: 0,
-      pendingCount: 0,
-      voidCount: 0,
-      hitCount: 0,
-      missCount: 0,
-      hitRate: null,
-      totalStaked: 0,
-      totalGrossPayout: 0,
-      status: "running",
-      pendingBet: null,
-      latestOutcome: null,
-      latestVoid: null,
-      startedAt: null,
-      updatedAt: null,
-    },
     metrics: {
-      readyCount: 1_001,
-      settledCount: 1_000,
+      readyCount: 1,
+      settledCount: 0,
       pendingCount: 1,
-      top1Hits: 1_000,
-      top1Rate: 1,
-      meanBrierLoss: 0,
+      top1Hits: 0,
+      top1Rate: null,
+      meanBrierLoss: null,
       uniformBrierLoss: 18 / 37,
-      beatsUniform: true,
-      qualityGate,
+      beatsUniform: null,
     },
     freshness: {
       currentRoundId: 101,
@@ -196,8 +163,6 @@ test("predictive leader API snapshot exposes only a strict ready number", () => 
 test("predictive leader API rejects malformed ready payloads", () => {
   for (const mutate of [
     (value) => { value.number = 37; },
-    (value) => { value.action = "WAIT"; },
-    (value) => { value.metrics.qualityGate.eligible = false; },
     (value) => { value.model.learnedFamilyWeights.price = 0.6; },
     (value) => { value.freshness.persistencePendingResults = 1; },
     (value) => { value.forecast.roundId = "102"; },
@@ -212,9 +177,7 @@ test("predictive leader API waiting and paused responses hide the number", () =>
   const waiting = predictiveLeaderApiSnapshot();
   waiting.status = "waiting";
   waiting.reason = "forecast_settled";
-  waiting.action = "WAIT";
   waiting.number = null;
-  waiting.candidateNumber = null;
   waiting.model = null;
   const normalizedWaiting = normalizePredictiveLeaderApiSnapshot(waiting);
   assert.equal(normalizedWaiting?.status, "waiting");
@@ -226,9 +189,7 @@ test("predictive leader API waiting and paused responses hide the number", () =>
   const paused = predictiveLeaderApiSnapshot();
   paused.status = "paused";
   paused.reason = "collector_unavailable";
-  paused.action = "WAIT";
   paused.number = null;
-  paused.candidateNumber = null;
   paused.forecast = null;
   paused.model = null;
   const normalizedPaused = normalizePredictiveLeaderApiSnapshot(paused);
@@ -237,59 +198,6 @@ test("predictive leader API waiting and paused responses hide the number", () =>
     loaded: true,
     snapshot: normalizedPaused,
   }), { state: "paused", reason: "collector_unavailable" });
-});
-
-test("predictive leader API preserves an observation-only candidate while action waits", () => {
-  const gated = predictiveLeaderApiSnapshot();
-  gated.status = "waiting";
-  gated.reason = "confidence_not_proven";
-  gated.action = "WAIT";
-  gated.number = null;
-  gated.candidateNumber = 7;
-  gated.metrics.qualityGate = assessPredictiveLeaderQualityGate(
-    Array.from({ length: 1_000 }, () => ({
-      evaluation: { top1Hit: false },
-    })),
-  );
-
-  const normalized = normalizePredictiveLeaderApiSnapshot(gated);
-
-  assert.equal(normalized?.action, "WAIT");
-  assert.equal(normalized?.number, null);
-  assert.equal(normalized?.candidateNumber, 7);
-  assert.equal(predictiveLeaderNumberContext({
-    loaded: true,
-    snapshot: normalized,
-  }).snapshot.candidateNumber, 7);
-});
-
-test("predictive leader preserves stale candidates as WAIT-only observations", () => {
-  for (const reason of [
-    "forecast_round_mismatch",
-    "forecast_settled",
-    "betting_closed",
-  ]) {
-    const stale = predictiveLeaderApiSnapshot();
-    stale.status = reason === "forecast_round_mismatch" ? "paused" : "waiting";
-    stale.reason = reason;
-    stale.action = "WAIT";
-    stale.number = null;
-    stale.candidateNumber = 7;
-    if (reason === "forecast_round_mismatch") {
-      stale.freshness.forecastRoundMatches = false;
-    } else {
-      stale.serverTime = stale.forecast.bettingClosesAt;
-    }
-
-    const normalized = normalizePredictiveLeaderApiSnapshot(stale);
-    assert.equal(normalized?.candidateNumber, 7, reason);
-    assert.equal(normalized?.number, null, reason);
-    assert.equal(normalized?.action, "WAIT", reason);
-    assert.equal(predictiveLeaderNumberContext({
-      loaded: true,
-      snapshot: normalized,
-    }).snapshot.candidateNumber, 7, reason);
-  }
 });
 
 test("predictive leader first-fetch error cannot remain stuck on loading", () => {
