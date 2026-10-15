@@ -2483,6 +2483,10 @@ const TRAJECTORY_SAMPLE_KEYS = Object.freeze([
 const TRAJECTORY_ADAPTIVE_VALIDATOR_SQL_FUNCTION =
   "trajectory_adaptive_snapshot_valid_v2";
 const TRAJECTORY_ADAPTIVE_VALIDATOR_ARGUMENT_COUNT = 15;
+const TRAJECTORY_METRIC_FACT_VERSION =
+  "trajectory-adaptive-snapshot-valid-v2/metrics-v1";
+const PREDICTIVE_LEADER_METRIC_FACT_VERSION =
+  "learned-leader-v1/metrics-v1";
 
 function trajectoryAdaptiveValidatorFingerprint(values) {
   if (values.length !== TRAJECTORY_ADAPTIVE_VALIDATOR_ARGUMENT_COUNT) {
@@ -2540,6 +2544,26 @@ function trajectoryAdaptiveValidatorFingerprint(values) {
     else if (bytes !== null) hash.update(bytes);
   }
   return hash.digest("base64url");
+}
+
+function trajectoryAdaptiveValidatorValuesFromRow(row) {
+  return [
+    row.status,
+    row.cutoff_at,
+    row.snapshot_locked_at,
+    row.lock_price,
+    row.snapshot_current_price,
+    row.median_cell_width,
+    row.direction,
+    row.probabilities_json,
+    row.expected_delta_cell_widths,
+    row.sample_json,
+    row.nearest_ids_json,
+    row.parameters_json,
+    row.current_prefix_json,
+    row.integration_json,
+    row.cells_json,
+  ];
 }
 
 function trajectoryNumbersEqual(left, right, tolerance = 1e-9) {
@@ -3537,6 +3561,73 @@ function mapTrajectoryMetrics(row) {
   };
 }
 
+function buildTrajectoryMetricFact(row, isValid) {
+  const empty = {
+    readyCount: 0,
+    settledCount: 0,
+    evaluatedCount: 0,
+    displayRangeHits: 0,
+    q50ExactHits: 0,
+    fullCorridorHits: 0,
+    rank37ReadyCount: 0,
+    rank37SettledCount: 0,
+    rank37EvaluatedCount: 0,
+    rank37Top1Hits: 0,
+    rank37Top3Hits: 0,
+  };
+  if (Number(isValid) !== 1) return empty;
+
+  const integration = deserializeJson(row.integration_json);
+  const hasSettlement = row.round_result_id !== null
+    && row.round_result_id !== undefined;
+  const actualNumber = Number(row.actual_number);
+  const rawCell = consistentTrajectoryRawCell(row.raw_cell, actualNumber);
+  const isGradable = hasSettlement && rawCell !== null;
+  const displayCells = integration?.displayRange?.cells;
+  const corridorCells = integration?.numberArea?.corridor?.cells;
+  const ranking = integration?.numberRanking;
+  const rank37Ready = ranking?.version === TRAJECTORY_RANK37_VERSION
+    && Number(ranking.evidenceCandidateCount)
+      >= TRAJECTORY_RANK37_MIN_EVIDENCE_CANDIDATES;
+  const rank37Ranking = Array.isArray(ranking?.ranking) ? ranking.ranking : [];
+
+  return {
+    readyCount: 1,
+    settledCount: Number(hasSettlement),
+    evaluatedCount: Number(isGradable),
+    displayRangeHits: Number(
+      isGradable
+      && Array.isArray(displayCells)
+      && displayCells.some((cell) => Number(cell?.wireCell) === rawCell),
+    ),
+    q50ExactHits: Number(
+      isGradable
+      && Number(integration?.numberArea?.typical?.wireCell) === rawCell,
+    ),
+    fullCorridorHits: Number(
+      isGradable
+      && Array.isArray(corridorCells)
+      && corridorCells.some((cell) => Number(cell?.wireCell) === rawCell),
+    ),
+    rank37ReadyCount: Number(rank37Ready),
+    rank37SettledCount: Number(rank37Ready && hasSettlement),
+    rank37EvaluatedCount: Number(rank37Ready && isGradable),
+    rank37Top1Hits: Number(
+      rank37Ready
+      && isGradable
+      && Number(rank37Ranking[0]?.number) === actualNumber,
+    ),
+    rank37Top3Hits: Number(
+      rank37Ready
+      && isGradable
+      && rank37Ranking.some(
+        (candidate) => Number(candidate?.rank) <= 3
+          && Number(candidate?.number) === actualNumber,
+      ),
+    ),
+  };
+}
+
 function validLearnedLeaderAudit(decision) {
   const learning = decision?.learning;
   if (
@@ -3743,6 +3834,75 @@ function mapPredictiveLeaderMetrics(rows) {
     top3Hits,
     top1Rate: settled.length > 0 ? top1Hits / settled.length : null,
     top3Rate: settled.length > 0 ? top3Hits / settled.length : null,
+    meanBrierLoss,
+    uniformBrierLoss: LEARNED_LEADER_UNIFORM_BRIER_LOSS,
+    beatsUniform:
+      meanBrierLoss === null ? null : meanBrierLoss < LEARNED_LEADER_UNIFORM_BRIER_LOSS,
+  };
+}
+
+function buildPredictiveLeaderMetricFact(row) {
+  const leader = mapForecastPredictiveLeader(row);
+  if (leader?.status !== "ready") {
+    return {
+      readyCount: 0,
+      settledCount: 0,
+      top1Hits: 0,
+      top3Hits: 0,
+      combinedBrierLoss: null,
+    };
+  }
+  if (leader.evaluation === null) {
+    return {
+      readyCount: 1,
+      settledCount: 0,
+      top1Hits: 0,
+      top3Hits: 0,
+      combinedBrierLoss: null,
+    };
+  }
+  return {
+    readyCount: 1,
+    settledCount: 1,
+    top1Hits: Number(leader.evaluation.top1Hit),
+    top3Hits: Number(leader.evaluation.top3Hit),
+    combinedBrierLoss: leader.evaluation.combinedBrierLoss,
+  };
+}
+
+function mapPredictiveLeaderMetricFacts(rows) {
+  const readyCount = rows.reduce(
+    (total, row) => total + Number(row.ready_count),
+    0,
+  );
+  const settledCount = rows.reduce(
+    (total, row) => total + Number(row.settled_count),
+    0,
+  );
+  const top1Hits = rows.reduce(
+    (total, row) => total + Number(row.top1_hits),
+    0,
+  );
+  const top3Hits = rows.reduce(
+    (total, row) => total + Number(row.top3_hits),
+    0,
+  );
+  const totalBrierLoss = rows.reduce(
+    (total, row) => total + Number(row.combined_brier_loss ?? 0),
+    0,
+  );
+  const meanBrierLoss = settledCount === 0
+    ? null
+    : totalBrierLoss / settledCount;
+  return {
+    algorithmVersion: LEARNED_LEADER_ALGORITHM_VERSION,
+    readyCount,
+    settledCount,
+    pendingCount: Math.max(0, readyCount - settledCount),
+    top1Hits,
+    top3Hits,
+    top1Rate: settledCount > 0 ? top1Hits / settledCount : null,
+    top3Rate: settledCount > 0 ? top3Hits / settledCount : null,
     meanBrierLoss,
     uniformBrierLoss: LEARNED_LEADER_UNIFORM_BRIER_LOSS,
     beatsUniform:
@@ -4030,6 +4190,131 @@ export class RouletteDatabase {
     const result = validAdaptiveTrajectorySnapshotSql(...values);
     this.trajectoryAdaptiveValidationCache.set(fingerprint, result);
     return result;
+  }
+
+  #writeTrajectoryMetricFacts(validatedRows) {
+    if (validatedRows.length === 0) return;
+    const statement = this.sqlite.prepare(`
+      INSERT INTO forecast_trajectory_metric_facts (
+        forecast_id, validator_version, ready_count, settled_count,
+        evaluated_count, display_range_hits, q50_exact_hits,
+        full_corridor_hits, rank37_ready_count, rank37_settled_count,
+        rank37_evaluated_count, rank37_top1_hits, rank37_top3_hits
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(forecast_id) DO UPDATE SET
+        validator_version = excluded.validator_version,
+        ready_count = excluded.ready_count,
+        settled_count = excluded.settled_count,
+        evaluated_count = excluded.evaluated_count,
+        display_range_hits = excluded.display_range_hits,
+        q50_exact_hits = excluded.q50_exact_hits,
+        full_corridor_hits = excluded.full_corridor_hits,
+        rank37_ready_count = excluded.rank37_ready_count,
+        rank37_settled_count = excluded.rank37_settled_count,
+        rank37_evaluated_count = excluded.rank37_evaluated_count,
+        rank37_top1_hits = excluded.rank37_top1_hits,
+        rank37_top3_hits = excluded.rank37_top3_hits
+    `);
+    const clearDirty = this.sqlite.prepare(`
+      DELETE FROM forecast_trajectory_metric_dirty WHERE forecast_id = ?
+    `);
+    this.sqlite.exec("BEGIN IMMEDIATE");
+    try {
+      for (const { row, isValid } of validatedRows) {
+        const fact = buildTrajectoryMetricFact(row, isValid);
+        statement.run(
+          Number(row.forecast_id),
+          TRAJECTORY_METRIC_FACT_VERSION,
+          fact.readyCount,
+          fact.settledCount,
+          fact.evaluatedCount,
+          fact.displayRangeHits,
+          fact.q50ExactHits,
+          fact.fullCorridorHits,
+          fact.rank37ReadyCount,
+          fact.rank37SettledCount,
+          fact.rank37EvaluatedCount,
+          fact.rank37Top1Hits,
+          fact.rank37Top3Hits,
+        );
+        clearDirty.run(Number(row.forecast_id));
+      }
+      this.sqlite.exec("COMMIT");
+    } catch (error) {
+      try {
+        this.sqlite.exec("ROLLBACK");
+      } catch {
+        // Preserve the materialization error.
+      }
+      throw error;
+    }
+  }
+
+  #ensureTrajectoryMetricFacts(source, instrument) {
+    const rows = this.sqlite.prepare(`
+      WITH candidate_ids AS (
+        SELECT forecast_id FROM forecast_trajectory_metric_dirty
+        UNION
+        SELECT trajectory_shadows.forecast_id
+        FROM forecast_trajectory_shadows AS trajectory_shadows
+          INDEXED BY forecast_trajectory_shadows_metric_idx
+        LEFT JOIN forecast_trajectory_metric_facts AS metric_facts
+          ON metric_facts.forecast_id = trajectory_shadows.forecast_id
+         AND metric_facts.validator_version = ?
+        WHERE trajectory_shadows.model_version = ?
+          AND trajectory_shadows.status = 'ready'
+          AND metric_facts.forecast_id IS NULL
+      )
+      SELECT
+        trajectory_shadows.forecast_id,
+        trajectory_shadows.status,
+        trajectory_shadows.cutoff_at,
+        snapshots.locked_at AS snapshot_locked_at,
+        trajectory_shadows.lock_price,
+        snapshots.current_price AS snapshot_current_price,
+        trajectory_shadows.median_cell_width,
+        trajectory_shadows.direction,
+        trajectory_shadows.probabilities_json,
+        trajectory_shadows.expected_delta_cell_widths,
+        trajectory_shadows.sample_json,
+        trajectory_shadows.nearest_ids_json,
+        trajectory_shadows.parameters_json,
+        trajectory_shadows.current_prefix_json,
+        trajectory_shadows.integration_json,
+        snapshots.cells_json,
+        settlements.round_result_id,
+        settlements.actual_number,
+        settlement_results.raw_cell
+      FROM candidate_ids AS metric_dirty
+      CROSS JOIN forecast_trajectory_shadows AS trajectory_shadows
+        ON trajectory_shadows.forecast_id = metric_dirty.forecast_id
+      JOIN round_forecasts AS forecasts
+        ON forecasts.id = trajectory_shadows.forecast_id
+      JOIN forecast_snapshots AS snapshots
+        ON snapshots.id = forecasts.snapshot_id
+      LEFT JOIN forecast_settlements AS settlements
+        ON settlements.forecast_id = forecasts.id
+      LEFT JOIN round_results AS settlement_results
+        ON settlement_results.id = settlements.round_result_id
+      WHERE snapshots.source = ?
+        AND snapshots.instrument = ?
+        AND trajectory_shadows.model_version = ?
+        AND trajectory_shadows.status = 'ready'
+      ORDER BY trajectory_shadows.forecast_id
+    `).all(
+      TRAJECTORY_METRIC_FACT_VERSION,
+      TRAJECTORY_SHADOW_ADAPTIVE_VERSION,
+      source,
+      instrument,
+      TRAJECTORY_SHADOW_ADAPTIVE_VERSION,
+    );
+    const validatedRows = rows.map((row) => ({
+      row,
+      isValid: this.#validAdaptiveTrajectorySnapshotSql(
+        ...trajectoryAdaptiveValidatorValuesFromRow(row),
+      ),
+    }));
+    this.#writeTrajectoryMetricFacts(validatedRows);
   }
 
   #assertOpen() {
@@ -4350,6 +4635,7 @@ export class RouletteDatabase {
     this.#migratePredictiveLeaderAccountLadderResetV19(startingVersion);
     this.#migrateFollowerTop5GatedAccountDepositsV23();
     this.#finalizeSchemaVersionV24(startingVersion);
+    this.#migrateTrajectoryMetricFactsV25(startingVersion);
   }
 
   #migratePrecloseForecastsV10() {
@@ -5549,6 +5835,355 @@ export class RouletteDatabase {
     // Earlier idempotent migrations in this legacy chain write their own
     // version numbers. Preserve a newer compatible database version.
     this.sqlite.exec(`PRAGMA user_version = ${Math.max(24, startingVersion)}`);
+  }
+
+  #migrateTrajectoryMetricFactsV25(startingVersion) {
+    this.sqlite.exec("BEGIN IMMEDIATE");
+    try {
+      this.sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS forecast_trajectory_metric_facts (
+          forecast_id INTEGER PRIMARY KEY
+            REFERENCES round_forecasts(id) ON DELETE CASCADE,
+          validator_version TEXT NOT NULL,
+          ready_count INTEGER NOT NULL CHECK (ready_count IN (0, 1)),
+          settled_count INTEGER NOT NULL CHECK (settled_count IN (0, 1)),
+          evaluated_count INTEGER NOT NULL CHECK (evaluated_count IN (0, 1)),
+          display_range_hits INTEGER NOT NULL CHECK (display_range_hits IN (0, 1)),
+          q50_exact_hits INTEGER NOT NULL CHECK (q50_exact_hits IN (0, 1)),
+          full_corridor_hits INTEGER NOT NULL CHECK (full_corridor_hits IN (0, 1)),
+          rank37_ready_count INTEGER NOT NULL CHECK (rank37_ready_count IN (0, 1)),
+          rank37_settled_count INTEGER NOT NULL
+            CHECK (rank37_settled_count IN (0, 1)),
+          rank37_evaluated_count INTEGER NOT NULL
+            CHECK (rank37_evaluated_count IN (0, 1)),
+          rank37_top1_hits INTEGER NOT NULL CHECK (rank37_top1_hits IN (0, 1)),
+          rank37_top3_hits INTEGER NOT NULL CHECK (rank37_top3_hits IN (0, 1))
+        );
+
+        CREATE TABLE IF NOT EXISTS forecast_trajectory_metric_dirty (
+          forecast_id INTEGER PRIMARY KEY
+            REFERENCES round_forecasts(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS forecast_predictive_leader_metric_facts (
+          forecast_id INTEGER PRIMARY KEY
+            REFERENCES round_forecasts(id) ON DELETE CASCADE,
+          metric_version TEXT NOT NULL,
+          ready_count INTEGER NOT NULL CHECK (ready_count IN (0, 1)),
+          settled_count INTEGER NOT NULL CHECK (settled_count IN (0, 1)),
+          top1_hits INTEGER NOT NULL CHECK (top1_hits IN (0, 1)),
+          top3_hits INTEGER NOT NULL CHECK (top3_hits IN (0, 1)),
+          combined_brier_loss REAL,
+          CHECK (settled_count <= ready_count),
+          CHECK (top1_hits <= settled_count),
+          CHECK (top3_hits <= settled_count),
+          CHECK (
+            (settled_count = 0 AND combined_brier_loss IS NULL)
+            OR
+            (settled_count = 1 AND combined_brier_loss >= 0)
+          )
+        );
+
+        CREATE TABLE IF NOT EXISTS forecast_predictive_leader_metric_dirty (
+          forecast_id INTEGER PRIMARY KEY
+            REFERENCES round_forecasts(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS forecast_trajectory_shadows_metric_idx
+          ON forecast_trajectory_shadows(model_version, status, forecast_id);
+        CREATE INDEX IF NOT EXISTS forecast_predictive_leaders_metric_idx
+          ON forecast_predictive_leader_snapshots(
+            schema_version,
+            algorithm_version,
+            forecast_id
+          );
+        CREATE INDEX IF NOT EXISTS forecast_predictive_leaders_training_idx
+          ON forecast_predictive_leader_snapshots(
+            training_through_forecast_id,
+            forecast_id
+          );
+
+        INSERT OR IGNORE INTO forecast_trajectory_metric_dirty (forecast_id)
+        SELECT trajectory_shadows.forecast_id
+        FROM forecast_trajectory_shadows AS trajectory_shadows
+        LEFT JOIN forecast_trajectory_metric_facts AS metric_facts
+          ON metric_facts.forecast_id = trajectory_shadows.forecast_id
+         AND metric_facts.validator_version = '${TRAJECTORY_METRIC_FACT_VERSION}'
+        WHERE trajectory_shadows.model_version = '${TRAJECTORY_SHADOW_ADAPTIVE_VERSION}'
+          AND trajectory_shadows.status = 'ready'
+          AND metric_facts.forecast_id IS NULL;
+
+        INSERT OR IGNORE INTO forecast_predictive_leader_metric_dirty (forecast_id)
+        SELECT leaders.forecast_id
+        FROM forecast_predictive_leader_snapshots AS leaders
+        LEFT JOIN forecast_predictive_leader_metric_facts AS metric_facts
+          ON metric_facts.forecast_id = leaders.forecast_id
+         AND metric_facts.metric_version = '${PREDICTIVE_LEADER_METRIC_FACT_VERSION}'
+        WHERE leaders.schema_version = ${LEARNED_LEADER_SCHEMA_VERSION}
+          AND leaders.algorithm_version = '${LEARNED_LEADER_ALGORITHM_VERSION}'
+          AND metric_facts.forecast_id IS NULL;
+
+        CREATE TRIGGER IF NOT EXISTS trajectory_metric_facts_shadow_insert
+        AFTER INSERT ON forecast_trajectory_shadows
+        BEGIN
+          DELETE FROM forecast_trajectory_metric_facts
+          WHERE forecast_id = NEW.forecast_id;
+          INSERT OR IGNORE INTO forecast_trajectory_metric_dirty (forecast_id)
+          SELECT NEW.forecast_id
+          WHERE NEW.model_version = '${TRAJECTORY_SHADOW_ADAPTIVE_VERSION}'
+            AND NEW.status = 'ready';
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trajectory_metric_facts_shadow_update
+        AFTER UPDATE ON forecast_trajectory_shadows
+        BEGIN
+          DELETE FROM forecast_trajectory_metric_facts
+          WHERE forecast_id IN (OLD.forecast_id, NEW.forecast_id);
+          DELETE FROM forecast_trajectory_metric_dirty
+          WHERE forecast_id IN (OLD.forecast_id, NEW.forecast_id);
+          INSERT OR IGNORE INTO forecast_trajectory_metric_dirty (forecast_id)
+          SELECT NEW.forecast_id
+          WHERE NEW.model_version = '${TRAJECTORY_SHADOW_ADAPTIVE_VERSION}'
+            AND NEW.status = 'ready';
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trajectory_metric_facts_shadow_delete
+        AFTER DELETE ON forecast_trajectory_shadows
+        BEGIN
+          DELETE FROM forecast_trajectory_metric_facts
+          WHERE forecast_id = OLD.forecast_id;
+          DELETE FROM forecast_trajectory_metric_dirty
+          WHERE forecast_id = OLD.forecast_id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trajectory_metric_facts_snapshot_update
+        AFTER UPDATE OF locked_at, current_price, cells_json ON forecast_snapshots
+        BEGIN
+          DELETE FROM forecast_trajectory_metric_facts
+          WHERE forecast_id IN (
+            SELECT id FROM round_forecasts WHERE snapshot_id = NEW.id
+          );
+          INSERT OR IGNORE INTO forecast_trajectory_metric_dirty (forecast_id)
+          SELECT trajectory_shadows.forecast_id
+          FROM forecast_trajectory_shadows AS trajectory_shadows
+          JOIN round_forecasts AS forecasts
+            ON forecasts.id = trajectory_shadows.forecast_id
+          WHERE forecasts.snapshot_id = NEW.id
+            AND trajectory_shadows.model_version = '${TRAJECTORY_SHADOW_ADAPTIVE_VERSION}'
+            AND trajectory_shadows.status = 'ready';
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trajectory_metric_facts_settlement_insert
+        AFTER INSERT ON forecast_settlements
+        BEGIN
+          DELETE FROM forecast_trajectory_metric_facts
+          WHERE forecast_id = NEW.forecast_id;
+          INSERT OR IGNORE INTO forecast_trajectory_metric_dirty (forecast_id)
+          SELECT trajectory_shadows.forecast_id
+          FROM forecast_trajectory_shadows AS trajectory_shadows
+          WHERE trajectory_shadows.forecast_id = NEW.forecast_id
+            AND trajectory_shadows.model_version = '${TRAJECTORY_SHADOW_ADAPTIVE_VERSION}'
+            AND trajectory_shadows.status = 'ready';
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trajectory_metric_facts_settlement_update
+        AFTER UPDATE ON forecast_settlements
+        BEGIN
+          DELETE FROM forecast_trajectory_metric_facts
+          WHERE forecast_id IN (OLD.forecast_id, NEW.forecast_id);
+          INSERT OR IGNORE INTO forecast_trajectory_metric_dirty (forecast_id)
+          SELECT trajectory_shadows.forecast_id
+          FROM forecast_trajectory_shadows AS trajectory_shadows
+          WHERE trajectory_shadows.forecast_id IN (
+              OLD.forecast_id,
+              NEW.forecast_id
+            )
+            AND trajectory_shadows.model_version = '${TRAJECTORY_SHADOW_ADAPTIVE_VERSION}'
+            AND trajectory_shadows.status = 'ready';
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trajectory_metric_facts_settlement_delete
+        AFTER DELETE ON forecast_settlements
+        BEGIN
+          DELETE FROM forecast_trajectory_metric_facts
+          WHERE forecast_id = OLD.forecast_id;
+          INSERT OR IGNORE INTO forecast_trajectory_metric_dirty (forecast_id)
+          SELECT trajectory_shadows.forecast_id
+          FROM forecast_trajectory_shadows AS trajectory_shadows
+          WHERE trajectory_shadows.forecast_id = OLD.forecast_id
+            AND trajectory_shadows.model_version = '${TRAJECTORY_SHADOW_ADAPTIVE_VERSION}'
+            AND trajectory_shadows.status = 'ready';
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trajectory_metric_facts_result_update
+        AFTER UPDATE OF result_number, raw_cell ON round_results
+        BEGIN
+          DELETE FROM forecast_trajectory_metric_facts
+          WHERE forecast_id IN (
+            SELECT forecast_id
+            FROM forecast_settlements
+            WHERE round_result_id IN (OLD.id, NEW.id)
+          );
+          INSERT OR IGNORE INTO forecast_trajectory_metric_dirty (forecast_id)
+          SELECT trajectory_shadows.forecast_id
+          FROM forecast_trajectory_shadows AS trajectory_shadows
+          JOIN forecast_settlements AS settlements
+            ON settlements.forecast_id = trajectory_shadows.forecast_id
+          WHERE settlements.round_result_id IN (OLD.id, NEW.id)
+            AND trajectory_shadows.model_version = '${TRAJECTORY_SHADOW_ADAPTIVE_VERSION}'
+            AND trajectory_shadows.status = 'ready';
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS predictive_metric_facts_leader_insert
+        AFTER INSERT ON forecast_predictive_leader_snapshots
+        BEGIN
+          DELETE FROM forecast_predictive_leader_metric_facts
+          WHERE forecast_id = NEW.forecast_id;
+          INSERT OR IGNORE INTO forecast_predictive_leader_metric_dirty (forecast_id)
+          SELECT NEW.forecast_id
+          WHERE NEW.schema_version = ${LEARNED_LEADER_SCHEMA_VERSION}
+            AND NEW.algorithm_version = '${LEARNED_LEADER_ALGORITHM_VERSION}';
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS predictive_metric_facts_leader_update
+        AFTER UPDATE ON forecast_predictive_leader_snapshots
+        BEGIN
+          DELETE FROM forecast_predictive_leader_metric_facts
+          WHERE forecast_id IN (OLD.forecast_id, NEW.forecast_id);
+          DELETE FROM forecast_predictive_leader_metric_dirty
+          WHERE forecast_id IN (OLD.forecast_id, NEW.forecast_id);
+          INSERT OR IGNORE INTO forecast_predictive_leader_metric_dirty (forecast_id)
+          SELECT NEW.forecast_id
+          WHERE NEW.schema_version = ${LEARNED_LEADER_SCHEMA_VERSION}
+            AND NEW.algorithm_version = '${LEARNED_LEADER_ALGORITHM_VERSION}';
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS predictive_metric_facts_leader_delete
+        AFTER DELETE ON forecast_predictive_leader_snapshots
+        BEGIN
+          DELETE FROM forecast_predictive_leader_metric_facts
+          WHERE forecast_id = OLD.forecast_id;
+          DELETE FROM forecast_predictive_leader_metric_dirty
+          WHERE forecast_id = OLD.forecast_id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS predictive_metric_facts_snapshot_update
+        AFTER UPDATE OF locked_at ON forecast_snapshots
+        BEGIN
+          DELETE FROM forecast_predictive_leader_metric_facts
+          WHERE forecast_id IN (
+            SELECT id FROM round_forecasts WHERE snapshot_id = NEW.id
+          );
+          INSERT OR IGNORE INTO forecast_predictive_leader_metric_dirty (forecast_id)
+          SELECT leaders.forecast_id
+          FROM forecast_predictive_leader_snapshots AS leaders
+          JOIN round_forecasts AS forecasts ON forecasts.id = leaders.forecast_id
+          WHERE forecasts.snapshot_id = NEW.id
+            AND leaders.schema_version = ${LEARNED_LEADER_SCHEMA_VERSION}
+            AND leaders.algorithm_version = '${LEARNED_LEADER_ALGORITHM_VERSION}';
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS predictive_metric_facts_settlement_insert
+        AFTER INSERT ON forecast_settlements
+        BEGIN
+          DELETE FROM forecast_predictive_leader_metric_facts
+          WHERE forecast_id = NEW.forecast_id
+             OR forecast_id IN (
+               SELECT forecast_id
+               FROM forecast_predictive_leader_snapshots
+               WHERE training_through_forecast_id = NEW.forecast_id
+             );
+          INSERT OR IGNORE INTO forecast_predictive_leader_metric_dirty (forecast_id)
+          SELECT leaders.forecast_id
+          FROM forecast_predictive_leader_snapshots AS leaders
+          WHERE (
+              leaders.forecast_id = NEW.forecast_id
+              OR leaders.training_through_forecast_id = NEW.forecast_id
+            )
+            AND leaders.schema_version = ${LEARNED_LEADER_SCHEMA_VERSION}
+            AND leaders.algorithm_version = '${LEARNED_LEADER_ALGORITHM_VERSION}';
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS predictive_metric_facts_settlement_update
+        AFTER UPDATE ON forecast_settlements
+        BEGIN
+          DELETE FROM forecast_predictive_leader_metric_facts
+          WHERE forecast_id IN (OLD.forecast_id, NEW.forecast_id)
+             OR forecast_id IN (
+               SELECT forecast_id
+               FROM forecast_predictive_leader_snapshots
+               WHERE training_through_forecast_id IN (
+                 OLD.forecast_id,
+                 NEW.forecast_id
+               )
+             );
+          INSERT OR IGNORE INTO forecast_predictive_leader_metric_dirty (forecast_id)
+          SELECT leaders.forecast_id
+          FROM forecast_predictive_leader_snapshots AS leaders
+          WHERE (
+              leaders.forecast_id IN (OLD.forecast_id, NEW.forecast_id)
+              OR leaders.training_through_forecast_id IN (
+                OLD.forecast_id,
+                NEW.forecast_id
+              )
+            )
+            AND leaders.schema_version = ${LEARNED_LEADER_SCHEMA_VERSION}
+            AND leaders.algorithm_version = '${LEARNED_LEADER_ALGORITHM_VERSION}';
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS predictive_metric_facts_settlement_delete
+        AFTER DELETE ON forecast_settlements
+        BEGIN
+          DELETE FROM forecast_predictive_leader_metric_facts
+          WHERE forecast_id = OLD.forecast_id
+             OR forecast_id IN (
+               SELECT forecast_id
+               FROM forecast_predictive_leader_snapshots
+               WHERE training_through_forecast_id = OLD.forecast_id
+             );
+          INSERT OR IGNORE INTO forecast_predictive_leader_metric_dirty (forecast_id)
+          SELECT leaders.forecast_id
+          FROM forecast_predictive_leader_snapshots AS leaders
+          WHERE (
+              leaders.forecast_id = OLD.forecast_id
+              OR leaders.training_through_forecast_id = OLD.forecast_id
+            )
+            AND leaders.schema_version = ${LEARNED_LEADER_SCHEMA_VERSION}
+            AND leaders.algorithm_version = '${LEARNED_LEADER_ALGORITHM_VERSION}';
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS metric_facts_forecast_snapshot_update
+        AFTER UPDATE OF snapshot_id ON round_forecasts
+        BEGIN
+          DELETE FROM forecast_trajectory_metric_facts
+          WHERE forecast_id = NEW.id;
+          DELETE FROM forecast_predictive_leader_metric_facts
+          WHERE forecast_id = NEW.id;
+          INSERT OR IGNORE INTO forecast_trajectory_metric_dirty (forecast_id)
+          SELECT trajectory_shadows.forecast_id
+          FROM forecast_trajectory_shadows AS trajectory_shadows
+          WHERE trajectory_shadows.forecast_id = NEW.id
+            AND trajectory_shadows.model_version = '${TRAJECTORY_SHADOW_ADAPTIVE_VERSION}'
+            AND trajectory_shadows.status = 'ready';
+          INSERT OR IGNORE INTO forecast_predictive_leader_metric_dirty (forecast_id)
+          SELECT leaders.forecast_id
+          FROM forecast_predictive_leader_snapshots AS leaders
+          WHERE leaders.forecast_id = NEW.id
+            AND leaders.schema_version = ${LEARNED_LEADER_SCHEMA_VERSION}
+            AND leaders.algorithm_version = '${LEARNED_LEADER_ALGORITHM_VERSION}';
+        END;
+
+        PRAGMA user_version = ${Math.max(25, startingVersion)};
+        COMMIT;
+      `);
+    } catch (error) {
+      try {
+        this.sqlite.exec("ROLLBACK");
+      } catch {
+        // Preserve the migration error.
+      }
+      throw error;
+    }
   }
 
   #migrateContinuityReconciliationV9() {
@@ -11309,8 +11944,9 @@ export class RouletteDatabase {
       }
     }
 
+    let predictiveLeaderOutcome = { inserted: false };
     try {
-      this.#recordPredictiveLeaderSnapshot(
+      predictiveLeaderOutcome = this.#recordPredictiveLeaderSnapshot(
         primaryOutcome.forecastId,
         trajectoryShadow,
       );
@@ -11329,7 +11965,11 @@ export class RouletteDatabase {
       );
     }
 
-    return { inserted: primaryOutcome.inserted, roundId: externalRoundId };
+    return {
+      inserted: primaryOutcome.inserted,
+      databaseChanged: primaryOutcome.inserted || predictiveLeaderOutcome.inserted,
+      roundId: externalRoundId,
+    };
   }
 
   settlePredictiveLeaderAccount(source = "buleto", instrument = "default") {
@@ -11364,7 +12004,7 @@ export class RouletteDatabase {
             results.result_number AS stored_result_number,
             results.settled_at AS result_occurred_at
           FROM predictive_leader_account_bets AS bets
-          JOIN forecast_predictive_leader_snapshots AS leaders
+        CROSS JOIN forecast_predictive_leader_snapshots AS leaders
             ON leaders.forecast_id = bets.forecast_id
           JOIN round_forecasts AS forecasts ON forecasts.id = bets.forecast_id
           JOIN forecast_snapshots AS snapshots ON snapshots.id = forecasts.snapshot_id
@@ -11767,9 +12407,65 @@ export class RouletteDatabase {
     });
   }
 
-  #predictiveLeaderMetricRows(source, instrument, horizonSeconds) {
-    return this.sqlite
-      .prepare(`
+  #writePredictiveLeaderMetricFacts(rows) {
+    if (rows.length === 0) return;
+    const statement = this.sqlite.prepare(`
+      INSERT INTO forecast_predictive_leader_metric_facts (
+        forecast_id, metric_version, ready_count, settled_count,
+        top1_hits, top3_hits, combined_brier_loss
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(forecast_id) DO UPDATE SET
+        metric_version = excluded.metric_version,
+        ready_count = excluded.ready_count,
+        settled_count = excluded.settled_count,
+        top1_hits = excluded.top1_hits,
+        top3_hits = excluded.top3_hits,
+        combined_brier_loss = excluded.combined_brier_loss
+    `);
+    const clearDirty = this.sqlite.prepare(`
+      DELETE FROM forecast_predictive_leader_metric_dirty WHERE forecast_id = ?
+    `);
+    this.sqlite.exec("BEGIN IMMEDIATE");
+    try {
+      for (const row of rows) {
+        const fact = buildPredictiveLeaderMetricFact(row);
+        statement.run(
+          Number(row.forecast_id),
+          PREDICTIVE_LEADER_METRIC_FACT_VERSION,
+          fact.readyCount,
+          fact.settledCount,
+          fact.top1Hits,
+          fact.top3Hits,
+          fact.combinedBrierLoss,
+        );
+        clearDirty.run(Number(row.forecast_id));
+      }
+      this.sqlite.exec("COMMIT");
+    } catch (error) {
+      try {
+        this.sqlite.exec("ROLLBACK");
+      } catch {
+        // Preserve the materialization error.
+      }
+      throw error;
+    }
+  }
+
+  #ensurePredictiveLeaderMetricFacts(source, instrument, horizonSeconds) {
+    const rows = this.sqlite.prepare(`
+        WITH candidate_ids AS (
+          SELECT forecast_id FROM forecast_predictive_leader_metric_dirty
+          UNION
+          SELECT leaders.forecast_id
+          FROM forecast_predictive_leader_snapshots AS leaders
+            INDEXED BY forecast_predictive_leaders_metric_idx
+          LEFT JOIN forecast_predictive_leader_metric_facts AS metric_facts
+            ON metric_facts.forecast_id = leaders.forecast_id
+           AND metric_facts.metric_version = ?
+          WHERE leaders.schema_version = ?
+            AND leaders.algorithm_version = ?
+            AND metric_facts.forecast_id IS NULL
+        )
         SELECT
           forecasts.id AS forecast_id,
           snapshots.locked_at,
@@ -11794,7 +12490,9 @@ export class RouletteDatabase {
           settlements.actual_number,
           settlements.settled_at,
           settlements.created_at AS settlement_created_at
-        FROM forecast_predictive_leader_snapshots AS leaders
+        FROM candidate_ids AS metric_dirty
+        CROSS JOIN forecast_predictive_leader_snapshots AS leaders
+          ON leaders.forecast_id = metric_dirty.forecast_id
         JOIN round_forecasts AS forecasts ON forecasts.id = leaders.forecast_id
         JOIN forecast_snapshots AS snapshots ON snapshots.id = forecasts.snapshot_id
         LEFT JOIN forecast_settlements AS settlements
@@ -11808,14 +12506,44 @@ export class RouletteDatabase {
           AND leaders.schema_version = ?
           AND leaders.algorithm_version = ?
         ORDER BY leaders.forecast_id
-      `)
-      .all(
-        source,
-        instrument,
-        horizonSeconds,
-        LEARNED_LEADER_SCHEMA_VERSION,
-        LEARNED_LEADER_ALGORITHM_VERSION,
-      );
+      `).all(
+      PREDICTIVE_LEADER_METRIC_FACT_VERSION,
+      LEARNED_LEADER_SCHEMA_VERSION,
+      LEARNED_LEADER_ALGORITHM_VERSION,
+      source,
+      instrument,
+      horizonSeconds,
+      LEARNED_LEADER_SCHEMA_VERSION,
+      LEARNED_LEADER_ALGORITHM_VERSION,
+    );
+    this.#writePredictiveLeaderMetricFacts(rows);
+  }
+
+  #predictiveLeaderMetricRows(source, instrument, horizonSeconds) {
+    this.#ensurePredictiveLeaderMetricFacts(source, instrument, horizonSeconds);
+    return this.sqlite.prepare(`
+      SELECT
+        metric_facts.ready_count,
+        metric_facts.settled_count,
+        metric_facts.top1_hits,
+        metric_facts.top3_hits,
+        metric_facts.combined_brier_loss
+      FROM forecast_predictive_leader_metric_facts AS metric_facts
+      JOIN round_forecasts AS forecasts
+        ON forecasts.id = metric_facts.forecast_id
+      JOIN forecast_snapshots AS snapshots
+        ON snapshots.id = forecasts.snapshot_id
+      WHERE metric_facts.metric_version = ?
+        AND snapshots.source = ?
+        AND snapshots.instrument = ?
+        AND snapshots.horizon_seconds = ?
+      ORDER BY metric_facts.forecast_id
+    `).all(
+      PREDICTIVE_LEADER_METRIC_FACT_VERSION,
+      source,
+      instrument,
+      horizonSeconds,
+    );
   }
 
   #predictiveLeaderAccountState(source, instrument) {
@@ -12360,12 +13088,19 @@ export class RouletteDatabase {
         trajectory_shadows.parameters_json,
         trajectory_shadows.current_prefix_json,
         trajectory_shadows.integration_json,
-        snapshots.cells_json
+        snapshots.cells_json,
+        settlements.round_result_id,
+        settlements.actual_number,
+        settlement_results.raw_cell
       FROM forecast_trajectory_shadows AS trajectory_shadows
       JOIN round_forecasts AS forecasts
         ON forecasts.id = trajectory_shadows.forecast_id
       JOIN forecast_snapshots AS snapshots
         ON snapshots.id = forecasts.snapshot_id
+      LEFT JOIN forecast_settlements AS settlements
+        ON settlements.forecast_id = forecasts.id
+      LEFT JOIN round_results AS settlement_results
+        ON settlement_results.id = settlements.round_result_id
       WHERE snapshots.source = ?
         AND snapshots.instrument = ?
         AND trajectory_shadows.model_version = ?
@@ -12388,25 +13123,15 @@ export class RouletteDatabase {
       );
       if (rows.length === 0) break;
 
+      const validatedRows = [];
       for (const row of rows) {
-        validCount += Number(this.#validAdaptiveTrajectorySnapshotSql(
-          row.status,
-          row.cutoff_at,
-          row.snapshot_locked_at,
-          row.lock_price,
-          row.snapshot_current_price,
-          row.median_cell_width,
-          row.direction,
-          row.probabilities_json,
-          row.expected_delta_cell_widths,
-          row.sample_json,
-          row.nearest_ids_json,
-          row.parameters_json,
-          row.current_prefix_json,
-          row.integration_json,
-          row.cells_json,
-        ));
+        const isValid = this.#validAdaptiveTrajectorySnapshotSql(
+          ...trajectoryAdaptiveValidatorValuesFromRow(row),
+        );
+        validCount += Number(isValid);
+        validatedRows.push({ row, isValid });
       }
+      this.#writeTrajectoryMetricFacts(validatedRows);
 
       checkedCount += rows.length;
       batchCount += 1;
@@ -12430,6 +13155,16 @@ export class RouletteDatabase {
       this.#assertOpen();
     }
 
+    if (signal?.aborted !== true) {
+      await this.#warmPredictiveLeaderMetricFactsIncrementally({
+        safeSource,
+        safeInstrument,
+        batchSize,
+        yieldControl,
+        signal,
+      });
+    }
+
     return {
       checkedCount,
       validCount,
@@ -12439,6 +13174,71 @@ export class RouletteDatabase {
       misses: this.trajectoryAdaptiveValidationCacheMisses,
       aborted: signal?.aborted === true,
     };
+  }
+
+  async #warmPredictiveLeaderMetricFactsIncrementally({
+    safeSource,
+    safeInstrument,
+    batchSize,
+    yieldControl,
+    signal,
+  }) {
+    const statement = this.sqlite.prepare(`
+      SELECT
+        forecasts.id AS forecast_id,
+        snapshots.locked_at,
+        leaders.forecast_id AS leader_forecast_id,
+        leaders.schema_version AS leader_schema_version,
+        leaders.algorithm_version AS leader_algorithm_version,
+        leaders.status AS leader_status,
+        leaders.locked_at AS leader_locked_at,
+        leaders.history_max_result_id AS leader_history_max_result_id,
+        leaders.training_through_forecast_id
+          AS leader_training_through_forecast_id,
+        leaders.training_through_result_id
+          AS leader_training_through_result_id,
+        leader_training_settlements.round_result_id
+          AS leader_expected_training_result_id,
+        leaders.training_count AS leader_training_count,
+        leaders.predicted_number AS leader_predicted_number,
+        leaders.score AS leader_score,
+        leaders.snapshot_json AS leader_snapshot_json,
+        leaders.created_at AS leader_created_at,
+        settlements.round_result_id,
+        settlements.actual_number,
+        settlements.settled_at,
+        settlements.created_at AS settlement_created_at
+      FROM forecast_predictive_leader_metric_dirty AS metric_dirty
+      JOIN forecast_predictive_leader_snapshots AS leaders
+        ON leaders.forecast_id = metric_dirty.forecast_id
+      JOIN round_forecasts AS forecasts ON forecasts.id = leaders.forecast_id
+      JOIN forecast_snapshots AS snapshots ON snapshots.id = forecasts.snapshot_id
+      LEFT JOIN forecast_settlements AS settlements
+        ON settlements.forecast_id = forecasts.id
+      LEFT JOIN forecast_settlements AS leader_training_settlements
+        ON leader_training_settlements.forecast_id =
+          leaders.training_through_forecast_id
+      WHERE snapshots.source = ?
+        AND snapshots.instrument = ?
+        AND leaders.schema_version = ?
+        AND leaders.algorithm_version = ?
+      ORDER BY leaders.forecast_id
+      LIMIT ?
+    `);
+    while (signal?.aborted !== true) {
+      const rows = statement.all(
+        safeSource,
+        safeInstrument,
+        LEARNED_LEADER_SCHEMA_VERSION,
+        LEARNED_LEADER_ALGORITHM_VERSION,
+        batchSize,
+      );
+      if (rows.length === 0) return;
+      this.#writePredictiveLeaderMetricFacts(rows);
+      if (rows.length < batchSize || signal?.aborted === true) return;
+      await yieldControl();
+      this.#assertOpen();
+    }
   }
 
   getPredictiveLeaderReadState(source = "buleto", instrument = "default") {
@@ -12532,7 +13332,7 @@ export class RouletteDatabase {
       latestResult: this.getLatestResult(safeSource, safeInstrument),
       precloseForecast: {
         latest,
-        predictiveLeaderMetrics: mapPredictiveLeaderMetrics(predictiveLeaderRows),
+        predictiveLeaderMetrics: mapPredictiveLeaderMetricFacts(predictiveLeaderRows),
         predictiveLeaderAccount: this.#predictiveLeaderAccountState(
           safeSource,
           safeInstrument,
@@ -12706,124 +13506,42 @@ export class RouletteDatabase {
         };
     const forecastCount = Number(metrics.forecast_count);
     const settledCount = Number(metrics.settled_count);
+    this.#ensureTrajectoryMetricFacts(safeSource, safeInstrument);
     const trajectoryMetrics = mapTrajectoryMetrics(
       this.sqlite
         .prepare(`
-          WITH eligible AS (
-            SELECT
-              trajectory_shadows.integration_json,
-              settlements.round_result_id,
-              settlements.actual_number,
-              settlement_results.raw_cell,
-              json_extract(
-                trajectory_shadows.integration_json,
-                '$.numberArea.typical.wireCell'
-              ) AS q50_wire_cell,
-              json_extract(
-                trajectory_shadows.integration_json,
-                '$.numberRanking.version'
-              ) = ?
-              AND json_extract(
-                trajectory_shadows.integration_json,
-                '$.numberRanking.evidenceCandidateCount'
-              ) >= ? AS has_rank37
-            FROM forecast_trajectory_shadows AS trajectory_shadows
-            JOIN round_forecasts AS forecasts
-              ON forecasts.id = trajectory_shadows.forecast_id
-            JOIN forecast_snapshots AS snapshots
-              ON snapshots.id = forecasts.snapshot_id
-            LEFT JOIN forecast_settlements AS settlements
-              ON settlements.forecast_id = forecasts.id
-            LEFT JOIN round_results AS settlement_results
-              ON settlement_results.id = settlements.round_result_id
-            WHERE snapshots.source = ?
-              AND snapshots.instrument = ?
-              AND trajectory_shadows.model_version = ?
-              AND trajectory_shadows.status = 'ready'
-              AND trajectory_adaptive_snapshot_valid_v2(
-                trajectory_shadows.status,
-                trajectory_shadows.cutoff_at,
-                snapshots.locked_at,
-                trajectory_shadows.lock_price,
-                snapshots.current_price,
-                trajectory_shadows.median_cell_width,
-                trajectory_shadows.direction,
-                trajectory_shadows.probabilities_json,
-                trajectory_shadows.expected_delta_cell_widths,
-                trajectory_shadows.sample_json,
-                trajectory_shadows.nearest_ids_json,
-                trajectory_shadows.parameters_json,
-                trajectory_shadows.current_prefix_json,
-                trajectory_shadows.integration_json,
-                snapshots.cells_json
-              ) = 1
-          ), graded AS (
-            SELECT
-              *,
-              CASE
-                WHEN round_result_id IS NOT NULL
-                  AND raw_cell BETWEEN 0 AND 37
-                  AND actual_number = CASE WHEN raw_cell = 37 THEN 0 ELSE raw_cell END
-                THEN 1 ELSE 0
-              END AS is_gradable
-            FROM eligible
-          )
           SELECT
-            COUNT(*) AS ready_count,
-            COALESCE(SUM(round_result_id IS NOT NULL), 0) AS settled_count,
-            COALESCE(SUM(is_gradable), 0) AS evaluated_count,
-            COALESCE(SUM(
-              is_gradable AND EXISTS (
-                SELECT 1
-                FROM json_each(
-                  graded.integration_json,
-                  '$.displayRange.cells'
-                ) AS displayed
-                WHERE json_extract(displayed.value, '$.wireCell') = graded.raw_cell
-              )
-            ), 0) AS display_range_hits,
-            COALESCE(SUM(is_gradable AND q50_wire_cell = raw_cell), 0)
-              AS q50_exact_hits,
-            COALESCE(SUM(
-              is_gradable AND EXISTS (
-                SELECT 1
-                FROM json_each(
-                  graded.integration_json,
-                  '$.numberArea.corridor.cells'
-                ) AS corridor
-                WHERE json_extract(corridor.value, '$.wireCell') = graded.raw_cell
-              )
-            ), 0) AS full_corridor_hits,
-            COALESCE(SUM(has_rank37), 0) AS rank37_ready_count,
-            COALESCE(SUM(has_rank37 AND round_result_id IS NOT NULL), 0)
+            COALESCE(SUM(metric_facts.ready_count), 0) AS ready_count,
+            COALESCE(SUM(metric_facts.settled_count), 0) AS settled_count,
+            COALESCE(SUM(metric_facts.evaluated_count), 0) AS evaluated_count,
+            COALESCE(SUM(metric_facts.display_range_hits), 0)
+              AS display_range_hits,
+            COALESCE(SUM(metric_facts.q50_exact_hits), 0) AS q50_exact_hits,
+            COALESCE(SUM(metric_facts.full_corridor_hits), 0)
+              AS full_corridor_hits,
+            COALESCE(SUM(metric_facts.rank37_ready_count), 0)
+              AS rank37_ready_count,
+            COALESCE(SUM(metric_facts.rank37_settled_count), 0)
               AS rank37_settled_count,
-            COALESCE(SUM(has_rank37 AND is_gradable), 0)
+            COALESCE(SUM(metric_facts.rank37_evaluated_count), 0)
               AS rank37_evaluated_count,
-            COALESCE(SUM(
-                has_rank37 AND is_gradable AND actual_number = json_extract(
-                  integration_json,
-                  '$.numberRanking.ranking[0].number'
-                )
-              ), 0) AS rank37_top1_hits,
-            COALESCE(SUM(
-                has_rank37 AND is_gradable AND EXISTS (
-                  SELECT 1
-                  FROM json_each(
-                    graded.integration_json,
-                    '$.numberRanking.ranking'
-                  ) AS ranked_number
-                  WHERE json_extract(ranked_number.value, '$.rank') <= 3
-                    AND json_extract(ranked_number.value, '$.number') = graded.actual_number
-                )
-              ), 0) AS rank37_top3_hits
-          FROM graded
+            COALESCE(SUM(metric_facts.rank37_top1_hits), 0)
+              AS rank37_top1_hits,
+            COALESCE(SUM(metric_facts.rank37_top3_hits), 0)
+              AS rank37_top3_hits
+          FROM forecast_trajectory_metric_facts AS metric_facts
+          JOIN round_forecasts AS forecasts
+            ON forecasts.id = metric_facts.forecast_id
+          JOIN forecast_snapshots AS snapshots
+            ON snapshots.id = forecasts.snapshot_id
+          WHERE metric_facts.validator_version = ?
+            AND snapshots.source = ?
+            AND snapshots.instrument = ?
         `)
         .get(
-          TRAJECTORY_RANK37_VERSION,
-          TRAJECTORY_RANK37_MIN_EVIDENCE_CANDIDATES,
+          TRAJECTORY_METRIC_FACT_VERSION,
           safeSource,
           safeInstrument,
-          TRAJECTORY_SHADOW_ADAPTIVE_VERSION,
         ),
     );
     const predictiveLeaderRows = latest
@@ -12833,7 +13551,7 @@ export class RouletteDatabase {
           latest.horizonSeconds,
         )
       : [];
-    const predictiveLeaderMetrics = mapPredictiveLeaderMetrics(
+    const predictiveLeaderMetrics = mapPredictiveLeaderMetricFacts(
       predictiveLeaderRows,
     );
     const predictiveLeaderAccount = this.#predictiveLeaderAccountState(

@@ -349,7 +349,7 @@ test("bulk trajectory prefix loading is differential-equivalent to 500 legacy qu
       database.recordPrecloseForecast(
         forecastAttempt("bulk-current", current.correctedLockPrice),
       ),
-      { inserted: true, roundId: "bulk-current" },
+      { inserted: true, databaseChanged: true, roundId: "bulk-current" },
     );
     assert.equal(
       tickPrefixSelectCount,

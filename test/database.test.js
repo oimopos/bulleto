@@ -407,9 +407,13 @@ test("schema contains all persistence tables", () => {
       "follower_top5_sessions",
       "forecast_consensus_snapshots",
       "forecast_pair_snapshots",
+      "forecast_predictive_leader_metric_dirty",
+      "forecast_predictive_leader_metric_facts",
       "forecast_predictive_leader_snapshots",
       "forecast_settlements",
       "forecast_snapshots",
+      "forecast_trajectory_metric_dirty",
+      "forecast_trajectory_metric_facts",
       "forecast_trajectory_shadows",
       "incident_resolutions",
       "incidents",
@@ -425,7 +429,18 @@ test("schema contains all persistence tables", () => {
       "virtual_bet_sessions",
       "virtual_bets",
     ]);
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 24);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 25);
+    assert.equal(
+      database.sqlite
+        .prepare(`
+          SELECT COUNT(*) AS count
+          FROM sqlite_master
+          WHERE type = 'index'
+            AND name = 'forecast_predictive_leaders_training_idx'
+        `)
+        .get().count,
+      1,
+    );
     assert.equal(
       database.sqlite
         .prepare("SELECT COUNT(*) AS count FROM predictive_leader_account_ladder_resets")
@@ -503,7 +518,206 @@ test("schema contains all persistence tables", () => {
   }
 });
 
-test("version 24 keeps the Top-5 deposit and retained v20-v22 tables", () => {
+test("version 25 backfills metric facts and rebuilds a tampered row", () => {
+  const directory = mkdtempSync(join(tmpdir(), "roulette-v25-metric-facts-"));
+  const path = join(directory, "tracker.sqlite");
+  const currentStartMs = BASE_TIME + 4_000_000;
+  const currentLockedMs = currentStartMs + 51_000;
+  const currentEndMs = currentStartMs + 100_000;
+  let clockMs = BASE_TIME;
+  let database = createDatabase({
+    path,
+    clock: () => new Date(clockMs),
+  });
+  try {
+    const cells = Array.from({ length: 38 }, (_, wireCell) => ({
+      c: wireCell,
+      vt: 5.6 - wireCell / 100,
+      vf: 5.59 - wireCell / 100,
+    }));
+    const prefix = (startsAtMs) => [
+      ...[1, 5, 10, 15, 20, 25, 30, 35, 40, 45].map((seconds) => ({
+        atMs: startsAtMs + seconds * 1_000,
+        price: 5.3 + seconds * 0.0006,
+      })),
+      { atMs: startsAtMs + 50_000, price: 5.33 },
+      {
+        atMs: startsAtMs + 50_000,
+        price: 5.34,
+        receivedAtMs: startsAtMs + 51_000,
+      },
+    ];
+    const historicalResults = [];
+    for (let index = 0; index < 30; index += 1) {
+      const roundId = `v25-history-${index}`;
+      const startsAtMs = currentStartMs - (30 - index) * 120_000;
+      const cutoffMs = startsAtMs + 51_000;
+      const endsAtMs = startsAtMs + 100_000;
+      clockMs = cutoffMs + 100;
+      database.recordRoundTrajectory(roundTrajectory(roundId, {
+        startsAtMs,
+        receivedAtMs: cutoffMs,
+        factors: prefix(startsAtMs),
+      }));
+      historicalResults.push(event(7, `v25-history-${index}`, 0, {
+        externalRoundId: roundId,
+        settledAt: iso(endsAtMs),
+        observedAt: iso(endsAtMs),
+        price: index >= 26 ? 5.22 : 5.36,
+      }));
+    }
+    database.ingestBatch(historicalResults);
+    markResultsCreatedAtObservation(database, "v25-history-");
+    clockMs = currentLockedMs + 100;
+    database.recordRoundTrajectory(roundTrajectory("v25-existing-forecast", {
+      startsAtMs: currentStartMs,
+      receivedAtMs: currentLockedMs,
+      cells,
+      factors: prefix(currentStartMs),
+    }));
+    clockMs = currentLockedMs + 2_000;
+    assert.equal(
+      database.recordPrecloseForecast(precloseForecast("v25-existing-forecast", {
+        bettingClosesAt: iso(currentStartMs + 60_000),
+        roundEndsAt: iso(currentEndMs),
+        factorAt: iso(currentLockedMs),
+        lockedAt: iso(currentLockedMs),
+        currentPrice: 5.34,
+        startPrice: 5.35,
+        cells,
+      })).inserted,
+      true,
+    );
+    const initialState = database.getPrecloseForecastState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    const expected = initialState.predictiveLeaderMetrics;
+    const expectedTrajectory = initialState.trajectoryMetrics;
+    assert.equal(initialState.latest.predictiveLeader.status, "unavailable");
+    assert.equal(initialState.latest.trajectoryShadow.status, "ready");
+    assert.equal(
+      database.sqlite
+        .prepare("SELECT COUNT(*) AS count FROM forecast_predictive_leader_metric_facts")
+        .get().count,
+      1,
+    );
+    database.sqlite.exec(`
+      DELETE FROM forecast_predictive_leader_metric_facts;
+      DELETE FROM forecast_predictive_leader_metric_dirty;
+      DELETE FROM forecast_trajectory_metric_facts;
+      DELETE FROM forecast_trajectory_metric_dirty;
+      PRAGMA user_version = 24;
+    `);
+    database.close();
+
+    database = createDatabase({ path });
+    assert.equal(
+      database.sqlite
+        .prepare("SELECT COUNT(*) AS count FROM forecast_predictive_leader_metric_dirty")
+        .get().count,
+      1,
+    );
+    assert.equal(
+      database.sqlite
+        .prepare("SELECT COUNT(*) AS count FROM forecast_trajectory_metric_dirty")
+        .get().count,
+      1,
+    );
+    const reopenedState = database.getPrecloseForecastState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    assert.deepEqual(reopenedState.predictiveLeaderMetrics, expected);
+    assert.deepEqual(reopenedState.trajectoryMetrics, expectedTrajectory);
+    assert.equal(
+      database.sqlite
+        .prepare("SELECT COUNT(*) AS count FROM forecast_predictive_leader_metric_dirty")
+        .get().count,
+      0,
+    );
+    assert.equal(
+      database.sqlite
+        .prepare("SELECT COUNT(*) AS count FROM forecast_trajectory_metric_dirty")
+        .get().count,
+      0,
+    );
+
+    database.sqlite.exec(`
+      DELETE FROM forecast_predictive_leader_metric_facts;
+      DELETE FROM forecast_predictive_leader_metric_dirty;
+      DELETE FROM forecast_trajectory_metric_facts;
+      DELETE FROM forecast_trajectory_metric_dirty;
+    `);
+    const missingFactsState = database.getPrecloseForecastState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    assert.deepEqual(
+      missingFactsState.predictiveLeaderMetrics,
+      expected,
+      "a missing leader fact must rebuild even without a dirty marker",
+    );
+    assert.deepEqual(
+      missingFactsState.trajectoryMetrics,
+      expectedTrajectory,
+      "a missing trajectory fact must rebuild even without a dirty marker",
+    );
+    database.sqlite
+      .prepare(`
+        UPDATE forecast_predictive_leader_metric_facts
+        SET metric_version = 'stale-test-version'
+      `)
+      .run();
+    database.sqlite
+      .prepare(`
+        UPDATE forecast_trajectory_metric_facts
+        SET validator_version = 'stale-test-version'
+      `)
+      .run();
+    const outdatedFactsState = database.getPrecloseForecastState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    assert.deepEqual(
+      outdatedFactsState.predictiveLeaderMetrics,
+      expected,
+      "an outdated leader fact must rebuild in the same process",
+    );
+    assert.deepEqual(
+      outdatedFactsState.trajectoryMetrics,
+      expectedTrajectory,
+      "an outdated trajectory fact must rebuild in the same process",
+    );
+
+    database.sqlite
+      .prepare("UPDATE forecast_predictive_leader_snapshots SET snapshot_json = '{}'")
+      .run();
+    assert.equal(
+      database.sqlite
+        .prepare("SELECT COUNT(*) AS count FROM forecast_predictive_leader_metric_dirty")
+        .get().count,
+      1,
+    );
+    const tampered = database.getPrecloseForecastState(
+      "buleto",
+      "PRIMECOIN(XPM)/RUB",
+    );
+    assert.equal(tampered.latest.predictiveLeader, null);
+    assert.equal(tampered.predictiveLeaderMetrics.readyCount, 0);
+    assert.equal(
+      database.sqlite
+        .prepare("SELECT COUNT(*) AS count FROM forecast_predictive_leader_metric_dirty")
+        .get().count,
+      0,
+    );
+  } finally {
+    database.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("version 25 keeps the Top-5 deposit and retained v20-v22 tables", () => {
   const directory = mkdtempSync(join(tmpdir(), "roulette-v24-retained-"));
   const path = join(directory, "tracker.sqlite");
   let database = createDatabase({ path });
@@ -532,7 +746,7 @@ test("version 24 keeps the Top-5 deposit and retained v20-v22 tables", () => {
     database = createDatabase({ path });
     assert.equal(
       database.sqlite.prepare("PRAGMA user_version").get().user_version,
-      24,
+      25,
     );
     assert.equal(
       database.sqlite
@@ -597,7 +811,7 @@ test("version 24 repairs stale stream state before accepting another result", ()
         .map((row) => Number(row.continuity_epoch)),
       [0, 1, 1],
     );
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 24);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 25);
   } finally {
     database.close();
     rmSync(directory, { recursive: true, force: true });
@@ -739,7 +953,7 @@ test("version 13 creates one live follower tracker at the current tail", () => {
       "buleto",
       "PRIMECOIN(XPM)/RUB",
     );
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 24);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 25);
     assert.equal(migrated.status, "armed");
     assert.equal(migrated.currentSession.sourceNumber, 9);
     assert.deepEqual(migrated.currentSession.fixedNumbers, [5, 4, 3, 2, 1]);
@@ -772,6 +986,7 @@ test("pre-close forecasts enforce the five-second lock boundary and fresh factor
     const valid = precloseForecast("forecast-valid-t-minus-6");
     assert.deepEqual(database.recordPrecloseForecast(valid), {
       inserted: true,
+      databaseChanged: true,
       roundId: "forecast-valid-t-minus-6",
     });
 
@@ -922,6 +1137,7 @@ test("predictive leader is frozen before outcome, settles independently, and rem
     clockMs = BASE_TIME + 52_000;
     assert.deepEqual(database.recordPrecloseForecast(attempt), {
       inserted: true,
+      databaseChanged: true,
       roundId: "107",
     });
 
@@ -978,6 +1194,7 @@ test("predictive leader is frozen before outcome, settles independently, and rem
 
     assert.deepEqual(database.recordPrecloseForecast(attempt), {
       inserted: false,
+      databaseChanged: false,
       roundId: "107",
     });
     assert.equal(
@@ -2259,6 +2476,7 @@ test("trajectory shadow freezes a correction-aware past-only READY prediction an
     clockMs = currentLockedMs + 2_000;
     assert.deepEqual(database.recordPrecloseForecast(attempt), {
       inserted: true,
+      databaseChanged: true,
       roundId: currentRoundId,
     });
     const currentForecastId = Number(
@@ -3047,6 +3265,7 @@ test("start-price v2 round-trips its prediction basis and frozen OLS shadow", ()
   try {
     assert.deepEqual(database.recordPrecloseForecast(attempt), {
       inserted: true,
+      databaseChanged: true,
       roundId: "start-price-v2-round-trip",
     });
     const storedFeatures = JSON.parse(
@@ -3339,6 +3558,7 @@ test("early capture leaves enough compute time to freeze a causal predictive lea
     forecastClockCalls = 0;
     assert.deepEqual(database.recordPrecloseForecast(attempt), {
       inserted: true,
+      databaseChanged: true,
       roundId: "107",
     });
 
@@ -3432,7 +3652,7 @@ test("predictive leader still fails closed when compute crosses the five-second 
           secondsToEnd: 55,
         },
       })),
-      { inserted: true, roundId: "107" },
+      { inserted: true, databaseChanged: true, roundId: "107" },
     );
 
     assert.equal(
@@ -3491,7 +3711,7 @@ test("trajectory shadow failure cannot roll back the primary forecast transactio
 
     assert.deepEqual(
       database.recordPrecloseForecast(precloseForecast("shadow-isolated")),
-      { inserted: true, roundId: "shadow-isolated" },
+      { inserted: true, databaseChanged: true, roundId: "shadow-isolated" },
     );
     for (const table of [
       "forecast_snapshots",
@@ -3561,7 +3781,7 @@ test("predictive leader failure cannot roll back the forecast or trajectory shad
     `);
     assert.deepEqual(
       database.recordPrecloseForecast(precloseForecast("leader-isolated")),
-      { inserted: true, roundId: "leader-isolated" },
+      { inserted: true, databaseChanged: true, roundId: "leader-isolated" },
     );
     for (const table of [
       "forecast_snapshots",
@@ -3596,7 +3816,7 @@ test("predictive leader failure cannot roll back the forecast or trajectory shad
     database.sqlite.exec("DROP TRIGGER reject_predictive_leader");
     assert.deepEqual(
       database.recordPrecloseForecast(precloseForecast("leader-isolated")),
-      { inserted: false, roundId: "leader-isolated" },
+      { inserted: false, databaseChanged: true, roundId: "leader-isolated" },
     );
     assert.equal(
       database.sqlite
@@ -3703,6 +3923,7 @@ test("forecast pair snapshot fixes deterministic anchor, ranking, ties, and over
     clockMs = BASE_TIME + 52_000;
     assert.deepEqual(database.recordPrecloseForecast(attempt), {
       inserted: true,
+      databaseChanged: true,
       roundId: "7015",
     });
 
@@ -3776,6 +3997,7 @@ test("forecast pair snapshot fixes deterministic anchor, ranking, ties, and over
     };
     assert.deepEqual(database.recordPrecloseForecast(attempt), {
       inserted: false,
+      databaseChanged: false,
       roundId: "7015",
     });
     assert.deepEqual(
@@ -4180,7 +4402,7 @@ test("versions 11 and 12 do not backfill derived snapshots for version 10 foreca
       path,
       clock: () => new Date(BASE_TIME + 52_000),
     });
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 24);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 25);
     assert.equal(
       Number(
         database.sqlite
@@ -4259,7 +4481,7 @@ test("version 12 does not backfill consensus for legacy version 11 forecasts", (
       path,
       clock: () => new Date(BASE_TIME + 52_000),
     });
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 24);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 25);
     assert.equal(
       database.sqlite
         .prepare("SELECT COUNT(*) AS count FROM forecast_consensus_snapshots")
@@ -4321,7 +4543,7 @@ test("version 14 migration preserves a legacy Borda consensus row exactly", () =
       clock: () => new Date(BASE_TIME + 52_000),
     });
 
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 24);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 25);
     const migratedRow = {
       ...database.sqlite.prepare("SELECT * FROM forecast_consensus_snapshots").get(),
     };
@@ -4375,7 +4597,7 @@ test("versions 15 through 19 add empty prospective tables without backfilling le
       path,
       clock: () => new Date(BASE_TIME + 52_000),
     });
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 24);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 25);
     assert.equal(
       database.sqlite.prepare("SELECT COUNT(*) AS count FROM round_trajectories").get()
         .count,
@@ -4471,7 +4693,7 @@ test("version 17 never backfills an existing version 16 leader into the paper ac
       path,
       clock: () => new Date(BASE_TIME + 52_000),
     });
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 24);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 25);
     assert.equal(
       database.sqlite
         .prepare("SELECT COUNT(*) AS count FROM forecast_predictive_leader_snapshots")
@@ -4622,7 +4844,7 @@ test("version 18 preserves version 17 bet rows and adds nullable void audit fiel
       path,
       clock: () => new Date(clockMs),
     });
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 24);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 25);
     const after = database.sqlite
       .prepare("SELECT * FROM predictive_leader_account_bets ORDER BY forecast_id")
       .all();
@@ -4996,7 +5218,7 @@ test("version 5 history is backfilled into continuity epochs before migration co
 
   const database = createDatabase({ path });
   try {
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 24);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 25);
     assert.deepEqual(
       database.sqlite
         .prepare("SELECT continuity_epoch FROM round_results ORDER BY settled_at, id")
@@ -5056,7 +5278,7 @@ test("version 9 reconciles a proven contiguous shutdown boundary without deletin
 
     database = createDatabase({ path, gapThresholdSeconds: 135 });
     const state = database.getDashboardState();
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 24);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 25);
     assert.equal(state.totals.results, 5, "raw results are never recreated or deleted");
     assert.equal(state.totals.cycles, 1);
     assert.equal(state.totals.invalidCycles, 0);
@@ -7285,7 +7507,7 @@ test("v7 paper history initializes v8 bankroll with all known net results exactl
       "buleto",
       "PRIMECOIN(XPM)/RUB",
     );
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 24);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 25);
     assert.equal(state.testBank.initialBalance, 87_700);
     assert.equal(state.testBank.currentBalance, 87_910);
     assert.equal(state.testBank.netResult, 210);

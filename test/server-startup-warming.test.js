@@ -154,7 +154,7 @@ test('warming keeps liveness up while heavy state reads fail closed with retry m
   const forecastsRoute = routeBody('/api/forecasts', '/api/predictive-leader');
   assert.match(forecastsRoute, /trajectoryValidationIsWarming\s*\(\s*\)/);
   assert.match(forecastsRoute, /sendStartupWarming\s*\(\s*response\s*\)/);
-  assert.match(forecastsRoute, /db\.getPrecloseForecastState\s*\(/);
+  assert.match(forecastsRoute, /precloseForecastStateFromDatabase\s*\(\s*\)/);
 
   const liveRoute = routeBody('/api/live', '/api/health');
   assert.match(liveRoute, /sendJson\s*\(\s*response,\s*200,/);
