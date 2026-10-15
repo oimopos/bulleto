@@ -230,6 +230,16 @@ function assertWarmAccountInvariants(account) {
 
 function assertGatedAccountInvariants(account) {
   assert.equal(
+    account.contributedBalance,
+    account.initialBalance + account.totalDeposits,
+  );
+  assert.equal(
+    account.contributedBalance - account.totalStaked + account.totalGrossPayout,
+    account.finalBalance,
+  );
+  assert.equal(account.finalBalance - account.contributedBalance, account.netResult);
+  assert.equal(account.depositCount === 0, account.latestDeposit === null);
+  assert.equal(
     account.observedWithoutBetCount + account.eligibleBetCount,
     account.trackedAttemptCount,
   );
@@ -238,11 +248,6 @@ function assertGatedAccountInvariants(account) {
     account.eligibleBetCount,
   );
   assert.equal(account.hitCount + account.missCount, account.betCount);
-  assert.equal(
-    account.initialBalance - account.totalStaked + account.totalGrossPayout,
-    account.finalBalance,
-  );
-  assert.equal(account.finalBalance - account.initialBalance, account.netResult);
   assert.equal(
     account.nextRoundCost,
     account.model.numbersPerRound * account.nextStakePerNumber,
@@ -1818,6 +1823,289 @@ test("frozen Top-5 gated account permanently stops after the full ticket becomes
   }
 });
 
+test("a durable Top-5 deposit is applied once after the latest result without rewriting P/L or the ladder", () => {
+  const directory = mkdtempSync(join(tmpdir(), "roulette-top5-deposit-"));
+  const path = join(directory, "tracker.sqlite");
+  const depositKey = "manual-top5-credit-2026-10-15-50000";
+  const amount = 50_000;
+  const depositedAt = "2026-10-15T12:00:00.000Z";
+  let database = createDatabase({ path });
+
+  try {
+    const writer = createTrackerFixtureWriter(database, "gated-deposit");
+    ingestGatedCalibrationCohort(writer, [1, 1, 1, 1, 1]);
+    armGatedCurrentSession(writer);
+    writer.ingest(Array.from({ length: 100 }, () => GATED_FILLER));
+
+    const before = trackerState(database).gatedAccount;
+    assert.equal(before.status, "exhausted");
+    assert.ok(before.skippedAfterExhaustionCount > 0);
+    assert.ok(before.ladder.missCount > 0);
+    assert.ok(before.ladder.totalLoss > 0);
+    const afterResultId = Number(
+      database.sqlite
+        .prepare(`
+          SELECT MAX(id) AS id
+          FROM round_results
+          WHERE source = ? AND instrument = ?
+        `)
+        .get(SOURCE, INSTRUMENT).id,
+    );
+    const beforeSessions = database.sqlite
+      .prepare(`
+        SELECT *
+        FROM follower_top5_sessions
+        WHERE source = ? AND instrument = ?
+        ORDER BY id
+      `)
+      .all(SOURCE, INSTRUMENT)
+      .map((row) => ({ ...row }));
+    const beforeAttempts = database.sqlite
+      .prepare(`
+        SELECT attempts.*
+        FROM follower_top5_attempts AS attempts
+        JOIN follower_top5_sessions AS sessions ON sessions.id = attempts.session_id
+        WHERE sessions.source = ? AND sessions.instrument = ?
+        ORDER BY attempts.id
+      `)
+      .all(SOURCE, INSTRUMENT)
+      .map((row) => ({ ...row }));
+
+    assert.deepEqual(
+      database.applyFollowerTop5GatedDeposit(SOURCE, INSTRUMENT, {
+        depositKey,
+        amount,
+        depositedAt,
+      }),
+      { applied: true, depositKey, amount, afterResultId, depositedAt },
+    );
+
+    const funded = trackerState(database).gatedAccount;
+    assert.deepEqual(
+      {
+        initialBalance: funded.initialBalance,
+        totalDeposits: funded.totalDeposits,
+        contributedBalance: funded.contributedBalance,
+        depositCount: funded.depositCount,
+        finalBalance: funded.finalBalance,
+        netResult: funded.netResult,
+        latestDeposit: funded.latestDeposit,
+      },
+      {
+        initialBalance: 10_000,
+        totalDeposits: amount,
+        contributedBalance: 60_000,
+        depositCount: 1,
+        finalBalance: before.finalBalance + amount,
+        netResult: before.netResult,
+        latestDeposit: {
+          depositKey,
+          amount,
+          afterResultId,
+          balanceBefore: before.finalBalance,
+          balanceAfter: before.finalBalance + amount,
+          depositedAt,
+        },
+      },
+    );
+    assert.deepEqual(
+      {
+        status: funded.status,
+        nextStakePerNumber: funded.nextStakePerNumber,
+        nextRoundCost: funded.nextRoundCost,
+        betCount: funded.betCount,
+        hitCount: funded.hitCount,
+        missCount: funded.missCount,
+        totalStaked: funded.totalStaked,
+        totalGrossPayout: funded.totalGrossPayout,
+        ladder: funded.ladder,
+        latestOutcome: funded.latestOutcome,
+        minimumBalance: funded.minimumBalance,
+        maximumDrawdown: funded.maximumDrawdown,
+      },
+      {
+        status: "running",
+        nextStakePerNumber: before.nextStakePerNumber,
+        nextRoundCost: before.nextRoundCost,
+        betCount: before.betCount,
+        hitCount: before.hitCount,
+        missCount: before.missCount,
+        totalStaked: before.totalStaked,
+        totalGrossPayout: before.totalGrossPayout,
+        ladder: before.ladder,
+        latestOutcome: before.latestOutcome,
+        minimumBalance: before.minimumBalance,
+        maximumDrawdown: before.maximumDrawdown,
+      },
+      "depositing cash must not rewrite any prior bet or reset its recovery ladder",
+    );
+    assert.equal(funded.canAffordNextRound, true);
+    assert.equal(funded.shortfall, 0);
+    assert.equal(funded.exhaustedAt, null);
+    assert.equal(
+      funded.skippedAfterExhaustionCount,
+      before.skippedAfterExhaustionCount,
+    );
+    assert.equal(funded.currentAction.action, "would_bet");
+    assert.equal(
+      funded.currentAction.attemptNumber,
+      before.currentAction.attemptNumber,
+    );
+    assert.deepEqual(
+      database.sqlite
+        .prepare(`
+          SELECT *
+          FROM follower_top5_sessions
+          WHERE source = ? AND instrument = ?
+          ORDER BY id
+        `)
+        .all(SOURCE, INSTRUMENT)
+        .map((row) => ({ ...row })),
+      beforeSessions,
+    );
+    assert.deepEqual(
+      database.sqlite
+        .prepare(`
+          SELECT attempts.*
+          FROM follower_top5_attempts AS attempts
+          JOIN follower_top5_sessions AS sessions ON sessions.id = attempts.session_id
+          WHERE sessions.source = ? AND sessions.instrument = ?
+          ORDER BY attempts.id
+        `)
+        .all(SOURCE, INSTRUMENT)
+        .map((row) => ({ ...row })),
+      beforeAttempts,
+    );
+    assertGatedAccountInvariants(funded);
+
+    assert.deepEqual(
+      database.applyFollowerTop5GatedDeposit(SOURCE, INSTRUMENT, {
+        depositKey,
+        amount,
+        depositedAt,
+      }),
+      { applied: false, depositKey, amount, afterResultId, depositedAt },
+    );
+    assert.equal(trackerState(database).gatedAccount.finalBalance, funded.finalBalance);
+
+    database.close();
+    database = createDatabase({ path });
+    assert.deepEqual(
+      database.applyFollowerTop5GatedDeposit(SOURCE, INSTRUMENT, {
+        depositKey,
+        amount,
+        depositedAt,
+      }),
+      { applied: false, depositKey, amount, afterResultId, depositedAt },
+    );
+    const reopened = trackerState(database).gatedAccount;
+    assert.equal(reopened.depositCount, 1);
+    assert.equal(reopened.totalDeposits, amount);
+    assert.equal(reopened.finalBalance, funded.finalBalance);
+    assert.deepEqual(reopened.latestDeposit, funded.latestDeposit);
+    assert.deepEqual(reopened.ladder, before.ladder);
+
+    const latestSettledAt = database.sqlite
+      .prepare(`
+        SELECT settled_at
+        FROM round_results
+        WHERE source = ? AND instrument = ?
+        ORDER BY settled_at DESC, id DESC
+        LIMIT 1
+      `)
+      .get(SOURCE, INSTRUMENT).settled_at;
+    const nextOffsetSeconds = (Date.parse(latestSettledAt) - BASE_TIME) / 1_000 + 1;
+    database.ingestBatch([
+      event(
+        GATED_FILLER,
+        "gated-deposit-late-pre-deposit-result",
+        nextOffsetSeconds,
+      ),
+    ]);
+    const afterLateResult = trackerState(database).gatedAccount;
+    assert.equal(afterLateResult.finalBalance, funded.finalBalance);
+    assert.equal(afterLateResult.betCount, funded.betCount);
+    assert.equal(
+      afterLateResult.skippedAfterExhaustionCount,
+      funded.skippedAfterExhaustionCount + 1,
+    );
+    assert.equal(
+      afterLateResult.currentAction.attemptNumber,
+      funded.currentAction.attemptNumber + 1,
+    );
+
+    const postDepositGapAt = new Date(
+      Date.parse(depositedAt) + 1_000,
+    ).toISOString();
+    database.ingestBatchAfterGap(
+      {
+        source: SOURCE,
+        instrument: INSTRUMENT,
+        incidentKey: "gated-deposit-post-deposit-gap",
+        detectedAt: postDepositGapAt,
+        message: "post-deposit gap must reset the resumed ladder",
+      },
+      [],
+    );
+    const afterGap = trackerState(database).gatedAccount;
+    assert.equal(afterGap.finalBalance, funded.finalBalance);
+    assert.equal(afterGap.netResult, funded.netResult);
+    assert.deepEqual(afterGap.ladder, { missCount: 0, totalLoss: 0 });
+    assert.equal(afterGap.nextStakePerNumber, 10);
+    assert.equal(afterGap.nextRoundCost, 50);
+
+    const postDepositAnchorAt = new Date(
+      Date.parse(depositedAt) + 2_000,
+    ).toISOString();
+    database.ingestBatch([
+      event(
+        GATED_CURRENT_SOURCE,
+        "gated-deposit-first-post-gap-anchor",
+        nextOffsetSeconds + 1,
+        {
+          settledAt: postDepositAnchorAt,
+          observedAt: postDepositAnchorAt,
+        },
+      ),
+    ]);
+    const firstPostDepositAt = new Date(
+      Date.parse(depositedAt) + 3_000,
+    ).toISOString();
+    database.ingestBatch([
+      event(
+        0,
+        "gated-deposit-first-paid-result-after-gap",
+        nextOffsetSeconds + 2,
+        {
+          settledAt: firstPostDepositAt,
+          observedAt: firstPostDepositAt,
+        },
+      ),
+    ]);
+
+    const continued = trackerState(database).gatedAccount;
+    assert.equal(continued.depositCount, 1);
+    assert.equal(continued.totalDeposits, amount);
+    assert.equal(continued.contributedBalance, 60_000);
+    assert.equal(continued.betCount, funded.betCount + 1);
+    assert.equal(continued.missCount, funded.missCount + 1);
+    assert.equal(continued.totalStaked, funded.totalStaked + afterGap.nextRoundCost);
+    assert.equal(continued.totalGrossPayout, funded.totalGrossPayout);
+    assert.equal(continued.netResult, funded.netResult - afterGap.nextRoundCost);
+    assert.equal(continued.finalBalance, funded.finalBalance - afterGap.nextRoundCost);
+    assert.equal(continued.latestOutcome.attemptId, beforeAttempts.at(-1).id + 2);
+    assert.equal(continued.latestOutcome.attemptNumber, 1);
+    assert.equal(continued.latestOutcome.stakePerNumber, 10);
+    assert.equal(continued.latestOutcome.totalStake, 50);
+    assert.equal(continued.latestOutcome.balanceAfter, continued.finalBalance);
+    assert.deepEqual(continued.latestDeposit, funded.latestDeposit);
+    assertGatedAccountInvariants(continued);
+  } finally {
+    if (!database.closed) database.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("a hit inside a catch-up batch closes once and re-arms only at the batch tail", () => {
   const database = createDatabase({ path: ":memory:" });
   try {
@@ -2005,7 +2293,7 @@ test("version 12 history upgrades by arming only its latest tail without backfil
 
     database = createDatabase({ path });
     const state = trackerState(database);
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 19);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 23);
     assert.equal(state.status, "armed");
     assert.equal(state.currentSession.anchor.number, 9);
     assert.equal(state.currentSession.attemptCount, 0);

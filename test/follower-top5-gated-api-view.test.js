@@ -79,6 +79,10 @@ function gatedAccount(overrides = {}) {
     },
     status: "waiting",
     initialBalance: 10_000,
+    totalDeposits: 0,
+    contributedBalance: 10_000,
+    depositCount: 0,
+    latestDeposit: null,
     finalBalance: 10_000,
     netResult: 0,
     nextStakePerNumber: 10,
@@ -282,6 +286,10 @@ test("Top-5 gated snapshot emits one stable five-number BET for an open round", 
   assert.deepEqual(snapshot.account, {
     status: "running",
     initialBalance: 10_000,
+    totalDeposits: 0,
+    contributedBalance: 10_000,
+    depositCount: 0,
+    latestDeposit: null,
     currentBalance: 9_900,
     profit: -100,
     nextStakePerNumber: 20,
@@ -372,6 +380,77 @@ test("Top-5 gated snapshot emits one stable five-number BET for an open round", 
   );
   assert.equal(advanced.signal.action, "BET");
   assert.equal(advanced.freshness.trackerSynced, true);
+});
+
+test("Top-5 gated snapshot exposes deposits separately from strategy profit", () => {
+  const latestDeposit = {
+    depositKey: "manual-top-up-2026-10-15-50000",
+    amount: 50_000,
+    afterResultId: 21_528,
+    balanceBefore: 780,
+    balanceAfter: 50_780,
+    depositedAt: "2026-10-15T11:09:09.441Z",
+  };
+  const latestOutcome = {
+    attemptId: 20_832,
+    sessionId: 1_686,
+    attemptNumber: 51,
+    resultId: 20_832,
+    targetNumbers: [8, 25, 23, 4, 17],
+    selectionCount: 5,
+    resultNumber: 32,
+    hitRank: null,
+    stakePerNumber: 2_060,
+    totalStake: 10_300,
+    outcome: "miss",
+    grossPayout: 0,
+    balanceAfter: 780,
+    nextStakePerNumber: 2_400,
+    nextRoundCost: 12_000,
+    gateEvidence: evidence(),
+    occurredAt: "2026-10-14T17:44:59.000Z",
+  };
+  const snapshot = followerTop5GatedSnapshotForApi({
+    trackerState: tracker({
+      status: "running",
+      totalDeposits: 50_000,
+      contributedBalance: 60_000,
+      depositCount: 1,
+      latestDeposit,
+      finalBalance: 50_780,
+      netResult: -9_220,
+      nextStakePerNumber: 2_400,
+      nextRoundCost: 12_000,
+      latestOutcome,
+    }),
+    collectorState: collector(),
+    now: NOW,
+  });
+
+  assert.equal(snapshot.schemaVersion, 1);
+  assert.equal(
+    snapshot.algorithmVersion,
+    "follower-top5-cumulative80-ladder-v1",
+  );
+  assert.equal(snapshot.currentBalance, 50_780);
+  assert.equal(snapshot.profit, -9_220);
+  assert.deepEqual(snapshot.account, {
+    status: "running",
+    initialBalance: 10_000,
+    totalDeposits: 50_000,
+    contributedBalance: 60_000,
+    depositCount: 1,
+    latestDeposit,
+    currentBalance: 50_780,
+    profit: -9_220,
+    nextStakePerNumber: 2_400,
+    nextRoundCost: 12_000,
+    canAffordNextRound: true,
+    shortfall: 0,
+    ladder: { missCount: 0, totalLoss: 0 },
+    dataComplete: true,
+  });
+  assert.deepEqual(snapshot.latestOutcome, latestOutcome);
 });
 
 test("Top-5 gated snapshot suppresses BET for unavailable, closed, and exhausted states", () => {

@@ -312,6 +312,10 @@ test(
       assert.equal(gatedResponse.headers.get("cache-control"), "no-store");
       const gated = await gatedResponse.json();
       assert.equal(new Date(gated.serverTime).toISOString(), gated.serverTime);
+      assert.equal(
+        new Date(gated.account.latestDeposit.depositedAt).toISOString(),
+        gated.account.latestDeposit.depositedAt,
+      );
       assert.deepEqual(gated, {
         schemaVersion: 1,
         algorithmVersion: "follower-top5-cumulative80-ladder-v1",
@@ -321,7 +325,7 @@ test(
         source: SOURCE,
         instrument: INSTRUMENT,
         status: "waiting",
-        currentBalance: 10_000,
+        currentBalance: 60_000,
         profit: 0,
         serverTime: gated.serverTime,
         strategy: {
@@ -350,7 +354,18 @@ test(
         account: {
           status: "waiting",
           initialBalance: 10_000,
-          currentBalance: 10_000,
+          totalDeposits: 50_000,
+          contributedBalance: 60_000,
+          depositCount: 1,
+          latestDeposit: {
+            depositKey: "manual-top-up-2026-10-15-50000",
+            amount: 50_000,
+            afterResultId: 3,
+            balanceBefore: 10_000,
+            balanceAfter: 60_000,
+            depositedAt: gated.account.latestDeposit.depositedAt,
+          },
+          currentBalance: 60_000,
           profit: 0,
           nextStakePerNumber: 10,
           nextRoundCost: 50,

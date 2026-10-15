@@ -18,6 +18,10 @@ import { virtualBettorSnapshotForApi } from './virtual-bettor-api.js';
 
 const ROOT_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const PUBLIC_DIR = resolve(ROOT_DIR, 'public');
+const FOLLOWER_TOP5_DEPOSIT = Object.freeze({
+  depositKey: 'manual-top-up-2026-10-15-50000',
+  amount: 50_000,
+});
 
 function integerEnv(name, fallback, { min = 0, max = Number.MAX_SAFE_INTEGER } = {}) {
   const raw = process.env[name];
@@ -111,6 +115,15 @@ const resultPipeline = new ResultPipeline({
 // The paper bettor only records a simulation in this local database. It has
 // no credentials, browser automation, payment access, or Buleto write calls.
 db.initializeVirtualBettor('buleto', config.instrument);
+const followerTop5Deposit = db.applyFollowerTop5GatedDeposit(
+  'buleto',
+  config.instrument,
+  FOLLOWER_TOP5_DEPOSIT,
+);
+console.info(
+  `[follower-top5] deposit ${followerTop5Deposit.applied ? 'applied' : 'already applied'}: `
+    + `${followerTop5Deposit.amount}; afterResultId=${followerTop5Deposit.afterResultId ?? 'none'}`,
+);
 db.settlePrecloseForecasts('buleto', config.instrument);
 db.settlePredictiveLeaderAccount('buleto', config.instrument);
 db.applyPredictiveLeaderAccountReset('buleto', config.instrument);

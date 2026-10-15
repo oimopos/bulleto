@@ -85,6 +85,7 @@ function latestOutcomeForApi(outcome) {
   if (!outcome) return null;
   const targetNumbers = frozenTargetNumbers(outcome.targetNumbers);
   return {
+    attemptId: outcome.attemptId,
     sessionId: outcome.sessionId,
     attemptNumber: outcome.attemptNumber,
     resultId: outcome.resultId,
@@ -334,6 +335,14 @@ export function followerTop5GatedSnapshotForApi({
     account: {
       status: account.status ?? 'waiting',
       initialBalance: account.initialBalance ?? null,
+      totalDeposits: account.totalDeposits ?? 0,
+      contributedBalance: account.contributedBalance
+        ?? account.initialBalance
+        ?? null,
+      depositCount: account.depositCount ?? 0,
+      latestDeposit: account.latestDeposit
+        ? { ...account.latestDeposit }
+        : null,
       currentBalance: account.finalBalance ?? null,
       profit: account.netResult ?? null,
       nextStakePerNumber: account.nextStakePerNumber ?? null,

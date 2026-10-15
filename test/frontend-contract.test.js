@@ -155,7 +155,7 @@ test("combined leader is the first dashboard block and renders exactly one numbe
   assert.match(block, /эвристический ранговый индекс, не вероятность и не гарантия преимущества/);
   assert.match(block, /Давность, виртуальная цель, невыпавшие числа, survivor и исторический аналог остаются только наблюдением/);
   assert.match(block, /1 из 37 \(≈2,7%\)/);
-  assert.match(html, /<script type="module" src="\/app\.js\?v=43"><\/script>/);
+  assert.match(html, /<script type="module" src="\/app\.js\?v=44"><\/script>/);
 
   assert.match(app, /from "\.\/combined-number\.js\?v=7"/);
   assert.match(app, /normalizePredictiveLeaderApiSnapshot/);
@@ -945,7 +945,7 @@ test("warm next-round forecast exposes a strict 5-percent walk-forward contract"
   assert.match(html, /id="follower-dynamic-next-title"[^>]*>[^<]*≥5%/);
   assert.match(html, /id="follower-dynamic-next-note"[^>]*>[\s\S]*?5%/);
   assert.match(html, /styles\.css\?v=30/);
-  assert.match(html, /app\.js\?v=43/);
+  assert.match(html, /app\.js\?v=44/);
   assert.match(styles, /\.follower-dynamic-next\s*\{/);
   assert.match(styles, /\.follower-warm-current\s*\{/);
   assert.match(styles, /\.follower-warm-picks\s*\{/);
@@ -1024,6 +1024,19 @@ test("raw dynamic top-5 archival account uses one strict shared ticket ladder", 
 });
 
 test("live fixed top-5 account gates one shared ticket ladder on cumulative 80 percent", () => {
+  const gatedNormalizerStart = app.indexOf(
+    "function normalizedFollowerLiveGatedAccount(value, currentSession, trackerStatus)",
+  );
+  const gatedNormalizerEnd = app.indexOf(
+    "function normalizedFollowerTop5Tracker(value)",
+    gatedNormalizerStart,
+  );
+  const gatedNormalizer = app.slice(gatedNormalizerStart, gatedNormalizerEnd);
+  assert.ok(
+    gatedNormalizerStart >= 0 && gatedNormalizerEnd > gatedNormalizerStart,
+    "the deposit contract must stay inside the live gated account normalizer",
+  );
+
   for (const id of [
     "follower-live-account",
     "follower-live-account-status",
@@ -1054,6 +1067,13 @@ test("live fixed top-5 account gates one shared ticket ladder on cumulative 80 p
   assert.match(app, /startPolicy !== "latch-for-session"/);
   assert.match(app, /noCrossingPolicy !== "observe-only"/);
   assert.match(app, /initialBalance !== 10_000/);
+  assert.match(gatedNormalizer, /value\.totalDeposits/);
+  assert.match(gatedNormalizer, /value\.contributedBalance/);
+  assert.match(gatedNormalizer, /value\.depositCount/);
+  assert.match(gatedNormalizer, /value\.latestDeposit/);
+  assert.match(gatedNormalizer, /contributedBalance !== initialBalance \+ totalDeposits/);
+  assert.match(gatedNormalizer, /finalBalance !== contributedBalance \+ netResult/);
+  assert.match(gatedNormalizer, /outcome\?\.attemptId/);
   assert.match(app, /trackedAttemptCount !== observedWithoutBetCount \+ eligibleBetCount/);
   assert.match(app, /eligibleBetCount !== betCount \+ skippedAfterExhaustionCount/);
   assert.match(app, /hitCount \+ missCount !== betCount/);
@@ -1173,7 +1193,7 @@ test("cycle comparison language is descriptive, responsive, and cache-busted", (
   assert.match(block, /не предсказывает следующее число/);
   assert.doesNotMatch(block, /должн/iu);
   assert.match(html, /href="\/styles\.css\?v=30"/);
-  assert.match(html, /src="\/app\.js\?v=43"/);
+  assert.match(html, /src="\/app\.js\?v=44"/);
   assert.match(styles, /\.cycle-sequence-list\s*\{[\s\S]*?repeat\(auto-fill, minmax\(50px, 1fr\)\)/);
   assert.match(
     styles,

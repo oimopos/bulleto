@@ -848,6 +848,7 @@ export function buildFollowerTop5GatedAccount(
   {
     currentContinuityEpoch = null,
     trackerStatus = "waiting_training",
+    depositRows = [],
   } = {},
 ) {
   const orderedRows = [...rows].sort(
@@ -879,6 +880,11 @@ export function buildFollowerTop5GatedAccount(
       - (rightIndex ?? Number.MAX_SAFE_INTEGER)
       || Number(left.id) - Number(right.id);
   });
+  const deposits = [...depositRows].sort(
+    (left, right) =>
+      Number(left.after_result_id ?? 0) - Number(right.after_result_id ?? 0)
+      || Number(left.id) - Number(right.id),
+  );
   const decisions = [];
   const decisionKey = (sessionId, attemptNumber) =>
     `${sessionId}:${attemptNumber}`;
@@ -933,7 +939,82 @@ export function buildFollowerTop5GatedAccount(
     exhaustedAt: null,
     ladderMissCount: 0,
     ladderTotalLoss: 0,
+    totalDeposits: 0,
+    depositCount: 0,
+    latestDeposit: null,
     latestOutcome: null,
+  };
+  let nextDepositIndex = 0;
+  const applyDeposit = (deposit) => {
+    const amount = Number(deposit.amount);
+    const afterResultId = deposit.after_result_id == null
+      ? null
+      : Number(deposit.after_result_id);
+    if (
+      !Number.isSafeInteger(amount)
+      || amount <= 0
+      || (afterResultId !== null && (
+        !Number.isSafeInteger(afterResultId) || afterResultId < 1
+      ))
+      || typeof deposit.deposit_key !== "string"
+      || deposit.deposit_key.trim() === ""
+      || !Number.isFinite(Date.parse(deposit.deposited_at))
+    ) {
+      throw new Error("gated follower account deposit is invalid");
+    }
+    const balanceBefore = account.currentBalance;
+    const balanceAfter = balanceBefore + amount;
+    const totalDeposits = account.totalDeposits + amount;
+    if (
+      !Number.isSafeInteger(balanceAfter)
+      || !Number.isSafeInteger(totalDeposits)
+    ) {
+      throw new RangeError("gated follower account deposit overflows balance");
+    }
+    account.currentBalance = balanceAfter;
+    account.totalDeposits = totalDeposits;
+    account.depositCount += 1;
+    account.latestDeposit = {
+      depositKey: deposit.deposit_key,
+      amount,
+      afterResultId,
+      balanceBefore,
+      balanceAfter,
+      depositedAt: deposit.deposited_at,
+    };
+    account.peakBalance = Math.max(account.peakBalance, balanceAfter);
+    if (
+      account.status === "exhausted"
+      && balanceAfter
+        >= FOLLOWER_TOP5_COUNT * account.nextStakePerNumber
+    ) {
+      account.status = account.betCount > 0 ? "running" : "waiting";
+      account.exhaustedAt = null;
+    }
+  };
+  const applyDepositsBeforeEvent = (
+    resultId,
+    occurredAt,
+    { boundaryInclusive = false } = {},
+  ) => {
+    const occurredAtMs = Date.parse(occurredAt);
+    if (!Number.isFinite(occurredAtMs)) {
+      throw new Error("gated follower account attempt timestamp is invalid");
+    }
+    while (nextDepositIndex < deposits.length) {
+      const deposit = deposits[nextDepositIndex];
+      const afterResultId = deposit.after_result_id == null
+        ? null
+        : Number(deposit.after_result_id);
+      const followsBoundary = afterResultId === null
+        || (boundaryInclusive
+          ? resultId >= afterResultId
+          : resultId > afterResultId);
+      const followsDepositTime = occurredAtMs > Date.parse(deposit.deposited_at);
+      if (!followsBoundary || !followsDepositTime) break;
+      applyDeposit(deposit);
+      nextDepositIndex += 1;
+    }
   };
   const resetLadder = () => {
     if (account.status === "exhausted") return;
@@ -947,6 +1028,13 @@ export function buildFollowerTop5GatedAccount(
   for (const session of sessions) {
     const sessionId = Number(session.id);
     const sessionEpoch = Number(session.continuity_epoch);
+    const sessionAnchor = rowById.get(Number(session.anchor_result_id))?.row;
+    if (sessionAnchor) {
+      applyDepositsBeforeEvent(
+        Number(sessionAnchor.id),
+        sessionAnchor.settled_at,
+      );
+    }
     if (
       previousSessionEpoch !== null
       && sessionEpoch !== previousSessionEpoch
@@ -963,6 +1051,10 @@ export function buildFollowerTop5GatedAccount(
 
     attempts.forEach((attempt, index) => {
       const attemptNumber = Number(attempt.attempt_number);
+      applyDepositsBeforeEvent(
+        Number(attempt.round_result_id),
+        attempt.occurred_at,
+      );
       const evidence = evidenceByKey.get(
         decisionKey(sessionId, attemptNumber),
       ) ?? null;
@@ -1057,6 +1149,7 @@ export function buildFollowerTop5GatedAccount(
       }
 
       account.latestOutcome = {
+        attemptId: Number(attempt.id),
         sessionId,
         attemptNumber,
         resultId: Number(attempt.round_result_id),
@@ -1081,7 +1174,22 @@ export function buildFollowerTop5GatedAccount(
       startAttempt,
       startEvidence,
     });
-    if (session.status === "invalid_gap") resetLadder();
+    if (session.status === "invalid_gap") {
+      const boundaryResultId = attempts.length === 0
+        ? Number(session.anchor_result_id)
+        : Number(attempts.at(-1).round_result_id);
+      applyDepositsBeforeEvent(
+        boundaryResultId,
+        session.completed_at ?? session.last_event_at,
+        { boundaryInclusive: true },
+      );
+      resetLadder();
+    }
+  }
+
+  while (nextDepositIndex < deposits.length) {
+    applyDeposit(deposits[nextDepositIndex]);
+    nextDepositIndex += 1;
   }
 
   const firstSession = sessions[0] ?? null;
@@ -1217,9 +1325,16 @@ export function buildFollowerTop5GatedAccount(
     },
     status: account.status,
     initialBalance: FOLLOWER_WARM_ACCOUNT_STARTING_BALANCE,
+    totalDeposits: account.totalDeposits,
+    contributedBalance:
+      FOLLOWER_WARM_ACCOUNT_STARTING_BALANCE + account.totalDeposits,
+    depositCount: account.depositCount,
+    latestDeposit: account.latestDeposit,
     finalBalance: account.currentBalance,
     netResult:
-      account.currentBalance - FOLLOWER_WARM_ACCOUNT_STARTING_BALANCE,
+      account.currentBalance
+      - FOLLOWER_WARM_ACCOUNT_STARTING_BALANCE
+      - account.totalDeposits,
     nextStakePerNumber: account.nextStakePerNumber,
     nextRoundCost,
     canAffordNextRound:
@@ -4246,6 +4361,7 @@ export class RouletteDatabase {
     this.#migratePredictiveLeaderAccountV17();
     this.#migratePredictiveLeaderAccountVoidV18();
     this.#migratePredictiveLeaderAccountLadderResetV19(startingVersion);
+    this.#migrateFollowerTop5GatedAccountDepositsV23();
   }
 
   #migratePrecloseForecastsV10() {
@@ -5344,6 +5460,32 @@ export class RouletteDatabase {
       }
       throw error;
     }
+  }
+
+  #migrateFollowerTop5GatedAccountDepositsV23() {
+    this.sqlite.exec(`
+      BEGIN IMMEDIATE;
+
+      CREATE TABLE IF NOT EXISTS follower_top5_gated_account_deposits (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source TEXT NOT NULL,
+        instrument TEXT NOT NULL,
+        deposit_key TEXT NOT NULL CHECK (length(trim(deposit_key)) > 0),
+        amount INTEGER NOT NULL CHECK (amount > 0),
+        after_result_id INTEGER REFERENCES round_results(id),
+        deposited_at TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(source, instrument, deposit_key)
+      );
+
+      CREATE INDEX IF NOT EXISTS follower_top5_gated_deposits_stream_idx
+        ON follower_top5_gated_account_deposits(
+          source, instrument, after_result_id, id
+        );
+
+      PRAGMA user_version = 23;
+      COMMIT;
+    `);
   }
 
   #migrateContinuityReconciliationV9() {
@@ -7816,6 +7958,17 @@ export class RouletteDatabase {
         WHERE sessions.source = ? AND sessions.instrument = ?
       `)
       .get(source, instrument);
+    const depositRevision = this.sqlite
+      .prepare(`
+        SELECT
+          COUNT(*) AS row_count,
+          MAX(id) AS maximum_id,
+          SUM(amount) AS amount_checksum,
+          MAX(deposited_at) AS latest_at
+        FROM follower_top5_gated_account_deposits
+        WHERE source = ? AND instrument = ?
+      `)
+      .get(source, instrument);
     const cacheKey = `${source}\u0000${instrument}`;
     const signature = [
       Number(resultRevision.row_count),
@@ -7829,6 +7982,10 @@ export class RouletteDatabase {
       Number(sessionRevision.miss_checksum ?? 0),
       Number(attemptRevision.row_count),
       attemptRevision.maximum_id == null ? null : Number(attemptRevision.maximum_id),
+      Number(depositRevision.row_count),
+      depositRevision.maximum_id == null ? null : Number(depositRevision.maximum_id),
+      Number(depositRevision.amount_checksum ?? 0),
+      depositRevision.latest_at,
       currentContinuityEpoch,
       trackerStatus,
     ].join(":");
@@ -7860,12 +8017,112 @@ export class RouletteDatabase {
         ORDER BY attempts.id
       `)
       .all(source, instrument);
+    const deposits = this.sqlite
+      .prepare(`
+        SELECT *
+        FROM follower_top5_gated_account_deposits
+        WHERE source = ? AND instrument = ?
+        ORDER BY COALESCE(after_result_id, 0), id
+      `)
+      .all(source, instrument);
     const value = buildFollowerTop5GatedAccount(rows, sessions, attempts, {
       currentContinuityEpoch,
       trackerStatus,
+      depositRows: deposits,
     });
     this.followerTop5GatedAccountCache.set(cacheKey, { signature, value });
     return value;
+  }
+
+  applyFollowerTop5GatedDeposit(
+    source = "buleto",
+    instrument = "default",
+    {
+      depositKey,
+      amount,
+      depositedAt = this.clock(),
+    } = {},
+  ) {
+    this.#assertOpen();
+    const safeSource = asNonEmptyText(source, undefined, "source");
+    const safeInstrument = asNonEmptyText(instrument, undefined, "instrument");
+    const safeDepositKey = asNonEmptyText(
+      depositKey,
+      undefined,
+      "depositKey",
+    );
+    const safeAmount = Number(amount);
+    if (!Number.isSafeInteger(safeAmount) || safeAmount <= 0) {
+      throw new RangeError("amount must be a positive safe integer");
+    }
+    const safeDepositedAt = asTimestamp(
+      depositedAt,
+      undefined,
+      "depositedAt",
+    );
+
+    const result = this.#transaction(() => {
+      const existing = this.sqlite
+        .prepare(`
+          SELECT *
+          FROM follower_top5_gated_account_deposits
+          WHERE source = ? AND instrument = ? AND deposit_key = ?
+        `)
+        .get(safeSource, safeInstrument, safeDepositKey);
+      if (existing) {
+        if (Number(existing.amount) !== safeAmount) {
+          throw new Error("follower Top-5 deposit key has a different amount");
+        }
+        return { applied: false, row: existing };
+      }
+
+      const boundary = this.sqlite
+        .prepare(`
+          SELECT MAX(id) AS result_id
+          FROM round_results
+          WHERE source = ? AND instrument = ?
+        `)
+        .get(safeSource, safeInstrument);
+      const afterResultId = boundary.result_id == null
+        ? null
+        : Number(boundary.result_id);
+      const insert = this.sqlite
+        .prepare(`
+          INSERT INTO follower_top5_gated_account_deposits (
+            source, instrument, deposit_key, amount, after_result_id,
+            deposited_at, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        `)
+        .run(
+          safeSource,
+          safeInstrument,
+          safeDepositKey,
+          safeAmount,
+          afterResultId,
+          safeDepositedAt,
+          safeDepositedAt,
+        );
+      const row = this.sqlite
+        .prepare(`
+          SELECT *
+          FROM follower_top5_gated_account_deposits
+          WHERE id = ?
+        `)
+        .get(Number(insert.lastInsertRowid));
+      return { applied: true, row };
+    });
+    this.followerTop5GatedAccountCache.delete(
+      `${safeSource}\u0000${safeInstrument}`,
+    );
+    return {
+      applied: result.applied,
+      depositKey: result.row.deposit_key,
+      amount: Number(result.row.amount),
+      afterResultId: result.row.after_result_id == null
+        ? null
+        : Number(result.row.after_result_id),
+      depositedAt: result.row.deposited_at,
+    };
   }
 
   getFollowerTop5TrackerState(source = "buleto", instrument = "default") {

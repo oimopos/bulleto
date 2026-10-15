@@ -4408,6 +4408,9 @@ import {
       && left.every((number, index) => number === right[index]);
 
     const initialBalance = asOptionalNonNegativeInteger(value.initialBalance);
+    const totalDeposits = asOptionalNonNegativeInteger(value.totalDeposits);
+    const contributedBalance = asOptionalNonNegativeInteger(value.contributedBalance);
+    const depositCount = asOptionalNonNegativeInteger(value.depositCount);
     const finalBalance = asOptionalNonNegativeInteger(value.finalBalance);
     const netResult = safeInteger(value.netResult);
     const nextStakePerNumber = positiveStakePerNumber(value.nextStakePerNumber);
@@ -4441,11 +4444,47 @@ import {
       && finalBalance !== null
       && expectedNextRoundCost !== null
       && finalBalance >= expectedNextRoundCost;
+    let latestDeposit = null;
+    if (value.latestDeposit !== null) {
+      const deposit = value.latestDeposit;
+      const amount = asOptionalNonNegativeInteger(deposit?.amount);
+      const afterResultId = deposit?.afterResultId === null
+        ? null
+        : asOptionalNonNegativeInteger(deposit?.afterResultId);
+      const balanceBefore = asOptionalNonNegativeInteger(deposit?.balanceBefore);
+      const balanceAfter = asOptionalNonNegativeInteger(deposit?.balanceAfter);
+      if (
+        typeof deposit?.depositKey !== "string"
+        || deposit.depositKey.trim() === ""
+        || amount === null || amount < 1
+        || (afterResultId !== null && afterResultId < 1)
+        || balanceBefore === null
+        || balanceAfter !== balanceBefore + amount
+        || !parseDate(deposit?.depositedAt)
+      ) {
+        return null;
+      }
+      latestDeposit = {
+        depositKey: deposit.depositKey,
+        amount,
+        afterResultId,
+        balanceBefore,
+        balanceAfter,
+        depositedAt: deposit.depositedAt
+      };
+    }
     if (
       initialBalance !== 10_000
+      || totalDeposits === null
+      || contributedBalance !== initialBalance + totalDeposits
+      || depositCount === null
+      || (depositCount === 0) !== (latestDeposit === null)
+      || (latestDeposit !== null && (
+        depositCount < 1 || latestDeposit.amount > totalDeposits
+      ))
       || finalBalance === null
       || netResult === null
-      || finalBalance !== initialBalance + netResult
+      || finalBalance !== contributedBalance + netResult
       || nextStakePerNumber === null
       || nextRoundCost !== expectedNextRoundCost
       || typeof value.canAffordNextRound !== "boolean"
@@ -4508,11 +4547,11 @@ import {
         || totalStaked !== 0
         || totalGrossPayout !== 0
         || netResult !== 0
-        || finalBalance !== initialBalance
+        || finalBalance !== contributedBalance
         || maxStakePerNumber !== 0
         || maxRoundCost !== 0
         || maximumDrawdown !== 0
-        || peakBalance !== initialBalance
+        || peakBalance !== finalBalance
         || minimumBalance !== initialBalance
         || value.firstBetAt !== null
         || value.lastBetAt !== null
@@ -4585,6 +4624,7 @@ import {
     let latestOutcome = null;
     if (value.latestOutcome !== null) {
       const outcome = value.latestOutcome;
+      const attemptId = asOptionalNonNegativeInteger(outcome?.attemptId);
       const sessionId = asOptionalNonNegativeInteger(outcome?.sessionId);
       const attemptNumber = asOptionalNonNegativeInteger(outcome?.attemptNumber);
       const resultId = asOptionalNonNegativeInteger(outcome?.resultId);
@@ -4601,10 +4641,15 @@ import {
       const outcomeNextStake = positiveStakePerNumber(outcome?.nextStakePerNumber);
       const outcomeNextCost = asOptionalNonNegativeInteger(outcome?.nextRoundCost);
       const gateEvidence = normalizedFollowerLiveGateEvidence(outcome?.gateEvidence);
+      const occurredAt = parseDate(outcome?.occurredAt);
       const expectedHitIndex = outcomeTargets?.indexOf(resultNumber) ?? -1;
       const expectedOutcome = expectedHitIndex >= 0 ? "hit" : "miss";
+      const depositFollowsOutcome = latestDeposit !== null
+        && occurredAt !== null
+        && parseDate(latestDeposit.depositedAt).getTime() >= occurredAt.getTime();
       if (
-        sessionId === null || sessionId < 1
+        attemptId === null || attemptId < 1
+        || sessionId === null || sessionId < 1
         || attemptNumber === null || attemptNumber < 1
         || resultId === null || resultId < 1
         || outcomeTargets === null
@@ -4619,17 +4664,20 @@ import {
         || grossPayout !== (
           expectedOutcome === "hit" ? stakePerNumber * model.grossPayoutMultiplier : 0
         )
-        || balanceAfter !== finalBalance
+        || (depositFollowsOutcome
+          ? latestDeposit.balanceAfter !== finalBalance
+          : balanceAfter !== finalBalance)
         || outcomeNextStake === null
         || outcomeNextCost !== model.numbersPerRound * outcomeNextStake
         || gateEvidence === null
         || gateEvidence.rate < strategy.threshold
-        || !parseDate(outcome?.occurredAt)
+        || occurredAt === null
         || outcome.occurredAt !== value.lastBetAt
       ) {
         return null;
       }
       latestOutcome = {
+        attemptId,
         sessionId,
         attemptNumber,
         resultId,
@@ -4823,6 +4871,10 @@ import {
     return {
       status: value.status,
       initialBalance,
+      totalDeposits,
+      contributedBalance,
+      depositCount,
+      latestDeposit,
       finalBalance,
       netResult,
       nextStakePerNumber,
@@ -5205,9 +5257,12 @@ import {
     const stoppedText = account.skippedAfterExhaustionCount > 0
       ? ` После остановки пропущено ${formatRiskAmount(account.skippedAfterExhaustionCount)} ${pluralForm(account.skippedAfterExhaustionCount, "подходящий билет", "подходящих билета", "подходящих билетов")}.`
       : "";
+    const depositsText = account.totalDeposits > 0
+      ? ` Пополнений: ${formatRiskAmount(account.depositCount)}, внесено ${formatRiskAmount(account.totalDeposits)}; результат ставок не включает пополнения.`
+      : "";
     setTextIfChanged(
       elements.followerLiveAccountAudit,
-      `Покрытие: ${formatRiskAmount(account.trackedSessionCount)} ${pluralForm(account.trackedSessionCount, "сохранённая серия", "сохранённые серии", "сохранённых серий")}, ${formatRiskAmount(account.trackedAttemptCount)} ${pluralForm(account.trackedAttemptCount, "попытка", "попытки", "попыток")}; порог достигался в ${formatRiskAmount(account.qualifiedSessionCount)} ${pluralForm(account.qualifiedSessionCount, "серии", "сериях", "сериях")}, без билета наблюдалось ${formatRiskAmount(account.observedWithoutBetCount)}. Всего поставлено ${formatRiskAmount(account.totalStaked)}, валовые выплаты ${formatRiskAmount(account.totalGrossPayout)}, максимальная просадка ${formatRiskAmount(account.maximumDrawdown)}. ${ladderText}${latestText}${gapsText}${stoppedText}`
+      `Покрытие: ${formatRiskAmount(account.trackedSessionCount)} ${pluralForm(account.trackedSessionCount, "сохранённая серия", "сохранённые серии", "сохранённых серий")}, ${formatRiskAmount(account.trackedAttemptCount)} ${pluralForm(account.trackedAttemptCount, "попытка", "попытки", "попыток")}; порог достигался в ${formatRiskAmount(account.qualifiedSessionCount)} ${pluralForm(account.qualifiedSessionCount, "серии", "сериях", "сериях")}, без билета наблюдалось ${formatRiskAmount(account.observedWithoutBetCount)}. Всего поставлено ${formatRiskAmount(account.totalStaked)}, валовые выплаты ${formatRiskAmount(account.totalGrossPayout)}, максимальная просадка ${formatRiskAmount(account.maximumDrawdown)}.${depositsText} ${ladderText}${latestText}${gapsText}${stoppedText}`
     );
   }
 
