@@ -683,9 +683,9 @@ test("combined leader is the first dashboard block and renders exactly one numbe
   assert.match(block, /Команда BET закрыта/);
   assert.match(block, /1 000 проспективных прогнозов/);
   assert.match(block, /нижнюю границу Wilson 95% выше случайной базы 1\/37/);
-  assert.match(html, /<script type="module" src="\/app\.js\?v=52"><\/script>/);
+  assert.match(html, /<script type="module" src="\/app\.js\?v=53"><\/script>/);
 
-  assert.match(app, /from "\.\/combined-number\.js\?v=9"/);
+  assert.match(app, /from "\.\/combined-number\.js\?v=10"/);
   assert.match(app, /normalizePredictiveLeaderApiSnapshot/);
   assert.match(app, /predictiveLeaderNumberContext/);
   assert.match(combinedNumber, /export function normalizePredictiveLeaderApiSnapshot\(value\)/);
@@ -1755,7 +1755,7 @@ test("warm next-round forecast exposes a strict 5-percent walk-forward contract"
   assert.match(html, /id="follower-dynamic-next-title"[^>]*>[^<]*≥5%/);
   assert.match(html, /id="follower-dynamic-next-note"[^>]*>[\s\S]*?5%/);
   assert.match(html, /styles\.css\?v=34/);
-  assert.match(html, /app\.js\?v=52/);
+  assert.match(html, /app\.js\?v=53/);
   assert.match(styles, /\.follower-dynamic-next\s*\{/);
   assert.match(styles, /\.follower-warm-current\s*\{/);
   assert.match(styles, /\.follower-warm-picks\s*\{/);
@@ -1983,7 +1983,7 @@ test("cycle comparison language is descriptive, responsive, and cache-busted", (
   assert.match(block, /не предсказывает следующее число/);
   assert.doesNotMatch(block, /должн/iu);
   assert.match(html, /href="\/styles\.css\?v=34"/);
-  assert.match(html, /src="\/app\.js\?v=52"/);
+  assert.match(html, /src="\/app\.js\?v=53"/);
   assert.match(styles, /\.cycle-sequence-list\s*\{[\s\S]*?repeat\(auto-fill, minmax\(50px, 1fr\)\)/);
   assert.match(
     styles,

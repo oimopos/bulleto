@@ -1758,7 +1758,7 @@ test("confirmed-signal balance starts at 1000 and rejects an unqualified leader"
   }
 });
 
-test("confirmed-signal account records one bet, settles outcomes, and voids across a gap", () => {
+test("confirmed-signal account skips an unresolved cohort gap, records bets, and voids safely", () => {
   let clockMs = BASE_TIME + 10_000;
   const database = createDatabase({
     path: ":memory:",
@@ -1897,10 +1897,11 @@ test("confirmed-signal account records one bet, settles outcomes, and voids acro
     };
 
     for (let sequence = 1; sequence <= 1_000; sequence += 1) {
-      createForecast(sequence, 7);
+      createForecast(sequence, sequence === 500 ? null : 7);
     }
+    createForecast(1_001, 7);
 
-    let current = createForecast(1_001);
+    let current = createForecast(1_002);
     clockMs = current.lockedAtMs + 2_000;
     const firstBet = {
       source,
@@ -1929,7 +1930,7 @@ test("confirmed-signal account records one bet, settles outcomes, and voids acro
       1_350,
     );
 
-    current = createForecast(1_002);
+    current = createForecast(1_003);
     clockMs = current.lockedAtMs + 2_000;
     assert.equal(database.recordPredictiveLeaderSignal({
       source,
@@ -1949,7 +1950,7 @@ test("confirmed-signal account records one bet, settles outcomes, and voids acro
       1_340,
     );
 
-    current = createForecast(1_003);
+    current = createForecast(1_004);
     clockMs = current.lockedAtMs + 2_000;
     assert.equal(database.recordPredictiveLeaderSignal({
       source,

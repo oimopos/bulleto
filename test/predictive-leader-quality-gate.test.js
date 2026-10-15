@@ -49,6 +49,31 @@ test("quality gate confirms only when the fixed cohort lower Wilson bound beats 
   assert.ok(chanceLike.lowerBound <= 1 / 37);
 });
 
+test("quality gate skips an unresolved gap before freezing the first 1000 settled leaders", () => {
+  const afterGap = assessPredictiveLeaderQualityGate([
+    ...Array.from({ length: 38 }, () => settledLeader(true)),
+    ...Array.from({ length: 961 }, () => settledLeader(false)),
+    { evaluation: null },
+    settledLeader(false),
+  ]);
+  assert.equal(afterGap.status, "confirmed");
+  assert.equal(afterGap.reason, "confirmed");
+  assert.equal(afterGap.eligible, true);
+  assert.equal(afterGap.cohortSize, 1_000);
+  assert.equal(afterGap.sampleSize, 1_000);
+  assert.equal(afterGap.hitCount, 38);
+  assert.ok(afterGap.lowerBound > 1 / 37);
+
+  const afterLaterHits = assessPredictiveLeaderQualityGate([
+    ...Array.from({ length: 38 }, () => settledLeader(true)),
+    ...Array.from({ length: 961 }, () => settledLeader(false)),
+    { evaluation: null },
+    settledLeader(false),
+    ...Array.from({ length: 100 }, () => settledLeader(true)),
+  ]);
+  assert.deepEqual(afterLaterHits, afterGap);
+});
+
 test("quality gate freezes the first cohort and fails closed on invalid rows", () => {
   const rejected = assessPredictiveLeaderQualityGate([
     ...Array.from({ length: 1_000 }, () => settledLeader(false)),

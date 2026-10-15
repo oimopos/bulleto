@@ -1,5 +1,5 @@
 export const PREDICTIVE_LEADER_QUALITY_GATE = Object.freeze({
-  version: "top1-fixed-cohort-wilson95-v1",
+  version: "top1-first-settled-cohort-wilson95-v2",
   requiredSampleSize: 1_000,
   baselineRate: 1 / 37,
   confidenceLevel: 0.95,
@@ -33,23 +33,26 @@ export function assessPredictiveLeaderQualityGate(readyLeaders, invalidReadyCoun
     baselineRate,
     confidenceLevel,
   } = PREDICTIVE_LEADER_QUALITY_GATE;
-  const cohort = readyLeaders.slice(0, requiredSampleSize);
-  const settled = cohort.filter((leader) => leader.evaluation !== null);
-  const hitCount = settled.reduce(
+  // A historical gap can leave a ready leader unresolved forever. Build the
+  // cohort from authoritative outcomes so a permanently missing slot cannot
+  // block later prospective evidence.
+  const settled = readyLeaders.filter((leader) => leader.evaluation !== null);
+  const cohort = settled.slice(0, requiredSampleSize);
+  const cohortSize = Math.min(readyLeaders.length, requiredSampleSize);
+  const hitCount = cohort.reduce(
     (total, leader) => total + Number(leader.evaluation.top1Hit),
     0,
   );
-  const cohortComplete = cohort.length === requiredSampleSize
-    && settled.length === requiredSampleSize;
+  const cohortComplete = cohort.length === requiredSampleSize;
   const interval = cohortComplete && invalidReadyCount === 0
-    ? wilsonInterval(hitCount, settled.length)
+    ? wilsonInterval(hitCount, cohort.length)
     : null;
   let status = "collecting";
   let reason = "insufficient_sample";
   if (invalidReadyCount > 0) {
     status = "invalid";
     reason = "invalid_evaluation";
-  } else if (cohort.length === requiredSampleSize && !cohortComplete) {
+  } else if (cohortSize === requiredSampleSize && !cohortComplete) {
     status = "pending";
     reason = "cohort_pending";
   } else if (cohortComplete) {
@@ -62,10 +65,10 @@ export function assessPredictiveLeaderQualityGate(readyLeaders, invalidReadyCoun
     status,
     reason,
     eligible: status === "confirmed",
-    cohortSize: cohort.length,
-    sampleSize: settled.length,
+    cohortSize,
+    sampleSize: cohort.length,
     hitCount,
-    hitRate: settled.length > 0 ? hitCount / settled.length : null,
+    hitRate: cohort.length > 0 ? hitCount / cohort.length : null,
     lowerBound: interval?.lower ?? null,
   };
 }

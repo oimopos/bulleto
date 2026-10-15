@@ -204,7 +204,7 @@ function normalizedPredictiveLeaderApiMetrics(value) {
   }
   if (
     !isPlainRecord(qualityGate)
-    || qualityGate.version !== "top1-fixed-cohort-wilson95-v1"
+    || qualityGate.version !== "top1-first-settled-cohort-wilson95-v2"
     || !["collecting", "pending", "rejected", "confirmed", "invalid"]
       .includes(qualityGate.status)
     || typeof qualityGate.eligible !== "boolean"
