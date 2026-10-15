@@ -294,7 +294,7 @@ export class BuletoCollector extends EventEmitter {
     this.snapshotFailureCounted = false;
     this.forecastRound = null;
     this.latestFactors = [];
-    this.forecastErrorRoundId = null;
+    this.forecastErrorKey = null;
     this.trajectoryRound = null;
     this.latestTrajectoryFactors = [];
     this.trajectoryFactorKeys = new Set();
@@ -329,7 +329,7 @@ export class BuletoCollector extends EventEmitter {
     this.unmatchedSnapshotCount = 0;
     this.forecastRound = null;
     this.latestFactors = [];
-    this.forecastErrorRoundId = null;
+    this.forecastErrorKey = null;
     this.#clearPrecloseForecastTimer();
     this.#resetRoundTrajectory();
     this.generation += 1;
@@ -393,7 +393,7 @@ export class BuletoCollector extends EventEmitter {
     this.snapshotFailureCounted = false;
     this.forecastRound = null;
     this.latestFactors = [];
-    this.forecastErrorRoundId = null;
+    this.forecastErrorKey = null;
     this.#clearPrecloseForecastTimer();
     this.#resetRoundTrajectory();
 
@@ -713,7 +713,7 @@ export class BuletoCollector extends EventEmitter {
         factors: this.latestFactors,
         receivedAt,
       });
-      this.forecastErrorRoundId = null;
+      this.forecastErrorKey = null;
       this.emit('preclose-forecast', {
         source: this.source,
         instrument: this.instrument,
@@ -721,8 +721,10 @@ export class BuletoCollector extends EventEmitter {
       });
     } catch (error) {
       const roundId = String(this.forecastRound.id ?? 'unknown');
-      if (this.forecastErrorRoundId === roundId) return;
-      this.forecastErrorRoundId = roundId;
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      const errorKey = `${roundId}\u0000${errorMessage}`;
+      if (this.forecastErrorKey === errorKey) return;
+      this.forecastErrorKey = errorKey;
       this.emit(
         'collector-error',
         new Error(`Не удалось зафиксировать прогноз раунда ${roundId}`, { cause: error }),

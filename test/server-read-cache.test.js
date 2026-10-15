@@ -132,9 +132,9 @@ test("idempotent pre-close retries refresh readers only after a durable change",
   const listener = server.slice(listenerStart, listenerEnd);
   assert.match(
     listener,
-    /if \(forecastOutcomeChanged\(outcome\)\) broadcastUpdate\('forecast'\)/,
+    /if \(forecastOutcomeChanged\(outcome\)\) \{[\s\S]*capturePredictiveLeaderSignalForForecast\(\);[\s\S]*broadcastUpdate\('forecast'\);[\s\S]*\}/,
   );
-  assert.doesNotMatch(listener, /\n\s*broadcastUpdate\('forecast'\);/);
+  assert.equal((listener.match(/broadcastUpdate\('forecast'\);/g) || []).length, 1);
 });
 
 test("read cache is bounded and keeps recently used snapshots", () => {

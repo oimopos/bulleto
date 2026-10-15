@@ -454,6 +454,60 @@ test('collector emits a pre-close forecast in the safe window and ignores future
   );
 });
 
+test('collector retries a stale-factor forecast when fresh factors arrive in the same round', (t) => {
+  const { collector, socket } = startFakeCollector(t);
+  syncInitialSnapshot(socket);
+  const forecasts = [];
+  const errors = [];
+  collector.on('preclose-forecast', (forecast) => forecasts.push(forecast));
+  collector.on('collector-error', (error) => errors.push(error));
+
+  const currentMs = Date.now();
+  const staleFactorMs = currentMs - 6_000;
+  socket.message({
+    type: 'round',
+    data: forecastRound({
+      id: 508,
+      bettingClosesAtMs: currentMs + 12_000,
+    }),
+  });
+  socket.message({
+    type: 'factors',
+    data: [
+      { dt: iso(staleFactorMs - 4_000), v: 19.6 },
+      { dt: iso(staleFactorMs - 2_000), v: 19.8 },
+      { dt: iso(staleFactorMs), v: 20 },
+    ],
+  });
+
+  assert.equal(forecasts.length, 0);
+  assert.equal(errors.length, 1);
+  assert.match(errors[0].cause.message, /latest factor is more than 5 seconds old/);
+
+  socket.message({
+    type: 'factors',
+    data: [
+      { dt: iso(staleFactorMs - 4_000), v: 19.6 },
+      { dt: iso(staleFactorMs - 2_000), v: 19.8 },
+      { dt: iso(staleFactorMs), v: 20 },
+    ],
+  });
+  assert.equal(errors.length, 1, 'identical failures are logged only once');
+
+  socket.message({
+    type: 'factors',
+    data: [
+      { dt: iso(Date.now() - 2_000), v: 20 },
+      { dt: iso(Date.now() - 1_000), v: 20.1 },
+      { dt: iso(Date.now()), v: 20.2 },
+    ],
+  });
+
+  assert.equal(forecasts.length, 1);
+  assert.equal(forecasts[0].round.externalRoundId, '508');
+  assert.equal(errors.length, 1);
+});
+
 test('collector does not emit a forecast after betting is closed', (t) => {
   const { collector, socket } = startFakeCollector(t);
   syncInitialSnapshot(socket);

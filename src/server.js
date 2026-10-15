@@ -403,14 +403,8 @@ function followerTop5GatedForApi() {
   });
 }
 
-function predictiveLeaderForApi() {
-  const source = 'buleto';
-  const instrument = config.instrument;
-  const state = cachedDatabaseRead(
-    'predictive-leader-state',
-    () => db.getPredictiveLeaderReadState(source, instrument),
-  );
-  const snapshot = predictiveLeaderSnapshotForApi({
+function predictiveLeaderSnapshotForState(state, source, instrument, now = new Date()) {
+  return predictiveLeaderSnapshotForApi({
     state: {
       ...state,
       latestResult: resultForApi(state.latestResult),
@@ -419,8 +413,11 @@ function predictiveLeaderForApi() {
     },
     source,
     instrument,
-    now: new Date(),
+    now,
   });
+}
+
+function recordPredictiveLeaderSignalIfBet(snapshot, source, instrument) {
   if (snapshot.action === 'BET') {
     db.recordPredictiveLeaderSignal({
       source,
@@ -430,10 +427,37 @@ function predictiveLeaderForApi() {
       authorizedAt: snapshot.serverTime,
     });
   }
+}
+
+function predictiveLeaderForApi() {
+  const source = 'buleto';
+  const instrument = config.instrument;
+  const state = cachedDatabaseRead(
+    'predictive-leader-state',
+    () => db.getPredictiveLeaderReadState(source, instrument),
+  );
+  const snapshot = predictiveLeaderSnapshotForState(
+    state,
+    source,
+    instrument,
+  );
+  recordPredictiveLeaderSignalIfBet(snapshot, source, instrument);
   return {
     ...snapshot,
     signalAccount: db.getPredictiveLeaderSignalAccount(source, instrument),
   };
+}
+
+function capturePredictiveLeaderSignalForForecast() {
+  const source = 'buleto';
+  const instrument = config.instrument;
+  const state = db.getPredictiveLeaderReadState(source, instrument);
+  const snapshot = predictiveLeaderSnapshotForState(
+    state,
+    source,
+    instrument,
+  );
+  recordPredictiveLeaderSignalIfBet(snapshot, source, instrument);
 }
 
 function predictiveLeaderChallengersForApi() {
@@ -1014,7 +1038,17 @@ collector.on('preclose-forecast', (forecast) => {
     }
     // Repeated factor messages can emit the same pre-close attempt many times.
     // Only durable primary/child changes invalidate heavy read snapshots.
-    if (forecastOutcomeChanged(outcome)) broadcastUpdate('forecast');
+    if (forecastOutcomeChanged(outcome)) {
+      try {
+        capturePredictiveLeaderSignalForForecast();
+      } catch (error) {
+        console.error(
+          '[predictive-leader] automatic virtual signal capture failed',
+          error,
+        );
+      }
+      broadcastUpdate('forecast');
+    }
   } catch (error) {
     console.error('[forecast] persistence failed; waiting for the next pre-close tick', error);
   }
