@@ -53,8 +53,8 @@ test("dashboard keeps the exact read-only fetch URL list", () => {
   ]);
   assert.equal(
     [...app.matchAll(/\bfetchJson\(/g)].length,
-    3,
-    "only the helper, full-refresh dispatcher, and fast leader path may call fetchJson",
+    2,
+    "one helper definition and one settled dispatcher are the only fetchJson uses",
   );
 });
 
@@ -98,7 +98,6 @@ test("partial refresh marks cached dashboard state stale before rendering fresh 
     "renderAll",
     "setConnection",
     "scheduleQueuedRefresh",
-    "refreshPredictiveLeader",
     `"use strict"; ${app.slice(functionStart, functionEnd)}; return refreshAll;`,
   );
   const refreshAll = build(
@@ -110,7 +109,6 @@ test("partial refresh marks cached dashboard state stale before rendering fresh 
     () => rendered.push({ state: store.state, stateError: store.stateError }),
     () => {},
     () => {},
-    async () => false,
   );
 
   await refreshAll();
@@ -154,7 +152,6 @@ test("trajectory challenger endpoint failure stays isolated from dashboard state
     "setConnection",
     "scheduleQueuedRefresh",
     "captureServerClock",
-    "refreshPredictiveLeader",
     `"use strict"; ${app.slice(functionStart, functionEnd)}; return refreshAll;`,
   );
   const refreshAll = build(
@@ -167,7 +164,6 @@ test("trajectory challenger endpoint failure stays isolated from dashboard state
     () => {},
     () => {},
     () => {},
-    async () => false,
   );
 
   await refreshAll();
@@ -284,7 +280,6 @@ test("a full initial API outage renders the explicit failure state", async () =>
     "renderFetchFailure",
     "setConnection",
     "scheduleQueuedRefresh",
-    "refreshPredictiveLeader",
     `"use strict"; ${app.slice(functionStart, functionEnd)}; return refreshAll;`,
   );
   const refreshAll = build(
@@ -302,10 +297,6 @@ test("a full initial API outage renders the explicit failure state", async () =>
     () => { failureCompleted.push(store.hasCompletedInitialRender); },
     () => {},
     () => {},
-    () => new Promise((resolve) => pending.push({
-      resolve: () => resolve(true),
-      reject: () => resolve(false),
-    })),
   );
 
   const refresh = refreshAll();
@@ -361,7 +352,6 @@ test("core state renders before any optional endpoint settles", async () => {
     "setConnection",
     "scheduleQueuedRefresh",
     "captureServerClock",
-    "refreshPredictiveLeader",
     `"use strict"; ${app.slice(functionStart, functionEnd)}; return refreshAll;`,
   );
   const refreshAll = build(
@@ -377,10 +367,6 @@ test("core state renders before any optional endpoint settles", async () => {
     () => {},
     () => {},
     () => {},
-    () => fetchJson("/api/predictive-leader").then(
-      () => true,
-      () => false,
-    ),
   );
 
   const refresh = refreshAll();
@@ -419,7 +405,6 @@ test("background refresh avoids global busy state and refresh cleanup survives r
     "scheduleQueuedRefresh",
     "captureServerClock",
     "console",
-    "refreshPredictiveLeader",
     `"use strict"; ${app.slice(functionStart, functionEnd)}; return refreshAll;`,
   );
   const makeHarness = ({ completed, throws }) => {
@@ -472,10 +457,6 @@ test("background refresh avoids global busy state and refresh cleanup survives r
       () => { calls.queued += 1; },
       () => {},
       { error() {} },
-      async () => {
-        calls.urls.push("/api/predictive-leader");
-        return false;
-      },
     );
     return { refreshAll, store, elements, calls };
   };
@@ -496,18 +477,11 @@ test("background refresh avoids global busy state and refresh cleanup survives r
   assert.equal(failing.calls.urls.length, 9, "one broken renderer cannot cancel independent API reads");
 });
 
-test("SSE forecast bypasses an active full refresh for the leader request", () => {
+test("SSE connected is ignored and refresh storms coalesce while a refresh is active", () => {
   const connectStart = app.indexOf("  function connectEventStream() {");
   const connectEnd = app.indexOf("  elements.refreshButton.addEventListener", connectStart);
   const listeners = {};
   let scheduled = 0;
-  let leaderRefreshes = 0;
-  let leaderInvalidations = 0;
-  const eventStore = {
-    eventSource: null,
-    predictiveLeaderRequiresFreshSnapshot: false,
-    refreshing: true,
-  };
   class FakeEventSource {
     static OPEN = 1;
     static CLOSED = 2;
@@ -521,53 +495,23 @@ test("SSE forecast bypasses an active full refresh for the leader request", () =
     "setConnection",
     "EventSource",
     "scheduleRefresh",
-    "refreshPredictiveLeader",
-    "invalidatePredictiveLeaderBet",
     "announce",
     "renderCombinedPick",
     `"use strict"; ${app.slice(connectStart, connectEnd)}; return connectEventStream;`,
   )(
     { EventSource: FakeEventSource },
-    eventStore,
+    { eventSource: null, predictiveLeaderRequiresFreshSnapshot: false },
     () => {},
     FakeEventSource,
     () => { scheduled += 1; },
-    () => { leaderRefreshes += 1; },
-    () => { leaderInvalidations += 1; },
     () => {},
     () => {},
   );
   connect();
-  listeners.open();
-  assert.equal(
-    leaderRefreshes,
-    1,
-    "opening or reconnecting the stream must close the subscription/read race",
-  );
   listeners.update({ data: JSON.stringify({ reason: "connected" }) });
   assert.equal(scheduled, 0);
-  assert.equal(leaderRefreshes, 1);
-  assert.equal(leaderInvalidations, 0);
   listeners.update({ data: JSON.stringify({ reason: "results" }) });
   assert.equal(scheduled, 1);
-  assert.equal(leaderRefreshes, 1);
-  assert.equal(leaderInvalidations, 1);
-  listeners.update({ data: JSON.stringify({ reason: "forecast" }) });
-  assert.equal(
-    leaderRefreshes,
-    2,
-    "forecast must start the lightweight leader read synchronously even during refreshAll",
-  );
-  assert.equal(
-    scheduled,
-    2,
-    "forecast still schedules the coalesced full refresh for the remaining panels",
-  );
-  assert.equal(leaderInvalidations, 2, "a new forecast must hide the previous BET immediately");
-  eventStore.predictiveLeaderRequiresFreshSnapshot = true;
-  listeners.open();
-  assert.equal(leaderRefreshes, 3, "reconnect must immediately refresh the leader");
-  assert.equal(scheduled, 3, "reconnect must recover updates missed by the full dashboard");
 
   const scheduleStart = app.indexOf("  function scheduleRefresh() {");
   const scheduleEnd = app.indexOf("  function connectEventStream()", scheduleStart);
@@ -690,32 +634,17 @@ test("server starts without a synchronous full-history validation warmup", () =>
   assert.doesNotMatch(server, /db\.warmPrecloseForecastValidation\(/);
 });
 
-test("dashboard shares fail-closed leader loading across full and fast refreshes", () => {
-  const leaderStart = app.indexOf("function startPredictiveLeaderRequest");
-  const leaderEnd = app.indexOf("function extractItems", leaderStart);
-  const leader = app.slice(leaderStart, leaderEnd);
+test("dashboard wires predictive leader loading and SSE invalidation fail-closed", () => {
   const refreshStart = app.indexOf("async function refreshAll");
   const refreshEnd = app.indexOf("function renderFetchFailure", refreshStart);
   const refresh = app.slice(refreshStart, refreshEnd);
-  assert.ok(leaderStart >= 0 && leaderEnd > leaderStart);
   assert.ok(refreshStart >= 0 && refreshEnd > refreshStart);
   assert.match(refresh, /url: "\/api\/predictive-leader"/);
-  assert.match(refresh, /load: \(\) => refreshPredictiveLeader\(\)/);
-  assert.match(refresh, /if \(request\.load\) \{\s*accepted = await request\.load\(\);/);
-  assert.match(leader, /request\?\.id === store\.predictiveLeaderRequestId/);
-  assert.match(leader, /normalizePredictiveLeaderApiSnapshot\(payload\)/);
-  assert.match(leader, /normalizedPredictiveLeaderAccount\(snapshot\?\.account\)/);
-  assert.match(leader, /store\.predictiveLeaderLoaded = true/);
-  assert.match(leader, /store\.predictiveLeaderError = true/);
-  assert.match(leader, /store\.predictiveLeaderRequiresFreshSnapshot = false/);
-  assert.match(leader, /fetchJson\("\/api\/predictive-leader"\)/);
-  assert.match(leader, /window\.performance\.now\(\) - request\.startedAt/);
-  assert.match(leader, /remainingMs = closesAtMs - serverTimeMs - requestElapsedMs/);
-  assert.match(app, /const PREDICTIVE_LEADER_FALLBACK_INTERVAL_MS = 2_000/);
-  assert.match(
-    app,
-    /store\.eventSource\.readyState !== EventSource\.OPEN[\s\S]*?store\.predictiveLeaderError[\s\S]*?store\.predictiveLeaderRequiresFreshSnapshot[\s\S]*?void refreshPredictiveLeader\(\);[\s\S]*?PREDICTIVE_LEADER_FALLBACK_INTERVAL_MS/,
-  );
+  assert.match(refresh, /normalizePredictiveLeaderApiSnapshot\(payload\)/);
+  assert.match(refresh, /normalizedPredictiveLeaderAccount\(snapshot\?\.account\)/);
+  assert.match(refresh, /store\.predictiveLeaderLoaded = true/);
+  assert.match(refresh, /store\.predictiveLeaderError = true/);
+  assert.match(refresh, /store\.predictiveLeaderRequiresFreshSnapshot = false/);
 
   const eventErrorStart = app.indexOf('source.addEventListener("error"');
   const eventErrorEnd = app.indexOf("});", eventErrorStart);
@@ -754,7 +683,7 @@ test("combined leader is the first dashboard block and renders exactly one numbe
   assert.match(block, /Команда BET закрыта/);
   assert.match(block, /1 000 проспективных прогнозов/);
   assert.match(block, /нижнюю границу Wilson 95% выше случайной базы 1\/37/);
-  assert.match(html, /<script type="module" src="\/app\.js\?v=54"><\/script>/);
+  assert.match(html, /<script type="module" src="\/app\.js\?v=53"><\/script>/);
 
   assert.match(app, /from "\.\/combined-number\.js\?v=10"/);
   assert.match(app, /normalizePredictiveLeaderApiSnapshot/);
@@ -792,10 +721,7 @@ test("combined leader is the first dashboard block and renders exactly one numbe
   assert.match(contextBlock, /predictiveLeaderNumberContext\(/);
   assert.match(contextBlock, /loaded: store\.predictiveLeaderLoaded/);
   assert.match(contextBlock, /error: store\.predictiveLeaderError/);
-  assert.match(
-    contextBlock,
-    /requiresFreshSnapshot:\s*store\.predictiveLeaderRequiresFreshSnapshot \|\| predictiveLeaderBetExpired\(\)/,
-  );
+  assert.match(contextBlock, /requiresFreshSnapshot: store\.predictiveLeaderRequiresFreshSnapshot/);
   assert.match(contextBlock, /snapshot: store\.predictiveLeaderSnapshot/);
   assert.doesNotMatch(contextBlock, /store\.state|precloseForecast|latestForecast/);
   assert.doesNotMatch(contextBlock, /combineNumberRankings|combinedTripleFollowerRanking/);
@@ -1829,7 +1755,7 @@ test("warm next-round forecast exposes a strict 5-percent walk-forward contract"
   assert.match(html, /id="follower-dynamic-next-title"[^>]*>[^<]*≥5%/);
   assert.match(html, /id="follower-dynamic-next-note"[^>]*>[\s\S]*?5%/);
   assert.match(html, /styles\.css\?v=34/);
-  assert.match(html, /app\.js\?v=54/);
+  assert.match(html, /app\.js\?v=53/);
   assert.match(styles, /\.follower-dynamic-next\s*\{/);
   assert.match(styles, /\.follower-warm-current\s*\{/);
   assert.match(styles, /\.follower-warm-picks\s*\{/);
@@ -2057,7 +1983,7 @@ test("cycle comparison language is descriptive, responsive, and cache-busted", (
   assert.match(block, /не предсказывает следующее число/);
   assert.doesNotMatch(block, /должн/iu);
   assert.match(html, /href="\/styles\.css\?v=34"/);
-  assert.match(html, /src="\/app\.js\?v=54"/);
+  assert.match(html, /src="\/app\.js\?v=53"/);
   assert.match(styles, /\.cycle-sequence-list\s*\{[\s\S]*?repeat\(auto-fill, minmax\(50px, 1fr\)\)/);
   assert.match(
     styles,
