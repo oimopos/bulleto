@@ -50,7 +50,7 @@ function createClock() {
     now = target;
   }
 
-  return { clearTimeout, setTimeout, tick };
+  return { clearTimeout, now: () => now, setTimeout, tick };
 }
 
 function refreshHarness() {
@@ -81,6 +81,87 @@ function refreshHarness() {
     scheduler,
     store,
     completedRefreshes: () => completedRefreshes,
+  };
+}
+
+function predictiveLeaderHarness() {
+  const blockStart = app.indexOf("  function startPredictiveLeaderRequest() {");
+  const blockEnd = app.indexOf("\n\n  function extractItems", blockStart);
+  assert.ok(blockStart >= 0 && blockEnd > blockStart);
+
+  const pending = [];
+  const renders = [];
+  const clock = createClock();
+  const fakeWindow = {
+    clearTimeout: clock.clearTimeout,
+    performance: { now: clock.now },
+    setTimeout: clock.setTimeout,
+  };
+  const store = {
+    refreshing: true,
+    predictiveLeaderSnapshot: null,
+    predictiveLeaderLoaded: false,
+    predictiveLeaderError: false,
+    predictiveLeaderRequiresFreshSnapshot: false,
+    predictiveLeaderRequestId: 0,
+    predictiveLeaderRefreshPromise: null,
+    predictiveLeaderExpiryTimer: null,
+    predictiveLeaderExpiresAt: null,
+    lastSyncAt: null,
+  };
+  const build = new Function(
+    "window",
+    "store",
+    "fetchJson",
+    "normalizePredictiveLeaderApiSnapshot",
+    "normalizedPredictiveLeaderAccount",
+    "normalizedPredictiveLeaderSignalAccount",
+    "captureServerClock",
+    "renderCombinedPick",
+    "renderPredictiveLeaderSignalAccount",
+    "updateLastSync",
+    `"use strict"; ${app.slice(blockStart, blockEnd)};`
+      + " return { invalidatePredictiveLeaderBet, refreshPredictiveLeader };",
+  );
+  const { invalidatePredictiveLeaderBet, refreshPredictiveLeader } = build(
+    fakeWindow,
+    store,
+    (url) => {
+      assert.equal(url, "/api/predictive-leader");
+      return new Promise((resolve, reject) => pending.push({ resolve, reject }));
+    },
+    (payload) => payload,
+    (account) => account,
+    (account) => account,
+    () => {},
+    () => {
+      renders.push(store.predictiveLeaderRequiresFreshSnapshot
+        ? "hidden"
+        : store.predictiveLeaderSnapshot?.marker ?? null);
+    },
+    () => {},
+    () => {},
+  );
+
+  return {
+    clock,
+    invalidatePredictiveLeaderBet,
+    pending,
+    refreshPredictiveLeader,
+    renders,
+    store,
+  };
+}
+
+function leaderPayload(marker, overrides = {}) {
+  return {
+    marker,
+    status: "waiting",
+    action: "WAIT",
+    account: null,
+    signalAccount: { marker },
+    serverTime: "2026-10-15T12:00:00.000Z",
+    ...overrides,
   };
 }
 
@@ -146,4 +227,102 @@ test("an explicit refresh supersedes a pending SSE timer", () => {
     app.slice(refreshStart, app.indexOf("function renderFetchFailure", refreshStart)),
     /store\.refreshing = false;[\s\S]*?scheduleQueuedRefresh\(\);/,
   );
+});
+
+test("latest-started leader refresh rejects every older response and failure", async () => {
+  const harness = predictiveLeaderHarness();
+
+  const oldSuccess = harness.refreshPredictiveLeader({ priority: true });
+  const newSuccess = harness.refreshPredictiveLeader({ priority: true });
+  assert.equal(harness.pending.length, 2, "the leader path must bypass active full-refresh work");
+
+  harness.pending[0].resolve(leaderPayload("old"));
+  assert.equal(await oldSuccess, false);
+  assert.equal(harness.store.predictiveLeaderSnapshot, null);
+  assert.deepEqual(
+    harness.renders,
+    [],
+    "an older response must stay invisible while the latest-started request is pending",
+  );
+
+  harness.pending[1].resolve(leaderPayload("new"));
+  assert.equal(await newSuccess, true);
+  assert.equal(
+    harness.store.predictiveLeaderSnapshot.marker,
+    "new",
+    "only the latest-started response may become visible",
+  );
+  assert.equal(harness.store.predictiveLeaderRequestId, 2);
+  assert.equal(harness.store.predictiveLeaderError, false);
+  assert.deepEqual(harness.renders, ["new"]);
+
+  const oldFailure = harness.refreshPredictiveLeader({ priority: true });
+  const newestSuccess = harness.refreshPredictiveLeader({ priority: true });
+  harness.pending[3].resolve(leaderPayload("newest"));
+  assert.equal(await newestSuccess, true);
+  harness.pending[2].reject(new Error("late timeout"));
+  assert.equal(await oldFailure, false);
+  assert.equal(harness.store.predictiveLeaderSnapshot.marker, "newest");
+  assert.equal(harness.store.predictiveLeaderError, false);
+  assert.equal(harness.store.predictiveLeaderRequiresFreshSnapshot, false);
+  assert.deepEqual(harness.renders, ["new", "newest"]);
+});
+
+test("leader lifecycle invalidation supersedes an in-flight response", async () => {
+  const harness = predictiveLeaderHarness();
+  const request = harness.refreshPredictiveLeader({ priority: true });
+
+  harness.invalidatePredictiveLeaderBet();
+  assert.equal(harness.store.predictiveLeaderRequestId, 2);
+  assert.equal(harness.store.predictiveLeaderRefreshPromise, null);
+  harness.pending[0].resolve(leaderPayload("obsolete"));
+
+  assert.equal(await request, false);
+  assert.equal(harness.store.predictiveLeaderSnapshot, null);
+  assert.deepEqual(harness.renders, []);
+});
+
+test("ready BET expires at bettingClosesAt after subtracting request elapsed time", async () => {
+  const harness = predictiveLeaderHarness();
+  const request = harness.refreshPredictiveLeader({ priority: true });
+
+  harness.clock.tick(3_000);
+  harness.pending[0].resolve(leaderPayload("bet", {
+    status: "ready",
+    action: "BET",
+    forecast: { bettingClosesAt: "2026-10-15T12:00:10.000Z" },
+  }));
+  assert.equal(await request, true);
+  assert.equal(harness.store.predictiveLeaderRequiresFreshSnapshot, false);
+  assert.equal(harness.store.predictiveLeaderExpiresAt, 10_000);
+  assert.deepEqual(harness.renders, ["bet"]);
+
+  harness.clock.tick(6_999);
+  assert.equal(
+    harness.store.predictiveLeaderRequiresFreshSnapshot,
+    false,
+    "BET remains visible one millisecond before the server close instant",
+  );
+  harness.clock.tick(1);
+  assert.equal(harness.store.predictiveLeaderRequiresFreshSnapshot, true);
+  assert.equal(harness.store.predictiveLeaderRequestId, 2);
+  assert.equal(harness.store.predictiveLeaderExpiryTimer, null);
+  assert.equal(harness.store.predictiveLeaderExpiresAt, null);
+  assert.deepEqual(harness.renders, ["bet", "hidden"]);
+
+  const lateHarness = predictiveLeaderHarness();
+  const lateRequest = lateHarness.refreshPredictiveLeader({ priority: true });
+  lateHarness.clock.tick(10_000);
+  lateHarness.pending[0].resolve(leaderPayload("already-closed", {
+    status: "ready",
+    action: "BET",
+    forecast: { bettingClosesAt: "2026-10-15T12:00:10.000Z" },
+  }));
+  assert.equal(await lateRequest, true);
+  assert.equal(
+    lateHarness.store.predictiveLeaderRequiresFreshSnapshot,
+    true,
+    "a BET received at the exact close boundary must never be exposed",
+  );
+  assert.deepEqual(lateHarness.renders, ["hidden"]);
 });

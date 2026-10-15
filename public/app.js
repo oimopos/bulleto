@@ -16,6 +16,7 @@ import {
   const ALL_NUMBERS = Array.from({ length: 37 }, (_, number) => number);
   const REFRESH_INTERVAL_MS = 45_000;
   const REFRESH_DEBOUNCE_MS = 180;
+  const PREDICTIVE_LEADER_FALLBACK_INTERVAL_MS = 2_000;
   const AGE_UPDATE_INTERVAL_MS = 30_000;
   const PRECLOSE_CAPTURE_MAX_LEAD_MS = 15_000;
   const FOLLOWER_COLLAPSED_LIMIT = 5;
@@ -276,6 +277,10 @@ import {
     predictiveLeaderLoaded: false,
     predictiveLeaderError: false,
     predictiveLeaderRequiresFreshSnapshot: false,
+    predictiveLeaderRequestId: 0,
+    predictiveLeaderRefreshPromise: null,
+    predictiveLeaderExpiryTimer: null,
+    predictiveLeaderExpiresAt: null,
     trajectoryDirectionChallengerSnapshot: null,
     trajectoryDirectionChallengerLoaded: false,
     trajectoryDirectionChallengerError: false,
@@ -1188,6 +1193,144 @@ import {
     }
   }
 
+  function startPredictiveLeaderRequest() {
+    store.predictiveLeaderRequestId += 1;
+    return {
+      id: store.predictiveLeaderRequestId,
+      startedAt: window.performance.now(),
+    };
+  }
+
+  function isCurrentPredictiveLeaderRequest(request) {
+    return request?.id === store.predictiveLeaderRequestId;
+  }
+
+  function clearPredictiveLeaderExpiry() {
+    window.clearTimeout(store.predictiveLeaderExpiryTimer);
+    store.predictiveLeaderExpiryTimer = null;
+    store.predictiveLeaderExpiresAt = null;
+  }
+
+  function armPredictiveLeaderExpiry(snapshot, request) {
+    clearPredictiveLeaderExpiry();
+    if (snapshot.status !== "ready" || snapshot.action !== "BET") return;
+
+    const serverTimeMs = Date.parse(snapshot.serverTime);
+    const closesAtMs = Date.parse(snapshot.forecast?.bettingClosesAt ?? "");
+    const requestElapsedMs = Math.max(
+      0,
+      window.performance.now() - request.startedAt,
+    );
+    const remainingMs = closesAtMs - serverTimeMs - requestElapsedMs;
+    if (!Number.isFinite(remainingMs) || remainingMs <= 0) {
+      store.predictiveLeaderRequiresFreshSnapshot = true;
+      return;
+    }
+
+    store.predictiveLeaderExpiresAt = window.performance.now() + remainingMs;
+    store.predictiveLeaderExpiryTimer = window.setTimeout(() => {
+      store.predictiveLeaderExpiryTimer = null;
+      if (store.predictiveLeaderSnapshot !== snapshot) return;
+      invalidatePredictiveLeaderBet();
+    }, remainingMs);
+  }
+
+  function applyPredictiveLeaderPayload(payload, request) {
+    if (!isCurrentPredictiveLeaderRequest(request)) return false;
+
+    const snapshot = normalizePredictiveLeaderApiSnapshot(payload);
+    const account = snapshot?.account === null
+      ? null
+      : normalizedPredictiveLeaderAccount(snapshot?.account);
+    const signalAccount = normalizedPredictiveLeaderSignalAccount(
+      snapshot?.signalAccount,
+    );
+    store.predictiveLeaderLoaded = true;
+    if (
+      !snapshot
+      || (snapshot.account !== null && !account)
+      || !signalAccount
+    ) {
+      clearPredictiveLeaderExpiry();
+      store.predictiveLeaderSnapshot = null;
+      store.predictiveLeaderError = true;
+      store.predictiveLeaderRequiresFreshSnapshot = true;
+      return false;
+    }
+    store.predictiveLeaderSnapshot = { ...snapshot, account, signalAccount };
+    store.predictiveLeaderError = false;
+    store.predictiveLeaderRequiresFreshSnapshot = false;
+    captureServerClock(snapshot.serverTime);
+    armPredictiveLeaderExpiry(store.predictiveLeaderSnapshot, request);
+    return true;
+  }
+
+  function failPredictiveLeaderRequest(request) {
+    if (!isCurrentPredictiveLeaderRequest(request)) return false;
+    clearPredictiveLeaderExpiry();
+    store.predictiveLeaderSnapshot = null;
+    store.predictiveLeaderLoaded = true;
+    store.predictiveLeaderError = true;
+    store.predictiveLeaderRequiresFreshSnapshot = true;
+    return true;
+  }
+
+  function invalidatePredictiveLeaderBet() {
+    // A lifecycle event makes every response started before it obsolete.
+    store.predictiveLeaderRequestId += 1;
+    store.predictiveLeaderRefreshPromise = null;
+    if (store.predictiveLeaderSnapshot?.action !== "BET") return;
+    clearPredictiveLeaderExpiry();
+    store.predictiveLeaderRequiresFreshSnapshot = true;
+    renderCombinedPick();
+  }
+
+  function predictiveLeaderBetExpired() {
+    return store.predictiveLeaderSnapshot?.action === "BET"
+      && Number.isFinite(store.predictiveLeaderExpiresAt)
+      && window.performance.now() >= store.predictiveLeaderExpiresAt;
+  }
+
+  function renderPredictiveLeaderRefresh() {
+    renderCombinedPick();
+    renderPredictiveLeaderSignalAccount();
+    updateLastSync();
+  }
+
+  async function refreshPredictiveLeader({ priority = false } = {}) {
+    // Fallback polls share work, while forecast/open events always bypass an
+    // in-flight fallback so the short pre-close window is sampled immediately.
+    if (!priority && store.predictiveLeaderRefreshPromise) {
+      return store.predictiveLeaderRefreshPromise;
+    }
+
+    const requestContext = startPredictiveLeaderRequest();
+    const requestPromise = (async () => {
+      try {
+        const payload = await fetchJson("/api/predictive-leader");
+        const accepted = applyPredictiveLeaderPayload(payload, requestContext);
+        if (isCurrentPredictiveLeaderRequest(requestContext)) {
+          if (accepted) store.lastSyncAt = new Date();
+          renderPredictiveLeaderRefresh();
+        }
+        return accepted;
+      } catch {
+        const failed = failPredictiveLeaderRequest(requestContext);
+        if (failed) renderPredictiveLeaderRefresh();
+        return false;
+      }
+    })();
+
+    store.predictiveLeaderRefreshPromise = requestPromise;
+    try {
+      return await requestPromise;
+    } finally {
+      if (store.predictiveLeaderRefreshPromise === requestPromise) {
+        store.predictiveLeaderRefreshPromise = null;
+      }
+    }
+  }
+
   function extractItems(payload) {
     if (Array.isArray(payload)) return payload;
     return Array.isArray(payload?.items) ? payload.items : [];
@@ -1313,35 +1456,7 @@ import {
         },
         {
           url: "/api/predictive-leader",
-          apply(payload) {
-            const snapshot = normalizePredictiveLeaderApiSnapshot(payload);
-            const account = snapshot?.account === null
-              ? null
-              : normalizedPredictiveLeaderAccount(snapshot?.account);
-            const signalAccount = normalizedPredictiveLeaderSignalAccount(
-              snapshot?.signalAccount,
-            );
-            store.predictiveLeaderLoaded = true;
-            if (
-              !snapshot
-              || (snapshot.account !== null && !account)
-              || !signalAccount
-            ) {
-              store.predictiveLeaderSnapshot = null;
-              store.predictiveLeaderError = true;
-              return false;
-            }
-            store.predictiveLeaderSnapshot = { ...snapshot, account, signalAccount };
-            store.predictiveLeaderError = false;
-            store.predictiveLeaderRequiresFreshSnapshot = false;
-            captureServerClock(snapshot.serverTime);
-            return true;
-          },
-          fail() {
-            store.predictiveLeaderSnapshot = null;
-            store.predictiveLeaderLoaded = true;
-            store.predictiveLeaderError = true;
-          },
+          load: () => refreshPredictiveLeader(),
         },
         {
           url: "/api/trajectory-direction/challenger",
@@ -1387,10 +1502,15 @@ import {
 
       const optionalTasks = optionalRequests.map(async (request) => {
         if (request.deferUntilLightweightDispatch) await Promise.resolve();
-        const result = await settledFetch(request.url);
-        const accepted = result.status === "fulfilled"
-          ? request.apply(result.value)
-          : (request.fail(), false);
+        let accepted = false;
+        if (request.load) {
+          accepted = await request.load();
+        } else {
+          const result = await settledFetch(request.url);
+          accepted = result.status === "fulfilled"
+            ? request.apply(result.value)
+            : (request.fail(), false);
+        }
         if (accepted) {
           successfulRequests += 1;
           store.lastSyncAt = new Date();
@@ -3521,7 +3641,8 @@ import {
     return predictiveLeaderNumberContext({
       loaded: store.predictiveLeaderLoaded,
       error: store.predictiveLeaderError,
-      requiresFreshSnapshot: store.predictiveLeaderRequiresFreshSnapshot,
+      requiresFreshSnapshot:
+        store.predictiveLeaderRequiresFreshSnapshot || predictiveLeaderBetExpired(),
       snapshot: store.predictiveLeaderSnapshot,
     });
   }
@@ -7369,7 +7490,9 @@ import {
 
     source.addEventListener("open", () => {
       setConnection("online", "Онлайн");
-      if (store.predictiveLeaderRequiresFreshSnapshot) scheduleRefresh();
+      const needsFullRefresh = store.predictiveLeaderRequiresFreshSnapshot;
+      void refreshPredictiveLeader({ priority: true });
+      if (needsFullRefresh) scheduleRefresh();
     });
 
     source.addEventListener("update", (event) => {
@@ -7380,7 +7503,11 @@ import {
         reason = "";
       }
       if (reason === "connected") return;
+      invalidatePredictiveLeaderBet();
       if (reason === "gap") announce("Обнаружен пропуск в истории результатов");
+      if (reason === "forecast") {
+        void refreshPredictiveLeader({ priority: true });
+      }
       scheduleRefresh();
     });
 
@@ -7388,6 +7515,7 @@ import {
 
     source.addEventListener("error", () => {
       if (store.eventSource !== source) return;
+      invalidatePredictiveLeaderBet();
       store.predictiveLeaderRequiresFreshSnapshot = true;
       renderCombinedPick();
       if (source.readyState === EventSource.CLOSED) {
@@ -7422,7 +7550,10 @@ import {
     renderTriples();
   });
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible") refreshAll();
+    if (document.visibilityState === "visible") {
+      renderCombinedPick();
+      refreshAll();
+    }
   });
   window.addEventListener("beforeunload", () => store.eventSource?.close());
 
@@ -7432,6 +7563,19 @@ import {
   connectEventStream();
   refreshAll();
   window.setInterval(() => refreshAll(), REFRESH_INTERVAL_MS);
+  window.setInterval(() => {
+    // The normal 45-second dashboard poll is longer than the BET window. Use a
+    // lightweight fallback only while the live event stream is unavailable.
+    if (
+      !("EventSource" in window)
+      || !store.eventSource
+      || store.eventSource.readyState !== EventSource.OPEN
+      || store.predictiveLeaderError
+      || store.predictiveLeaderRequiresFreshSnapshot
+    ) {
+      void refreshPredictiveLeader();
+    }
+  }, PREDICTIVE_LEADER_FALLBACK_INTERVAL_MS);
   window.setInterval(() => {
     if (store.stateLoaded) renderPrecloseForecast();
   }, 1_000);
