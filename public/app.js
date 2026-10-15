@@ -109,10 +109,6 @@ import {
     trajectoryShadowRangeMetrics: document.getElementById("trajectory-shadow-range-metrics"),
     trajectoryShadowSample: document.getElementById("trajectory-shadow-sample"),
     trajectoryDirectionChallenger: document.getElementById("trajectory-direction-challenger"),
-    precloseHitHistory: document.getElementById("preclose-hit-history"),
-    precloseHitHistoryCount: document.getElementById("preclose-hit-history-count"),
-    precloseHitHistoryList: document.getElementById("preclose-hit-history-list"),
-    precloseHitHistoryStatus: document.getElementById("preclose-hit-history-status"),
     followerPanel: document.getElementById("follower-panel"),
     followerTitle: document.getElementById("follower-title"),
     followerLive: document.getElementById("follower-live-tracker"),
@@ -292,10 +288,6 @@ import {
     followerHitCurve: null,
     pairsLoaded: false,
     pairsError: false,
-    forecastHits: [],
-    forecastHitsLoaded: false,
-    forecastHitsError: false,
-    forecastHitsHasMore: false,
     followerSourceNumber: null,
     followerSourceLocked: false,
     followerVisibleCount: FOLLOWER_COLLAPSED_LIMIT,
@@ -1218,7 +1210,7 @@ import {
       elements.main.setAttribute("aria-busy", "true");
     }
     let successfulRequests = 0;
-    const requestCount = 10;
+    const requestCount = 9;
     const settledFetch = async (url) => {
       try {
         return { status: "fulfilled", value: await fetchJson(url) };
@@ -1308,17 +1300,6 @@ import {
             return true;
           },
           fail() { store.pairsError = true; },
-        },
-        {
-          url: "/api/forecasts/hits?limit=20",
-          apply(payload) {
-            store.forecastHits = extractItems(payload);
-            store.forecastHitsHasMore = payload?.hasMore === true;
-            store.forecastHitsLoaded = true;
-            store.forecastHitsError = false;
-            return true;
-          },
-          fail() { store.forecastHitsError = true; },
         },
         {
           url: "/api/cycle-comparison",
@@ -1501,7 +1482,6 @@ import {
     }
     renderFollowerTop5Tracker(store.state?.followerTop5Tracker || null);
     renderFollowerHitCurve();
-    renderForecastHitHistory();
     renderVirtualBettor(store.state?.virtualBettor || null);
     renderCycleComparison(store.cycleComparison);
   }
@@ -1514,7 +1494,6 @@ import {
     renderPredictiveLeaderSignalAccount();
     renderLatestResult(latestResult);
     renderPrecloseForecast();
-    renderForecastHitHistory();
     renderFollowerTop5Tracker(store.state?.followerTop5Tracker || null);
     renderFollowers(latestResult);
     renderOverdueNumbers();
@@ -3672,192 +3651,6 @@ import {
       `Все 37 чисел получили ранг по замороженным распределениям похожих траекторий и весам, обученным на ${trainingCount} завершённых снимках. На экран вынесены только первые три; это ранговая масса, не вероятность.`,
     );
     elements.precloseComparison.title = `Rank‑37 зафиксирован по срезу ${formatDateTime(latest.lockedAt, { alwaysShowDate: true })}`;
-  }
-
-  function normalizeForecastHit(value) {
-    const rankedNumbers = Array.isArray(value?.rankedNumbers)
-      ? value.rankedNumbers.map(asRouletteNumber)
-      : [];
-    const actualNumber = asRouletteNumber(value?.actualNumber);
-
-    if (
-      rankedNumbers.length !== 3
-      || rankedNumbers.some((number) => number === null)
-      || new Set(rankedNumbers).size !== 3
-      || actualNumber === null
-      || !rankedNumbers.includes(actualNumber)
-    ) {
-      return null;
-    }
-
-    return {
-      roundId: value?.roundId,
-      rankedNumbers,
-      actualNumber,
-      lockedAt: value?.lockedAt,
-      settledAt: value?.settledAt,
-      modelVersion: value?.modelVersion
-    };
-  }
-
-  function forecastHitPick(number, rank, actualNumber) {
-    const isHit = number === actualNumber;
-    const item = createElement("li", `preclose-hit-card__pick${isHit ? " is-hit" : ""}`);
-    const rankLabel = createElement("span", "preclose-hit-card__rank", `#${rank}`);
-    rankLabel.setAttribute("aria-hidden", "true");
-
-    const ball = createElement(
-      "span",
-      `preclose-hit-card__number ${rouletteColorClass(number)}`,
-      number,
-    );
-    ball.setAttribute("aria-hidden", "true");
-
-    item.append(
-      rankLabel,
-      ball,
-      createElement("span", "sr-only", `${rank} место: число ${number}, ${rouletteColorLabel(number)}${isHit ? ", совпало с результатом" : ""}`),
-    );
-    return item;
-  }
-
-  function forecastHitCard(hit) {
-    const card = createElement("li", "preclose-hit-card");
-    const sequence = createElement("div", "preclose-hit-card__sequence");
-    const ranking = createElement("ol", "preclose-hit-card__ranking");
-    ranking.setAttribute("aria-label", "Зафиксированный архивный top-3 start-price-v2");
-    hit.rankedNumbers.forEach((number, index) => {
-      ranking.appendChild(forecastHitPick(number, index + 1, hit.actualNumber));
-    });
-
-    const arrow = createElement("span", "preclose-hit-card__arrow", "→");
-    arrow.setAttribute("aria-hidden", "true");
-
-    const outcome = createElement("div", "preclose-hit-card__outcome");
-    const outcomeLabel = createElement("span", "preclose-hit-card__outcome-label", "выпало");
-    const actualBall = createElement(
-      "span",
-      `preclose-hit-card__actual ${rouletteColorClass(hit.actualNumber)}`,
-      hit.actualNumber,
-    );
-    actualBall.setAttribute("aria-hidden", "true");
-    outcome.append(
-      outcomeLabel,
-      actualBall,
-      createElement("span", "sr-only", `Выпало число ${hit.actualNumber}, ${rouletteColorLabel(hit.actualNumber)}; попадание подтверждено`),
-    );
-
-    sequence.append(ranking, arrow, outcome);
-
-    const meta = createElement("p", "preclose-hit-card__meta");
-    const fullRoundId = hit.roundId === null || hit.roundId === undefined || hit.roundId === ""
-      ? ""
-      : String(hit.roundId);
-    const round = createElement("span", "preclose-hit-card__round", `Раунд ${compactId(hit.roundId)}`);
-    if (fullRoundId) round.title = `Раунд ${fullRoundId}`;
-    meta.appendChild(round);
-
-    const eventAt = hit.settledAt || hit.lockedAt;
-    const eventDate = parseDate(eventAt);
-    if (eventDate) {
-      const time = createElement("time", "preclose-hit-card__time", formatDateTime(eventDate, { alwaysShowDate: true }));
-      const fullDate = new Intl.DateTimeFormat("ru-RU", {
-        dateStyle: "long",
-        timeStyle: "medium"
-      }).format(eventDate);
-      time.dateTime = eventDate.toISOString();
-      time.title = fullDate;
-      time.setAttribute("aria-label", `${hit.settledAt ? "Результат зафиксирован" : "Прогноз зафиксирован"}: ${fullDate}`);
-      meta.appendChild(time);
-    }
-
-    const modelVersion = hit.modelVersion === null || hit.modelVersion === undefined
-      ? ""
-      : String(hit.modelVersion).trim();
-    if (modelVersion) {
-      const model = createElement("span", "preclose-hit-card__model", `Модель ${modelVersion}`);
-      model.title = `Версия модели: ${modelVersion}`;
-      meta.appendChild(model);
-    }
-
-    card.append(sequence, meta);
-    return card;
-  }
-
-  function renderForecastHitHistory() {
-    const history = elements.precloseHitHistory;
-    const list = elements.precloseHitHistoryList;
-
-    if (!store.forecastHitsLoaded) {
-      history.dataset.state = store.forecastHitsError ? "error" : "loading";
-      history.setAttribute("aria-busy", store.forecastHitsError ? "false" : "true");
-      elements.precloseHitHistoryCount.textContent = store.forecastHitsError ? "Ошибка" : "Загрузка…";
-      list.replaceChildren(createElement(
-        "li",
-        "empty-state",
-        store.forecastHitsError
-          ? "Не удалось загрузить историю попаданий."
-          : "Загружаем историю попаданий…",
-      ));
-      setTextIfChanged(
-        elements.precloseHitHistoryStatus,
-        store.forecastHitsError
-          ? "Повторим загрузку автоматически."
-          : "Загружаем архив попаданий прежней модели start-price-v2; эти записи не являются новым Rank‑37.",
-      );
-      return;
-    }
-
-    const hits = store.forecastHits
-      .map(normalizeForecastHit)
-      .filter((item) => item !== null)
-      .slice(0, 20);
-
-    history.setAttribute("aria-busy", "false");
-    if (!hits.length) {
-      history.dataset.state = store.forecastHitsError ? "error" : "empty";
-      elements.precloseHitHistoryCount.textContent = store.forecastHitsError ? "Ошибка" : "0 попаданий";
-      list.replaceChildren(createElement(
-        "li",
-        "empty-state",
-        store.forecastHitsError
-          ? "Не удалось обновить историю попаданий."
-          : "Подтверждённых попаданий архивного top-3 start-price-v2 пока нет.",
-      ));
-      setTextIfChanged(
-        elements.precloseHitHistoryStatus,
-        store.forecastHitsError
-          ? "Повторим загрузку автоматически."
-          : "Первое подтверждённое попадание архивной модели start-price-v2 появится здесь после проверки результата.",
-      );
-      return;
-    }
-
-    const fragment = document.createDocumentFragment();
-    hits.forEach((hit) => fragment.appendChild(forecastHitCard(hit)));
-    list.replaceChildren(fragment);
-
-    const hitLabel = pluralForm(hits.length, "попадание", "попадания", "попаданий");
-    if (store.forecastHitsError) {
-      history.dataset.state = "stale";
-      elements.precloseHitHistoryCount.textContent = `${hits.length} · не обновлено`;
-      setTextIfChanged(
-        elements.precloseHitHistoryStatus,
-        `Показаны последние загруженные ${hits.length} ${hitLabel} архивной модели start-price-v2; свежие данные временно недоступны.`,
-      );
-      return;
-    }
-
-    history.dataset.state = "ready";
-    elements.precloseHitHistoryCount.textContent = store.forecastHitsHasMore
-      ? `${hits.length} последних`
-      : `${hits.length} ${hitLabel}`;
-    setTextIfChanged(
-      elements.precloseHitHistoryStatus,
-      store.forecastHitsHasMore
-        ? `Показаны ${hits.length} последних ${hitLabel} архивной модели start-price-v2; более ранние записи остаются в истории.`
-        : `Показаны все ${hits.length} ${hitLabel} архивной модели start-price-v2 на данный момент.`,
-    );
   }
 
   function renderPrecloseTrajectoryMetrics(

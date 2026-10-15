@@ -630,26 +630,6 @@ const server = createServer((request, response) => {
       return;
     }
 
-    if (pathname === '/api/forecasts/hits') {
-      const limit = clampLimit(url.searchParams.get('limit'), 20, 100);
-      const readPayload = () => {
-        const matches = db.getPrecloseForecastHits(
-          'buleto',
-          config.instrument,
-          limit + 1,
-        );
-        return {
-          items: matches.slice(0, limit),
-          hasMore: matches.length > limit,
-        };
-      };
-      const payload = limit === 20
-        ? cachedDatabaseRead('preclose-forecast-hits:default', readPayload)
-        : readPayload();
-      sendJson(response, 200, payload);
-      return;
-    }
-
     if (pathname === '/api/cycles') {
       const limit = clampLimit(url.searchParams.get('limit'), 10, 100);
       const readItems = () => db.getCompletedCycles(limit).map(cycleForApi);

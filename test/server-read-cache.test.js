@@ -175,5 +175,5 @@ test("dashboard core excludes the full forecast audit while legacy state keeps i
   assert.match(coreRoute, /sendJson\(response, 200, dashboardCoreState\(\)\)/);
   assert.match(forecastsRoute, /precloseForecastStateFromDatabase\(\)/);
   assert.match(server, /limit === 80[\s\S]*?'recent-results:default'/);
-  assert.match(server, /limit === 20[\s\S]*?'preclose-forecast-hits:default'/);
+  assert.doesNotMatch(server, /preclose-forecast-hits:default/);
 });

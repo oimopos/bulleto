@@ -5509,7 +5509,7 @@ test("pre-close settlement requires the exact stream and round and reports hit m
   }
 });
 
-test("pre-close hit history preserves ranked combinations and isolates streams", () => {
+test("pre-close settlement isolates forecast streams", () => {
   const database = createDatabase({
     path: ":memory:",
     clock: () => new Date(BASE_TIME + 52_000),
@@ -5562,53 +5562,6 @@ test("pre-close hit history preserves ranked combinations and isolates streams",
       settled: 1,
     });
 
-    assert.deepEqual(
-      database.getPrecloseForecastHits("buleto", "PRIMECOIN(XPM)/RUB"),
-      [
-        {
-          roundId: "history-hit-new",
-          rankedNumbers: [19, 7, 11],
-          actualNumber: 7,
-          lockedAt: new Date(BASE_TIME + 51_000).toISOString(),
-          settledAt: new Date(BASE_TIME + 202_000).toISOString(),
-          modelVersion: "preclose-linear-v2",
-        },
-        {
-          roundId: "history-hit-old",
-          rankedNumbers: [7, 11, 19],
-          actualNumber: 11,
-          lockedAt: new Date(BASE_TIME + 51_000).toISOString(),
-          settledAt: new Date(BASE_TIME + 200_000).toISOString(),
-          modelVersion: "preclose-linear-v1",
-        },
-      ],
-    );
-    assert.deepEqual(
-      database.getPrecloseForecastHits("buleto", "PRIMECOIN(XPM)/RUB", 1),
-      [
-        {
-          roundId: "history-hit-new",
-          rankedNumbers: [19, 7, 11],
-          actualNumber: 7,
-          lockedAt: new Date(BASE_TIME + 51_000).toISOString(),
-          settledAt: new Date(BASE_TIME + 202_000).toISOString(),
-          modelVersion: "preclose-linear-v2",
-        },
-      ],
-    );
-    assert.equal(database.getPrecloseForecastHits("buleto", "OTHER").length, 1);
-    assert.equal(
-      database.getPrecloseForecastHits("other-source", "PRIMECOIN(XPM)/RUB").length,
-      1,
-    );
-    assert.throws(
-      () => database.getPrecloseForecastHits("buleto", "PRIMECOIN(XPM)/RUB", 0),
-      /limit must be an integer between 1 and 500/,
-    );
-    assert.throws(
-      () => database.getPrecloseForecastHits("buleto", "PRIMECOIN(XPM)/RUB", 501),
-      /limit must be an integer between 1 and 500/,
-    );
   } finally {
     database.close();
   }

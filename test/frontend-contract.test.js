@@ -46,7 +46,6 @@ test("dashboard keeps the exact read-only fetch URL list", () => {
     "/api/cycles?limit=10",
     "/api/sequences?limit=50",
     "/api/pairs",
-    "/api/forecasts/hits?limit=20",
     "/api/cycle-comparison",
     "/api/predictive-leader",
     "/api/trajectory-direction/challenger",
@@ -119,7 +118,7 @@ test("partial refresh marks cached dashboard state stale before rendering fresh 
   assert.equal(store.resultsLoaded, true);
   assert.equal(store.resultsError, false);
   assert.deepEqual(store.results, [{ id: "fresh" }]);
-  assert.equal(rendered.length, 10, "core and nine optional outcomes render independently");
+  assert.equal(rendered.length, 9, "core and eight optional outcomes render independently");
   assert.ok(rendered.every(({ state, stateError }) => state === staleState && stateError));
 });
 
@@ -306,7 +305,7 @@ test("a full initial API outage renders the explicit failure state", async () =>
   assert.deepEqual(failureCompleted, [false], "core failure must render before optional timeouts");
   assert.equal(busyRemoved, 1, "the initial loading state must end after the core failure");
   assert.equal(store.refreshing, true, "optional recovery may continue after the visible error");
-  assert.equal(pending.length, 9);
+  assert.equal(pending.length, 8);
 
   pending.forEach(({ reject }) => reject(new Error("offline")));
   await refresh;
@@ -475,7 +474,7 @@ test("background refresh avoids global busy state and refresh cleanup survives r
   assert.equal(failing.calls.remove, 1);
   assert.equal(failing.calls.removeBusy, 1);
   assert.equal(failing.calls.queued, 1);
-  assert.equal(failing.calls.urls.length, 10, "one broken renderer cannot cancel independent API reads");
+  assert.equal(failing.calls.urls.length, 9, "one broken renderer cannot cancel independent API reads");
 });
 
 test("SSE connected is ignored and refresh storms coalesce while a refresh is active", () => {
@@ -680,7 +679,7 @@ test("combined leader is the first dashboard block and renders exactly one numbe
   assert.match(block, /Команда BET закрыта/);
   assert.match(block, /1 000 проспективных прогнозов/);
   assert.match(block, /нижнюю границу Wilson 95% выше случайной базы 1\/37/);
-  assert.match(html, /<script type="module" src="\/app\.js\?v=51"><\/script>/);
+  assert.match(html, /<script type="module" src="\/app\.js\?v=52"><\/script>/);
 
   assert.match(app, /from "\.\/combined-number\.js\?v=9"/);
   assert.match(app, /normalizePredictiveLeaderApiSnapshot/);
@@ -862,7 +861,7 @@ test("trajectory shadow is prospective and exposes the full Rank-37 contract", (
   }
 
   const blockStart = html.indexOf('id="trajectory-shadow-panel"');
-  const blockEnd = html.indexOf('id="preclose-hit-history"');
+  const blockEnd = html.indexOf('id="preclose-note"');
   const block = html.slice(blockStart, blockEnd);
   assert.ok(blockStart >= 0 && blockEnd > blockStart);
   assert.match(block, /Shadow · факт отдельно от прогноза/);
@@ -895,6 +894,10 @@ test("trajectory shadow is prospective and exposes the full Rank-37 contract", (
   assert.match(block, /нулевой массой данных не получают вес/);
   assert.match(block, /не создаёт второй независимый вес/);
   assert.doesNotMatch(block, /roulette-(?:red|green|black)|is-(?:hit|positive|loss)/);
+  assert.doesNotMatch(html, /preclose-hit-history|Сохранённые попадания legacy Top/);
+  assert.doesNotMatch(app, /forecastHits|renderForecastHitHistory|\/api\/forecasts\/hits/);
+  assert.doesNotMatch(server, /\/api\/forecasts\/hits|preclose-forecast-hits/);
+  assert.doesNotMatch(database, /getPrecloseForecastHits|mapPrecloseForecastHit/);
 
   assert.match(app, /const TRAJECTORY_SHADOW_LEGACY_VERSION = "trajectory-shadow-knn-v1"/);
   assert.match(app, /const TRAJECTORY_SHADOW_ADAPTIVE_VERSION = "trajectory-shadow-adaptive-v2"/);
@@ -1747,8 +1750,8 @@ test("warm next-round forecast exposes a strict 5-percent walk-forward contract"
   );
   assert.match(html, /id="follower-dynamic-next-title"[^>]*>[^<]*≥5%/);
   assert.match(html, /id="follower-dynamic-next-note"[^>]*>[\s\S]*?5%/);
-  assert.match(html, /styles\.css\?v=33/);
-  assert.match(html, /app\.js\?v=51/);
+  assert.match(html, /styles\.css\?v=34/);
+  assert.match(html, /app\.js\?v=52/);
   assert.match(styles, /\.follower-dynamic-next\s*\{/);
   assert.match(styles, /\.follower-warm-current\s*\{/);
   assert.match(styles, /\.follower-warm-picks\s*\{/);
@@ -1975,8 +1978,8 @@ test("cycle comparison language is descriptive, responsive, and cache-busted", (
   assert.match(block, /не прогноз/);
   assert.match(block, /не предсказывает следующее число/);
   assert.doesNotMatch(block, /должн/iu);
-  assert.match(html, /href="\/styles\.css\?v=33"/);
-  assert.match(html, /src="\/app\.js\?v=51"/);
+  assert.match(html, /href="\/styles\.css\?v=34"/);
+  assert.match(html, /src="\/app\.js\?v=52"/);
   assert.match(styles, /\.cycle-sequence-list\s*\{[\s\S]*?repeat\(auto-fill, minmax\(50px, 1fr\)\)/);
   assert.match(
     styles,
