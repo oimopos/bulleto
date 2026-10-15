@@ -4,7 +4,7 @@ export const TRAJECTORY_RANK37_BASIS =
   "adaptive-weighted-neighbor-delta-to-current-bands";
 export const TRAJECTORY_RANK37_MIN_TRAINING_COUNT = 30;
 export const TRAJECTORY_RANK37_MIN_EVIDENCE_CANDIDATES = 3;
-export const PREDICTIVE_LEADER_API_SCHEMA_VERSION = 2;
+export const PREDICTIVE_LEADER_API_SCHEMA_VERSION = 3;
 export const PREDICTIVE_LEADER_API_ALGORITHM_VERSION =
   "learned-predictive-family-index-v5";
 export const PREDICTIVE_LEADER_API_LEARNING_VERSION =
@@ -385,6 +385,7 @@ export function normalizePredictiveLeaderApiSnapshot(value) {
     || nullableInstant(value.serverTime) === undefined
     || !PREDICTIVE_LEADER_REASONS[value.status]?.has(value.reason)
     || (value.account !== null && !isPlainRecord(value.account))
+    || !isPlainRecord(value.signalAccount)
   ) {
     return null;
   }
@@ -441,6 +442,7 @@ export function normalizePredictiveLeaderApiSnapshot(value) {
       forecast,
       model,
       account: value.account,
+      signalAccount: value.signalAccount,
       metrics,
       freshness,
     };
@@ -486,6 +488,7 @@ export function normalizePredictiveLeaderApiSnapshot(value) {
     forecast,
     model,
     account: value.account,
+    signalAccount: value.signalAccount,
     metrics,
     freshness,
   };

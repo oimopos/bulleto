@@ -485,6 +485,79 @@ h2 {
   text-align: center;
 }
 
+.signal-account {
+  min-width: 0;
+  padding-top: 14px;
+  grid-column: 1 / -1;
+  border-top: 1px solid var(--border-soft);
+}
+
+.signal-account__heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--text);
+  font-size: 11px;
+}
+
+.signal-account__heading span {
+  color: var(--muted);
+  font-size: 9px;
+  text-align: right;
+}
+
+.signal-account__metrics {
+  display: grid;
+  margin: 9px 0 0;
+  padding: 0;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 7px;
+}
+
+.signal-account__metrics > div {
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: 9px;
+  background: rgba(255, 255, 255, 0.018);
+}
+
+.signal-account__metrics dt {
+  color: var(--muted);
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: 0.045em;
+  text-transform: uppercase;
+}
+
+.signal-account__metrics dd {
+  margin: 5px 0 0;
+  color: var(--text);
+  font-size: 15px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 800;
+  line-height: 1.2;
+  overflow-wrap: anywhere;
+}
+
+.signal-account__metrics small {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 8px;
+  line-height: 1.4;
+}
+
+.signal-account[data-state="pending"] #signal-account-status {
+  color: #a4e7cd;
+}
+
+.signal-account[data-state="error"] #signal-account-status,
+.signal-account[data-state="exhausted"] #signal-account-status {
+  color: #f2b0b0;
+}
+
 .panel__topline {
   display: flex;
   align-items: flex-start;
@@ -4591,6 +4664,20 @@ tbody tr:first-child {
   .combined-pick {
     grid-template-columns: minmax(0, 1fr);
     gap: 20px;
+  }
+
+  .signal-account__heading {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 5px;
+  }
+
+  .signal-account__heading span {
+    text-align: left;
+  }
+
+  .signal-account__metrics {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .combined-pick__result {

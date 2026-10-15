@@ -15,7 +15,7 @@ import {
   wilsonInterval,
 } from './predictive-leader-quality-gate.js';
 
-export const PREDICTIVE_LEADER_API_SCHEMA_VERSION = 2;
+export const PREDICTIVE_LEADER_API_SCHEMA_VERSION = 3;
 
 const SUM_TOLERANCE = 1e-9;
 

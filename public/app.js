@@ -7,7 +7,7 @@ import {
   combinedTrajectorySignals,
   normalizePredictiveLeaderApiSnapshot,
   predictiveLeaderNumberContext,
-} from "./combined-number.js?v=8";
+} from "./combined-number.js?v=9";
 
 (() => {
   "use strict";
@@ -77,6 +77,11 @@ import {
     combinedPickNumber: document.getElementById("combined-pick-number"),
     combinedPickStatus: document.getElementById("combined-pick-status"),
     combinedPickSources: document.getElementById("combined-pick-sources"),
+    signalAccount: document.getElementById("signal-account"),
+    signalAccountStatus: document.getElementById("signal-account-status"),
+    signalAccountBalance: document.getElementById("signal-account-balance"),
+    signalAccountRecord: document.getElementById("signal-account-record"),
+    signalAccountPending: document.getElementById("signal-account-pending"),
     lastNumber: document.getElementById("last-number"),
     lastTime: document.getElementById("last-time"),
     lastPrice: document.getElementById("last-price"),
@@ -1332,13 +1337,20 @@ import {
             const account = snapshot?.account === null
               ? null
               : normalizedPredictiveLeaderAccount(snapshot?.account);
+            const signalAccount = normalizedPredictiveLeaderSignalAccount(
+              snapshot?.signalAccount,
+            );
             store.predictiveLeaderLoaded = true;
-            if (!snapshot || (snapshot.account !== null && !account)) {
+            if (
+              !snapshot
+              || (snapshot.account !== null && !account)
+              || !signalAccount
+            ) {
               store.predictiveLeaderSnapshot = null;
               store.predictiveLeaderError = true;
               return false;
             }
-            store.predictiveLeaderSnapshot = { ...snapshot, account };
+            store.predictiveLeaderSnapshot = { ...snapshot, account, signalAccount };
             store.predictiveLeaderError = false;
             store.predictiveLeaderRequiresFreshSnapshot = false;
             captureServerClock(snapshot.serverTime);
@@ -1463,6 +1475,7 @@ import {
 
   function renderFetchFailure() {
     renderCombinedPick();
+    renderPredictiveLeaderSignalAccount();
     renderPrecloseForecast();
     if (!store.hasCompletedInitialRender) {
       elements.resultsBody.replaceChildren(emptyTableRow("Не удалось загрузить результаты. Повторим попытку автоматически."));
@@ -1498,6 +1511,7 @@ import {
     renderCollector(store.state?.collector);
     renderGapWarning(store.state);
     renderCombinedPick();
+    renderPredictiveLeaderSignalAccount();
     renderLatestResult(latestResult);
     renderPrecloseForecast();
     renderForecastHitHistory();
@@ -3361,9 +3375,167 @@ import {
     };
   }
 
+  function normalizedPredictiveLeaderSignalAccount(value) {
+    if (
+      !isPlainRecord(value)
+      || value.schemaVersion !== 1
+      || value.mode !== "confirmed-bet-signals"
+      || value.initialBalance !== 1_000
+      || value.stake !== 10
+      || value.grossPayoutMultiplier !== 36
+      || !["running", "pending", "exhausted"].includes(value.status)
+    ) return null;
+    const integerFields = [
+      "currentBalance",
+      "profit",
+      "betCount",
+      "settledCount",
+      "pendingCount",
+      "voidCount",
+      "hitCount",
+      "missCount",
+      "totalStaked",
+      "totalGrossPayout",
+    ];
+    if (
+      integerFields.some((field) => !Number.isSafeInteger(value[field]))
+      || value.currentBalance < 0
+      || value.pendingCount > 1
+      || value.betCount !== value.settledCount + value.pendingCount + value.voidCount
+      || value.settledCount !== value.hitCount + value.missCount
+      || value.totalStaked % value.stake !== 0
+      || value.totalGrossPayout % (value.stake * value.grossPayoutMultiplier) !== 0
+      || value.currentBalance !== value.initialBalance
+        - value.totalStaked + value.totalGrossPayout
+      || value.profit !== value.currentBalance - value.initialBalance
+      || (value.settledCount === 0 && value.hitRate !== null)
+      || (value.settledCount > 0 && (
+        typeof value.hitRate !== "number"
+        || !Number.isFinite(value.hitRate)
+        || Math.abs(value.hitRate - value.hitCount / value.settledCount) > 1e-9
+      ))
+    ) return null;
+
+    let pendingBet = null;
+    if (value.pendingBet !== null) {
+      if (
+        !isPlainRecord(value.pendingBet)
+        || !Number.isSafeInteger(value.pendingBet.forecastId)
+        || value.pendingBet.forecastId <= 0
+        || !isStrictRouletteNumber(value.pendingBet.targetNumber)
+        || value.pendingBet.stake !== value.stake
+        || !strictTimestamp(value.pendingBet.placedAt)
+      ) return null;
+      pendingBet = { ...value.pendingBet };
+    }
+    if ((pendingBet !== null) !== (value.pendingCount === 1)) return null;
+    const latestOutcome = value.latestOutcome;
+    if (
+      (latestOutcome !== null && (
+        !isPlainRecord(latestOutcome)
+        || !Number.isSafeInteger(latestOutcome.forecastId)
+        || !isStrictRouletteNumber(latestOutcome.targetNumber)
+        || !isStrictRouletteNumber(latestOutcome.resultNumber)
+        || !["hit", "miss"].includes(latestOutcome.outcome)
+        || (latestOutcome.outcome === "hit")
+          !== (latestOutcome.targetNumber === latestOutcome.resultNumber)
+        || latestOutcome.stake !== value.stake
+        || !Number.isSafeInteger(latestOutcome.balanceAfter)
+        || !strictTimestamp(latestOutcome.occurredAt)
+      ))
+      || (value.settledCount > 0) !== (latestOutcome !== null)
+    ) return null;
+    const latestVoid = value.latestVoid;
+    if (
+      latestVoid !== null && (
+        !isPlainRecord(latestVoid)
+        || !Number.isSafeInteger(latestVoid.forecastId)
+        || !isStrictRouletteNumber(latestVoid.targetNumber)
+        || !strictTimestamp(latestVoid.voidedAt)
+      )
+    ) return null;
+    if (
+      (value.voidCount > 0) !== (latestVoid !== null)
+      || (value.betCount === 0 && (
+        value.currentBalance !== value.initialBalance
+        || value.startedAt !== null
+        || value.updatedAt !== null
+      ))
+      || (value.betCount > 0 && (
+        !strictTimestamp(value.startedAt)
+        || !strictTimestamp(value.updatedAt)
+      ))
+    ) return null;
+    return {
+      status: value.status,
+      initialBalance: value.initialBalance,
+      currentBalance: value.currentBalance,
+      profit: value.profit,
+      stake: value.stake,
+      betCount: value.betCount,
+      settledCount: value.settledCount,
+      pendingCount: value.pendingCount,
+      voidCount: value.voidCount,
+      hitCount: value.hitCount,
+      missCount: value.missCount,
+      hitRate: value.hitRate,
+      pendingBet,
+      latestOutcome: latestOutcome ? { ...latestOutcome } : null,
+      latestVoid: latestVoid ? { ...latestVoid } : null,
+    };
+  }
+
   function currentPriceTrajectorySignals(latestForecast) {
     const shadow = normalizedTrajectoryShadow(latestForecast?.trajectoryShadow);
     return combinedTrajectorySignals(shadow);
+  }
+
+  function renderPredictiveLeaderSignalAccount() {
+    const account = store.predictiveLeaderSnapshot?.signalAccount ?? null;
+    if (!account || store.predictiveLeaderError) {
+      elements.signalAccount.dataset.state = store.predictiveLeaderLoaded
+        ? "error"
+        : "loading";
+      elements.signalAccount.setAttribute(
+        "aria-busy",
+        String(!store.predictiveLeaderLoaded),
+      );
+      setTextIfChanged(elements.signalAccountStatus, store.predictiveLeaderLoaded
+        ? "Баланс сигналов BET сейчас недоступен"
+        : "Загрузка баланса…");
+      setTextIfChanged(elements.signalAccountBalance, "—");
+      setTextIfChanged(elements.signalAccountRecord, "—");
+      setTextIfChanged(elements.signalAccountPending, "Нет подтверждённых данных");
+      return;
+    }
+
+    elements.signalAccount.dataset.state = account.status;
+    elements.signalAccount.setAttribute("aria-busy", "false");
+    const pending = account.pendingBet;
+    setTextIfChanged(
+      elements.signalAccountStatus,
+      pending
+        ? `BET подтверждён · число ${pending.targetNumber} ждёт результата`
+        : account.status === "exhausted"
+          ? "Виртуальный счёт исчерпан"
+          : "Открытой ставки нет · учитываются только сигналы BET",
+    );
+    setTextIfChanged(
+      elements.signalAccountBalance,
+      `${formatRiskAmount(account.currentBalance)} · ${formatSignedRiskAmount(account.profit)}`,
+    );
+    setTextIfChanged(
+      elements.signalAccountRecord,
+      `${formatRiskAmount(account.hitCount)} / ${formatRiskAmount(account.missCount)} · ${formatRiskAmount(account.betCount)} сигналов`,
+    );
+    setTextIfChanged(
+      elements.signalAccountPending,
+      pending
+        ? `Подтверждённый BET: ${formatRiskAmount(pending.stake)} на число ${pending.targetNumber}`
+        : account.latestOutcome
+          ? `Последний сигнал: ${account.latestOutcome.targetNumber} → ${account.latestOutcome.resultNumber} · ${account.latestOutcome.outcome === "hit" ? "попадание" : "промах"}`
+          : "Ожидаем первый подтверждённый BET",
+    );
   }
 
   function currentCombinedNumberContext() {

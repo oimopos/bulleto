@@ -5006,6 +5006,69 @@ export class RouletteDatabase {
     this.#migratePredictiveLeaderAccountLadderResetV19(startingVersion);
     this.#migratePredictiveLeaderChallengersV20();
     this.#migrateTrajectoryDirectionChallengerV21();
+    this.#migratePredictiveLeaderSignalAccountV22();
+  }
+
+  #migratePredictiveLeaderSignalAccountV22() {
+    this.sqlite.exec(`
+      BEGIN IMMEDIATE;
+
+      CREATE TABLE IF NOT EXISTS predictive_leader_signal_bets (
+        forecast_id INTEGER PRIMARY KEY REFERENCES
+          forecast_predictive_leader_snapshots(forecast_id),
+        source TEXT NOT NULL,
+        instrument TEXT NOT NULL,
+        target_number INTEGER NOT NULL CHECK (target_number BETWEEN 0 AND 36),
+        stake INTEGER NOT NULL CHECK (stake = 10),
+        balance_before INTEGER NOT NULL CHECK (balance_before >= stake),
+        gate_version TEXT NOT NULL CHECK (length(trim(gate_version)) > 0),
+        gate_sample_size INTEGER NOT NULL CHECK (gate_sample_size = 1000),
+        gate_hit_count INTEGER NOT NULL CHECK (
+          gate_hit_count >= 0 AND gate_hit_count <= gate_sample_size
+        ),
+        gate_lower_bound REAL NOT NULL CHECK (
+          gate_lower_bound > (1.0 / 37.0) AND gate_lower_bound <= 1
+        ),
+        continuity_epoch INTEGER NOT NULL CHECK (continuity_epoch >= 0),
+        status TEXT NOT NULL CHECK (status IN ('pending', 'settled', 'void')),
+        round_result_id INTEGER REFERENCES round_results(id),
+        result_number INTEGER CHECK (
+          result_number IS NULL OR result_number BETWEEN 0 AND 36
+        ),
+        outcome TEXT CHECK (outcome IS NULL OR outcome IN ('hit', 'miss')),
+        gross_payout INTEGER CHECK (gross_payout IS NULL OR gross_payout >= 0),
+        balance_after INTEGER CHECK (balance_after IS NULL OR balance_after >= 0),
+        placed_at TEXT NOT NULL,
+        settled_at TEXT,
+        CHECK (
+          (status = 'pending' AND round_result_id IS NULL
+            AND result_number IS NULL AND outcome IS NULL
+            AND gross_payout IS NULL AND balance_after IS NULL
+            AND settled_at IS NULL)
+          OR
+          (status = 'settled' AND round_result_id IS NOT NULL
+            AND result_number IS NOT NULL AND outcome IS NOT NULL
+            AND gross_payout IS NOT NULL AND balance_after IS NOT NULL
+            AND settled_at IS NOT NULL
+            AND (outcome = 'hit') = (target_number = result_number)
+            AND gross_payout = CASE WHEN outcome = 'hit' THEN stake * 36 ELSE 0 END)
+          OR
+          (status = 'void' AND round_result_id IS NULL
+            AND result_number IS NULL AND outcome IS NULL
+            AND gross_payout IS NULL AND balance_after IS NULL
+            AND settled_at IS NOT NULL)
+        )
+      );
+
+      CREATE UNIQUE INDEX IF NOT EXISTS predictive_leader_signal_one_pending_idx
+        ON predictive_leader_signal_bets(source, instrument)
+        WHERE status = 'pending';
+      CREATE INDEX IF NOT EXISTS predictive_leader_signal_stream_idx
+        ON predictive_leader_signal_bets(source, instrument, forecast_id DESC);
+
+      PRAGMA user_version = 22;
+      COMMIT;
+    `);
   }
 
   #migratePrecloseForecastsV10() {
@@ -12548,6 +12611,282 @@ export class RouletteDatabase {
       inserted: primaryOutcome.inserted,
       roundId: externalRoundId,
       ...(!primaryOutcome.inserted && repairedChild ? { repaired: true } : {}),
+    };
+  }
+
+  recordPredictiveLeaderSignal({
+    source = "buleto",
+    instrument = "default",
+    forecastId,
+    targetNumber,
+    authorizedAt,
+  } = {}) {
+    this.#assertOpen();
+    const safeSource = asNonEmptyText(source, undefined, "source");
+    const safeInstrument = asNonEmptyText(instrument, undefined, "instrument");
+    const safeForecastId = Number(forecastId);
+    if (!Number.isSafeInteger(safeForecastId) || safeForecastId <= 0) {
+      throw new TypeError("forecastId must be a positive safe integer");
+    }
+    const safeTargetNumber = Number(targetNumber);
+    if (!Number.isInteger(safeTargetNumber) || safeTargetNumber < 0 || safeTargetNumber > 36) {
+      throw new RangeError("targetNumber must be an integer from 0 through 36");
+    }
+    const safeAuthorizedAt = asTimestamp(
+      authorizedAt ?? this.clock(),
+      undefined,
+      "authorizedAt",
+    );
+    return this.#transaction(() => {
+      const existing = this.sqlite
+        .prepare(`
+          SELECT status
+          FROM predictive_leader_signal_bets
+          WHERE forecast_id = ?
+        `)
+        .get(safeForecastId);
+      if (existing) return { recorded: false, reason: "already_recorded" };
+
+      const forecast = this.sqlite
+        .prepare(`
+          SELECT
+            leaders.status AS leader_status,
+            leaders.predicted_number,
+            snapshots.horizon_seconds,
+            snapshots.locked_at,
+            snapshots.betting_closes_at,
+            snapshots.source,
+            snapshots.instrument,
+            settlements.forecast_id AS settled_forecast_id
+          FROM forecast_predictive_leader_snapshots AS leaders
+          JOIN round_forecasts AS forecasts ON forecasts.id = leaders.forecast_id
+          JOIN forecast_snapshots AS snapshots ON snapshots.id = forecasts.snapshot_id
+          LEFT JOIN forecast_settlements AS settlements
+            ON settlements.forecast_id = forecasts.id
+          WHERE leaders.forecast_id = ?
+        `)
+        .get(safeForecastId);
+      if (
+        !forecast
+        || forecast.source !== safeSource
+        || forecast.instrument !== safeInstrument
+        || forecast.leader_status !== "ready"
+        || Number(forecast.predicted_number) !== safeTargetNumber
+        || forecast.settled_forecast_id != null
+        || Date.parse(safeAuthorizedAt) < Date.parse(forecast.locked_at)
+        || Date.parse(safeAuthorizedAt) >= Date.parse(forecast.betting_closes_at)
+      ) {
+        throw new Error("authorized predictive leader signal is not current and valid");
+      }
+      const qualityGate = mapPredictiveLeaderMetrics(
+        this.#predictiveLeaderMetricRows(
+          safeSource,
+          safeInstrument,
+          Number(forecast.horizon_seconds),
+        ),
+      ).qualityGate;
+      if (qualityGate.status !== "confirmed" || qualityGate.eligible !== true) {
+        throw new Error("predictive leader quality gate is not confirmed");
+      }
+      const pending = this.sqlite
+        .prepare(`
+          SELECT forecast_id
+          FROM predictive_leader_signal_bets
+          WHERE source = ? AND instrument = ? AND status = 'pending'
+        `)
+        .get(safeSource, safeInstrument);
+      if (pending) return { recorded: false, reason: "prior_pending" };
+
+      const totals = this.sqlite
+        .prepare(`
+          SELECT
+            COALESCE(SUM(CASE WHEN status <> 'void' THEN stake ELSE 0 END), 0)
+              AS total_staked,
+            COALESCE(SUM(CASE WHEN status = 'settled'
+              THEN gross_payout ELSE 0 END), 0) AS total_gross_payout
+          FROM predictive_leader_signal_bets
+          WHERE source = ? AND instrument = ?
+        `)
+        .get(safeSource, safeInstrument);
+      const balanceBefore = 1_000
+        - Number(totals.total_staked)
+        + Number(totals.total_gross_payout);
+      const stake = 10;
+      if (balanceBefore < stake) return { recorded: false, reason: "bankroll_exhausted" };
+      this.sqlite
+        .prepare(`
+          INSERT INTO predictive_leader_signal_bets (
+            forecast_id, source, instrument, target_number, stake,
+            balance_before, gate_version, gate_sample_size, gate_hit_count,
+            gate_lower_bound, continuity_epoch, status, placed_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+        `)
+        .run(
+          safeForecastId,
+          safeSource,
+          safeInstrument,
+          safeTargetNumber,
+          stake,
+          balanceBefore,
+          qualityGate.version,
+          qualityGate.sampleSize,
+          qualityGate.hitCount,
+          qualityGate.lowerBound,
+          this.#continuityEpoch(safeSource, safeInstrument) ?? 0,
+          safeAuthorizedAt,
+        );
+      return { recorded: true, reason: "bet_recorded" };
+    });
+  }
+
+  settlePredictiveLeaderSignals(source = "buleto", instrument = "default") {
+    this.#assertOpen();
+    const safeSource = asNonEmptyText(source, undefined, "source");
+    const safeInstrument = asNonEmptyText(instrument, undefined, "instrument");
+    const now = asTimestamp(this.clock(), undefined, "signal settledAt");
+    return this.#transaction(() => {
+      const pending = this.sqlite
+        .prepare(`
+          SELECT *
+          FROM predictive_leader_signal_bets
+          WHERE source = ? AND instrument = ? AND status = 'pending'
+        `)
+        .get(safeSource, safeInstrument);
+      if (!pending) return { settled: 0, voided: 0 };
+
+      const currentEpoch = this.#continuityEpoch(safeSource, safeInstrument) ?? 0;
+      if (Number(pending.continuity_epoch) !== currentEpoch) {
+        const voided = this.sqlite
+          .prepare(`
+            UPDATE predictive_leader_signal_bets
+            SET status = 'void', settled_at = ?
+            WHERE forecast_id = ? AND status = 'pending'
+          `)
+          .run(now, Number(pending.forecast_id));
+        return { settled: 0, voided: Number(voided.changes) };
+      }
+
+      const result = this.sqlite
+        .prepare(`
+          SELECT
+            settlements.round_result_id,
+            settlements.actual_number,
+            settlements.settled_at,
+            results.result_number,
+            results.settled_at AS result_settled_at
+          FROM forecast_settlements AS settlements
+          JOIN round_results AS results
+            ON results.id = settlements.round_result_id
+          WHERE settlements.forecast_id = ?
+        `)
+        .get(Number(pending.forecast_id));
+      if (!result) return { settled: 0, voided: 0 };
+      if (
+        Number(result.actual_number) !== Number(result.result_number)
+        || result.settled_at !== result.result_settled_at
+      ) {
+        throw new Error("predictive leader signal settlement is inconsistent");
+      }
+      const hit = Number(pending.target_number) === Number(result.result_number);
+      const grossPayout = hit ? Number(pending.stake) * 36 : 0;
+      const balanceAfter = Number(pending.balance_before)
+        - Number(pending.stake)
+        + grossPayout;
+      const updated = this.sqlite
+        .prepare(`
+          UPDATE predictive_leader_signal_bets
+          SET status = 'settled', round_result_id = ?, result_number = ?,
+            outcome = ?, gross_payout = ?, balance_after = ?, settled_at = ?
+          WHERE forecast_id = ? AND status = 'pending'
+        `)
+        .run(
+          Number(result.round_result_id),
+          Number(result.result_number),
+          hit ? "hit" : "miss",
+          grossPayout,
+          balanceAfter,
+          now,
+          Number(pending.forecast_id),
+        );
+      return { settled: Number(updated.changes), voided: 0 };
+    });
+  }
+
+  getPredictiveLeaderSignalAccount(source = "buleto", instrument = "default") {
+    this.#assertOpen();
+    const safeSource = asNonEmptyText(source, undefined, "source");
+    const safeInstrument = asNonEmptyText(instrument, undefined, "instrument");
+    const rows = this.sqlite
+      .prepare(`
+        SELECT *
+        FROM predictive_leader_signal_bets
+        WHERE source = ? AND instrument = ?
+        ORDER BY forecast_id
+      `)
+      .all(safeSource, safeInstrument);
+    const activeRows = rows.filter((row) => row.status !== "void");
+    const settled = rows.filter((row) => row.status === "settled");
+    const pending = rows.find((row) => row.status === "pending") ?? null;
+    const hits = settled.filter((row) => row.outcome === "hit").length;
+    const misses = settled.length - hits;
+    const totalStaked = activeRows.reduce(
+      (total, row) => total + Number(row.stake),
+      0,
+    );
+    const totalGrossPayout = settled.reduce(
+      (total, row) => total + Number(row.gross_payout),
+      0,
+    );
+    const currentBalance = 1_000 - totalStaked + totalGrossPayout;
+    const last = rows.at(-1) ?? null;
+    const latestOutcome = settled.at(-1) ?? null;
+    const latestVoid = [...rows].reverse().find((row) => row.status === "void") ?? null;
+    return {
+      schemaVersion: 1,
+      mode: "confirmed-bet-signals",
+      initialBalance: 1_000,
+      currentBalance,
+      profit: currentBalance - 1_000,
+      stake: 10,
+      grossPayoutMultiplier: 36,
+      betCount: rows.length,
+      settledCount: settled.length,
+      pendingCount: Number(pending !== null),
+      voidCount: rows.filter((row) => row.status === "void").length,
+      hitCount: hits,
+      missCount: misses,
+      hitRate: settled.length > 0 ? hits / settled.length : null,
+      totalStaked,
+      totalGrossPayout,
+      status: currentBalance < 10 ? "exhausted" : pending ? "pending" : "running",
+      pendingBet: pending
+        ? {
+            forecastId: Number(pending.forecast_id),
+            targetNumber: Number(pending.target_number),
+            stake: Number(pending.stake),
+            placedAt: pending.placed_at,
+          }
+        : null,
+      latestOutcome: latestOutcome
+        ? {
+            forecastId: Number(latestOutcome.forecast_id),
+            targetNumber: Number(latestOutcome.target_number),
+            resultNumber: Number(latestOutcome.result_number),
+            outcome: latestOutcome.outcome,
+            stake: Number(latestOutcome.stake),
+            balanceAfter: Number(latestOutcome.balance_after),
+            occurredAt: latestOutcome.settled_at,
+          }
+        : null,
+      latestVoid: latestVoid
+        ? {
+            forecastId: Number(latestVoid.forecast_id),
+            targetNumber: Number(latestVoid.target_number),
+            voidedAt: latestVoid.settled_at,
+          }
+        : null,
+      startedAt: rows[0]?.placed_at ?? null,
+      updatedAt: last?.settled_at ?? last?.placed_at ?? null,
     };
   }
 

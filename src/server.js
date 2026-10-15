@@ -112,6 +112,7 @@ const resultPipeline = new ResultPipeline({
 // no credentials, browser automation, payment access, or Buleto write calls.
 db.initializeVirtualBettor('buleto', config.instrument);
 db.settlePrecloseForecasts('buleto', config.instrument);
+db.settlePredictiveLeaderSignals('buleto', config.instrument);
 db.settlePredictiveLeaderAccount('buleto', config.instrument);
 db.applyPredictiveLeaderAccountReset('buleto', config.instrument);
 db.reconcilePredictiveLeaderAccount('buleto', config.instrument);
@@ -121,6 +122,7 @@ const DATABASE_WRITE_UPDATE_REASONS = new Set([
   'results',
   'forecast-settled',
   'predictive-leader-account',
+  'predictive-leader-signal-account',
 ]);
 const FORECAST_DATABASE_READ_CACHE_KEYS = new Set([
   'dashboard-api-state',
@@ -408,7 +410,7 @@ function predictiveLeaderForApi() {
     'predictive-leader-state',
     () => db.getPredictiveLeaderReadState(source, instrument),
   );
-  return predictiveLeaderSnapshotForApi({
+  const snapshot = predictiveLeaderSnapshotForApi({
     state: {
       ...state,
       latestResult: resultForApi(state.latestResult),
@@ -419,6 +421,19 @@ function predictiveLeaderForApi() {
     instrument,
     now: new Date(),
   });
+  if (snapshot.action === 'BET') {
+    db.recordPredictiveLeaderSignal({
+      source,
+      instrument,
+      forecastId: snapshot.forecast.id,
+      targetNumber: snapshot.number,
+      authorizedAt: snapshot.serverTime,
+    });
+  }
+  return {
+    ...snapshot,
+    signalAccount: db.getPredictiveLeaderSignalAccount(source, instrument),
+  };
 }
 
 function predictiveLeaderChallengersForApi() {
@@ -860,6 +875,21 @@ function publishPipelineOutcome(outcome) {
     if (forecastOutcome.settled > 0) broadcastUpdate('forecast-settled');
   } catch (error) {
     console.error('[forecast] settlement failed; it will be retried', error);
+    retryError ??= error;
+  }
+  try {
+    const signalOutcome = db.settlePredictiveLeaderSignals(
+      'buleto',
+      config.instrument,
+    );
+    if (signalOutcome.settled > 0 || signalOutcome.voided > 0) {
+      broadcastUpdate('predictive-leader-signal-account');
+    }
+  } catch (error) {
+    console.error(
+      '[predictive-leader] signal account settlement failed; it will be retried',
+      error,
+    );
     retryError ??= error;
   }
   try {

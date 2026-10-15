@@ -680,9 +680,9 @@ test("combined leader is the first dashboard block and renders exactly one numbe
   assert.match(block, /Команда BET закрыта/);
   assert.match(block, /1 000 проспективных прогнозов/);
   assert.match(block, /нижнюю границу Wilson 95% выше случайной базы 1\/37/);
-  assert.match(html, /<script type="module" src="\/app\.js\?v=50"><\/script>/);
+  assert.match(html, /<script type="module" src="\/app\.js\?v=51"><\/script>/);
 
-  assert.match(app, /from "\.\/combined-number\.js\?v=8"/);
+  assert.match(app, /from "\.\/combined-number\.js\?v=9"/);
   assert.match(app, /normalizePredictiveLeaderApiSnapshot/);
   assert.match(app, /predictiveLeaderNumberContext/);
   assert.match(combinedNumber, /export function normalizePredictiveLeaderApiSnapshot\(value\)/);
@@ -761,6 +761,20 @@ test("dashboard does not display the ungated predictive leader reference simulat
   assert.doesNotMatch(block, /бумажный счёт|Следующая ставка|Условная ставка/);
   assert.doesNotMatch(html, /combined-pick-account/);
   assert.doesNotMatch(app, /combinedPickAccount|renderPredictiveLeaderAccount/);
+  for (const id of [
+    "signal-account",
+    "signal-account-status",
+    "signal-account-balance",
+    "signal-account-record",
+    "signal-account-pending",
+  ]) {
+    assert.equal([...html.matchAll(new RegExp(`\\bid="${id}"`, "g"))].length, 1);
+    assert.match(app, new RegExp(`getElementById\\("${id}"\\)`));
+  }
+  assert.match(block, /Баланс подтверждённых BET-сигналов/);
+  assert.match(block, /только прогнозы, для которых API выдал BET/);
+  assert.match(app, /function renderPredictiveLeaderSignalAccount\(\)/);
+  assert.match(app, /BET подтверждён · число/);
 
   assert.match(app, /const PREDICTIVE_LEADER_ACCOUNT_SCHEMA_VERSION = 1/);
   assert.match(
@@ -1733,8 +1747,8 @@ test("warm next-round forecast exposes a strict 5-percent walk-forward contract"
   );
   assert.match(html, /id="follower-dynamic-next-title"[^>]*>[^<]*≥5%/);
   assert.match(html, /id="follower-dynamic-next-note"[^>]*>[\s\S]*?5%/);
-  assert.match(html, /styles\.css\?v=32/);
-  assert.match(html, /app\.js\?v=50/);
+  assert.match(html, /styles\.css\?v=33/);
+  assert.match(html, /app\.js\?v=51/);
   assert.match(styles, /\.follower-dynamic-next\s*\{/);
   assert.match(styles, /\.follower-warm-current\s*\{/);
   assert.match(styles, /\.follower-warm-picks\s*\{/);
@@ -1961,8 +1975,8 @@ test("cycle comparison language is descriptive, responsive, and cache-busted", (
   assert.match(block, /не прогноз/);
   assert.match(block, /не предсказывает следующее число/);
   assert.doesNotMatch(block, /должн/iu);
-  assert.match(html, /href="\/styles\.css\?v=32"/);
-  assert.match(html, /src="\/app\.js\?v=50"/);
+  assert.match(html, /href="\/styles\.css\?v=33"/);
+  assert.match(html, /src="\/app\.js\?v=51"/);
   assert.match(styles, /\.cycle-sequence-list\s*\{[\s\S]*?repeat\(auto-fill, minmax\(50px, 1fr\)\)/);
   assert.match(
     styles,

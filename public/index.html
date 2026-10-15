@@ -7,8 +7,8 @@
     <meta name="color-scheme" content="dark">
     <meta name="description" content="Онлайн-монитор результатов рулетки и циклов исключения чисел от 0 до 36">
     <title>Круг 37 — монитор результатов</title>
-    <link rel="stylesheet" href="/styles.css?v=32">
-    <script type="module" src="/app.js?v=50"></script>
+    <link rel="stylesheet" href="/styles.css?v=33">
+    <script type="module" src="/app.js?v=51"></script>
   </head>
   <body>
     <a class="skip-link" href="#main-content">Перейти к содержимому</a>
@@ -58,6 +58,29 @@
           <output class="result-ball result-ball--empty combined-pick__number" id="combined-pick-number" aria-label="Сводное число пока не рассчитано">—</output>
           <span class="combined-pick__sources" id="combined-pick-sources">Ожидаем данные</span>
         </div>
+        <section class="signal-account" id="signal-account" data-state="loading" aria-label="Виртуальный баланс подтверждённых BET-сигналов" aria-busy="true">
+          <div class="signal-account__heading">
+            <strong>Баланс подтверждённых BET-сигналов</strong>
+            <span id="signal-account-status" role="status" aria-live="polite" aria-atomic="true">Загрузка баланса…</span>
+          </div>
+          <dl class="signal-account__metrics">
+            <div>
+              <dt>Виртуальный баланс</dt>
+              <dd id="signal-account-balance">—</dd>
+              <small>старт 1 000 · фиксированная ставка 10</small>
+            </div>
+            <div>
+              <dt>Попадания / промахи</dt>
+              <dd id="signal-account-record">—</dd>
+              <small>только прогнозы, для которых API выдал BET</small>
+            </div>
+            <div>
+              <dt>Текущий сигнал</dt>
+              <dd id="signal-account-pending">—</dd>
+              <small>виртуальный учёт · реальные ставки отключены</small>
+            </div>
+          </dl>
+        </section>
       </section>
 
       <div class="page-heading">
