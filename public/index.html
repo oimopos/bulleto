@@ -8,7 +8,7 @@
     <meta name="description" content="Онлайн-монитор результатов рулетки и циклов исключения чисел от 0 до 36">
     <title>Круг 37 — монитор результатов</title>
     <link rel="stylesheet" href="/styles.css?v=30">
-    <script type="module" src="/app.js?v=45"></script>
+    <script type="module" src="/app.js?v=46"></script>
   </head>
   <body>
     <a class="skip-link" href="#main-content">Перейти к содержимому</a>
@@ -48,21 +48,21 @@
 
       <section class="panel combined-pick" id="combined-pick" data-state="loading" data-algorithm="learned-predictive-family-index-v5" aria-labelledby="combined-pick-title" aria-describedby="combined-pick-status combined-pick-note" aria-busy="true">
         <div class="combined-pick__copy">
-          <p class="eyebrow">Актуальные прогнозные сигналы · один итог</p>
-          <p class="combined-pick__title" id="combined-pick-title">Одно число по прогнозным блокам</p>
+          <p class="eyebrow">Фильтр качества · явное решение WAIT / BET</p>
+          <p class="combined-pick__title" id="combined-pick-title">Кандидат и условная ставка</p>
           <p class="combined-pick__status" id="combined-pick-status" role="status" aria-live="polite" aria-atomic="true">Загружаем решение, зафиксированное сервером до результата.</p>
-          <p class="combined-pick__note" id="combined-pick-note">Сервер заранее фиксирует полные распределения ценовой траектории и условной истории, объединяет их в две семьи и выводит ровно одно число. Семейные веса начинают с 50/50 и меняются только по прошлым завершённым общим снимкам; текущий результат в расчёт не попадает. Давность, виртуальная цель, невыпавшие числа, survivor и исторический аналог остаются только наблюдением. Это эвристический ранговый индекс, не вероятность и не гарантия преимущества. Базовый шанс отдельного числа — 1 из 37 (≈2,7%).</p>
+          <p class="combined-pick__note" id="combined-pick-note">Сервер заранее фиксирует кандидата из ценовой траектории и условной истории, но разрешает условную ставку только при одновременном подтверждении качества на скользящем окне: нижняя граница Wilson для Top‑1 должна быть выше точки безубыточности, а Brier — лучше равномерной модели. При WAIT кандидат остаётся только наблюдением, ставка не фиксируется. Текущий результат в проверку не попадает. Это виртуальная симуляция, не рекомендация и не гарантия преимущества; базовый шанс числа — 1 из 37 (≈2,7%).</p>
         </div>
         <div class="combined-pick__result">
-          <span class="combined-pick__label">Одно число</span>
+          <span class="combined-pick__label" id="combined-pick-label">Решение · WAIT</span>
           <output class="result-ball result-ball--empty combined-pick__number" id="combined-pick-number" aria-label="Сводное число пока не рассчитано">—</output>
           <span class="combined-pick__sources" id="combined-pick-sources">Ожидаем данные</span>
         </div>
         <section class="combined-pick-account" id="combined-pick-account" data-state="loading" aria-labelledby="combined-pick-account-title" aria-describedby="combined-pick-account-note" aria-busy="true">
           <div class="combined-pick-account__header">
             <div>
-              <p class="eyebrow">Проспективная симуляция · один лидер</p>
-              <h3 id="combined-pick-account-title">Виртуальный счёт лестницы</h3>
+              <p class="eyebrow">Проспективная симуляция · только подтверждённые сигналы</p>
+              <h3 id="combined-pick-account-title">Виртуальный счёт фиксированных ставок</h3>
             </div>
             <span class="combined-pick-account__status" id="combined-pick-account-status" role="status" aria-live="polite" aria-atomic="true">Загрузка…</span>
           </div>
@@ -83,12 +83,12 @@
               <small id="combined-pick-account-rate-detail">по завершённым · не вероятность; база 1/37 ≈2,7%</small>
             </div>
             <div class="combined-pick-account__metric">
-              <dt id="combined-pick-account-stake-label">Следующая ставка</dt>
+              <dt id="combined-pick-account-stake-label">Фиксированная ставка</dt>
               <dd id="combined-pick-account-stake">—</dd>
-              <small id="combined-pick-account-ladder">ступень — · серия —</small>
+              <small id="combined-pick-account-model">по 10 на подтверждённый сигнал · без повышения</small>
             </div>
           </dl>
-          <p class="combined-pick-account__note" id="combined-pick-account-note">На каждое заранее сохранённое число фиксируется только условная ставка. Старт 1 000, ставка и шаг 10, максимум 2 500; выплата ×36 включает возврат. Попадание сбрасывает лестницу. Частота — прошлое наблюдение, не вероятность следующего результата. Это виртуальная («бумажная») симуляция; реальных ставок и действий нет.</p>
+          <p class="combined-pick-account__note" id="combined-pick-account-note">Счёт начинается с 1 000. Только при решении BET фиксируется ровно 10 условных единиц; после промаха сумма не повышается. Валовая выплата ×36 включает возврат. При WAIT кандидат не затрагивает счёт. Частота — прошлое наблюдение, не вероятность следующего результата. Это виртуальная («бумажная») симуляция; реальных ставок и действий нет.</p>
         </section>
       </section>
 

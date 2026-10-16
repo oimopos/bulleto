@@ -760,7 +760,14 @@ test(
         `measurement only (no timing threshold): trajectory build ${trajectoryBuildElapsedMs.toFixed(1)}ms; leader ${firstLeaderRead.elapsedMs.toFixed(1)}ms / ${secondLeaderRead.elapsedMs.toFixed(1)}ms; trajectory read ${trajectoryRead.elapsedMs.toFixed(1)}ms`,
       );
       assert.deepEqual(trajectoryRead.payload, beforeJsonState);
-      assert.deepEqual(firstLeaderRead.payload.account, beforeJsonState.predictiveLeaderAccount);
+      assert.deepEqual(
+        firstLeaderRead.payload.account,
+        beforeJsonState.predictiveLeaderSignalAccount,
+      );
+      assert.deepEqual(
+        firstLeaderRead.payload.legacyAccount,
+        beforeJsonState.predictiveLeaderAccount,
+      );
       assert.deepEqual(secondLeaderRead.payload.account, firstLeaderRead.payload.account);
       assert.deepEqual(secondLeaderRead.payload.metrics, firstLeaderRead.payload.metrics);
 

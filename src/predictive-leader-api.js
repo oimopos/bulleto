@@ -10,10 +10,18 @@ import {
   PREDICTIVE_LEADER_ACCOUNT_STRATEGY_VERSION,
   nextPredictiveLeaderStake,
 } from './predictive-leader-account.js';
+import {
+  PREDICTIVE_LEADER_QUALITY_GATE,
+} from './predictive-leader-quality-gate.js';
 
-export const PREDICTIVE_LEADER_API_SCHEMA_VERSION = 1;
+export const PREDICTIVE_LEADER_API_SCHEMA_VERSION = 4;
 
 const SUM_TOLERANCE = 1e-9;
+const SIGNAL_ACCOUNT_SCHEMA_VERSION = 1;
+const SIGNAL_ACCOUNT_STRATEGY_VERSION = 'quality-gated-fixed10-v1';
+const SIGNAL_ACCOUNT_STARTING_BALANCE = 1_000;
+const SIGNAL_ACCOUNT_STAKE = 10;
+const SIGNAL_ACCOUNT_GROSS_PAYOUT_MULTIPLIER = 36;
 
 function isPlainObject(value) {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
@@ -163,6 +171,301 @@ function metricsForApi(value) {
     uniformBrierLoss,
     beatsUniform,
   };
+}
+
+const QUALITY_GATE_REASONS = Object.freeze({
+  collecting: new Set(['insufficient_sample']),
+  rejected: new Set([
+    'current_family_count_not_two',
+    'wilson_lower_bound_not_above_break_even',
+    'mean_brier_loss_not_below_uniform',
+  ]),
+  confirmed: new Set(['quality_confirmed']),
+  invalid: new Set([
+    'invalid_input',
+    'invalid_current_family_count',
+    'malformed_facts',
+  ]),
+});
+
+function wilson95(hitCount, sampleSize) {
+  if (sampleSize === 0) return null;
+  const z = 1.959963984540054;
+  const rate = hitCount / sampleSize;
+  const zSquared = z ** 2;
+  const denominator = 1 + zSquared / sampleSize;
+  const center = (rate + zSquared / (2 * sampleSize)) / denominator;
+  const radius = z * Math.sqrt(
+    (rate * (1 - rate) + zSquared / (4 * sampleSize)) / sampleSize,
+  ) / denominator;
+  return {
+    lower: Math.max(0, center - radius),
+    upper: Math.min(1, center + radius),
+  };
+}
+
+function qualityGateForApi(value, forecast) {
+  if (
+    !isPlainObject(value)
+    || !isPlainObject(forecast)
+    || value.version !== PREDICTIVE_LEADER_QUALITY_GATE.version
+    || value.windowSize !== PREDICTIVE_LEADER_QUALITY_GATE.windowSize
+    || value.baselineRate !== PREDICTIVE_LEADER_QUALITY_GATE.baselineRate
+    || value.confidenceLevel !== PREDICTIVE_LEADER_QUALITY_GATE.confidenceLevel
+    || value.uniformBrierLoss !== PREDICTIVE_LEADER_QUALITY_GATE.uniformBrierLoss
+    || !QUALITY_GATE_REASONS[value.status]?.has(value.reason)
+    || typeof value.eligible !== 'boolean'
+    || value.eligible !== (value.status === 'confirmed')
+    || value.evaluatedForForecastId !== forecast.id
+    || value.cutoffAt !== forecast.lockedAt
+    || !Number.isSafeInteger(value.currentFamilyCount)
+    || value.currentFamilyCount < 0
+    || value.currentFamilyCount > 2
+    || !/^[0-9a-f]{64}$/.test(value.evidenceDigest)
+  ) {
+    return null;
+  }
+  const sampleSize = strictInteger(value.sampleSize);
+  const hitCount = strictInteger(value.hitCount);
+  const throughResultId = value.throughResultId === null
+    ? null
+    : strictInteger(value.throughResultId, { minimum: 1 });
+  const windowStartForecastId = value.windowStartForecastId === null
+    ? null
+    : strictInteger(value.windowStartForecastId, { minimum: 1 });
+  const windowEndForecastId = value.windowEndForecastId === null
+    ? null
+    : strictInteger(value.windowEndForecastId, { minimum: 1 });
+  if (
+    sampleSize === null
+    || sampleSize > PREDICTIVE_LEADER_QUALITY_GATE.windowSize
+    || hitCount === null
+    || hitCount > sampleSize
+    || (value.throughResultId !== null && throughResultId === null)
+    || (value.windowStartForecastId !== null && windowStartForecastId === null)
+    || (value.windowEndForecastId !== null && windowEndForecastId === null)
+    || (sampleSize === 0) !== (windowStartForecastId === null)
+    || (sampleSize === 0) !== (windowEndForecastId === null)
+    || (sampleSize === 0) !== (throughResultId === null)
+    || (sampleSize > 0 && windowStartForecastId > windowEndForecastId)
+    || (sampleSize > 0 && windowEndForecastId >= value.evaluatedForForecastId)
+  ) {
+    return null;
+  }
+  const interval = wilson95(hitCount, sampleSize);
+  const expectedHitRate = sampleSize === 0 ? null : hitCount / sampleSize;
+  const meanBrierLoss = value.meanBrierLoss;
+  const expectedBrierDelta = meanBrierLoss === null
+    ? null
+    : PREDICTIVE_LEADER_QUALITY_GATE.uniformBrierLoss - meanBrierLoss;
+  if (
+    (expectedHitRate === null
+      ? value.hitRate !== null
+      : typeof value.hitRate !== 'number'
+        || Math.abs(value.hitRate - expectedHitRate) > SUM_TOLERANCE)
+    || (interval === null
+      ? value.lowerBound !== null || value.upperBound !== null
+      : typeof value.lowerBound !== 'number'
+        || typeof value.upperBound !== 'number'
+        || Math.abs(value.lowerBound - interval.lower) > SUM_TOLERANCE
+        || Math.abs(value.upperBound - interval.upper) > SUM_TOLERANCE)
+    || (sampleSize === 0
+      ? meanBrierLoss !== null || value.brierDelta !== null
+      : typeof meanBrierLoss !== 'number'
+        || !Number.isFinite(meanBrierLoss)
+        || meanBrierLoss < 0
+        || meanBrierLoss > 1
+        || typeof value.brierDelta !== 'number'
+        || Math.abs(value.brierDelta - expectedBrierDelta) > SUM_TOLERANCE)
+    || (value.status === 'collecting'
+      && sampleSize >= PREDICTIVE_LEADER_QUALITY_GATE.windowSize)
+    || (['rejected', 'confirmed'].includes(value.status)
+      && sampleSize !== PREDICTIVE_LEADER_QUALITY_GATE.windowSize)
+    || (value.status === 'confirmed' && (
+      value.currentFamilyCount !== 2
+      || value.lowerBound <= PREDICTIVE_LEADER_QUALITY_GATE.baselineRate
+      || meanBrierLoss >= PREDICTIVE_LEADER_QUALITY_GATE.uniformBrierLoss
+    ))
+    || (value.status === 'invalid' && sampleSize !== 0)
+  ) {
+    return null;
+  }
+  return {
+    version: value.version,
+    status: value.status,
+    reason: value.reason,
+    eligible: value.eligible,
+    windowSize: value.windowSize,
+    sampleSize,
+    hitCount,
+    hitRate: value.hitRate,
+    baselineRate: value.baselineRate,
+    confidenceLevel: value.confidenceLevel,
+    lowerBound: value.lowerBound,
+    upperBound: value.upperBound,
+    meanBrierLoss,
+    uniformBrierLoss: value.uniformBrierLoss,
+    brierDelta: value.brierDelta,
+    windowStartForecastId,
+    windowEndForecastId,
+    evaluatedForForecastId: value.evaluatedForForecastId,
+    cutoffAt: value.cutoffAt,
+    currentFamilyCount: value.currentFamilyCount,
+    throughResultId,
+    evidenceDigest: value.evidenceDigest,
+  };
+}
+
+const SIGNAL_ACCOUNT_REASONS = Object.freeze({
+  waiting: new Set(['waiting_first_eligible_signal', 'waiting_quality_gate']),
+  pending: new Set(['bet_frozen']),
+  exhausted: new Set(['bankroll_exhausted']),
+});
+
+function signalAccountForApi(value) {
+  if (
+    !isPlainObject(value)
+    || value.schemaVersion !== SIGNAL_ACCOUNT_SCHEMA_VERSION
+    || value.strategyVersion !== SIGNAL_ACCOUNT_STRATEGY_VERSION
+    || value.leaderAlgorithmVersion !== LEARNED_LEADER_ALGORITHM_VERSION
+    || value.gateVersion !== PREDICTIVE_LEADER_QUALITY_GATE.version
+    || value.mode !== 'quality-gated-fixed-stake-simulation'
+    || value.executionEnabled !== false
+    || value.advisoryOnly !== true
+    || value.initialBalance !== SIGNAL_ACCOUNT_STARTING_BALANCE
+    || !SIGNAL_ACCOUNT_REASONS[value.status]?.has(value.reason)
+    || !isPlainObject(value.model)
+    || value.model.fixedStake !== SIGNAL_ACCOUNT_STAKE
+    || value.model.grossPayoutMultiplier
+      !== SIGNAL_ACCOUNT_GROSS_PAYOUT_MULTIPLIER
+    || value.model.payoutIncludesStake !== true
+  ) {
+    return null;
+  }
+  const integerFields = [
+    'currentBalance', 'availableBalance', 'reservedStake', 'profit', 'nextStake',
+    'shortfall', 'betCount', 'settledCount', 'pendingCount', 'voidCount',
+    'hitCount', 'missCount', 'totalStaked', 'totalGrossPayout', 'peakBalance',
+    'minimumBalance', 'maximumDrawdown', 'continuityGapCount',
+  ];
+  if (integerFields.some((field) => !Number.isSafeInteger(value[field]))) return null;
+  if (
+    integerFields.some((field) => field !== 'profit' && value[field] < 0)
+  ) {
+    return null;
+  }
+  const expectedSettled = value.hitCount + value.missCount;
+  const expectedBetCount = value.settledCount + value.pendingCount + value.voidCount;
+  const expectedTotalStaked = (value.settledCount + value.pendingCount)
+    * SIGNAL_ACCOUNT_STAKE;
+  const expectedGross = value.hitCount * SIGNAL_ACCOUNT_STAKE
+    * SIGNAL_ACCOUNT_GROSS_PAYOUT_MULTIPLIER;
+  const expectedBalance = value.initialBalance - expectedTotalStaked + expectedGross;
+  if (
+    value.currentBalance < 0
+    || value.availableBalance !== value.currentBalance
+    || value.profit !== value.currentBalance - value.initialBalance
+    || value.nextStake !== SIGNAL_ACCOUNT_STAKE
+    || value.pendingCount < 0
+    || value.pendingCount > 1
+    || value.reservedStake !== value.pendingCount * SIGNAL_ACCOUNT_STAKE
+    || value.settledCount !== expectedSettled
+    || value.betCount !== expectedBetCount
+    || value.totalStaked !== expectedTotalStaked
+    || value.totalGrossPayout !== expectedGross
+    || value.currentBalance !== expectedBalance
+    || typeof value.canAffordNext !== 'boolean'
+    || value.canAffordNext !== (value.currentBalance >= SIGNAL_ACCOUNT_STAKE)
+    || value.shortfall !== Math.max(0, SIGNAL_ACCOUNT_STAKE - value.currentBalance)
+    || value.peakBalance < Math.max(value.initialBalance, value.currentBalance)
+    || value.minimumBalance > Math.min(value.initialBalance, value.currentBalance)
+    || value.maximumDrawdown < value.peakBalance - value.currentBalance
+    || value.maximumDrawdown > value.peakBalance - value.minimumBalance
+    || value.continuityGapCount !== value.voidCount
+    || (value.settledCount === 0
+      ? value.hitRate !== null
+      : value.hitRate !== value.hitCount / value.settledCount)
+  ) {
+    return null;
+  }
+  const pendingBet = value.pendingBet;
+  if ((pendingBet !== null) !== (value.pendingCount === 1)) return null;
+  if (pendingBet !== null && (
+    !isPlainObject(pendingBet)
+    || strictInteger(pendingBet.forecastId, { minimum: 1 }) === null
+    || safeRouletteNumber(pendingBet.targetNumber) === null
+    || pendingBet.stake !== SIGNAL_ACCOUNT_STAKE
+    || pendingBet.balanceBefore !== value.currentBalance + SIGNAL_ACCOUNT_STAKE
+    || pendingBet.gateVersion !== PREDICTIVE_LEADER_QUALITY_GATE.version
+    || canonicalInstant(pendingBet.placedAt) === null
+  )) return null;
+  if ((value.status === 'pending') !== (pendingBet !== null)) return null;
+  const exhausted = pendingBet === null && !value.canAffordNext;
+  if ((value.status === 'exhausted') !== exhausted) return null;
+  for (const key of ['startedAt', 'updatedAt', 'exhaustedAt']) {
+    if (value[key] !== null && canonicalInstant(value[key]) === null) return null;
+  }
+  if ((value.betCount === 0) !== (value.startedAt === null)) return null;
+  if ((value.betCount === 0) !== (value.updatedAt === null)) return null;
+  if ((value.status === 'exhausted') !== (value.exhaustedAt !== null)) return null;
+  const latestOutcome = value.latestOutcome;
+  if ((latestOutcome !== null) !== (value.settledCount > 0)) return null;
+  if (latestOutcome !== null) {
+    const targetNumber = safeRouletteNumber(latestOutcome.targetNumber);
+    const resultNumber = safeRouletteNumber(latestOutcome.resultNumber);
+    const expectedOutcome = targetNumber === resultNumber ? 'hit' : 'miss';
+    const expectedGrossPayout = expectedOutcome === 'hit'
+      ? SIGNAL_ACCOUNT_STAKE * SIGNAL_ACCOUNT_GROSS_PAYOUT_MULTIPLIER
+      : 0;
+    if (
+      !isPlainObject(latestOutcome)
+      || strictInteger(latestOutcome.forecastId, { minimum: 1 }) === null
+      || strictInteger(latestOutcome.resultId, { minimum: 1 }) === null
+      || targetNumber === null
+      || resultNumber === null
+      || latestOutcome.stake !== SIGNAL_ACCOUNT_STAKE
+      || latestOutcome.outcome !== expectedOutcome
+      || latestOutcome.grossPayout !== expectedGrossPayout
+      || strictInteger(latestOutcome.balanceAfter, { minimum: 0 }) === null
+      || latestOutcome.balanceAfter !== value.currentBalance + value.reservedStake
+      || canonicalInstant(latestOutcome.occurredAt) === null
+    ) {
+      return null;
+    }
+  }
+  const latestVoid = value.latestVoid;
+  if ((latestVoid !== null) !== (value.voidCount > 0)) return null;
+  if (
+    latestVoid !== null
+    && (
+      !isPlainObject(latestVoid)
+      || strictInteger(latestVoid.forecastId, { minimum: 1 }) === null
+      || safeRouletteNumber(latestVoid.targetNumber) === null
+      || latestVoid.stake !== SIGNAL_ACCOUNT_STAKE
+      || latestVoid.reason !== 'integrity_gap'
+      || canonicalInstant(latestVoid.voidedAt) === null
+    )
+  ) {
+    return null;
+  }
+  if (
+    value.startedAt !== null
+    && (
+      Date.parse(value.startedAt) > Date.parse(value.updatedAt)
+      || (pendingBet !== null
+        && (Date.parse(pendingBet.placedAt) < Date.parse(value.startedAt)
+          || Date.parse(pendingBet.placedAt) > Date.parse(value.updatedAt)))
+      || (latestOutcome !== null
+        && (Date.parse(latestOutcome.occurredAt) < Date.parse(value.startedAt)
+          || Date.parse(latestOutcome.occurredAt) > Date.parse(value.updatedAt)))
+      || (latestVoid !== null
+        && (Date.parse(latestVoid.voidedAt) < Date.parse(value.startedAt)
+          || Date.parse(latestVoid.voidedAt) > Date.parse(value.updatedAt)))
+    )
+  ) {
+    return null;
+  }
+  return structuredClone(value);
 }
 
 function accountForApi(value) {
@@ -538,11 +841,12 @@ function baseResponse({
   metrics,
   freshness,
   account,
+  legacyAccount,
 }) {
   return {
     schemaVersion: PREDICTIVE_LEADER_API_SCHEMA_VERSION,
     algorithmVersion: LEARNED_LEADER_ALGORITHM_VERSION,
-    mode: 'observation',
+    mode: 'quality-gated-simulation',
     executionEnabled: false,
     advisoryOnly: true,
     source,
@@ -550,10 +854,14 @@ function baseResponse({
     serverTime,
     status: 'waiting',
     reason: 'state_unavailable',
+    action: 'WAIT',
     number: null,
+    candidateNumber: null,
     forecast: null,
     model: null,
+    qualityGate: null,
     account,
+    legacyAccount,
     metrics,
     freshness,
   };
@@ -578,7 +886,10 @@ export function predictiveLeaderSnapshotForApi({
   if (serverTime === null) throw new TypeError('now must be a valid timestamp');
 
   const metrics = metricsForApi(state?.precloseForecast?.predictiveLeaderMetrics);
-  const account = accountForApi(
+  const account = signalAccountForApi(
+    state?.precloseForecast?.predictiveLeaderSignalAccount,
+  );
+  const legacyAccount = accountForApi(
     state?.precloseForecast?.predictiveLeaderAccount,
   );
   if (!isPlainObject(state)) {
@@ -589,6 +900,7 @@ export function predictiveLeaderSnapshotForApi({
       metrics,
       freshness: emptyFreshness(),
       account,
+      legacyAccount,
     });
   }
 
@@ -642,6 +954,7 @@ export function predictiveLeaderSnapshotForApi({
     metrics,
     freshness,
     account,
+    legacyAccount,
   });
 
   if (!integrityOk) return withStatus(base, 'paused', 'integrity_gap');
@@ -711,6 +1024,12 @@ export function predictiveLeaderSnapshotForApi({
   if (!forecastRoundMatches) {
     return withStatus(base, 'paused', 'forecast_round_mismatch', { forecast });
   }
+  if (Date.parse(serverTime) < Date.parse(forecastLockedAt)) {
+    return withStatus(base, 'paused', 'forecast_invalid', { forecast });
+  }
+  if (Date.parse(serverTime) >= Date.parse(bettingClosesAt)) {
+    return withStatus(base, 'waiting', 'betting_closed', { forecast });
+  }
   if (latestForecast.settlement !== null) {
     return withStatus(base, 'waiting', 'forecast_settled', { forecast });
   }
@@ -744,19 +1063,70 @@ export function predictiveLeaderSnapshotForApi({
       ([family, weight]) => [family, weight],
     ),
   );
+  const model = {
+    sourceCount: leader.sourceCount,
+    familyCount: leader.familyCount,
+    activeFamilies: Object.keys(activeFamilyWeights),
+    activeFamilyWeights,
+    learningVersion: leader.learning.version,
+    learningStatus: leader.learning.status,
+    trainingCount: leader.learning.trainingCount,
+    learnedFamilyWeights,
+    tieBreakApplied: leader.tieBreakApplied,
+  };
+  const rawGate = latestForecast.predictiveLeaderQualityGate;
+  const qualityGate = qualityGateForApi(rawGate, forecast);
+  const observed = { candidateNumber: number, forecast, model, qualityGate };
+  if (!qualityGate) {
+    return withStatus(
+      base,
+      rawGate == null ? 'waiting' : 'paused',
+      rawGate == null ? 'quality_not_frozen' : 'quality_evidence_invalid',
+      observed,
+    );
+  }
+  if (qualityGate.currentFamilyCount !== leader.familyCount) {
+    return withStatus(base, 'paused', 'quality_evidence_invalid', observed);
+  }
+  if (qualityGate.status !== 'confirmed' || qualityGate.eligible !== true) {
+    const reason = qualityGate.status === 'collecting'
+      ? 'quality_collecting'
+      : qualityGate.status === 'invalid'
+        ? 'quality_evidence_invalid'
+        : 'quality_not_proven';
+    return withStatus(
+      base,
+      qualityGate.status === 'invalid' ? 'paused' : 'waiting',
+      reason,
+      observed,
+    );
+  }
+  if (!account) {
+    return withStatus(base, 'paused', 'signal_account_invalid', observed);
+  }
+  if (account.status === 'exhausted') {
+    return withStatus(base, 'waiting', 'bankroll_exhausted', observed);
+  }
+  if (
+    account.status !== 'pending'
+    || account.pendingBet?.forecastId !== forecastId
+    || account.pendingBet?.targetNumber !== number
+    || account.pendingBet?.gateVersion !== qualityGate.version
+  ) {
+    const pendingPrevious = account.status === 'pending';
+    return withStatus(
+      base,
+      pendingPrevious ? 'waiting' : 'paused',
+      pendingPrevious ? 'signal_pending_previous' : 'signal_not_recorded',
+      observed,
+    );
+  }
   return withStatus(base, 'ready', 'ready', {
+    action: 'BET',
     number,
+    candidateNumber: number,
     forecast,
-    model: {
-      sourceCount: leader.sourceCount,
-      familyCount: leader.familyCount,
-      activeFamilies: Object.keys(activeFamilyWeights),
-      activeFamilyWeights,
-      learningVersion: leader.learning.version,
-      learningStatus: leader.learning.status,
-      trainingCount: leader.learning.trainingCount,
-      learnedFamilyWeights,
-      tieBreakApplied: leader.tieBreakApplied,
-    },
+    model,
+    qualityGate,
   });
 }

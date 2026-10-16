@@ -90,7 +90,12 @@ test("lightweight predictive leader read preserves the frozen leader, metrics, a
 
     assert.deepEqual(
       Object.keys(lightweight.precloseForecast).sort(),
-      ["latest", "predictiveLeaderAccount", "predictiveLeaderMetrics"],
+      [
+        "latest",
+        "predictiveLeaderAccount",
+        "predictiveLeaderMetrics",
+        "predictiveLeaderSignalAccount",
+      ],
     );
     assert.deepEqual(lightweight.precloseForecast.latest, {
       id: full.latest.id,
@@ -102,6 +107,7 @@ test("lightweight predictive leader read preserves the frozen leader, metrics, a
       roundEndsAt: full.latest.roundEndsAt,
       lockedAt: full.latest.lockedAt,
       predictiveLeader: full.latest.predictiveLeader,
+      predictiveLeaderQualityGate: full.latest.predictiveLeaderQualityGate,
       settlement: full.latest.settlement,
     });
     assert.equal(lightweight.precloseForecast.latest.predictiveLeader.status, "ready");
@@ -113,6 +119,14 @@ test("lightweight predictive leader read preserves the frozen leader, metrics, a
     assert.deepEqual(
       lightweight.precloseForecast.predictiveLeaderAccount,
       full.predictiveLeaderAccount,
+    );
+    assert.deepEqual(
+      lightweight.precloseForecast.predictiveLeaderSignalAccount,
+      full.predictiveLeaderSignalAccount,
+    );
+    assert.equal(
+      lightweight.precloseForecast.predictiveLeaderSignalAccount.reason,
+      "waiting_first_eligible_signal",
     );
     assert.equal(lightweight.precloseForecast.predictiveLeaderAccount.status, "pending");
     assert.equal(

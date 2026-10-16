@@ -15,6 +15,9 @@ import {
   PREDICTIVE_LEADER_ACCOUNT_STARTING_BALANCE,
   PREDICTIVE_LEADER_ACCOUNT_STRATEGY_VERSION,
 } from '../src/predictive-leader-account.js';
+import {
+  evaluatePredictiveLeaderQualityGate,
+} from '../src/predictive-leader-quality-gate.js';
 
 const SOURCE = 'buleto';
 const INSTRUMENT = 'XPM/RUB';
@@ -24,6 +27,7 @@ const BETTING_CLOSES_AT = '2026-10-10T10:00:28.000Z';
 const ROUND_ENDS_AT = '2026-10-10T10:00:30.000Z';
 const SERVER_TIME = '2026-10-10T10:00:22.000Z';
 const ACCOUNT_STARTED_AT = '2026-10-10T10:00:21.000Z';
+const FORECAST_ID = 1_001;
 
 function pristineAccount() {
   return {
@@ -103,7 +107,7 @@ function pendingAccount() {
     continuityGapCount: 0,
     ladder: { missCount: 0, totalLoss: 0 },
     pendingBet: {
-      forecastId: 77,
+      forecastId: FORECAST_ID,
       targetNumber: 7,
       stake: 10,
       balanceBefore: 1000,
@@ -162,7 +166,7 @@ function voidedAccount() {
     continuityGapCount: 1,
     pendingBet: null,
     latestVoid: {
-      forecastId: 77,
+      forecastId: FORECAST_ID,
       targetNumber: 7,
       stake: 10,
       reason: 'integrity_gap',
@@ -218,7 +222,7 @@ function readyDecision() {
         family: 'price',
         numbers: [7, 11, 19],
         weights: [0.6, 0.3, 0.1],
-        cursor: { forecastId: 77, cutoffAt: LOCKED_AT },
+        cursor: { forecastId: FORECAST_ID, cutoffAt: LOCKED_AT },
       },
       {
         id: 'conditional-pair-full',
@@ -241,12 +245,135 @@ function readyDecision() {
 function mappedLeader(decision = readyDecision()) {
   return {
     ...decision,
-    forecastId: 77,
+    forecastId: FORECAST_ID,
     historyMaxResultId: 10,
     trainingThroughForecastId: null,
     trainingThroughResultId: null,
     createdAt: '2026-10-10T10:00:21.000Z',
     evaluation: null,
+  };
+}
+
+function confirmedQualityGate() {
+  const facts = Array.from({ length: 1_000 }, (_, index) => ({
+    forecastId: index + 1,
+    top1Hit: index < 38,
+    combinedBrierLoss: 0.4,
+  }));
+  return {
+    ...evaluatePredictiveLeaderQualityGate({ facts, currentFamilyCount: 2 }),
+    evaluatedForForecastId: FORECAST_ID,
+    cutoffAt: LOCKED_AT,
+    currentFamilyCount: 2,
+    throughResultId: 10,
+    evidenceDigest: 'a'.repeat(64),
+  };
+}
+
+function signalAccount() {
+  return {
+    schemaVersion: 1,
+    strategyVersion: 'quality-gated-fixed10-v1',
+    leaderAlgorithmVersion: LEARNED_LEADER_ALGORITHM_VERSION,
+    gateVersion: 'rolling-1000-wilson95-brier-v1',
+    mode: 'quality-gated-fixed-stake-simulation',
+    executionEnabled: false,
+    advisoryOnly: true,
+    status: 'pending',
+    reason: 'bet_frozen',
+    initialBalance: 1_000,
+    currentBalance: 990,
+    availableBalance: 990,
+    reservedStake: 10,
+    profit: -10,
+    model: {
+      fixedStake: 10,
+      grossPayoutMultiplier: 36,
+      payoutIncludesStake: true,
+    },
+    nextStake: 10,
+    canAffordNext: true,
+    shortfall: 0,
+    betCount: 1,
+    settledCount: 0,
+    pendingCount: 1,
+    voidCount: 0,
+    hitCount: 0,
+    missCount: 0,
+    hitRate: null,
+    totalStaked: 10,
+    totalGrossPayout: 0,
+    peakBalance: 1_000,
+    minimumBalance: 990,
+    maximumDrawdown: 10,
+    continuityGapCount: 0,
+    pendingBet: {
+      forecastId: FORECAST_ID,
+      targetNumber: 7,
+      stake: 10,
+      balanceBefore: 1_000,
+      gateVersion: 'rolling-1000-wilson95-brier-v1',
+      placedAt: ACCOUNT_STARTED_AT,
+    },
+    latestVoid: null,
+    latestOutcome: null,
+    startedAt: ACCOUNT_STARTED_AT,
+    updatedAt: ACCOUNT_STARTED_AT,
+    exhaustedAt: null,
+  };
+}
+
+function waitingSignalAccount() {
+  return {
+    ...signalAccount(),
+    status: 'waiting',
+    reason: 'waiting_first_eligible_signal',
+    currentBalance: 1_000,
+    availableBalance: 1_000,
+    reservedStake: 0,
+    profit: 0,
+    betCount: 0,
+    pendingCount: 0,
+    totalStaked: 0,
+    minimumBalance: 1_000,
+    maximumDrawdown: 0,
+    pendingBet: null,
+    startedAt: null,
+    updatedAt: null,
+  };
+}
+
+function finalStakePendingSignalAccount() {
+  return {
+    ...signalAccount(),
+    currentBalance: 0,
+    availableBalance: 0,
+    profit: -1_000,
+    canAffordNext: false,
+    shortfall: 10,
+    betCount: 100,
+    settledCount: 99,
+    missCount: 99,
+    hitRate: 0,
+    totalStaked: 1_000,
+    minimumBalance: 0,
+    maximumDrawdown: 1_000,
+    pendingBet: {
+      ...signalAccount().pendingBet,
+      balanceBefore: 10,
+    },
+    latestOutcome: {
+      forecastId: FORECAST_ID - 1,
+      resultId: 10,
+      targetNumber: 7,
+      resultNumber: 8,
+      stake: 10,
+      outcome: 'miss',
+      grossPayout: 0,
+      balanceAfter: 10,
+      occurredAt: LATEST_SETTLED_AT,
+    },
+    startedAt: '2026-10-09T10:00:00.000Z',
   };
 }
 
@@ -276,7 +403,7 @@ function freshState() {
     warnings: [],
     precloseForecast: {
       latest: {
-        id: 77,
+        id: FORECAST_ID,
         source: SOURCE,
         instrument: INSTRUMENT,
         roundId: '101',
@@ -285,6 +412,7 @@ function freshState() {
         roundEndsAt: ROUND_ENDS_AT,
         settlement: null,
         predictiveLeader: mappedLeader(),
+        predictiveLeaderQualityGate: confirmedQualityGate(),
       },
       predictiveLeaderMetrics: {
         algorithmVersion: LEARNED_LEADER_ALGORITHM_VERSION,
@@ -300,6 +428,7 @@ function freshState() {
         beatsUniform: null,
       },
       predictiveLeaderAccount: pendingAccount(),
+      predictiveLeaderSignalAccount: signalAccount(),
     },
   };
 }
@@ -319,7 +448,7 @@ test('separate predictive leader GET view exposes exactly one fresh number', () 
   assert.deepEqual(payload, {
     schemaVersion: PREDICTIVE_LEADER_API_SCHEMA_VERSION,
     algorithmVersion: LEARNED_LEADER_ALGORITHM_VERSION,
-    mode: 'observation',
+    mode: 'quality-gated-simulation',
     executionEnabled: false,
     advisoryOnly: true,
     source: SOURCE,
@@ -327,9 +456,11 @@ test('separate predictive leader GET view exposes exactly one fresh number', () 
     serverTime: SERVER_TIME,
     status: 'ready',
     reason: 'ready',
+    action: 'BET',
     number: 7,
+    candidateNumber: 7,
     forecast: {
-      id: 77,
+      id: FORECAST_ID,
       roundId: '101',
       lockedAt: LOCKED_AT,
       bettingClosesAt: BETTING_CLOSES_AT,
@@ -352,7 +483,9 @@ test('separate predictive leader GET view exposes exactly one fresh number', () 
       },
       tieBreakApplied: false,
     },
-    account: pendingAccount(),
+    qualityGate: confirmedQualityGate(),
+    account: signalAccount(),
+    legacyAccount: pendingAccount(),
     metrics: {
       readyCount: 1,
       settledCount: 0,
@@ -390,6 +523,110 @@ test('separate predictive leader GET view exposes exactly one fresh number', () 
     1,
     'the endpoint must expose one roulette prediction only',
   );
+});
+
+test('the final affordable signal remains a valid pending BET at zero balance', () => {
+  const state = freshState();
+  const account = finalStakePendingSignalAccount();
+  state.precloseForecast.predictiveLeaderSignalAccount = account;
+
+  const payload = snapshot(state);
+
+  assert.equal(payload.status, 'ready');
+  assert.equal(payload.reason, 'ready');
+  assert.equal(payload.action, 'BET');
+  assert.equal(payload.number, 7);
+  assert.deepEqual(payload.account, account);
+  assert.equal(payload.account.canAffordNext, false);
+  assert.equal(payload.account.exhaustedAt, null);
+});
+
+test('signal account validation rejects negative counters and malformed audit rows', () => {
+  const negative = signalAccount();
+  Object.assign(negative, {
+    currentBalance: 640,
+    availableBalance: 640,
+    profit: -360,
+    betCount: 1,
+    settledCount: -1,
+    pendingCount: 1,
+    voidCount: 1,
+    hitCount: -1,
+    missCount: 0,
+    hitRate: 1,
+    totalStaked: 0,
+    totalGrossPayout: -360,
+    minimumBalance: 640,
+    maximumDrawdown: 360,
+    continuityGapCount: 1,
+    latestVoid: {
+      forecastId: FORECAST_ID - 1,
+      targetNumber: 7,
+      stake: 10,
+      reason: 'integrity_gap',
+      voidedAt: ACCOUNT_STARTED_AT,
+    },
+  });
+  negative.pendingBet.balanceBefore = 650;
+  const cases = [
+    ['negative counters', negative],
+    ['malformed latest outcome', { ...signalAccount(), latestOutcome: {} }],
+    ['malformed latest void', { ...signalAccount(), latestVoid: {} }],
+  ];
+
+  for (const [label, account] of cases) {
+    const state = freshState();
+    state.precloseForecast.predictiveLeaderSignalAccount = account;
+    const payload = snapshot(state);
+    assert.equal(payload.status, 'paused', label);
+    assert.equal(payload.reason, 'signal_account_invalid', label);
+    assert.equal(payload.action, 'WAIT', label);
+    assert.equal(payload.account, null, label);
+  }
+});
+
+test('quality gate rejects evidence from the evaluated or a future forecast', () => {
+  const state = freshState();
+  state.precloseForecast.latest.predictiveLeaderQualityGate = {
+    ...confirmedQualityGate(),
+    windowEndForecastId: FORECAST_ID,
+  };
+
+  const payload = snapshot(state);
+
+  assert.equal(payload.status, 'paused');
+  assert.equal(payload.reason, 'quality_evidence_invalid');
+  assert.equal(payload.action, 'WAIT');
+  assert.equal(payload.number, null);
+  assert.equal(payload.qualityGate, null);
+});
+
+test('quality rejection exposes a candidate but authorizes WAIT only', () => {
+  const state = freshState();
+  const facts = Array.from({ length: 1_000 }, (_, index) => ({
+    forecastId: index + 1,
+    top1Hit: index < 25,
+    combinedBrierLoss: 0.4,
+  }));
+  state.precloseForecast.latest.predictiveLeaderQualityGate = {
+    ...evaluatePredictiveLeaderQualityGate({ facts, currentFamilyCount: 2 }),
+    evaluatedForForecastId: FORECAST_ID,
+    cutoffAt: LOCKED_AT,
+    currentFamilyCount: 2,
+    throughResultId: 10,
+    evidenceDigest: 'b'.repeat(64),
+  };
+  state.precloseForecast.predictiveLeaderSignalAccount = waitingSignalAccount();
+
+  const payload = snapshot(state);
+  assert.equal(payload.status, 'waiting');
+  assert.equal(payload.reason, 'quality_not_proven');
+  assert.equal(payload.action, 'WAIT');
+  assert.equal(payload.number, null);
+  assert.equal(payload.candidateNumber, 7);
+  assert.equal(payload.qualityGate.status, 'rejected');
+  assert.equal(payload.qualityGate.eligible, false);
+  assert.equal(payload.account.currentBalance, 1_000);
 });
 
 test('predictive leader GET view fails closed instead of returning a stale number', () => {
@@ -489,9 +726,10 @@ test('predictive leader GET view fails closed instead of returning a stale numbe
     const payload = snapshot(state);
     assert.equal(payload.status, scenario.status, scenario.reason);
     assert.equal(payload.reason, scenario.reason);
+    assert.equal(payload.action, 'WAIT');
     assert.equal(payload.number, null);
     assert.equal(payload.model, null);
-    assert.deepEqual(payload.account, pendingAccount());
+    assert.deepEqual(payload.account, signalAccount());
   }
 });
 
@@ -511,9 +749,10 @@ test('predictive leader GET view exposes persisted account states without mutati
 
     assert.equal(payload.status, 'ready');
     assert.equal(payload.number, 7);
-    assert.deepEqual(payload.account, account);
-    assert.notStrictEqual(payload.account, account);
-    assert.notStrictEqual(payload.account.model, account.model);
+    assert.deepEqual(payload.account, signalAccount());
+    assert.deepEqual(payload.legacyAccount, account);
+    assert.notStrictEqual(payload.legacyAccount, account);
+    assert.notStrictEqual(payload.legacyAccount.model, account.model);
     assert.deepEqual(state, before, `${account.status} input state must stay untouched`);
   }
 });
@@ -521,7 +760,7 @@ test('predictive leader GET view exposes persisted account states without mutati
 test('predictive leader GET view validates auditable void account fields', () => {
   const valid = freshState();
   valid.precloseForecast.predictiveLeaderAccount = voidedAccount();
-  assert.deepEqual(snapshot(valid).account, voidedAccount());
+  assert.deepEqual(snapshot(valid).legacyAccount, voidedAccount());
 
   for (const mutate of [
     (account) => { account.voidCount = 0; },
@@ -532,7 +771,7 @@ test('predictive leader GET view validates auditable void account fields', () =>
     const state = freshState();
     state.precloseForecast.predictiveLeaderAccount = voidedAccount();
     mutate(state.precloseForecast.predictiveLeaderAccount);
-    assert.equal(snapshot(state).account, null);
+    assert.equal(snapshot(state).legacyAccount, null);
   }
 });
 
@@ -543,7 +782,7 @@ test('predictive leader GET view keeps a valid account on waiting and paused res
   const waitingPayload = snapshot(waitingState);
   assert.equal(waitingPayload.status, 'waiting');
   assert.equal(waitingPayload.reason, 'forecast_settled');
-  assert.deepEqual(waitingPayload.account, waitingAccount());
+  assert.deepEqual(waitingPayload.legacyAccount, waitingAccount());
 
   const pausedState = freshState();
   pausedState.precloseForecast.predictiveLeaderAccount = exhaustedAccount();
@@ -552,7 +791,7 @@ test('predictive leader GET view keeps a valid account on waiting and paused res
   const pausedPayload = snapshot(pausedState);
   assert.equal(pausedPayload.status, 'paused');
   assert.equal(pausedPayload.reason, 'collector_unavailable');
-  assert.deepEqual(pausedPayload.account, exhaustedAccount());
+  assert.deepEqual(pausedPayload.legacyAccount, exhaustedAccount());
 });
 
 test('predictive leader GET view rejects invalid account snapshots independently', () => {
@@ -589,7 +828,7 @@ test('predictive leader GET view rejects invalid account snapshots independently
     const payload = snapshot(state);
     assert.equal(payload.status, 'ready', label);
     assert.equal(payload.number, 7, label);
-    assert.equal(payload.account, null, label);
+    assert.equal(payload.legacyAccount, null, label);
     assert.deepEqual(state, before, `${label} input state must stay untouched`);
   }
 });
@@ -603,7 +842,7 @@ test('predictive leader GET view never initializes an absent account', () => {
 
   assert.equal(payload.status, 'ready');
   assert.equal(payload.number, 7);
-  assert.equal(payload.account, null);
+  assert.equal(payload.legacyAccount, null);
   assert.deepEqual(state, before);
 });
 
@@ -614,6 +853,8 @@ test('predictive leader GET view has a stable waiting shape without state', () =
   assert.equal(payload.number, null);
   assert.equal(payload.forecast, null);
   assert.equal(payload.model, null);
+  assert.equal(payload.qualityGate, null);
   assert.equal(payload.account, null);
+  assert.equal(payload.legacyAccount, null);
   assert.equal(payload.freshness.currentRoundId, null);
 });

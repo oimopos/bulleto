@@ -100,6 +100,7 @@ const db = createDatabase({
   logger: console,
   gapThresholdSeconds: config.gapThresholdSeconds,
   virtualStartingBalance: config.virtualStartingBalance,
+  predictiveLeaderLegacyAccountEnabled: false,
 });
 const collector = new BuletoCollector({
   url: config.wsUrl,
@@ -130,6 +131,7 @@ console.info(
     + `${followerTop5Deposit.amount}; afterResultId=${followerTop5Deposit.afterResultId ?? 'none'}`,
 );
 db.settlePrecloseForecasts('buleto', config.instrument);
+db.settlePredictiveLeaderSignalAccount('buleto', config.instrument);
 db.settlePredictiveLeaderAccount('buleto', config.instrument);
 db.applyPredictiveLeaderAccountReset('buleto', config.instrument);
 db.reconcilePredictiveLeaderAccount('buleto', config.instrument);
@@ -139,6 +141,7 @@ const DATABASE_WRITE_UPDATE_REASONS = new Set([
   'results',
   'forecast',
   'forecast-settled',
+  'predictive-leader-signal-account',
   'predictive-leader-account',
 ]);
 const MAX_DATABASE_READ_CACHE_ENTRIES = 32;
@@ -965,6 +968,21 @@ function publishPipelineOutcome(outcome) {
     if (forecastOutcome.settled > 0) broadcastUpdate('forecast-settled');
   } catch (error) {
     console.error('[forecast] settlement failed; it will be retried', error);
+    retryError ??= error;
+  }
+  try {
+    const signalOutcome = db.settlePredictiveLeaderSignalAccount(
+      'buleto',
+      config.instrument,
+    );
+    if (signalOutcome.settled > 0 || signalOutcome.voided > 0) {
+      broadcastUpdate('predictive-leader-signal-account');
+    }
+  } catch (error) {
+    console.error(
+      '[predictive-leader] gated signal settlement failed; it will be retried',
+      error,
+    );
     retryError ??= error;
   }
   try {

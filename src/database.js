@@ -54,6 +54,10 @@ import {
   normalizeLearnedLeaderDecision,
 } from "./learned-leader.js";
 import {
+  PREDICTIVE_LEADER_QUALITY_GATE,
+  evaluatePredictiveLeaderQualityGate,
+} from "./predictive-leader-quality-gate.js";
+import {
   PREDICTIVE_LEADER_ACCOUNT_MODEL,
   PREDICTIVE_LEADER_ACCOUNT_SCHEMA_VERSION,
   PREDICTIVE_LEADER_ACCOUNT_STARTING_BALANCE,
@@ -83,6 +87,12 @@ const TRAJECTORY_DISPLAY_RANGE_POLICY =
 const TRAJECTORY_DISPLAY_RANGE_MAX_CELLS = 6;
 const PREDICTIVE_LEADER_ACCOUNT_RESET_KEY = "manual-ladder-restart-2026-10-12";
 const PREDICTIVE_LEADER_ACCOUNT_RESET_REASON = "user_requested";
+const PREDICTIVE_LEADER_SIGNAL_ACCOUNT_SCHEMA_VERSION = 1;
+const PREDICTIVE_LEADER_SIGNAL_ACCOUNT_STRATEGY_VERSION =
+  "quality-gated-fixed10-v1";
+const PREDICTIVE_LEADER_SIGNAL_ACCOUNT_STARTING_BALANCE = 1_000;
+const PREDICTIVE_LEADER_SIGNAL_STAKE = 10;
+const PREDICTIVE_LEADER_SIGNAL_GROSS_PAYOUT_MULTIPLIER = 36;
 const FOLLOWER_TOP5_HORIZONS = Object.freeze([1, 2, 3, 5, 10, 20]);
 const FOLLOWER_TOP5_ALL_HORIZONS = Object.freeze(
   Array.from({ length: 20 }, (_, index) => index + 1),
@@ -3841,6 +3851,55 @@ function mapPredictiveLeaderMetrics(rows) {
   };
 }
 
+function mapPredictiveLeaderQualityGate(row) {
+  if (
+    row?.leader_gate_forecast_id === null
+    || row?.leader_gate_forecast_id === undefined
+  ) {
+    return null;
+  }
+  const gate = deserializeJson(row.leader_gate_snapshot_json);
+  const forecastId = Number(row.forecast_id);
+  const sampleSize = Number(gate?.sampleSize);
+  const windowStartForecastId = gate?.windowStartForecastId;
+  const windowEndForecastId = gate?.windowEndForecastId;
+  const throughResultId = gate?.throughResultId;
+  if (
+    !gate
+    || typeof gate !== "object"
+    || Array.isArray(gate)
+    || Number(row.leader_gate_forecast_id) !== Number(row.forecast_id)
+    || row.leader_gate_version !== gate.version
+    || row.leader_gate_status !== gate.status
+    || Boolean(row.leader_gate_eligible) !== gate.eligible
+    || row.leader_gate_cutoff_at !== gate.cutoffAt
+    || Number(gate.evaluatedForForecastId) !== forecastId
+    || !Number.isSafeInteger(sampleSize)
+    || sampleSize < 0
+    || sampleSize > PREDICTIVE_LEADER_QUALITY_GATE.windowSize
+    || (sampleSize === 0) !== (windowStartForecastId === null)
+    || (sampleSize === 0) !== (windowEndForecastId === null)
+    || (sampleSize === 0) !== (throughResultId === null)
+    || (gate.status === "collecting"
+      && sampleSize >= PREDICTIVE_LEADER_QUALITY_GATE.windowSize)
+    || (["rejected", "confirmed"].includes(gate.status)
+      && sampleSize !== PREDICTIVE_LEADER_QUALITY_GATE.windowSize)
+    || (gate.status === "invalid" && sampleSize !== 0)
+    || (sampleSize > 0 && (
+      !Number.isSafeInteger(windowStartForecastId)
+      || windowStartForecastId < 1
+      || !Number.isSafeInteger(windowEndForecastId)
+      || windowEndForecastId < windowStartForecastId
+      || windowEndForecastId >= forecastId
+      || !Number.isSafeInteger(throughResultId)
+      || throughResultId < 1
+    ))
+  ) {
+    return null;
+  }
+  return gate;
+}
+
 function buildPredictiveLeaderMetricFact(row) {
   const leader = mapForecastPredictiveLeader(row);
   if (leader?.status !== "ready") {
@@ -3920,6 +3979,7 @@ function mapPrecloseForecast(row) {
   const consensus = mapForecastConsensus(row, rankedNumbers);
   const trajectoryShadow = mapForecastTrajectoryShadow(row);
   const predictiveLeader = mapForecastPredictiveLeader(row);
+  const predictiveLeaderQualityGate = mapPredictiveLeaderQualityGate(row);
   return {
     id: Number(row.forecast_id ?? row.id),
     snapshotId: Number(row.snapshot_id),
@@ -3946,6 +4006,7 @@ function mapPrecloseForecast(row) {
     consensus,
     trajectoryShadow,
     predictiveLeader,
+    predictiveLeaderQualityGate,
     settlement:
       row.actual_number === null || row.actual_number === undefined
         ? null
@@ -3974,6 +4035,7 @@ function mapPredictiveLeaderForecast(row) {
     roundEndsAt: row.round_ends_at,
     lockedAt: row.locked_at,
     predictiveLeader: mapForecastPredictiveLeader(row),
+    predictiveLeaderQualityGate: mapPredictiveLeaderQualityGate(row),
     settlement:
       row.actual_number === null || row.actual_number === undefined
         ? null
@@ -4102,6 +4164,7 @@ export class RouletteDatabase {
     logger = null,
     gapThresholdSeconds = 135,
     virtualStartingBalance = DEFAULT_VIRTUAL_STARTING_BALANCE,
+    predictiveLeaderLegacyAccountEnabled = true,
     clock = () => new Date(),
   } = {}) {
     if (typeof path !== "string" || path.trim() === "") {
@@ -4110,6 +4173,9 @@ export class RouletteDatabase {
     if (typeof clock !== "function") {
       throw new TypeError("clock must be a function");
     }
+    if (typeof predictiveLeaderLegacyAccountEnabled !== "boolean") {
+      throw new TypeError("predictiveLeaderLegacyAccountEnabled must be a boolean");
+    }
 
     this.logger = logger;
     this.clock = clock;
@@ -4117,6 +4183,8 @@ export class RouletteDatabase {
     this.virtualStartingBalance = normalizedVirtualStartingBalance(
       virtualStartingBalance,
     );
+    this.predictiveLeaderLegacyAccountEnabled =
+      predictiveLeaderLegacyAccountEnabled;
     this.followerTop5HitCurveCache = new Map();
     this.followerTop5GatedAccountCache = new Map();
     this.trajectoryAdaptiveValidationCache = new Map();
@@ -4636,6 +4704,7 @@ export class RouletteDatabase {
     this.#migrateFollowerTop5GatedAccountDepositsV23();
     this.#finalizeSchemaVersionV24(startingVersion);
     this.#migrateTrajectoryMetricFactsV25(startingVersion);
+    this.#migratePredictiveLeaderQualityAndSignalV26(startingVersion);
   }
 
   #migratePrecloseForecastsV10() {
@@ -6184,6 +6253,171 @@ export class RouletteDatabase {
       }
       throw error;
     }
+  }
+
+  #migratePredictiveLeaderQualityAndSignalV26(startingVersion) {
+    this.sqlite.exec("BEGIN IMMEDIATE");
+    try {
+      this.sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS forecast_predictive_leader_quality_snapshots (
+          forecast_id INTEGER PRIMARY KEY REFERENCES
+            forecast_predictive_leader_snapshots(forecast_id) ON DELETE CASCADE,
+          policy_version TEXT NOT NULL CHECK (length(trim(policy_version)) > 0),
+          cutoff_at TEXT NOT NULL,
+          status TEXT NOT NULL CHECK (
+            status IN ('collecting', 'rejected', 'confirmed', 'invalid')
+          ),
+          reason TEXT NOT NULL CHECK (length(trim(reason)) > 0),
+          eligible INTEGER NOT NULL CHECK (eligible IN (0, 1)),
+          sample_size INTEGER NOT NULL CHECK (
+            sample_size BETWEEN 0 AND ${PREDICTIVE_LEADER_QUALITY_GATE.windowSize}
+          ),
+          hit_count INTEGER NOT NULL CHECK (
+            hit_count >= 0 AND hit_count <= sample_size
+          ),
+          lower_bound REAL,
+          mean_brier_loss REAL,
+          window_start_forecast_id INTEGER REFERENCES round_forecasts(id),
+          window_end_forecast_id INTEGER REFERENCES round_forecasts(id),
+          snapshot_json TEXT NOT NULL CHECK (
+            json_valid(snapshot_json) AND json_type(snapshot_json) = 'object'
+          ),
+          created_at TEXT NOT NULL,
+          CHECK (eligible = (status = 'confirmed')),
+          CHECK (json_extract(snapshot_json, '$.version') = policy_version),
+          CHECK (json_extract(snapshot_json, '$.status') = status),
+          CHECK (json_extract(snapshot_json, '$.reason') = reason),
+          CHECK (json_extract(snapshot_json, '$.eligible') = eligible),
+          CHECK (json_extract(snapshot_json, '$.sampleSize') = sample_size),
+          CHECK (json_extract(snapshot_json, '$.hitCount') = hit_count),
+          CHECK (json_extract(snapshot_json, '$.cutoffAt') = cutoff_at),
+          CHECK (json_extract(snapshot_json, '$.evaluatedForForecastId') = forecast_id),
+          CHECK (
+            (sample_size = 0 AND window_start_forecast_id IS NULL
+              AND window_end_forecast_id IS NULL)
+            OR
+            (sample_size > 0 AND window_start_forecast_id IS NOT NULL
+              AND window_end_forecast_id IS NOT NULL
+              AND window_start_forecast_id <= window_end_forecast_id
+              AND window_end_forecast_id < forecast_id)
+          ),
+          CHECK (cutoff_at <= created_at)
+        );
+
+        CREATE INDEX IF NOT EXISTS predictive_leader_quality_status_idx
+          ON forecast_predictive_leader_quality_snapshots(
+            policy_version, status, forecast_id DESC
+          );
+        CREATE TRIGGER IF NOT EXISTS predictive_leader_quality_causal_insert
+          BEFORE INSERT ON forecast_predictive_leader_quality_snapshots
+          WHEN NEW.sample_size > 0 AND (
+            NEW.window_start_forecast_id IS NULL
+            OR NEW.window_end_forecast_id IS NULL
+            OR NEW.window_start_forecast_id > NEW.window_end_forecast_id
+            OR NEW.window_end_forecast_id >= NEW.forecast_id
+          )
+          BEGIN
+            SELECT RAISE(ABORT, 'predictive leader quality window is not causal');
+          END;
+        CREATE TRIGGER IF NOT EXISTS predictive_leader_quality_causal_update
+          BEFORE UPDATE OF forecast_id, sample_size, window_start_forecast_id,
+            window_end_forecast_id
+          ON forecast_predictive_leader_quality_snapshots
+          WHEN NEW.sample_size > 0 AND (
+            NEW.window_start_forecast_id IS NULL
+            OR NEW.window_end_forecast_id IS NULL
+            OR NEW.window_start_forecast_id > NEW.window_end_forecast_id
+            OR NEW.window_end_forecast_id >= NEW.forecast_id
+          )
+          BEGIN
+            SELECT RAISE(ABORT, 'predictive leader quality window is not causal');
+          END;
+
+        CREATE TABLE IF NOT EXISTS forecast_predictive_leader_evaluation_voids (
+          forecast_id INTEGER NOT NULL REFERENCES
+            forecast_predictive_leader_snapshots(forecast_id) ON DELETE CASCADE,
+          incident_id INTEGER NOT NULL REFERENCES incidents(id),
+          void_continuity_epoch INTEGER NOT NULL CHECK (void_continuity_epoch >= 1),
+          reason TEXT NOT NULL CHECK (reason = 'integrity_gap'),
+          voided_at TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          PRIMARY KEY (forecast_id, incident_id),
+          CHECK (voided_at <= created_at)
+        );
+        CREATE INDEX IF NOT EXISTS predictive_leader_evaluation_void_incident_idx
+          ON forecast_predictive_leader_evaluation_voids(incident_id, forecast_id);
+
+        CREATE TABLE IF NOT EXISTS predictive_leader_gated_fixed_bets (
+          forecast_id INTEGER PRIMARY KEY REFERENCES
+            forecast_predictive_leader_quality_snapshots(forecast_id),
+          source TEXT NOT NULL,
+          instrument TEXT NOT NULL,
+          schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+          strategy_version TEXT NOT NULL CHECK (length(trim(strategy_version)) > 0),
+          leader_algorithm_version TEXT NOT NULL CHECK (
+            length(trim(leader_algorithm_version)) > 0
+          ),
+          gate_version TEXT NOT NULL CHECK (length(trim(gate_version)) > 0),
+          continuity_epoch INTEGER NOT NULL CHECK (continuity_epoch >= 0),
+          target_number INTEGER NOT NULL CHECK (target_number BETWEEN 0 AND 36),
+          stake INTEGER NOT NULL CHECK (stake = 10),
+          balance_before INTEGER NOT NULL CHECK (balance_before >= stake),
+          status TEXT NOT NULL CHECK (status IN ('pending', 'settled', 'void')),
+          round_result_id INTEGER UNIQUE REFERENCES round_results(id),
+          result_number INTEGER CHECK (
+            result_number IS NULL OR result_number BETWEEN 0 AND 36
+          ),
+          outcome TEXT CHECK (outcome IS NULL OR outcome IN ('hit', 'miss')),
+          gross_payout INTEGER CHECK (gross_payout IS NULL OR gross_payout >= 0),
+          balance_after INTEGER CHECK (balance_after IS NULL OR balance_after >= 0),
+          void_reason TEXT CHECK (
+            void_reason IS NULL OR void_reason = 'integrity_gap'
+          ),
+          placed_at TEXT NOT NULL,
+          settled_at TEXT,
+          updated_at TEXT NOT NULL,
+          CHECK (
+            (status = 'pending' AND round_result_id IS NULL
+              AND result_number IS NULL AND outcome IS NULL
+              AND gross_payout IS NULL AND balance_after IS NULL
+              AND void_reason IS NULL AND settled_at IS NULL)
+            OR
+            (status = 'settled' AND round_result_id IS NOT NULL
+              AND result_number IS NOT NULL AND outcome IS NOT NULL
+              AND gross_payout IS NOT NULL AND balance_after IS NOT NULL
+              AND void_reason IS NULL AND settled_at IS NOT NULL
+              AND balance_after = balance_before - stake + gross_payout
+              AND (outcome = 'hit') = (target_number = result_number)
+              AND gross_payout = CASE
+                WHEN outcome = 'hit' THEN stake * 36 ELSE 0 END)
+            OR
+            (status = 'void' AND round_result_id IS NULL
+              AND result_number IS NULL AND outcome IS NULL
+              AND gross_payout IS NULL AND balance_after IS NULL
+              AND void_reason = 'integrity_gap' AND settled_at IS NOT NULL)
+          )
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS predictive_leader_gated_fixed_pending_idx
+          ON predictive_leader_gated_fixed_bets(source, instrument)
+          WHERE status = 'pending';
+        CREATE INDEX IF NOT EXISTS predictive_leader_gated_fixed_stream_idx
+          ON predictive_leader_gated_fixed_bets(
+            source, instrument, forecast_id DESC
+          );
+
+        PRAGMA user_version = ${Math.max(26, startingVersion)};
+        COMMIT;
+      `);
+    } catch (error) {
+      try {
+        this.sqlite.exec("ROLLBACK");
+      } catch {
+        // Preserve the migration error.
+      }
+      throw error;
+    }
+    this.#backfillPredictiveLeaderEvaluationVoids();
   }
 
   #migrateContinuityReconciliationV9() {
@@ -8040,11 +8274,21 @@ export class RouletteDatabase {
           incident.source,
           incident.instrument,
         );
+        const predictiveLeaderEvaluationVoid = deferPredictiveLeaderVoid
+          ? null
+          : this.#voidUnresolvedPredictiveLeaderEvaluationsForGapInTransaction({
+              source: incident.source,
+              instrument: incident.instrument,
+              incidentId: Number(existing.id),
+              continuityEpoch,
+              voidedAt: now,
+            });
         return {
           row: existing,
           cycleId: existing.cycle_id == null ? null : Number(existing.cycle_id),
           duplicate: true,
           continuityEpoch,
+          predictiveLeaderEvaluationVoid,
           predictiveLeaderVoid: deferPredictiveLeaderVoid
             ? null
             : this.#voidPredictiveLeaderPendingBetForGapInTransaction({
@@ -8113,6 +8357,15 @@ export class RouletteDatabase {
       incident.instrument,
     );
     const incidentId = Number(insertion.lastInsertRowid);
+    const predictiveLeaderEvaluationVoid = deferPredictiveLeaderVoid
+      ? null
+      : this.#voidUnresolvedPredictiveLeaderEvaluationsForGapInTransaction({
+          source: incident.source,
+          instrument: incident.instrument,
+          incidentId,
+          continuityEpoch,
+          voidedAt: now,
+        });
     return {
       row: this.sqlite
         .prepare("SELECT * FROM incidents WHERE id = ?")
@@ -8120,6 +8373,7 @@ export class RouletteDatabase {
       cycleId,
       duplicate: false,
       continuityEpoch,
+      predictiveLeaderEvaluationVoid,
       predictiveLeaderVoid: deferPredictiveLeaderVoid
         ? null
         : this.#voidPredictiveLeaderPendingBetForGapInTransaction({
@@ -8406,6 +8660,14 @@ export class RouletteDatabase {
         this.#processFollowerTop5TrackerBatch(insertedResultRows, now);
 
         for (const outcome of gapOutcomes) {
+          outcome.predictiveLeaderEvaluationVoid =
+            this.#voidUnresolvedPredictiveLeaderEvaluationsForGapInTransaction({
+              source: outcome.row.source,
+              instrument: outcome.row.instrument,
+              incidentId: Number(outcome.row.id),
+              continuityEpoch: outcome.continuityEpoch,
+              voidedAt: now,
+            });
           outcome.predictiveLeaderVoid =
             this.#voidPredictiveLeaderPendingBetForGapInTransaction({
               source: outcome.row.source,
@@ -10618,6 +10880,133 @@ export class RouletteDatabase {
     return unsettledAtEnd === 1;
   }
 
+  #voidUnresolvedPredictiveLeaderEvaluationsForGapInTransaction({
+    source,
+    instrument,
+    incidentId,
+    continuityEpoch,
+    voidedAt,
+  }) {
+    const incident = this.sqlite.prepare(`
+      SELECT
+        incidents.*,
+        incident_resolutions.incident_id AS resolved_incident_id
+      FROM incidents
+      LEFT JOIN incident_resolutions
+        ON incident_resolutions.incident_id = incidents.id
+      WHERE incidents.id = ?
+        AND incidents.source = ?
+        AND incidents.instrument = ?
+        AND incidents.kind = 'gap'
+    `).get(incidentId, source, instrument);
+    if (!incident) {
+      throw new Error("predictive leader evaluation void incident cursor is invalid");
+    }
+    if (incident.resolved_incident_id !== null) {
+      return { voided: 0, reason: "incident_resolved" };
+    }
+    const nextEpoch = Number(continuityEpoch);
+    if (!Number.isSafeInteger(nextEpoch) || nextEpoch < 1) {
+      throw new Error("predictive leader evaluation void continuity cursor is invalid");
+    }
+    const safeVoidedAt = asTimestamp(
+      voidedAt,
+      undefined,
+      "predictive leader evaluation voidedAt",
+    );
+    const candidates = this.sqlite.prepare(`
+      SELECT leaders.forecast_id
+      FROM forecast_predictive_leader_snapshots AS leaders
+      JOIN round_forecasts AS forecasts ON forecasts.id = leaders.forecast_id
+      JOIN forecast_snapshots AS snapshots ON snapshots.id = forecasts.snapshot_id
+      LEFT JOIN forecast_settlements AS settlements
+        ON settlements.forecast_id = leaders.forecast_id
+      WHERE snapshots.source = ?
+        AND snapshots.instrument = ?
+        AND leaders.schema_version = ?
+        AND leaders.algorithm_version = ?
+        AND leaders.status = 'ready'
+        AND leaders.created_at <= ?
+        AND settlements.forecast_id IS NULL
+        AND NOT EXISTS (
+          SELECT 1
+          FROM forecast_predictive_leader_evaluation_voids AS evaluation_voids
+          WHERE evaluation_voids.forecast_id = leaders.forecast_id
+            AND evaluation_voids.incident_id = ?
+        )
+      ORDER BY leaders.forecast_id
+    `).all(
+      source,
+      instrument,
+      LEARNED_LEADER_SCHEMA_VERSION,
+      LEARNED_LEADER_ALGORITHM_VERSION,
+      incident.created_at,
+      Number(incident.id),
+    );
+    const insert = this.sqlite.prepare(`
+      INSERT OR IGNORE INTO forecast_predictive_leader_evaluation_voids (
+        forecast_id, incident_id, void_continuity_epoch, reason,
+        voided_at, created_at
+      ) VALUES (?, ?, ?, 'integrity_gap', ?, ?)
+    `);
+    let voided = 0;
+    for (const candidate of candidates) {
+      const forecastId = Number(candidate.forecast_id);
+      if (
+        this.#predictiveLeaderPendingResultIsResolvable(
+          forecastId,
+          source,
+          instrument,
+        )
+      ) {
+        continue;
+      }
+      voided += Number(insert.run(
+        forecastId,
+        Number(incident.id),
+        nextEpoch,
+        safeVoidedAt,
+        safeVoidedAt,
+      ).changes);
+    }
+    return { voided, reason: voided > 0 ? "integrity_gap" : "no_unresolved_forecast" };
+  }
+
+  #backfillPredictiveLeaderEvaluationVoids() {
+    const incidents = this.sqlite.prepare(`
+      SELECT
+        incidents.*,
+        (
+          SELECT COUNT(*)
+          FROM incidents AS prior
+          WHERE prior.kind = 'gap'
+            AND prior.source = incidents.source
+            AND prior.instrument = incidents.instrument
+            AND prior.id <= incidents.id
+        ) AS continuity_epoch
+      FROM incidents
+      WHERE incidents.kind = 'gap'
+        AND NOT EXISTS (
+          SELECT 1
+          FROM incident_resolutions
+          WHERE incident_resolutions.incident_id = incidents.id
+        )
+      ORDER BY incidents.id
+    `).all();
+    if (incidents.length === 0) return;
+    this.#transaction(() => {
+      for (const incident of incidents) {
+        this.#voidUnresolvedPredictiveLeaderEvaluationsForGapInTransaction({
+          source: incident.source,
+          instrument: incident.instrument,
+          incidentId: Number(incident.id),
+          continuityEpoch: Number(incident.continuity_epoch),
+          voidedAt: incident.created_at,
+        });
+      }
+    });
+  }
+
   #voidPredictiveLeaderPendingBetForGapInTransaction({
     source,
     instrument,
@@ -10940,6 +11329,215 @@ export class RouletteDatabase {
     ));
   }
 
+  #predictiveLeaderQualityEvidenceRows({
+    source,
+    instrument,
+    horizonSeconds,
+    cutoffAt,
+    historyMaxResultId,
+    beforeForecastId,
+  }) {
+    if (historyMaxResultId === null) return [];
+    const rows = this.sqlite.prepare(`
+      SELECT
+        leaders.forecast_id,
+        metric_facts.metric_version,
+        metric_facts.ready_count,
+        metric_facts.settled_count,
+        metric_facts.top1_hits,
+        metric_facts.combined_brier_loss,
+        settlements.round_result_id,
+        settlements.actual_number,
+        settlements.settled_at AS settlement_settled_at,
+        settlements.created_at AS settlement_created_at,
+        results.result_number,
+        results.settled_at AS result_settled_at,
+        results.observed_at AS result_observed_at,
+        results.created_at AS result_created_at
+      FROM forecast_predictive_leader_snapshots AS leaders
+      JOIN round_forecasts AS forecasts ON forecasts.id = leaders.forecast_id
+      JOIN forecast_snapshots AS snapshots ON snapshots.id = forecasts.snapshot_id
+      JOIN forecast_settlements AS settlements
+        ON settlements.forecast_id = leaders.forecast_id
+      JOIN round_results AS results ON results.id = settlements.round_result_id
+      LEFT JOIN forecast_predictive_leader_metric_facts AS metric_facts
+        ON metric_facts.forecast_id = leaders.forecast_id
+       AND metric_facts.metric_version = ?
+      WHERE snapshots.source = ?
+        AND snapshots.instrument = ?
+        AND snapshots.horizon_seconds = ?
+        AND leaders.schema_version = ?
+        AND leaders.algorithm_version = ?
+        AND leaders.status = 'ready'
+        AND snapshots.locked_at < ?
+        AND leaders.created_at < ?
+        AND settlements.settled_at < ?
+        AND settlements.created_at < ?
+        AND results.settled_at < ?
+        AND results.observed_at < ?
+        AND results.created_at < ?
+        AND results.id <= ?
+        AND leaders.forecast_id < ?
+      ORDER BY leaders.forecast_id DESC, results.id DESC
+      LIMIT ?
+    `).all(
+      PREDICTIVE_LEADER_METRIC_FACT_VERSION,
+      source,
+      instrument,
+      horizonSeconds,
+      LEARNED_LEADER_SCHEMA_VERSION,
+      LEARNED_LEADER_ALGORITHM_VERSION,
+      cutoffAt,
+      cutoffAt,
+      cutoffAt,
+      cutoffAt,
+      cutoffAt,
+      cutoffAt,
+      cutoffAt,
+      historyMaxResultId,
+      beforeForecastId,
+      PREDICTIVE_LEADER_QUALITY_GATE.windowSize,
+    );
+    return rows.reverse().map((row) => {
+      const valid = row.metric_version === PREDICTIVE_LEADER_METRIC_FACT_VERSION
+        && Number(row.ready_count) === 1
+        && Number(row.settled_count) === 1
+        && [0, 1].includes(Number(row.top1_hits))
+        && typeof row.combined_brier_loss === "number"
+        && Number.isFinite(row.combined_brier_loss)
+        && row.combined_brier_loss >= 0
+        && row.combined_brier_loss <= 1
+        && Number(row.actual_number) === Number(row.result_number)
+        && row.settlement_settled_at === row.result_settled_at;
+      return valid
+        ? {
+            forecastId: Number(row.forecast_id),
+            top1Hit: Boolean(row.top1_hits),
+            combinedBrierLoss: Number(row.combined_brier_loss),
+          }
+        : {
+            forecastId: Number(row.forecast_id),
+            top1Hit: null,
+            combinedBrierLoss: row.combined_brier_loss,
+          };
+    });
+  }
+
+  #freezePredictiveLeaderQualityGateInTransaction({
+    forecastId,
+    parent,
+    decision,
+    historyMaxResultId,
+    createdAt,
+  }) {
+    const facts = this.#predictiveLeaderQualityEvidenceRows({
+      source: parent.source,
+      instrument: parent.instrument,
+      horizonSeconds: Number(parent.horizon_seconds),
+      cutoffAt: parent.locked_at,
+      historyMaxResultId,
+      beforeForecastId: forecastId,
+    });
+    const assessed = evaluatePredictiveLeaderQualityGate({
+      facts,
+      currentFamilyCount: decision.familyCount,
+    });
+    const throughResultId = assessed.sampleSize === 0 || historyMaxResultId === null
+      ? null
+      : historyMaxResultId;
+    const evidenceDigest = createHash("sha256")
+      .update(JSON.stringify(facts))
+      .digest("hex");
+    const gate = Object.freeze({
+      ...assessed,
+      evaluatedForForecastId: forecastId,
+      cutoffAt: parent.locked_at,
+      currentFamilyCount: decision.familyCount,
+      throughResultId,
+      evidenceDigest,
+    });
+    this.sqlite.prepare(`
+      INSERT INTO forecast_predictive_leader_quality_snapshots (
+        forecast_id, policy_version, cutoff_at, status, reason, eligible,
+        sample_size, hit_count, lower_bound, mean_brier_loss,
+        window_start_forecast_id, window_end_forecast_id, snapshot_json,
+        created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      forecastId,
+      gate.version,
+      gate.cutoffAt,
+      gate.status,
+      gate.reason,
+      gate.eligible ? 1 : 0,
+      gate.sampleSize,
+      gate.hitCount,
+      gate.lowerBound,
+      gate.meanBrierLoss,
+      gate.windowStartForecastId,
+      gate.windowEndForecastId,
+      JSON.stringify(gate),
+      createdAt,
+    );
+    return gate;
+  }
+
+  #placePredictiveLeaderSignalBetInTransaction({
+    forecastId,
+    source,
+    instrument,
+    decision,
+    gate,
+    placedAt,
+  }) {
+    if (decision.status !== "ready" || gate.eligible !== true) {
+      return { placed: false, reason: "quality_not_confirmed" };
+    }
+    const pending = this.sqlite.prepare(`
+      SELECT forecast_id
+      FROM predictive_leader_gated_fixed_bets
+      WHERE source = ? AND instrument = ? AND status = 'pending'
+    `).get(source, instrument);
+    if (pending) return { placed: false, reason: "prior_pending" };
+    const totals = this.sqlite.prepare(`
+      SELECT
+        COALESCE(SUM(CASE WHEN status <> 'void' THEN stake ELSE 0 END), 0)
+          AS total_staked,
+        COALESCE(SUM(CASE WHEN status = 'settled'
+          THEN gross_payout ELSE 0 END), 0) AS total_gross_payout
+      FROM predictive_leader_gated_fixed_bets
+      WHERE source = ? AND instrument = ?
+    `).get(source, instrument);
+    const balanceBefore = PREDICTIVE_LEADER_SIGNAL_ACCOUNT_STARTING_BALANCE
+      - Number(totals.total_staked)
+      + Number(totals.total_gross_payout);
+    if (balanceBefore < PREDICTIVE_LEADER_SIGNAL_STAKE) {
+      return { placed: false, reason: "bankroll_exhausted" };
+    }
+    this.sqlite.prepare(`
+      INSERT INTO predictive_leader_gated_fixed_bets (
+        forecast_id, source, instrument, schema_version, strategy_version,
+        leader_algorithm_version, gate_version, continuity_epoch,
+        target_number, stake, balance_before, status, placed_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+    `).run(
+      forecastId,
+      source,
+      instrument,
+      PREDICTIVE_LEADER_SIGNAL_ACCOUNT_SCHEMA_VERSION,
+      PREDICTIVE_LEADER_SIGNAL_ACCOUNT_STRATEGY_VERSION,
+      LEARNED_LEADER_ALGORITHM_VERSION,
+      gate.version,
+      this.#continuityEpoch(source, instrument) ?? 0,
+      decision.leaderNumber,
+      PREDICTIVE_LEADER_SIGNAL_STAKE,
+      balanceBefore,
+      placedAt,
+      placedAt,
+    );
+    return { placed: true, reason: "bet_frozen" };
+  }
+
   #placePredictiveLeaderAccountBetInTransaction({
     forecastId,
     source,
@@ -11124,6 +11722,19 @@ export class RouletteDatabase {
   }
 
   #recordPredictiveLeaderSnapshot(forecastId, trajectoryShadow) {
+    const metricScope = this.sqlite.prepare(`
+      SELECT snapshots.source, snapshots.instrument, snapshots.horizon_seconds
+      FROM round_forecasts AS forecasts
+      JOIN forecast_snapshots AS snapshots ON snapshots.id = forecasts.snapshot_id
+      WHERE forecasts.id = ?
+    `).get(forecastId);
+    if (metricScope) {
+      this.#ensurePredictiveLeaderMetricFacts(
+        metricScope.source,
+        metricScope.instrument,
+        Number(metricScope.horizon_seconds),
+      );
+    }
     return this.#transaction(() => {
       const existing = this.sqlite
         .prepare(`
@@ -11249,14 +11860,31 @@ export class RouletteDatabase {
           JSON.stringify(decision),
           createdAt,
         );
-      this.#placePredictiveLeaderAccountBetInTransaction({
+      const qualityGate = this.#freezePredictiveLeaderQualityGateInTransaction({
+        forecastId,
+        parent,
+        decision,
+        historyMaxResultId: conditional.historyMaxResultId,
+        createdAt,
+      });
+      this.#placePredictiveLeaderSignalBetInTransaction({
         forecastId,
         source: parent.source,
         instrument: parent.instrument,
         decision,
-        historyMaxResultId: conditional.historyMaxResultId,
+        gate: qualityGate,
         placedAt: createdAt,
       });
+      if (this.predictiveLeaderLegacyAccountEnabled) {
+        this.#placePredictiveLeaderAccountBetInTransaction({
+          forecastId,
+          source: parent.source,
+          instrument: parent.instrument,
+          decision,
+          historyMaxResultId: conditional.historyMaxResultId,
+          placedAt: createdAt,
+        });
+      }
       const commitCheckedAt = asTimestamp(
         this.clock(),
         undefined,
@@ -11972,6 +12600,124 @@ export class RouletteDatabase {
     };
   }
 
+  settlePredictiveLeaderSignalAccount(
+    source = "buleto",
+    instrument = "default",
+  ) {
+    this.#assertOpen();
+    const safeSource = asNonEmptyText(source, undefined, "source");
+    const safeInstrument = asNonEmptyText(instrument, undefined, "instrument");
+    const now = asTimestamp(
+      this.clock(),
+      undefined,
+      "predictive leader signal settledAt",
+    );
+    return this.#transaction(() => {
+      const pending = this.sqlite.prepare(`
+        SELECT
+          bets.*,
+          leaders.status AS leader_status,
+          leaders.predicted_number AS leader_number,
+          gates.policy_version AS frozen_gate_version,
+          gates.eligible AS gate_eligible,
+          snapshots.source AS forecast_source,
+          snapshots.instrument AS forecast_instrument,
+          settlements.round_result_id AS settlement_result_id,
+          settlements.actual_number AS settlement_actual_number,
+          settlements.settled_at AS settlement_occurred_at,
+          results.result_number AS stored_result_number,
+          results.settled_at AS result_occurred_at
+        FROM predictive_leader_gated_fixed_bets AS bets
+        JOIN forecast_predictive_leader_snapshots AS leaders
+          ON leaders.forecast_id = bets.forecast_id
+        JOIN forecast_predictive_leader_quality_snapshots AS gates
+          ON gates.forecast_id = bets.forecast_id
+        JOIN round_forecasts AS forecasts ON forecasts.id = bets.forecast_id
+        JOIN forecast_snapshots AS snapshots ON snapshots.id = forecasts.snapshot_id
+        LEFT JOIN forecast_settlements AS settlements
+          ON settlements.forecast_id = bets.forecast_id
+        LEFT JOIN round_results AS results
+          ON results.id = settlements.round_result_id
+        WHERE bets.source = ? AND bets.instrument = ? AND bets.status = 'pending'
+      `).get(safeSource, safeInstrument);
+      if (!pending) return { settled: 0, voided: 0 };
+      if (
+        Number(pending.schema_version)
+          !== PREDICTIVE_LEADER_SIGNAL_ACCOUNT_SCHEMA_VERSION
+        || pending.strategy_version
+          !== PREDICTIVE_LEADER_SIGNAL_ACCOUNT_STRATEGY_VERSION
+        || pending.leader_algorithm_version !== LEARNED_LEADER_ALGORITHM_VERSION
+        || pending.gate_version !== PREDICTIVE_LEADER_QUALITY_GATE.version
+        || pending.frozen_gate_version !== PREDICTIVE_LEADER_QUALITY_GATE.version
+        || Number(pending.gate_eligible) !== 1
+        || pending.leader_status !== "ready"
+        || Number(pending.target_number) !== Number(pending.leader_number)
+        || pending.source !== pending.forecast_source
+        || pending.instrument !== pending.forecast_instrument
+        || Number(pending.stake) !== PREDICTIVE_LEADER_SIGNAL_STAKE
+      ) {
+        throw new Error("predictive leader signal cursor is invalid");
+      }
+
+      if (pending.settlement_result_id !== null) {
+        if (
+          Number(pending.settlement_actual_number)
+            !== Number(pending.stored_result_number)
+          || pending.settlement_occurred_at !== pending.result_occurred_at
+        ) {
+          throw new Error("predictive leader signal settlement is inconsistent");
+        }
+        const resultNumber = Number(pending.stored_result_number);
+        const hit = resultNumber === Number(pending.target_number);
+        const grossPayout = hit
+          ? PREDICTIVE_LEADER_SIGNAL_STAKE
+            * PREDICTIVE_LEADER_SIGNAL_GROSS_PAYOUT_MULTIPLIER
+          : 0;
+        const balanceAfter = Number(pending.balance_before)
+          - PREDICTIVE_LEADER_SIGNAL_STAKE
+          + grossPayout;
+        const update = this.sqlite.prepare(`
+          UPDATE predictive_leader_gated_fixed_bets
+          SET status = 'settled', round_result_id = ?, result_number = ?,
+            outcome = ?, gross_payout = ?, balance_after = ?, settled_at = ?,
+            updated_at = ?
+          WHERE forecast_id = ? AND status = 'pending'
+        `).run(
+          Number(pending.settlement_result_id),
+          resultNumber,
+          hit ? "hit" : "miss",
+          grossPayout,
+          balanceAfter,
+          pending.result_occurred_at,
+          now,
+          Number(pending.forecast_id),
+        );
+        return { settled: Number(update.changes), voided: 0 };
+      }
+
+      const currentEpoch = this.#continuityEpoch(safeSource, safeInstrument) ?? 0;
+      if (Number(pending.continuity_epoch) !== currentEpoch) {
+        if (
+          this.#predictiveLeaderPendingResultIsResolvable(
+            Number(pending.forecast_id),
+            safeSource,
+            safeInstrument,
+          )
+        ) {
+          return { settled: 0, voided: 0 };
+        }
+        const update = this.sqlite.prepare(`
+          UPDATE predictive_leader_gated_fixed_bets
+          SET status = 'void', void_reason = 'integrity_gap', settled_at = ?,
+            updated_at = ?
+          WHERE forecast_id = ? AND status = 'pending'
+        `).run(now, now, Number(pending.forecast_id));
+        return { settled: 0, voided: Number(update.changes) };
+      }
+      return { settled: 0, voided: 0 };
+    });
+  }
+
   settlePredictiveLeaderAccount(source = "buleto", instrument = "default") {
     this.#assertOpen();
     const safeSource = asNonEmptyText(source, undefined, "source");
@@ -12201,6 +12947,13 @@ export class RouletteDatabase {
         instrument: safeInstrument,
         appliedAt: now,
       });
+      if (!this.predictiveLeaderLegacyAccountEnabled) {
+        return {
+          placed: 0,
+          reason: "strategy_retired",
+          voided: voidOutcome.voided,
+        };
+      }
 
       const candidate = this.sqlite
         .prepare(`
@@ -12537,12 +13290,199 @@ export class RouletteDatabase {
         AND snapshots.source = ?
         AND snapshots.instrument = ?
         AND snapshots.horizon_seconds = ?
+        AND (
+          metric_facts.settled_count = 1
+          OR (
+            NOT EXISTS (
+              SELECT 1
+              FROM forecast_predictive_leader_evaluation_voids AS evaluation_voids
+              WHERE evaluation_voids.forecast_id = metric_facts.forecast_id
+                AND NOT EXISTS (
+                  SELECT 1
+                  FROM incident_resolutions
+                  WHERE incident_resolutions.incident_id = evaluation_voids.incident_id
+                )
+            )
+            AND NOT EXISTS (
+              SELECT 1
+              FROM predictive_leader_account_bets AS bets
+              WHERE bets.forecast_id = metric_facts.forecast_id
+                AND bets.status = 'void'
+            )
+            AND NOT EXISTS (
+              SELECT 1
+              FROM predictive_leader_gated_fixed_bets AS signal_bets
+              WHERE signal_bets.forecast_id = metric_facts.forecast_id
+                AND signal_bets.status = 'void'
+            )
+          )
+        )
       ORDER BY metric_facts.forecast_id
     `).all(
       PREDICTIVE_LEADER_METRIC_FACT_VERSION,
       source,
       instrument,
       horizonSeconds,
+    );
+  }
+
+  #predictiveLeaderSignalAccountState(source, instrument) {
+    const rows = this.sqlite.prepare(`
+      SELECT *
+      FROM predictive_leader_gated_fixed_bets
+      WHERE source = ? AND instrument = ?
+      ORDER BY forecast_id
+    `).all(source, instrument);
+    let currentBalance = PREDICTIVE_LEADER_SIGNAL_ACCOUNT_STARTING_BALANCE;
+    let peakBalance = currentBalance;
+    let minimumBalance = currentBalance;
+    let maximumDrawdown = 0;
+    let totalStaked = 0;
+    let totalGrossPayout = 0;
+    let pending = null;
+    let latestOutcome = null;
+    let latestVoid = null;
+    let hitCount = 0;
+    let missCount = 0;
+    let voidCount = 0;
+    let startedAt = null;
+    let updatedAt = null;
+
+    for (const row of rows) {
+      if (
+        Number(row.schema_version)
+          !== PREDICTIVE_LEADER_SIGNAL_ACCOUNT_SCHEMA_VERSION
+        || row.strategy_version
+          !== PREDICTIVE_LEADER_SIGNAL_ACCOUNT_STRATEGY_VERSION
+        || row.leader_algorithm_version !== LEARNED_LEADER_ALGORITHM_VERSION
+        || row.gate_version !== PREDICTIVE_LEADER_QUALITY_GATE.version
+        || Number(row.stake) !== PREDICTIVE_LEADER_SIGNAL_STAKE
+        || Number(row.balance_before) !== currentBalance
+      ) {
+        return null;
+      }
+      startedAt ??= row.placed_at;
+      updatedAt = row.updated_at;
+      if (row.status === "void") {
+        if (row.void_reason !== "integrity_gap") return null;
+        voidCount += 1;
+        latestVoid = {
+          forecastId: Number(row.forecast_id),
+          targetNumber: Number(row.target_number),
+          stake: Number(row.stake),
+          reason: row.void_reason,
+          voidedAt: row.settled_at,
+        };
+        continue;
+      }
+      totalStaked += Number(row.stake);
+      if (row.status === "pending") {
+        if (pending !== null) return null;
+        currentBalance -= Number(row.stake);
+        pending = {
+          forecastId: Number(row.forecast_id),
+          targetNumber: Number(row.target_number),
+          stake: Number(row.stake),
+          balanceBefore: Number(row.balance_before),
+          gateVersion: row.gate_version,
+          placedAt: row.placed_at,
+        };
+      } else if (row.status === "settled") {
+        const expectedOutcome = Number(row.target_number) === Number(row.result_number)
+          ? "hit"
+          : "miss";
+        const expectedGross = expectedOutcome === "hit"
+          ? Number(row.stake) * PREDICTIVE_LEADER_SIGNAL_GROSS_PAYOUT_MULTIPLIER
+          : 0;
+        const expectedBalance = currentBalance - Number(row.stake) + expectedGross;
+        if (
+          row.outcome !== expectedOutcome
+          || Number(row.gross_payout) !== expectedGross
+          || Number(row.balance_after) !== expectedBalance
+        ) {
+          return null;
+        }
+        currentBalance = expectedBalance;
+        totalGrossPayout += expectedGross;
+        if (expectedOutcome === "hit") hitCount += 1;
+        else missCount += 1;
+        latestOutcome = {
+          forecastId: Number(row.forecast_id),
+          resultId: Number(row.round_result_id),
+          targetNumber: Number(row.target_number),
+          resultNumber: Number(row.result_number),
+          stake: Number(row.stake),
+          outcome: row.outcome,
+          grossPayout: expectedGross,
+          balanceAfter: currentBalance,
+          occurredAt: row.settled_at,
+        };
+      } else {
+        return null;
+      }
+      peakBalance = Math.max(peakBalance, currentBalance);
+      minimumBalance = Math.min(minimumBalance, currentBalance);
+      maximumDrawdown = Math.max(maximumDrawdown, peakBalance - currentBalance);
+    }
+    const settledCount = hitCount + missCount;
+    const exhausted = pending === null
+      && currentBalance < PREDICTIVE_LEADER_SIGNAL_STAKE;
+    return {
+      schemaVersion: PREDICTIVE_LEADER_SIGNAL_ACCOUNT_SCHEMA_VERSION,
+      strategyVersion: PREDICTIVE_LEADER_SIGNAL_ACCOUNT_STRATEGY_VERSION,
+      leaderAlgorithmVersion: LEARNED_LEADER_ALGORITHM_VERSION,
+      gateVersion: PREDICTIVE_LEADER_QUALITY_GATE.version,
+      mode: "quality-gated-fixed-stake-simulation",
+      executionEnabled: false,
+      advisoryOnly: true,
+      status: exhausted ? "exhausted" : pending ? "pending" : "waiting",
+      reason: exhausted
+        ? "bankroll_exhausted"
+        : pending
+          ? "bet_frozen"
+          : rows.length === 0
+            ? "waiting_first_eligible_signal"
+            : "waiting_quality_gate",
+      initialBalance: PREDICTIVE_LEADER_SIGNAL_ACCOUNT_STARTING_BALANCE,
+      currentBalance,
+      availableBalance: currentBalance,
+      reservedStake: pending?.stake ?? 0,
+      profit: currentBalance - PREDICTIVE_LEADER_SIGNAL_ACCOUNT_STARTING_BALANCE,
+      model: {
+        fixedStake: PREDICTIVE_LEADER_SIGNAL_STAKE,
+        grossPayoutMultiplier: PREDICTIVE_LEADER_SIGNAL_GROSS_PAYOUT_MULTIPLIER,
+        payoutIncludesStake: true,
+      },
+      nextStake: PREDICTIVE_LEADER_SIGNAL_STAKE,
+      canAffordNext: currentBalance >= PREDICTIVE_LEADER_SIGNAL_STAKE,
+      shortfall: Math.max(0, PREDICTIVE_LEADER_SIGNAL_STAKE - currentBalance),
+      betCount: rows.length,
+      settledCount,
+      pendingCount: Number(pending !== null),
+      voidCount,
+      hitCount,
+      missCount,
+      hitRate: settledCount === 0 ? null : hitCount / settledCount,
+      totalStaked,
+      totalGrossPayout,
+      peakBalance,
+      minimumBalance,
+      maximumDrawdown,
+      continuityGapCount: voidCount,
+      pendingBet: pending,
+      latestVoid,
+      latestOutcome,
+      startedAt,
+      updatedAt,
+      exhaustedAt: exhausted ? updatedAt : null,
+    };
+  }
+
+  getPredictiveLeaderSignalAccount(source = "buleto", instrument = "default") {
+    this.#assertOpen();
+    return this.#predictiveLeaderSignalAccountState(
+      asNonEmptyText(source, undefined, "source"),
+      asNonEmptyText(instrument, undefined, "instrument"),
     );
   }
 
@@ -13276,13 +14216,21 @@ export class RouletteDatabase {
           leaders.predicted_number AS leader_predicted_number,
           leaders.score AS leader_score,
           leaders.snapshot_json AS leader_snapshot_json,
-          leaders.created_at AS leader_created_at
+          leaders.created_at AS leader_created_at,
+          leader_gates.forecast_id AS leader_gate_forecast_id,
+          leader_gates.policy_version AS leader_gate_version,
+          leader_gates.cutoff_at AS leader_gate_cutoff_at,
+          leader_gates.status AS leader_gate_status,
+          leader_gates.eligible AS leader_gate_eligible,
+          leader_gates.snapshot_json AS leader_gate_snapshot_json
         FROM round_forecasts AS forecasts
         JOIN forecast_snapshots AS snapshots ON snapshots.id = forecasts.snapshot_id
         LEFT JOIN forecast_settlements AS settlements
           ON settlements.forecast_id = forecasts.id
         LEFT JOIN forecast_predictive_leader_snapshots AS leaders
           ON leaders.forecast_id = forecasts.id
+        LEFT JOIN forecast_predictive_leader_quality_snapshots AS leader_gates
+          ON leader_gates.forecast_id = leaders.forecast_id
         LEFT JOIN forecast_settlements AS leader_training_settlements
           ON leader_training_settlements.forecast_id =
             leaders.training_through_forecast_id
@@ -13334,6 +14282,10 @@ export class RouletteDatabase {
         latest,
         predictiveLeaderMetrics: mapPredictiveLeaderMetricFacts(predictiveLeaderRows),
         predictiveLeaderAccount: this.#predictiveLeaderAccountState(
+          safeSource,
+          safeInstrument,
+        ),
+        predictiveLeaderSignalAccount: this.#predictiveLeaderSignalAccountState(
           safeSource,
           safeInstrument,
         ),
@@ -13449,7 +14401,13 @@ export class RouletteDatabase {
           predictive_leaders.predicted_number AS leader_predicted_number,
           predictive_leaders.score AS leader_score,
           predictive_leaders.snapshot_json AS leader_snapshot_json,
-          predictive_leaders.created_at AS leader_created_at
+          predictive_leaders.created_at AS leader_created_at,
+          leader_gates.forecast_id AS leader_gate_forecast_id,
+          leader_gates.policy_version AS leader_gate_version,
+          leader_gates.cutoff_at AS leader_gate_cutoff_at,
+          leader_gates.status AS leader_gate_status,
+          leader_gates.eligible AS leader_gate_eligible,
+          leader_gates.snapshot_json AS leader_gate_snapshot_json
         FROM round_forecasts AS forecasts
         JOIN forecast_snapshots AS snapshots ON snapshots.id = forecasts.snapshot_id
         LEFT JOIN forecast_settlements AS settlements
@@ -13462,6 +14420,8 @@ export class RouletteDatabase {
           ON trajectory_shadows.forecast_id = forecasts.id
         LEFT JOIN forecast_predictive_leader_snapshots AS predictive_leaders
           ON predictive_leaders.forecast_id = forecasts.id
+        LEFT JOIN forecast_predictive_leader_quality_snapshots AS leader_gates
+          ON leader_gates.forecast_id = predictive_leaders.forecast_id
         LEFT JOIN forecast_settlements AS leader_training_settlements
           ON leader_training_settlements.forecast_id =
             predictive_leaders.training_through_forecast_id
@@ -13558,6 +14518,10 @@ export class RouletteDatabase {
       safeSource,
       safeInstrument,
     );
+    const predictiveLeaderSignalAccount = this.#predictiveLeaderSignalAccountState(
+      safeSource,
+      safeInstrument,
+    );
     return {
       mode: "observation",
       executionEnabled: false,
@@ -13570,6 +14534,7 @@ export class RouletteDatabase {
       trajectoryMetrics,
       predictiveLeaderMetrics,
       predictiveLeaderAccount,
+      predictiveLeaderSignalAccount,
       metrics: {
         forecastCount,
         settledCount,

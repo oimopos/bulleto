@@ -71,10 +71,23 @@ const FRESH_STATE = Object.freeze({
 });
 
 function predictiveLeaderApiSnapshot() {
+  const gateHitCount = 50;
+  const gateSampleSize = 1_000;
+  const gateRate = gateHitCount / gateSampleSize;
+  const z = 1.959963984540054;
+  const zSquared = z ** 2;
+  const denominator = 1 + zSquared / gateSampleSize;
+  const center = (gateRate + zSquared / (2 * gateSampleSize)) / denominator;
+  const radius = z * Math.sqrt(
+    (gateRate * (1 - gateRate) + zSquared / (4 * gateSampleSize))
+      / gateSampleSize,
+  ) / denominator;
+  const gateVersion = "rolling-1000-wilson95-brier-v1";
+  const placedAt = "2026-10-10T10:00:20.000Z";
   return {
     schemaVersion: PREDICTIVE_LEADER_API_SCHEMA_VERSION,
     algorithmVersion: PREDICTIVE_LEADER_API_ALGORITHM_VERSION,
-    mode: "observation",
+    mode: "quality-gated-simulation",
     executionEnabled: false,
     advisoryOnly: true,
     source: "buleto",
@@ -82,9 +95,11 @@ function predictiveLeaderApiSnapshot() {
     serverTime: "2026-10-10T10:00:22.000Z",
     status: "ready",
     reason: "ready",
+    action: "BET",
     number: 7,
+    candidateNumber: 7,
     forecast: {
-      id: 77,
+      id: 1_001,
       roundId: "101",
       lockedAt: "2026-10-10T10:00:20.000Z",
       bettingClosesAt: "2026-10-10T10:00:25.000Z",
@@ -107,7 +122,81 @@ function predictiveLeaderApiSnapshot() {
       },
       tieBreakApplied: false,
     },
-    account: null,
+    qualityGate: {
+      version: gateVersion,
+      status: "confirmed",
+      reason: "quality_confirmed",
+      eligible: true,
+      windowSize: gateSampleSize,
+      sampleSize: gateSampleSize,
+      hitCount: gateHitCount,
+      hitRate: gateRate,
+      baselineRate: 1 / 36,
+      confidenceLevel: 0.95,
+      lowerBound: Math.max(0, center - radius),
+      upperBound: Math.min(1, center + radius),
+      meanBrierLoss: 0.45,
+      uniformBrierLoss: 18 / 37,
+      brierDelta: 18 / 37 - 0.45,
+      windowStartForecastId: 1,
+      windowEndForecastId: 1_000,
+      evaluatedForForecastId: 1_001,
+      cutoffAt: placedAt,
+      currentFamilyCount: 2,
+      throughResultId: 1_000,
+      evidenceDigest: "0".repeat(64),
+    },
+    account: {
+      schemaVersion: 1,
+      strategyVersion: "quality-gated-fixed10-v1",
+      leaderAlgorithmVersion: PREDICTIVE_LEADER_API_ALGORITHM_VERSION,
+      gateVersion,
+      mode: "quality-gated-fixed-stake-simulation",
+      executionEnabled: false,
+      advisoryOnly: true,
+      status: "pending",
+      reason: "bet_frozen",
+      initialBalance: 1_000,
+      currentBalance: 990,
+      availableBalance: 990,
+      reservedStake: 10,
+      profit: -10,
+      model: {
+        fixedStake: 10,
+        grossPayoutMultiplier: 36,
+        payoutIncludesStake: true,
+      },
+      nextStake: 10,
+      canAffordNext: true,
+      shortfall: 0,
+      betCount: 1,
+      settledCount: 0,
+      pendingCount: 1,
+      voidCount: 0,
+      hitCount: 0,
+      missCount: 0,
+      hitRate: null,
+      totalStaked: 10,
+      totalGrossPayout: 0,
+      peakBalance: 1_000,
+      minimumBalance: 990,
+      maximumDrawdown: 10,
+      continuityGapCount: 0,
+      pendingBet: {
+        forecastId: 1_001,
+        targetNumber: 7,
+        stake: 10,
+        balanceBefore: 1_000,
+        gateVersion,
+        placedAt,
+      },
+      latestVoid: null,
+      latestOutcome: null,
+      startedAt: placedAt,
+      updatedAt: placedAt,
+      exhaustedAt: null,
+    },
+    legacyAccount: null,
     metrics: {
       readyCount: 1,
       settledCount: 0,
@@ -163,7 +252,12 @@ test("predictive leader API snapshot exposes only a strict ready number", () => 
 test("predictive leader API rejects malformed ready payloads", () => {
   for (const mutate of [
     (value) => { value.number = 37; },
+    (value) => { value.action = "WAIT"; },
+    (value) => { value.candidateNumber = 8; },
     (value) => { value.model.learnedFamilyWeights.price = 0.6; },
+    (value) => { value.qualityGate.sampleSize = 999; },
+    (value) => { value.qualityGate.windowEndForecastId = value.forecast.id; },
+    (value) => { value.account.model.fixedStake = 20; },
     (value) => { value.freshness.persistencePendingResults = 1; },
     (value) => { value.forecast.roundId = "102"; },
   ]) {
@@ -177,27 +271,110 @@ test("predictive leader API waiting and paused responses hide the number", () =>
   const waiting = predictiveLeaderApiSnapshot();
   waiting.status = "waiting";
   waiting.reason = "forecast_settled";
+  waiting.action = "WAIT";
   waiting.number = null;
+  waiting.candidateNumber = null;
   waiting.model = null;
+  waiting.qualityGate = null;
   const normalizedWaiting = normalizePredictiveLeaderApiSnapshot(waiting);
   assert.equal(normalizedWaiting?.status, "waiting");
   assert.deepEqual(predictiveLeaderNumberContext({
     loaded: true,
     snapshot: normalizedWaiting,
-  }), { state: "waiting", reason: "forecast_settled" });
+  }), {
+    state: "waiting",
+    reason: "forecast_settled",
+    snapshot: normalizedWaiting,
+  });
 
   const paused = predictiveLeaderApiSnapshot();
   paused.status = "paused";
   paused.reason = "collector_unavailable";
+  paused.action = "WAIT";
   paused.number = null;
+  paused.candidateNumber = null;
   paused.forecast = null;
   paused.model = null;
+  paused.qualityGate = null;
   const normalizedPaused = normalizePredictiveLeaderApiSnapshot(paused);
   assert.equal(normalizedPaused?.status, "paused");
   assert.deepEqual(predictiveLeaderNumberContext({
     loaded: true,
     snapshot: normalizedPaused,
-  }), { state: "paused", reason: "collector_unavailable" });
+  }), {
+    state: "paused",
+    reason: "collector_unavailable",
+    snapshot: normalizedPaused,
+  });
+});
+
+test("predictive leader keeps the final affordable fixed stake actionable while reserved", () => {
+  const payload = predictiveLeaderApiSnapshot();
+  Object.assign(payload.account, {
+    currentBalance: 0,
+    availableBalance: 0,
+    reservedStake: 10,
+    profit: -1_000,
+    canAffordNext: false,
+    shortfall: 10,
+    betCount: 100,
+    settledCount: 99,
+    pendingCount: 1,
+    hitCount: 0,
+    missCount: 99,
+    hitRate: 0,
+    totalStaked: 1_000,
+    peakBalance: 1_000,
+    minimumBalance: 0,
+    maximumDrawdown: 1_000,
+    startedAt: "2026-10-10T09:00:00.000Z",
+    latestOutcome: {
+      forecastId: 1_000,
+      resultId: 1_000,
+      targetNumber: 1,
+      resultNumber: 2,
+      stake: 10,
+      outcome: "miss",
+      grossPayout: 0,
+      balanceAfter: 10,
+      occurredAt: "2026-10-10T10:00:19.000Z",
+    },
+  });
+  payload.account.pendingBet.balanceBefore = 10;
+
+  const normalized = normalizePredictiveLeaderApiSnapshot(payload);
+  assert.equal(normalized?.status, "ready");
+  assert.equal(normalized?.action, "BET");
+  assert.equal(normalized?.account.status, "pending");
+  assert.equal(normalized?.account.currentBalance, 0);
+  assert.equal(normalized?.account.canAffordNext, false);
+});
+
+test("quality WAIT keeps the candidate visible but never exposes an actionable number", () => {
+  const waiting = predictiveLeaderApiSnapshot();
+  waiting.status = "waiting";
+  waiting.reason = "quality_not_proven";
+  waiting.action = "WAIT";
+  waiting.number = null;
+  waiting.qualityGate.status = "rejected";
+  waiting.qualityGate.reason = "mean_brier_loss_not_below_uniform";
+  waiting.qualityGate.eligible = false;
+  waiting.qualityGate.meanBrierLoss = 0.5;
+  waiting.qualityGate.brierDelta = 18 / 37 - 0.5;
+
+  const normalized = normalizePredictiveLeaderApiSnapshot(waiting);
+  assert.equal(normalized?.action, "WAIT");
+  assert.equal(normalized?.number, null);
+  assert.equal(normalized?.candidateNumber, 7);
+  assert.equal(normalized?.qualityGate.status, "rejected");
+  assert.deepEqual(predictiveLeaderNumberContext({
+    loaded: true,
+    snapshot: normalized,
+  }), {
+    state: "waiting",
+    reason: "quality_not_proven",
+    snapshot: normalized,
+  });
 });
 
 test("predictive leader first-fetch error cannot remain stuck on loading", () => {
