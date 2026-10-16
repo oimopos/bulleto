@@ -296,9 +296,9 @@ test("quality-gated leader is the first dashboard block and separates candidate 
   assert.match(block, /При WAIT кандидат остаётся только наблюдением, ставка не фиксируется/);
   assert.match(block, /Текущий результат в проверку не попадает/);
   assert.match(block, /1 из 37 \(≈2,7%\)/);
-  assert.match(html, /<script type="module" src="\/app\.js\?v=46"><\/script>/);
+  assert.match(html, /<script type="module" src="\/app\.js\?v=47"><\/script>/);
 
-  assert.match(app, /from "\.\/combined-number\.js\?v=8"/);
+  assert.match(app, /from "\.\/combined-number\.js\?v=9"/);
   assert.match(app, /normalizePredictiveLeaderApiSnapshot/);
   assert.match(app, /predictiveLeaderNumberContext/);
   assert.match(combinedNumber, /export function normalizePredictiveLeaderApiSnapshot\(value\)/);
@@ -306,7 +306,8 @@ test("quality-gated leader is the first dashboard block and separates candidate 
   assert.match(combinedNumber, /value\.schemaVersion !== PREDICTIVE_LEADER_API_SCHEMA_VERSION/);
   assert.match(combinedNumber, /value\.algorithmVersion !== PREDICTIVE_LEADER_API_ALGORITHM_VERSION/);
   assert.match(combinedNumber, /PREDICTIVE_LEADER_API_SCHEMA_VERSION = 4/);
-  assert.match(combinedNumber, /value\.mode !== "quality-gated-simulation"/);
+  assert.match(combinedNumber, /value\.mode !== "observation"/);
+  assert.match(combinedNumber, /value\.strategyMode !== "quality-gated-simulation"/);
   assert.match(combinedNumber, /\(value\.status === "ready"\) !== \(value\.action === "BET"\)/);
   assert.match(combinedNumber, /candidateNumber/);
   assert.match(combinedNumber, /normalizedPredictiveLeaderQualityGate/);
@@ -1100,7 +1101,7 @@ test("warm next-round forecast exposes a strict 5-percent walk-forward contract"
   assert.match(html, /id="follower-dynamic-next-title"[^>]*>[^<]*≥5%/);
   assert.match(html, /id="follower-dynamic-next-note"[^>]*>[\s\S]*?5%/);
   assert.match(html, /styles\.css\?v=30/);
-  assert.match(html, /app\.js\?v=46/);
+  assert.match(html, /app\.js\?v=47/);
   assert.match(styles, /\.follower-dynamic-next\s*\{/);
   assert.match(styles, /\.follower-warm-current\s*\{/);
   assert.match(styles, /\.follower-warm-picks\s*\{/);
@@ -1348,7 +1349,7 @@ test("cycle comparison language is descriptive, responsive, and cache-busted", (
   assert.match(block, /не предсказывает следующее число/);
   assert.doesNotMatch(block, /должн/iu);
   assert.match(html, /href="\/styles\.css\?v=30"/);
-  assert.match(html, /src="\/app\.js\?v=46"/);
+  assert.match(html, /src="\/app\.js\?v=47"/);
   assert.match(styles, /\.cycle-sequence-list\s*\{[\s\S]*?repeat\(auto-fill, minmax\(50px, 1fr\)\)/);
   assert.match(
     styles,

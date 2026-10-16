@@ -213,6 +213,10 @@ test(
         leaderPayload.algorithmVersion,
         LEARNED_LEADER_ALGORITHM_VERSION,
       );
+      assert.equal(leaderPayload.mode, "observation");
+      assert.equal(leaderPayload.strategyMode, "quality-gated-simulation");
+      assert.equal(leaderPayload.executionEnabled, false);
+      assert.equal(leaderPayload.advisoryOnly, true);
       assert.ok(["waiting", "paused"].includes(leaderPayload.status));
       assert.equal(leaderPayload.number, null);
       assert.doesNotMatch(

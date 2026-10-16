@@ -846,7 +846,8 @@ function baseResponse({
   return {
     schemaVersion: PREDICTIVE_LEADER_API_SCHEMA_VERSION,
     algorithmVersion: LEARNED_LEADER_ALGORITHM_VERSION,
-    mode: 'quality-gated-simulation',
+    mode: 'observation',
+    strategyMode: 'quality-gated-simulation',
     executionEnabled: false,
     advisoryOnly: true,
     source,

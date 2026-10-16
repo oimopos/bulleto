@@ -87,7 +87,8 @@ function predictiveLeaderApiSnapshot() {
   return {
     schemaVersion: PREDICTIVE_LEADER_API_SCHEMA_VERSION,
     algorithmVersion: PREDICTIVE_LEADER_API_ALGORITHM_VERSION,
-    mode: "quality-gated-simulation",
+    mode: "observation",
+    strategyMode: "quality-gated-simulation",
     executionEnabled: false,
     advisoryOnly: true,
     source: "buleto",
@@ -252,6 +253,8 @@ test("predictive leader API snapshot exposes only a strict ready number", () => 
 test("predictive leader API rejects malformed ready payloads", () => {
   for (const mutate of [
     (value) => { value.number = 37; },
+    (value) => { value.mode = "quality-gated-simulation"; },
+    (value) => { value.strategyMode = "observation"; },
     (value) => { value.action = "WAIT"; },
     (value) => { value.candidateNumber = 8; },
     (value) => { value.model.learnedFamilyWeights.price = 0.6; },

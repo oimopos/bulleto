@@ -737,7 +737,8 @@ export function normalizePredictiveLeaderApiSnapshot(value) {
     !isPlainRecord(value)
     || value.schemaVersion !== PREDICTIVE_LEADER_API_SCHEMA_VERSION
     || value.algorithmVersion !== PREDICTIVE_LEADER_API_ALGORITHM_VERSION
-    || value.mode !== "quality-gated-simulation"
+    || value.mode !== "observation"
+    || value.strategyMode !== "quality-gated-simulation"
     || value.executionEnabled !== false
     || value.advisoryOnly !== true
     || typeof value.source !== "string"
@@ -868,6 +869,7 @@ export function normalizePredictiveLeaderApiSnapshot(value) {
     schemaVersion: value.schemaVersion,
     algorithmVersion: value.algorithmVersion,
     mode: value.mode,
+    strategyMode: value.strategyMode,
     executionEnabled: value.executionEnabled,
     advisoryOnly: value.advisoryOnly,
     source: value.source,

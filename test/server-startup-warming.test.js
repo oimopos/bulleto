@@ -179,6 +179,10 @@ test('predictive leader stays HTTP-readable but cannot expose a number while war
     instrument: 'XPM/RUB',
     now: '2026-10-15T00:00:00.000Z',
   });
+  assert.equal(unavailable.mode, 'observation');
+  assert.equal(unavailable.strategyMode, 'quality-gated-simulation');
+  assert.equal(unavailable.executionEnabled, false);
+  assert.equal(unavailable.advisoryOnly, true);
   assert.equal(unavailable.status, 'waiting');
   assert.equal(unavailable.reason, 'state_unavailable');
   assert.equal(unavailable.number, null);
