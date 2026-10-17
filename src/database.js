@@ -4048,6 +4048,105 @@ function mapPredictiveLeaderForecast(row) {
   };
 }
 
+function mapPredictiveLeaderOutcome(row) {
+  const resultId = Number(row.round_result_id);
+  const resultNumber = Number(row.result_number);
+  const continuityEpoch = Number(row.continuity_epoch);
+  const forecastId = row.forecast_id === null || row.forecast_id === undefined
+    ? null
+    : Number(row.forecast_id);
+  const base = {
+    resultId: Number.isSafeInteger(resultId) && resultId >= 1 ? resultId : null,
+    externalRoundId: row.result_external_round_id,
+    settledAt: row.result_settled_at,
+    resultNumber: Number.isInteger(resultNumber)
+      && resultNumber >= 0
+      && resultNumber <= 36
+      ? resultNumber
+      : null,
+    continuityEpoch: Number.isSafeInteger(continuityEpoch) && continuityEpoch >= 0
+      ? continuityEpoch
+      : null,
+    forecastId: Number.isSafeInteger(forecastId) && forecastId >= 1
+      ? forecastId
+      : null,
+    lockedAt: row.locked_at ?? null,
+    leaderNumber: null,
+    hit: null,
+    algorithmVersion: null,
+  };
+  if (
+    base.resultId === null
+    || base.resultNumber === null
+    || base.continuityEpoch === null
+    || !Number.isFinite(Date.parse(base.settledAt))
+  ) {
+    return { ...base, availability: "invalid" };
+  }
+
+  if (row.settlement_forecast_id === null || row.settlement_forecast_id === undefined) {
+    return { ...base, availability: "unavailable" };
+  }
+  if (
+    base.forecastId === null
+    || row.snapshot_id === null
+    || row.snapshot_id === undefined
+    || row.leader_forecast_id === null
+    || row.leader_forecast_id === undefined
+  ) {
+    return { ...base, availability: "unavailable" };
+  }
+
+  const lockedMs = Date.parse(row.locked_at);
+  const settledMs = Date.parse(row.result_settled_at);
+  const snapshotPersistedMs = Date.parse(row.snapshot_persisted_at);
+  const forecastCreatedMs = Date.parse(row.forecast_created_at);
+  const leaderCreatedMs = Date.parse(row.leader_created_at);
+  const settlementMatchesResult = Number(row.settlement_round_result_id) === base.resultId
+    && Number(row.actual_number) === base.resultNumber
+    && row.settlement_settled_at === row.result_settled_at
+    && row.external_round_id === row.result_external_round_id;
+  if (
+    !settlementMatchesResult
+    || !Number.isFinite(lockedMs)
+    || !Number.isFinite(snapshotPersistedMs)
+    || !Number.isFinite(forecastCreatedMs)
+    || !Number.isFinite(leaderCreatedMs)
+    || snapshotPersistedMs < lockedMs
+    || forecastCreatedMs < lockedMs
+    || leaderCreatedMs < lockedMs
+    || snapshotPersistedMs >= settledMs
+    || forecastCreatedMs >= settledMs
+    || leaderCreatedMs >= settledMs
+    || lockedMs >= settledMs
+  ) {
+    return { ...base, availability: "invalid" };
+  }
+
+  const leader = mapForecastPredictiveLeader({
+    ...row,
+    round_result_id: row.settlement_round_result_id,
+    settled_at: row.settlement_settled_at,
+  });
+  if (!leader) return { ...base, availability: "invalid" };
+  if (leader.status !== "ready") {
+    return {
+      ...base,
+      availability: "unavailable",
+      algorithmVersion: leader.algorithmVersion,
+    };
+  }
+  if (leader.evaluation === null) return { ...base, availability: "invalid" };
+
+  return {
+    ...base,
+    availability: "ready",
+    leaderNumber: leader.leaderNumber,
+    hit: leader.evaluation.top1Hit,
+    algorithmVersion: leader.algorithmVersion,
+  };
+}
+
 function mapPrecloseForecastHit(row) {
   const rawRankedNumbers = deserializeJson(row.ranked_numbers_json);
   if (!Array.isArray(rawRankedNumbers) || rawRankedNumbers.length !== 3) {
@@ -14408,6 +14507,95 @@ export class RouletteDatabase {
         forecastDisplayHit: Number(row.display_range_hits) === 1,
       };
     });
+  }
+
+  getPredictiveLeaderOutcomes(
+    source = "buleto",
+    instrument = "default",
+    options = {},
+  ) {
+    this.#assertOpen();
+    const safeSource = asNonEmptyText(source, undefined, "source");
+    const safeInstrument = asNonEmptyText(instrument, undefined, "instrument");
+    if (!options || typeof options !== "object" || Array.isArray(options)) {
+      throw new TypeError("options must be an object");
+    }
+    const safeSince = asTimestamp(options.since, undefined, "since");
+    const safeUntil = options.until === null || options.until === undefined
+      ? null
+      : asTimestamp(options.until, undefined, "until");
+    if (safeUntil !== null && Date.parse(safeUntil) <= Date.parse(safeSince)) {
+      throw new RangeError("until must be after since");
+    }
+
+    const rows = this.sqlite.prepare(`
+      SELECT
+        results.id AS round_result_id,
+        results.external_round_id AS result_external_round_id,
+        results.settled_at AS result_settled_at,
+        results.result_number,
+        results.continuity_epoch,
+        settlements.forecast_id AS settlement_forecast_id,
+        settlements.round_result_id AS settlement_round_result_id,
+        settlements.actual_number,
+        settlements.settled_at AS settlement_settled_at,
+        settlements.created_at AS settlement_created_at,
+        forecasts.id AS forecast_id,
+        snapshots.id AS snapshot_id,
+        snapshots.source,
+        snapshots.instrument,
+        snapshots.external_round_id,
+        snapshots.horizon_seconds,
+        snapshots.betting_closes_at,
+        snapshots.round_ends_at,
+        snapshots.locked_at,
+        snapshots.persisted_at AS snapshot_persisted_at,
+        forecasts.created_at AS forecast_created_at,
+        leaders.forecast_id AS leader_forecast_id,
+        leaders.schema_version AS leader_schema_version,
+        leaders.algorithm_version AS leader_algorithm_version,
+        leaders.status AS leader_status,
+        leaders.locked_at AS leader_locked_at,
+        leaders.history_max_result_id AS leader_history_max_result_id,
+        leaders.training_through_forecast_id
+          AS leader_training_through_forecast_id,
+        leaders.training_through_result_id
+          AS leader_training_through_result_id,
+        leader_training_settlements.round_result_id
+          AS leader_expected_training_result_id,
+        leaders.training_count AS leader_training_count,
+        leaders.predicted_number AS leader_predicted_number,
+        leaders.score AS leader_score,
+        leaders.snapshot_json AS leader_snapshot_json,
+        leaders.created_at AS leader_created_at
+      FROM round_results AS results
+      LEFT JOIN forecast_settlements AS settlements
+        ON settlements.round_result_id = results.id
+      LEFT JOIN round_forecasts AS forecasts
+        ON forecasts.id = settlements.forecast_id
+      LEFT JOIN forecast_snapshots AS snapshots
+        ON snapshots.id = forecasts.snapshot_id
+       AND snapshots.source = results.source
+       AND snapshots.instrument = results.instrument
+      LEFT JOIN forecast_predictive_leader_snapshots AS leaders
+        ON leaders.forecast_id = forecasts.id
+      LEFT JOIN forecast_settlements AS leader_training_settlements
+        ON leader_training_settlements.forecast_id =
+          leaders.training_through_forecast_id
+      WHERE results.source = ?
+        AND results.instrument = ?
+        AND results.settled_at >= ?
+        AND (? IS NULL OR results.settled_at < ?)
+      ORDER BY results.settled_at ASC, results.id ASC
+    `).all(
+      safeSource,
+      safeInstrument,
+      safeSince,
+      safeUntil,
+      safeUntil,
+    );
+
+    return rows.map(mapPredictiveLeaderOutcome);
   }
 
   getPrecloseForecastState(source = "buleto", instrument = "default") {

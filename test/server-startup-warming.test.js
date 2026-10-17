@@ -187,3 +187,13 @@ test('predictive leader stays HTTP-readable but cannot expose a number while war
   assert.equal(unavailable.reason, 'state_unavailable');
   assert.equal(unavailable.number, null);
 });
+
+test('predictive leader neighbor backtest is independent of trajectory warming', () => {
+  const route = routeBody(
+    '/api/predictive-leader-neighbor-backtest',
+    '/api/predictive-leader',
+  );
+  assert.match(route, /predictiveLeaderNeighborBacktestQuery\s*\(\s*url\s*\)/);
+  assert.match(route, /predictiveLeaderNeighborBacktestFromDatabase/);
+  assert.doesNotMatch(route, /trajectoryValidationIsWarming|sendStartupWarming/);
+});

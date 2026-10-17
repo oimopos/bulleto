@@ -275,6 +275,78 @@ test(
       assert.equal(backtestHead.headers.get("cache-control"), "no-store");
       assert.equal(await backtestHead.text(), "");
 
+      const neighborSince = new Date(Date.now() - 60 * 60 * 1_000).toISOString();
+      const neighborUrl = `${baseUrl}/api/predictive-leader-neighbor-backtest?since=${encodeURIComponent(neighborSince)}`;
+      const neighborResponse = await fetch(neighborUrl);
+      assert.equal(neighborResponse.status, 200, logs());
+      assert.equal(neighborResponse.headers.get("cache-control"), "no-store");
+      const neighborBacktest = await neighborResponse.json();
+      assert.equal(neighborBacktest.schemaVersion, 1);
+      assert.equal(neighborBacktest.mode, "retrospective-simulation");
+      assert.equal(
+        neighborBacktest.strategyMode,
+        "frozen-predictive-leader-numeric-neighbor-ladder",
+      );
+      assert.equal(neighborBacktest.executionEnabled, false);
+      assert.equal(neighborBacktest.advisoryOnly, true);
+      assert.equal(neighborBacktest.window.since, neighborSince);
+      assert.equal(neighborBacktest.window.lowerBound, "inclusive");
+      assert.equal(neighborBacktest.window.upperBound, "exclusive");
+      assert.equal(neighborBacktest.initialBalance, 1_000);
+      assert.equal(neighborBacktest.finalBalance, 1_000);
+      assert.equal(neighborBacktest.betCount, 0);
+      assert.equal(neighborBacktest.coverage.roundCount, 0);
+
+      const neighborHead = await fetch(neighborUrl, { method: "HEAD" });
+      assert.equal(neighborHead.status, 200, logs());
+      assert.equal(neighborHead.headers.get("cache-control"), "no-store");
+      assert.equal(await neighborHead.text(), "");
+
+      const missingSince = await fetch(
+        `${baseUrl}/api/predictive-leader-neighbor-backtest`,
+      );
+      assert.equal(missingSince.status, 400, logs());
+      assert.deepEqual(await missingSince.json(), {
+        error: "invalid_query",
+        reason: "exactly_one_since_parameter_required",
+      });
+
+      const nonCanonicalSince = await fetch(
+        `${baseUrl}/api/predictive-leader-neighbor-backtest?since=${encodeURIComponent("2026-10-17T00:00:00+05:00")}`,
+      );
+      assert.equal(nonCanonicalSince.status, 400, logs());
+      assert.deepEqual(await nonCanonicalSince.json(), {
+        error: "invalid_query",
+        reason: "since_must_be_canonical_utc_iso",
+      });
+
+      const futureSince = new Date(Date.now() + 60_000).toISOString();
+      const futureResponse = await fetch(
+        `${baseUrl}/api/predictive-leader-neighbor-backtest?since=${encodeURIComponent(futureSince)}`,
+      );
+      assert.equal(futureResponse.status, 400, logs());
+      assert.deepEqual(await futureResponse.json(), {
+        error: "invalid_query",
+        reason: "since_must_not_be_in_the_future",
+      });
+
+      const staleSince = new Date(Date.now() - 49 * 60 * 60 * 1_000).toISOString();
+      const staleResponse = await fetch(
+        `${baseUrl}/api/predictive-leader-neighbor-backtest?since=${encodeURIComponent(staleSince)}`,
+      );
+      assert.equal(staleResponse.status, 400, logs());
+      assert.deepEqual(await staleResponse.json(), {
+        error: "invalid_query",
+        reason: "window_must_not_exceed_48_hours",
+      });
+
+      const duplicateSince = await fetch(`${neighborUrl}&since=${encodeURIComponent(neighborSince)}`);
+      assert.equal(duplicateSince.status, 400, logs());
+      assert.deepEqual(await duplicateSince.json(), {
+        error: "invalid_query",
+        reason: "exactly_one_since_parameter_required",
+      });
+
       const response = await fetch(`${baseUrl}/api/virtual-bettor`);
       assert.equal(response.status, 200, logs());
       assert.match(response.headers.get("content-type") ?? "", /^application\/json\b/);

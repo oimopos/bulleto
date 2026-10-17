@@ -13,6 +13,7 @@ import { BuletoCollector } from './collector.js';
 import { createDatabase } from './database.js';
 import { followerTop5GatedSnapshotForApi } from './follower-top5-gated-api.js';
 import { predictiveLeaderSnapshotForApi } from './predictive-leader-api.js';
+import { runPredictiveLeaderNeighborBacktest } from './predictive-leader-neighbor-backtest.js';
 import { ResultPipeline } from './result-pipeline.js';
 import { runTrajectoryRangeBacktest } from './trajectory-range-backtest.js';
 import { virtualBettorSnapshotForApi } from './virtual-bettor-api.js';
@@ -23,6 +24,7 @@ const FOLLOWER_TOP5_DEPOSIT = Object.freeze({
   depositKey: 'manual-top-up-2026-10-15-50000',
   amount: 50_000,
 });
+const PREDICTIVE_LEADER_NEIGHBOR_BACKTEST_MAX_WINDOW_MS = 48 * 60 * 60 * 1_000;
 
 function integerEnv(name, fallback, { min = 0, max = Number.MAX_SAFE_INTEGER } = {}) {
   const raw = process.env[name];
@@ -483,6 +485,27 @@ function trajectoryRangeBacktestFromDatabase(limit) {
     : readPayload();
 }
 
+function predictiveLeaderNeighborBacktestFromDatabase(since, through) {
+  const observations = db.getPredictiveLeaderOutcomes(
+    'buleto',
+    config.instrument,
+    { since, until: through },
+  );
+  return {
+    ...runPredictiveLeaderNeighborBacktest(observations, {
+      requestedRoundCount: observations.length,
+      source: 'buleto',
+      instrument: config.instrument,
+    }),
+    window: {
+      since,
+      through,
+      lowerBound: 'inclusive',
+      upperBound: 'exclusive',
+    },
+  };
+}
+
 function latestResultFromDatabase() {
   return cachedDatabaseRead(
     'latest-result',
@@ -587,6 +610,39 @@ function clampLimit(rawValue, fallback, max) {
   if (rawValue === null || rawValue === '') return fallback;
   const value = Number(rawValue);
   return Number.isInteger(value) && value > 0 ? Math.min(value, max) : fallback;
+}
+
+function predictiveLeaderNeighborBacktestQuery(url, now = new Date()) {
+  const keys = [...url.searchParams.keys()];
+  if (
+    keys.length !== 1
+    || keys[0] !== 'since'
+    || url.searchParams.getAll('since').length !== 1
+  ) {
+    return { error: 'exactly_one_since_parameter_required' };
+  }
+  const rawSince = url.searchParams.get('since');
+  const sinceMs = Date.parse(rawSince ?? '');
+  if (
+    !Number.isFinite(sinceMs)
+    || new Date(sinceMs).toISOString() !== rawSince
+  ) {
+    return { error: 'since_must_be_canonical_utc_iso' };
+  }
+  const throughMs = now.getTime();
+  if (!Number.isFinite(throughMs)) {
+    throw new RangeError('now must be a valid timestamp');
+  }
+  if (sinceMs >= throughMs) {
+    return { error: 'since_must_not_be_in_the_future' };
+  }
+  if (throughMs - sinceMs > PREDICTIVE_LEADER_NEIGHBOR_BACKTEST_MAX_WINDOW_MS) {
+    return { error: 'window_must_not_exceed_48_hours' };
+  }
+  return {
+    since: new Date(sinceMs).toISOString(),
+    through: new Date(throughMs).toISOString(),
+  };
 }
 
 const mimeTypes = new Map([
@@ -728,6 +784,23 @@ const server = createServer((request, response) => {
       }
       const limit = clampLimit(url.searchParams.get('limit'), 100, 500);
       sendJson(response, 200, trajectoryRangeBacktestFromDatabase(limit));
+      return;
+    }
+
+    if (pathname === '/api/predictive-leader-neighbor-backtest') {
+      const query = predictiveLeaderNeighborBacktestQuery(url);
+      if (query.error) {
+        sendJson(response, 400, {
+          error: 'invalid_query',
+          reason: query.error,
+        });
+        return;
+      }
+      sendJson(
+        response,
+        200,
+        predictiveLeaderNeighborBacktestFromDatabase(query.since, query.through),
+      );
       return;
     }
 

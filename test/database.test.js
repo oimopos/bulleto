@@ -68,6 +68,29 @@ function precloseForecast(externalRoundId, overrides = {}) {
   };
 }
 
+function shiftedPrecloseForecast(externalRoundId, offsetSeconds, overrides = {}) {
+  const base = precloseForecast(externalRoundId);
+  const offsetMilliseconds = offsetSeconds * 1_000;
+  const shift = (value) => new Date(
+    Date.parse(value) + offsetMilliseconds,
+  ).toISOString();
+  return {
+    ...base,
+    bettingClosesAt: shift(base.bettingClosesAt),
+    roundEndsAt: shift(base.roundEndsAt),
+    factorAt: shift(base.factorAt),
+    lockedAt: shift(base.lockedAt),
+    features: {
+      ...base.features,
+      samples: base.features.samples.map((sample) => ({
+        ...sample,
+        dt: shift(sample.dt),
+      })),
+    },
+    ...overrides,
+  };
+}
+
 function startPriceForecast(externalRoundId, overrides = {}) {
   const base = precloseForecast(externalRoundId);
   const factorAt = overrides.factorAt ?? base.factorAt;
@@ -1258,6 +1281,181 @@ test("predictive leader is frozen before outcome, settles independently, and rem
     assert.equal(state.latest.predictiveLeader, null);
     assert.equal(state.predictiveLeaderMetrics.readyCount, 0);
     assert.equal(state.predictiveLeaderMetrics.settledCount, 0);
+  } finally {
+    database.close();
+  }
+});
+
+test("predictive leader outcome history returns only validated causal pairs in time order", () => {
+  let clockMs = BASE_TIME + 10_000;
+  const database = createDatabase({
+    path: ":memory:",
+    clock: () => new Date(clockMs),
+  });
+  const source = "buleto";
+  const instrument = "PRIMECOIN(XPM)/RUB";
+  const historyNumbers = [9, 4, 9, 4, 9, 5, 9];
+  const rounds = [
+    { externalRoundId: "107", offsetSeconds: 0, actualNumber: 9 },
+    { externalRoundId: "108", offsetSeconds: 120, actualNumber: 9 },
+    { externalRoundId: "109", offsetSeconds: 240, actualNumber: 9 },
+    { externalRoundId: "110", offsetSeconds: 360, actualNumber: 9 },
+  ];
+
+  try {
+    database.ingestBatch(
+      historyNumbers.map((number, index) => event(
+        number,
+        `leader-outcomes-history-${index}`,
+        index,
+        { externalRoundId: String(100 + index) },
+      )),
+    );
+    markResultsCreatedAtObservation(database, "leader-outcomes-history-");
+
+    for (const round of rounds) {
+      clockMs = BASE_TIME + (round.offsetSeconds + 52) * 1_000;
+      assert.equal(
+        database.recordPrecloseForecast(
+          shiftedPrecloseForecast(round.externalRoundId, round.offsetSeconds),
+        ).inserted,
+        true,
+      );
+      clockMs = BASE_TIME + (round.offsetSeconds + 101) * 1_000;
+      database.ingestBatch([event(
+        round.actualNumber,
+        `leader-outcome-${round.externalRoundId}`,
+        round.offsetSeconds + 100,
+        { externalRoundId: round.externalRoundId },
+      )]);
+      assert.equal(
+        database.settlePrecloseForecasts(source, instrument).settled,
+        1,
+      );
+    }
+    clockMs = BASE_TIME + 581_000;
+    database.ingestBatch([
+      event(17, "leader-outcome-without-forecast", 580, {
+        externalRoundId: "111",
+      }),
+    ]);
+
+    const stored = database.sqlite.prepare(`
+      SELECT
+        forecasts.id AS forecast_id,
+        snapshots.external_round_id,
+        snapshots.locked_at,
+        leaders.status,
+        leaders.predicted_number,
+        settlements.round_result_id,
+        settlements.actual_number,
+        settlements.settled_at,
+        results.continuity_epoch
+      FROM forecast_predictive_leader_snapshots AS leaders
+      JOIN round_forecasts AS forecasts ON forecasts.id = leaders.forecast_id
+      JOIN forecast_snapshots AS snapshots ON snapshots.id = forecasts.snapshot_id
+      JOIN forecast_settlements AS settlements
+        ON settlements.forecast_id = forecasts.id
+      JOIN round_results AS results ON results.id = settlements.round_result_id
+      ORDER BY settlements.settled_at, results.id
+    `).all();
+    assert.equal(stored.length, rounds.length);
+    assert.equal(stored[0].status, "ready");
+    assert.equal(Number(stored[0].predicted_number), 4);
+    assert.deepEqual(stored.slice(1).map((row) => row.status), [
+      "unavailable",
+      "unavailable",
+      "unavailable",
+    ]);
+
+    const since = iso(BASE_TIME + 100_000);
+    const until = iso(BASE_TIME + 300_000);
+    assert.deepEqual(
+      database.getPredictiveLeaderOutcomes(source, instrument, { since, until }),
+      stored.slice(0, 2).map((row) => ({
+        resultId: Number(row.round_result_id),
+        externalRoundId: row.external_round_id,
+        settledAt: row.settled_at,
+        resultNumber: Number(row.actual_number),
+        continuityEpoch: Number(row.continuity_epoch),
+        forecastId: Number(row.forecast_id),
+        lockedAt: row.locked_at,
+        leaderNumber: row.predicted_number === null
+          ? null
+          : Number(row.predicted_number),
+        hit: row.predicted_number === null
+          ? null
+          : Number(row.predicted_number) === Number(row.actual_number),
+        algorithmVersion: "learned-predictive-family-index-v5",
+        availability: row.status,
+      })),
+    );
+
+    database.sqlite.exec("PRAGMA ignore_check_constraints = ON");
+    try {
+      database.sqlite.prepare(`
+        UPDATE forecast_predictive_leader_snapshots
+        SET created_at = ?
+        WHERE forecast_id = ?
+      `).run(iso(BASE_TIME + 101_000), stored[0].forecast_id);
+      database.sqlite.prepare(`
+        UPDATE forecast_predictive_leader_snapshots
+        SET snapshot_json = json_set(snapshot_json, '$.leaderNumber', 36)
+        WHERE forecast_id = ?
+      `).run(stored[2].forecast_id);
+      database.sqlite.prepare(`
+        UPDATE forecast_settlements SET settled_at = ? WHERE forecast_id = ?
+      `).run(stored[3].locked_at, stored[3].forecast_id);
+      database.sqlite.prepare(`
+        UPDATE round_results SET settled_at = ? WHERE id = ?
+      `).run(stored[3].locked_at, stored[3].round_result_id);
+    } finally {
+      database.sqlite.exec("PRAGMA ignore_check_constraints = OFF");
+    }
+
+    const complete = database.getPredictiveLeaderOutcomes(
+      source,
+      instrument,
+      { since },
+    );
+    assert.equal(complete.length, 5, "every result in the window must be covered");
+    assert.deepEqual(
+      complete.map(({ externalRoundId, availability }) => ({
+        externalRoundId,
+        availability,
+      })),
+      [
+        { externalRoundId: "107", availability: "invalid" },
+        { externalRoundId: "108", availability: "unavailable" },
+        { externalRoundId: "109", availability: "invalid" },
+        { externalRoundId: "110", availability: "invalid" },
+        { externalRoundId: "111", availability: "unavailable" },
+      ],
+    );
+    assert.equal(complete[2].leaderNumber, null);
+    assert.equal(complete[2].hit, null);
+    assert.equal(complete[3].leaderNumber, null);
+    assert.equal(complete[4].forecastId, null);
+    assert.equal(complete[4].lockedAt, null);
+    assert.deepEqual(
+      database.getPredictiveLeaderOutcomes(source, "OTHER", { since }),
+      [],
+    );
+    assert.throws(
+      () => database.getPredictiveLeaderOutcomes(source, instrument),
+      /since must be a valid date/,
+    );
+    assert.throws(
+      () => database.getPredictiveLeaderOutcomes(source, instrument, null),
+      /options must be an object/,
+    );
+    assert.throws(
+      () => database.getPredictiveLeaderOutcomes(source, instrument, {
+        since,
+        until: since,
+      }),
+      /until must be after since/,
+    );
   } finally {
     database.close();
   }
