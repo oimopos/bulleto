@@ -242,6 +242,39 @@ test(
       assert.equal(leaderPost.headers.get("cache-control"), "no-store");
       assert.deepEqual(await leaderPost.json(), { error: "Метод не разрешён" });
 
+      const backtestResponse = await fetch(
+        `${baseUrl}/api/trajectory-range-backtest`,
+      );
+      assert.equal(backtestResponse.status, 200, logs());
+      assert.equal(backtestResponse.headers.get("cache-control"), "no-store");
+      const backtest = await backtestResponse.json();
+      assert.equal(backtest.schemaVersion, 1);
+      assert.equal(backtest.mode, "retrospective-simulation");
+      assert.equal(
+        backtest.strategyMode,
+        "frozen-trajectory-display-range-ladder",
+      );
+      assert.equal(backtest.executionEnabled, false);
+      assert.equal(backtest.advisoryOnly, true);
+      assert.equal(backtest.initialBalance, 1_000);
+      assert.equal(backtest.finalBalance, 1_000);
+      assert.equal(backtest.betCount, 0);
+      assert.equal(backtest.coverage.requestedRoundCount, 100);
+      assert.equal(backtest.coverage.roundCount, 3);
+      assert.equal(backtest.coverage.unavailableRangeCount, 3);
+      assert.deepEqual(
+        backtest.rounds.map((round) => round.status),
+        ["skipped", "skipped", "skipped"],
+      );
+
+      const backtestHead = await fetch(
+        `${baseUrl}/api/trajectory-range-backtest`,
+        { method: "HEAD" },
+      );
+      assert.equal(backtestHead.status, 200, logs());
+      assert.equal(backtestHead.headers.get("cache-control"), "no-store");
+      assert.equal(await backtestHead.text(), "");
+
       const response = await fetch(`${baseUrl}/api/virtual-bettor`);
       assert.equal(response.status, 200, logs());
       assert.match(response.headers.get("content-type") ?? "", /^application\/json\b/);

@@ -14293,6 +14293,123 @@ export class RouletteDatabase {
     };
   }
 
+  getRecentTrajectoryRangeOutcomes(
+    source = "buleto",
+    instrument = "default",
+    limit = 100,
+  ) {
+    this.#assertOpen();
+    const safeSource = asNonEmptyText(source, undefined, "source");
+    const safeInstrument = asNonEmptyText(instrument, undefined, "instrument");
+    const safeLimit = normalizedLimit(limit, 100);
+    this.#ensureTrajectoryMetricFacts(safeSource, safeInstrument);
+
+    const rows = this.sqlite.prepare(`
+      WITH recent_results AS (
+        SELECT
+          id,
+          external_round_id,
+          settled_at,
+          result_number,
+          raw_cell,
+          continuity_epoch
+        FROM round_results
+        WHERE source = ? AND instrument = ?
+        ORDER BY settled_at DESC, id DESC
+        LIMIT ?
+      )
+      SELECT
+        results.id AS result_id,
+        results.external_round_id,
+        results.settled_at,
+        results.result_number,
+        results.raw_cell,
+        results.continuity_epoch,
+        settlements.forecast_id,
+        snapshots.id AS snapshot_id,
+        snapshots.locked_at,
+        trajectory_shadows.status AS trajectory_status,
+        trajectory_shadows.integration_json,
+        metric_facts.evaluated_count,
+        metric_facts.display_range_hits
+      FROM recent_results AS results
+      LEFT JOIN forecast_settlements AS settlements
+        ON settlements.round_result_id = results.id
+      LEFT JOIN round_forecasts AS forecasts
+        ON forecasts.id = settlements.forecast_id
+      LEFT JOIN forecast_snapshots AS snapshots
+        ON snapshots.id = forecasts.snapshot_id
+       AND snapshots.source = ?
+       AND snapshots.instrument = ?
+      LEFT JOIN forecast_trajectory_shadows AS trajectory_shadows
+        ON trajectory_shadows.forecast_id = forecasts.id
+       AND snapshots.id IS NOT NULL
+       AND trajectory_shadows.model_version = ?
+      LEFT JOIN forecast_trajectory_metric_facts AS metric_facts
+        ON metric_facts.forecast_id = trajectory_shadows.forecast_id
+       AND metric_facts.validator_version = ?
+      ORDER BY results.settled_at ASC, results.id ASC
+    `).all(
+      safeSource,
+      safeInstrument,
+      safeLimit,
+      safeSource,
+      safeInstrument,
+      TRAJECTORY_SHADOW_ADAPTIVE_VERSION,
+      TRAJECTORY_METRIC_FACT_VERSION,
+    );
+
+    return rows.map((row) => {
+      const base = {
+        resultId: Number(row.result_id),
+        externalRoundId: row.external_round_id,
+        settledAt: row.settled_at,
+        resultNumber: Number(row.result_number),
+        rawCell: row.raw_cell === null ? null : Number(row.raw_cell),
+        continuityEpoch: Number(row.continuity_epoch),
+        forecastId: row.forecast_id === null ? null : Number(row.forecast_id),
+        lockedAt: row.locked_at,
+        targetNumbers: null,
+        forecastDisplayHit: null,
+      };
+      if (row.forecast_id === null || row.trajectory_status !== "ready") {
+        return { ...base, availability: "unavailable" };
+      }
+      if (
+        row.snapshot_id === null
+        || Number(row.evaluated_count) !== 1
+        || typeof row.integration_json !== "string"
+      ) {
+        return { ...base, availability: "invalid" };
+      }
+      const lockedMs = Date.parse(row.locked_at);
+      const settledMs = Date.parse(row.settled_at);
+      if (!Number.isFinite(lockedMs) || !Number.isFinite(settledMs) || lockedMs >= settledMs) {
+        return { ...base, availability: "invalid" };
+      }
+
+      const cells = deserializeJson(row.integration_json)?.displayRange?.cells;
+      const targetNumbers = Array.isArray(cells)
+        ? [...new Set(cells.map((cell) => Number(cell?.number)))]
+        : [];
+      if (
+        targetNumbers.length < 1
+        || targetNumbers.length > TRAJECTORY_DISPLAY_RANGE_MAX_CELLS
+        || targetNumbers.some(
+          (number) => !Number.isInteger(number) || number < 0 || number > 36,
+        )
+      ) {
+        return { ...base, availability: "invalid" };
+      }
+      return {
+        ...base,
+        availability: "ready",
+        targetNumbers,
+        forecastDisplayHit: Number(row.display_range_hits) === 1,
+      };
+    });
+  }
+
   getPrecloseForecastState(source = "buleto", instrument = "default") {
     this.#assertOpen();
     const safeSource = asNonEmptyText(source, undefined, "source");

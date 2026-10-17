@@ -14,6 +14,7 @@ import { createDatabase } from './database.js';
 import { followerTop5GatedSnapshotForApi } from './follower-top5-gated-api.js';
 import { predictiveLeaderSnapshotForApi } from './predictive-leader-api.js';
 import { ResultPipeline } from './result-pipeline.js';
+import { runTrajectoryRangeBacktest } from './trajectory-range-backtest.js';
 import { virtualBettorSnapshotForApi } from './virtual-bettor-api.js';
 
 const ROOT_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -468,6 +469,20 @@ function precloseForecastStateFromDatabase() {
   );
 }
 
+function trajectoryRangeBacktestFromDatabase(limit) {
+  const readPayload = () => runTrajectoryRangeBacktest(
+    db.getRecentTrajectoryRangeOutcomes('buleto', config.instrument, limit),
+    {
+      requestedRoundCount: limit,
+      source: 'buleto',
+      instrument: config.instrument,
+    },
+  );
+  return limit === 100
+    ? cachedDatabaseRead('trajectory-range-backtest:default', readPayload)
+    : readPayload();
+}
+
 function latestResultFromDatabase() {
   return cachedDatabaseRead(
     'latest-result',
@@ -703,6 +718,16 @@ const server = createServer((request, response) => {
         200,
         precloseForecastStateFromDatabase(),
       );
+      return;
+    }
+
+    if (pathname === '/api/trajectory-range-backtest') {
+      if (trajectoryValidationIsWarming()) {
+        sendStartupWarming(response);
+        return;
+      }
+      const limit = clampLimit(url.searchParams.get('limit'), 100, 500);
+      sendJson(response, 200, trajectoryRangeBacktestFromDatabase(limit));
       return;
     }
 

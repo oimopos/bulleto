@@ -2662,6 +2662,29 @@ test("trajectory shadow freezes a correction-aware past-only READY prediction an
     assert.ok(
       Math.abs(latest.trajectoryShadow.evaluation.deltaCellWidths - 2) < 1e-9,
     );
+    assert.deepEqual(
+      database.getRecentTrajectoryRangeOutcomes(
+        "buleto",
+        "PRIMECOIN(XPM)/RUB",
+        1,
+      ),
+      [
+        {
+          resultId: latest.trajectoryShadow.evaluation.resultId,
+          externalRoundId: currentRoundId,
+          settledAt: iso(currentEndMs),
+          resultNumber: 23,
+          rawCell: 23,
+          continuityEpoch: 0,
+          forecastId: currentForecastId,
+          lockedAt: iso(currentLockedMs),
+          targetNumbers: [23, 24, 25, 26, 27, 28],
+          forecastDisplayHit: true,
+          availability: "ready",
+        },
+      ],
+      "the backtest input must use the frozen range linked to the latest result",
+    );
 
     const currentResultId = latest.trajectoryShadow.evaluation.resultId;
     const setCurrentZero = database.sqlite.prepare(`
@@ -2702,6 +2725,14 @@ test("trajectory shadow freezes a correction-aware past-only READY prediction an
     assert.equal(latest.latest.trajectoryShadow.evaluation.displayRangeHit, null);
     assert.equal(latest.trajectoryMetrics.ungradableCount, 1);
     assert.equal(latest.trajectoryMetrics.rank37UngradableCount, 0);
+    assert.equal(
+      database.getRecentTrajectoryRangeOutcomes(
+        "buleto",
+        "PRIMECOIN(XPM)/RUB",
+        1,
+      )[0].availability,
+      "invalid",
+    );
 
     setCurrentZero.run(37, currentResultId);
     database.sqlite
