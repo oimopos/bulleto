@@ -42,6 +42,9 @@ test('trajectory listener is wired before primary forecast without gating it', (
 });
 
 test('current-cell capture carries the scheduled close through the database boundary', () => {
+  const metadataQueueStart = server.indexOf(
+    'const metadataConflictRetryQueue = createCurrentCellMetadataConflictRetryQueue',
+  );
   const schedulerStart = server.indexOf(
     'const currentCellHorizonScheduler = createCurrentCellHorizonScheduler',
   );
@@ -49,27 +52,62 @@ test('current-cell capture carries the scheduled close through the database boun
     'function isPermanentRoundTrajectoryError',
     schedulerStart,
   );
-  assert.ok(schedulerStart >= 0 && permanentErrorStart > schedulerStart);
+  assert.ok(
+    metadataQueueStart >= 0
+      && schedulerStart > metadataQueueStart
+      && permanentErrorStart > schedulerStart,
+  );
+  const metadataQueue = server.slice(metadataQueueStart, schedulerStart);
   const scheduler = server.slice(schedulerStart, permanentErrorStart);
+  assert.match(metadataQueue, /createCurrentCellMetadataConflictRetryQueue\(\{/);
+  assert.match(metadataQueue, /maxPending: MAX_PENDING_METADATA_CONFLICTS/);
+  assert.match(
+    metadataQueue,
+    /persist\(conflict\)[\s\S]*db\.recordCurrentCellHorizonMetadataConflict\(/,
+  );
+  assert.match(metadataQueue, /isTransientError: isTransientSqliteLock/);
+  assert.match(
+    metadataQueue,
+    /onDatabaseChanged\(\)[\s\S]*broadcastUpdate\('predictive-shadow-metadata-conflict'\)/,
+  );
+  assert.match(
+    scheduler,
+    /if \(!metadataConflictRetryQueue\.drain\(\)\) return \{ reason: 'transient' \};/,
+  );
   assert.match(
     scheduler,
     /db\.recordCurrentCellHorizonShadow\(\s*attempt\.source,\s*attempt\.instrument,\s*attempt\.externalRoundId,\s*attempt\.bettingClosesAt,\s*\)/,
   );
   assert.match(scheduler, /outcome\.reason === 'metadata_conflict'/);
+  assert.match(scheduler, /outcome\.databaseChanged/);
+  assert.match(
+    server,
+    /error\?\.code === 'ERR_SQLITE_ERROR'[\s\S]*error\.errcode === 5[\s\S]*error\.errcode === 6/,
+  );
+  assert.match(scheduler, /isTransientSqliteLock\(error\)/);
 
   const roundListener = server.slice(server.indexOf("collector.on('round',"));
   assert.match(roundListener, /scheduleOutcome\.status === 'metadata_conflict'/);
+  assert.match(
+    roundListener,
+    /metadataConflictRetryQueue\.enqueue\(\{[\s\S]*originalBettingClosesAt: scheduleOutcome\.originalBettingClosesAt,[\s\S]*observedBettingClosesAt: scheduleOutcome\.observedBettingClosesAt/,
+  );
 });
 
 test('shutdown cancels trajectory backoff and joins the final FIFO drain', () => {
   const shutdown = server.slice(server.indexOf('function shutdown(signal)'));
+  assert.match(shutdown, /metadataConflictRetryQueue\.cancelRetry\(\);/);
   assert.match(shutdown, /clearTimeout\(roundTrajectoryRetryTimer\);/);
+  assert.match(
+    shutdown,
+    /const metadataConflictsPersisted = metadataConflictRetryQueue\.drain\(\{ retry: false \}\);/,
+  );
   assert.match(
     shutdown,
     /const trajectoriesPersisted = drainRoundTrajectoryQueue\(\{ retry: false \}\);/,
   );
   assert.match(
     shutdown,
-    /if \(trajectoriesPersisted && pending\.results === 0 && pending\.gaps === 0\)/,
+    /metadataConflictsPersisted[\s\S]*&& trajectoriesPersisted[\s\S]*&& pending\.results === 0[\s\S]*&& pending\.gaps === 0/,
   );
 });

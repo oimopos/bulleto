@@ -104,7 +104,7 @@ test("v27 freezes the production v7 config and export provenance in new tables",
     predictiveLeaderLegacyAccountEnabled: false,
   });
   try {
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 28);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 29);
     const cohort = database.sqlite.prepare(`
       SELECT * FROM predictive_leader_v7_cohorts
     `).get();
@@ -173,6 +173,8 @@ test("v27 starts at MAX(forecast)+1 and never backfills an older forecast", () =
     nowMs = oldBase + 52_000;
     assert.equal(database.recordPrecloseForecast(forecast("legacy", oldBase)).inserted, true);
     database.sqlite.exec(`
+      DROP TABLE predictive_shadow_round_metadata_conflicts;
+      DROP TABLE predictive_shadow_integrity_boundaries;
       DROP TABLE forecast_predictive_leader_v7_snapshots;
       DROP TABLE predictive_leader_v7_cohorts;
       PRAGMA user_version = 26;
@@ -356,6 +358,49 @@ test("v7 shadow stays frozen, causal, read-only, and evaluates only after settle
   } finally {
     database.close();
     rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("v29 excludes a v7 snapshot after duplicate round metadata changes", () => {
+  let nowMs = LIVE_BASE;
+  const database = createDatabase({
+    path: ":memory:",
+    clock: () => new Date(nowMs),
+    logger: quietLogger,
+    predictiveLeaderLegacyAccountEnabled: false,
+  });
+  try {
+    nowMs = LIVE_BASE + 10_000;
+    seedPairHistory(database, LIVE_BASE);
+    nowMs = LIVE_BASE + 52_000;
+    assert.equal(database.recordPrecloseForecast(
+      forecast("v29-conflict", LIVE_BASE),
+    ).inserted, true);
+
+    const corrected = forecast("v29-conflict", LIVE_BASE);
+    corrected.bettingClosesAt = iso(LIVE_BASE + 60_100);
+    nowMs = LIVE_BASE + 53_000;
+    assert.deepEqual(database.recordPrecloseForecast(corrected), {
+      inserted: false,
+      databaseChanged: true,
+      roundId: "v29-conflict",
+    });
+
+    let audit = database.getPredictiveLeaderV7AuditState(SOURCE, INSTRUMENT);
+    assert.equal(audit.metrics.storedCount, 1);
+    assert.equal(audit.metrics.voidCount, 1);
+    assert.equal(audit.metrics.readyCount, 0);
+    assert.equal(audit.metrics.overall.settledCount, 0);
+    assert.equal(audit.latest.candidate.availability, "void");
+
+    nowMs = LIVE_BASE + 101_000;
+    database.ingestBatch([resultEvent(4, "v29-conflict", LIVE_BASE, 100)]);
+    assert.equal(database.settlePrecloseForecasts(SOURCE, INSTRUMENT).settled, 1);
+    audit = database.getPredictiveLeaderV7AuditState(SOURCE, INSTRUMENT);
+    assert.equal(audit.metrics.overall.settledCount, 0);
+    assert.equal(audit.metrics.pairedChampion.pairedCount, 0);
+  } finally {
+    database.close();
   }
 });
 

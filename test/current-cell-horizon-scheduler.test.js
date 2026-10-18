@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   CURRENT_CELL_HORIZON_SCHEDULER_CONFIG,
   createCurrentCellHorizonScheduler,
+  createCurrentCellMetadataConflictRetryQueue,
   currentCellHorizonRoundKey,
 } from "../src/current-cell-horizon-scheduler.js";
 
@@ -94,6 +95,96 @@ function fakeRuntime(initialMs = BASE_MS) {
   };
 }
 
+test("metadata conflict queue retries SQLITE_BUSY and broadcasts after persistence", async () => {
+  const runtime = fakeRuntime();
+  const conflict = {
+    source: "buleto",
+    instrument: "roulette",
+    externalRoundId: "conflicted",
+    originalBettingClosesAt: "2026-10-18T10:00:20.000Z",
+    observedBettingClosesAt: "2026-10-18T10:00:30.000Z",
+    observedAt: "2026-10-18T10:00:01.000Z",
+  };
+  let attempts = 0;
+  let changedCount = 0;
+  const transientFailures = [];
+  const queue = createCurrentCellMetadataConflictRetryQueue({
+    persist(value) {
+      attempts += 1;
+      assert.deepEqual(value, conflict);
+      if (attempts === 1) {
+        const error = new Error("database is locked");
+        error.code = "ERR_SQLITE_ERROR";
+        error.errcode = 5;
+        throw error;
+      }
+      return { databaseChanged: true };
+    },
+    isTransientError: (error) => (
+      error?.code === "ERR_SQLITE_ERROR" && error.errcode === 5
+    ),
+    onDatabaseChanged() {
+      changedCount += 1;
+    },
+    onTransientError(error, value, failureCount) {
+      transientFailures.push({ error, value, failureCount });
+    },
+    setTimeout: runtime.setTimeout,
+    clearTimeout: runtime.clearTimeout,
+    retryDelayMs: 25,
+    maxRetryDelayMs: 25,
+  });
+
+  assert.equal(queue.enqueue(conflict), false);
+  assert.equal(queue.pendingCount, 1);
+  assert.equal(attempts, 1);
+  assert.equal(changedCount, 0);
+  assert.equal(transientFailures.length, 1);
+  assert.equal(transientFailures[0].failureCount, 1);
+  assert.equal(runtime.pending().length, 1);
+
+  await runtime.fireNext();
+  assert.equal(attempts, 2);
+  assert.equal(queue.pendingCount, 0);
+  assert.equal(changedCount, 1);
+  assert.equal(runtime.pending().length, 0);
+});
+
+test("metadata conflict retry queue is bounded and deduplicates a pending identity", () => {
+  const runtime = fakeRuntime();
+  const permanentErrors = [];
+  const queue = createCurrentCellMetadataConflictRetryQueue({
+    persist() {
+      const error = new Error("busy");
+      error.code = "SQLITE_BUSY";
+      throw error;
+    },
+    isTransientError: (error) => error?.code === "SQLITE_BUSY",
+    onPermanentError(error, value) {
+      permanentErrors.push({ error, value });
+    },
+    setTimeout: runtime.setTimeout,
+    clearTimeout: runtime.clearTimeout,
+    maxPending: 2,
+  });
+  const conflict = {
+    source: "buleto",
+    instrument: "roulette",
+    externalRoundId: "one",
+  };
+
+  assert.equal(queue.enqueue(conflict), false);
+  assert.equal(queue.enqueue({ ...conflict }), false);
+  assert.equal(queue.pendingCount, 1);
+  assert.equal(queue.enqueue({ ...conflict, externalRoundId: "two" }), false);
+  assert.equal(queue.pendingCount, 2);
+  assert.equal(queue.enqueue({ ...conflict, externalRoundId: "three" }), false);
+  assert.equal(queue.pendingCount, 2);
+  assert.equal(permanentErrors.length, 1);
+  assert.match(permanentErrors[0].error.message, /reached 2 entries/);
+  queue.cancelRetry();
+});
+
 function scheduler(runtime, capture, overrides = {}) {
   return createCurrentCellHorizonScheduler({
     capture,
@@ -175,6 +266,14 @@ test("a corrected later close for the same id fails closed and blocks that ident
   const corrected = value.scheduleRound(round("same", BASE_MS + 30_000));
   assert.equal(original.status, "scheduled");
   assert.equal(corrected.status, "metadata_conflict");
+  assert.equal(
+    corrected.originalBettingClosesAt,
+    "2026-10-18T10:00:20.000Z",
+  );
+  assert.equal(
+    corrected.observedBettingClosesAt,
+    "2026-10-18T10:00:30.000Z",
+  );
   assert.notEqual(original.roundKey, corrected.roundKey);
   assert.equal(runtime.clearCount, 1);
   assert.equal(runtime.pending().length, 0);
@@ -204,6 +303,14 @@ test("a corrected earlier close for the same id also fails closed without captur
   value.scheduleRound(round("same", BASE_MS + 30_000));
   const corrected = value.scheduleRound(round("same", BASE_MS + 20_000));
   assert.equal(corrected.status, "metadata_conflict");
+  assert.equal(
+    corrected.originalBettingClosesAt,
+    "2026-10-18T10:00:30.000Z",
+  );
+  assert.equal(
+    corrected.observedBettingClosesAt,
+    "2026-10-18T10:00:20.000Z",
+  );
   assert.equal(runtime.clearCount, 1);
   assert.equal(runtime.pending().length, 0);
 

@@ -2650,6 +2650,15 @@ function trajectoryAdaptiveValidatorFingerprint(values) {
   return hash.digest("base64url");
 }
 
+function bettingClosesAtFromSerializedPayload(rawPayload) {
+  const parsed = deserializeJson(rawPayload);
+  const candidate = parsed?.bcd ?? parsed?.bettingClosesAt ?? null;
+  if (typeof candidate !== "string" || !Number.isFinite(Date.parse(candidate))) {
+    return null;
+  }
+  return new Date(candidate).toISOString();
+}
+
 function trajectoryAdaptiveValidatorValuesFromRow(row) {
   return [
     row.status,
@@ -5707,6 +5716,7 @@ export class RouletteDatabase {
     this.#migratePredictiveLeaderQualityAndSignalV26(startingVersion);
     this.#migratePredictiveLeaderV7ShadowV27(startingVersion);
     this.#migrateCurrentCellHorizonShadowV28(startingVersion);
+    this.#migrateCurrentCellHorizonMetadataVoidsV29(startingVersion);
   }
 
   #migratePrecloseForecastsV10() {
@@ -8105,6 +8115,290 @@ export class RouletteDatabase {
     }
   }
 
+  #migrateCurrentCellHorizonMetadataVoidsV29(startingVersion) {
+    this.sqlite.exec("BEGIN IMMEDIATE");
+    try {
+      this.sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS predictive_shadow_integrity_boundaries (
+          boundary_key TEXT PRIMARY KEY CHECK (
+            boundary_key = 'predictive-shadow-metadata-integrity-v1'
+          ),
+          policy_version TEXT NOT NULL CHECK (
+            policy_version = 'metadata-conflict-void-v1'
+          ),
+          current_cell_cohort_key TEXT NOT NULL REFERENCES current_cell_horizon_shadow_cohorts(
+            cohort_key
+          ),
+          v7_candidate_key TEXT NOT NULL REFERENCES predictive_leader_v7_cohorts(
+            candidate_key
+          ),
+          first_trajectory_id INTEGER NOT NULL CHECK (first_trajectory_id >= 1),
+          first_forecast_id INTEGER NOT NULL CHECK (first_forecast_id >= 1),
+          started_at TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          CHECK (started_at = created_at)
+        );
+
+        CREATE TABLE IF NOT EXISTS predictive_shadow_round_metadata_conflicts (
+          boundary_key TEXT NOT NULL REFERENCES predictive_shadow_integrity_boundaries(
+            boundary_key
+          ),
+          source TEXT NOT NULL,
+          instrument TEXT NOT NULL,
+          external_round_id TEXT NOT NULL,
+          reason TEXT NOT NULL CHECK (reason = 'metadata_conflict'),
+          original_betting_closes_at TEXT NOT NULL,
+          observed_betting_closes_at TEXT NOT NULL,
+          observed_at TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          PRIMARY KEY (boundary_key, source, instrument, external_round_id),
+          CHECK (original_betting_closes_at <> observed_betting_closes_at),
+          CHECK (observed_at <= created_at)
+        );
+
+        CREATE INDEX IF NOT EXISTS predictive_shadow_metadata_conflict_stream_idx
+          ON predictive_shadow_round_metadata_conflicts(
+            boundary_key, created_at, external_round_id
+          );
+
+        CREATE TRIGGER IF NOT EXISTS current_cell_horizon_snapshot_not_void
+        BEFORE INSERT ON round_trajectory_current_cell_horizon_snapshots
+        WHEN EXISTS (
+          SELECT 1
+          FROM predictive_shadow_round_metadata_conflicts AS voids
+          JOIN round_trajectories AS trajectories
+            ON trajectories.id = NEW.trajectory_id
+          JOIN predictive_shadow_integrity_boundaries AS boundaries
+            ON boundaries.boundary_key = voids.boundary_key
+           AND boundaries.current_cell_cohort_key = NEW.cohort_key
+          WHERE voids.boundary_key = 'predictive-shadow-metadata-integrity-v1'
+            AND voids.source = trajectories.source
+            AND voids.instrument = trajectories.instrument
+            AND voids.external_round_id = trajectories.external_round_id
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'current-cell shadow snapshot identity is void');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS current_cell_horizon_snapshot_v29_boundary
+        BEFORE INSERT ON round_trajectory_current_cell_horizon_snapshots
+        WHEN NOT EXISTS (
+          SELECT 1
+          FROM round_trajectories AS trajectories
+          JOIN predictive_shadow_integrity_boundaries AS boundaries
+            ON boundaries.current_cell_cohort_key = NEW.cohort_key
+          WHERE trajectories.id = NEW.trajectory_id
+            AND trajectories.id >= boundaries.first_trajectory_id
+            AND trajectories.created_at >= boundaries.started_at
+            AND NEW.cutoff_at >= boundaries.started_at
+            AND NEW.captured_at >= boundaries.started_at
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'current-cell shadow snapshot predates v29 boundary');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS current_cell_horizon_evaluation_not_void
+        BEFORE INSERT ON round_trajectory_current_cell_horizon_evaluations
+        WHEN EXISTS (
+          SELECT 1
+          FROM predictive_shadow_round_metadata_conflicts AS voids
+          JOIN round_trajectories AS trajectories
+            ON trajectories.id = NEW.trajectory_id
+          JOIN predictive_shadow_integrity_boundaries AS boundaries
+            ON boundaries.boundary_key = voids.boundary_key
+           AND boundaries.current_cell_cohort_key = NEW.cohort_key
+          WHERE voids.boundary_key = 'predictive-shadow-metadata-integrity-v1'
+            AND voids.source = trajectories.source
+            AND voids.instrument = trajectories.instrument
+            AND voids.external_round_id = trajectories.external_round_id
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'current-cell shadow evaluation identity is void');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS predictive_leader_v7_v29_boundary
+        BEFORE INSERT ON forecast_predictive_leader_v7_snapshots
+        WHEN NOT EXISTS (
+          SELECT 1
+          FROM round_forecasts AS forecasts
+          JOIN forecast_snapshots AS snapshots
+            ON snapshots.id = forecasts.snapshot_id
+          JOIN predictive_shadow_integrity_boundaries AS boundaries
+            ON boundaries.v7_candidate_key = NEW.candidate_key
+          WHERE forecasts.id = NEW.forecast_id
+            AND forecasts.id >= boundaries.first_forecast_id
+            AND snapshots.locked_at >= boundaries.started_at
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'predictive leader v7 snapshot predates v29 boundary');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS predictive_leader_v7_snapshot_not_void
+        BEFORE INSERT ON forecast_predictive_leader_v7_snapshots
+        WHEN EXISTS (
+          SELECT 1
+          FROM round_forecasts AS forecasts
+          JOIN forecast_snapshots AS snapshots
+            ON snapshots.id = forecasts.snapshot_id
+          JOIN predictive_shadow_integrity_boundaries AS boundaries
+            ON boundaries.v7_candidate_key = NEW.candidate_key
+          JOIN predictive_shadow_round_metadata_conflicts AS voids
+            ON voids.boundary_key = boundaries.boundary_key
+           AND voids.source = snapshots.source
+           AND voids.instrument = snapshots.instrument
+           AND voids.external_round_id = snapshots.external_round_id
+          WHERE forecasts.id = NEW.forecast_id
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'predictive leader v7 snapshot identity is void');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS current_cell_horizon_void_identity
+        BEFORE INSERT ON predictive_shadow_round_metadata_conflicts
+        WHEN NOT EXISTS (
+          SELECT 1
+          FROM predictive_shadow_integrity_boundaries AS boundaries
+          JOIN current_cell_horizon_shadow_cohorts AS cohorts
+            ON cohorts.cohort_key = boundaries.current_cell_cohort_key
+          JOIN predictive_leader_v7_cohorts AS v7_cohorts
+            ON v7_cohorts.candidate_key = boundaries.v7_candidate_key
+          WHERE boundaries.boundary_key = NEW.boundary_key
+            AND NEW.source = cohorts.source
+            AND NEW.instrument = cohorts.instrument
+            AND NEW.source = v7_cohorts.source
+            AND NEW.instrument = v7_cohorts.instrument
+            AND length(trim(NEW.external_round_id)) > 0
+            AND NEW.reason = 'metadata_conflict'
+            AND NEW.original_betting_closes_at <> NEW.observed_betting_closes_at
+            AND NEW.observed_at >= boundaries.started_at
+            AND NEW.created_at >= boundaries.started_at
+            AND NEW.created_at >= NEW.observed_at
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'current-cell shadow void identity is invalid');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS current_cell_horizon_void_immutable_update
+        BEFORE UPDATE ON predictive_shadow_round_metadata_conflicts
+        BEGIN
+          SELECT RAISE(ABORT, 'current-cell shadow void is immutable');
+        END;
+        CREATE TRIGGER IF NOT EXISTS current_cell_horizon_void_immutable_delete
+        BEFORE DELETE ON predictive_shadow_round_metadata_conflicts
+        BEGIN
+          SELECT RAISE(ABORT, 'current-cell shadow void is immutable');
+        END;
+        CREATE TRIGGER IF NOT EXISTS current_cell_horizon_boundary_immutable_update
+        BEFORE UPDATE ON predictive_shadow_integrity_boundaries
+        BEGIN
+          SELECT RAISE(ABORT, 'current-cell shadow gate boundary is immutable');
+        END;
+        CREATE TRIGGER IF NOT EXISTS current_cell_horizon_boundary_immutable_delete
+        BEFORE DELETE ON predictive_shadow_integrity_boundaries
+        BEGIN
+          SELECT RAISE(ABORT, 'current-cell shadow gate boundary is immutable');
+        END;
+      `);
+
+      const cohort = this.sqlite.prepare(`
+        SELECT *
+        FROM current_cell_horizon_shadow_cohorts
+        WHERE cohort_key = ?
+      `).get(CURRENT_CELL_HORIZON_SHADOW_COHORT_KEY);
+      if (!cohort) throw new Error("current-cell shadow cohort is missing");
+      const v7Cohort = this.sqlite.prepare(`
+        SELECT *
+        FROM predictive_leader_v7_cohorts
+        WHERE candidate_key = ?
+      `).get(PREDICTIVE_LEADER_V7_CANDIDATE_CONFIG.candidateId);
+      if (!v7Cohort) throw new Error("predictive leader v7 cohort is missing");
+      const existing = this.sqlite.prepare(`
+        SELECT *
+        FROM predictive_shadow_integrity_boundaries
+        WHERE boundary_key = 'predictive-shadow-metadata-integrity-v1'
+      `).get();
+      const firstTrajectoryId = Number(this.sqlite.prepare(`
+        SELECT COALESCE(MAX(id), 0) + 1 AS first_trajectory_id
+        FROM round_trajectories
+      `).get().first_trajectory_id);
+      const firstForecastId = Number(this.sqlite.prepare(`
+        SELECT COALESCE(MAX(id), 0) + 1 AS first_forecast_id
+        FROM round_forecasts
+      `).get().first_forecast_id);
+      let inserted = 0;
+      if (!existing) {
+        const minimumStartedAtMs = Math.max(
+          Date.parse(cohort.started_at),
+          Date.parse(v7Cohort.started_at),
+        );
+        const migrationStartedAtMs = startingVersion >= 28
+          ? Date.parse(asTimestamp(
+              this.clock(),
+              undefined,
+              "predictive shadow v29 boundary startedAt",
+            ))
+          : minimumStartedAtMs;
+        const startedAt = new Date(Math.max(
+          minimumStartedAtMs,
+          migrationStartedAtMs,
+        )).toISOString();
+        inserted = Number(this.sqlite.prepare(`
+          INSERT INTO predictive_shadow_integrity_boundaries (
+            boundary_key, policy_version, current_cell_cohort_key, v7_candidate_key,
+            first_trajectory_id, first_forecast_id, started_at, created_at
+          ) VALUES (
+            'predictive-shadow-metadata-integrity-v1',
+            'metadata-conflict-void-v1', ?, ?, ?, ?, ?, ?
+          )
+        `).run(
+          CURRENT_CELL_HORIZON_SHADOW_COHORT_KEY,
+          PREDICTIVE_LEADER_V7_CANDIDATE_CONFIG.candidateId,
+          firstTrajectoryId,
+          firstForecastId,
+          startedAt,
+          startedAt,
+        ).changes);
+      }
+      const boundary = this.sqlite.prepare(`
+        SELECT *
+        FROM predictive_shadow_integrity_boundaries
+        WHERE boundary_key = 'predictive-shadow-metadata-integrity-v1'
+      `).get();
+      if (
+        !boundary
+        || boundary.policy_version !== "metadata-conflict-void-v1"
+        || boundary.current_cell_cohort_key !== CURRENT_CELL_HORIZON_SHADOW_COHORT_KEY
+        || boundary.v7_candidate_key
+          !== PREDICTIVE_LEADER_V7_CANDIDATE_CONFIG.candidateId
+        || !Number.isSafeInteger(Number(boundary.first_trajectory_id))
+        || Number(boundary.first_trajectory_id) < 1
+        || !Number.isSafeInteger(Number(boundary.first_forecast_id))
+        || Number(boundary.first_forecast_id) < 1
+        || boundary.started_at !== boundary.created_at
+        || boundary.started_at < cohort.started_at
+        || boundary.started_at < v7Cohort.started_at
+        || (inserted === 1
+          && (
+            Number(boundary.first_trajectory_id) !== firstTrajectoryId
+            || Number(boundary.first_forecast_id) !== firstForecastId
+          ))
+      ) {
+        throw new Error("current-cell shadow v29 boundary is incompatible");
+      }
+      this.sqlite.exec(`
+        PRAGMA user_version = ${Math.max(29, startingVersion)};
+        COMMIT;
+      `);
+    } catch (error) {
+      try {
+        this.sqlite.exec("ROLLBACK");
+      } catch {
+        // Preserve the migration error.
+      }
+      throw error;
+    }
+  }
+
   #migrateContinuityReconciliationV9() {
     this.sqlite.exec("BEGIN IMMEDIATE");
     try {
@@ -10146,6 +10440,7 @@ export class RouletteDatabase {
         }
         const gapOutcome = gapOutcomes[0] ?? null;
         let duplicateCount = 0;
+        let metadataConflictCount = 0;
         const insertedResults = [];
         const insertedResultRows = [];
         const completedCycleIds = [];
@@ -10167,8 +10462,60 @@ export class RouletteDatabase {
           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT DO NOTHING
         `);
+        const storedForecastRoundMetadata = this.sqlite.prepare(`
+          SELECT betting_closes_at
+          FROM forecast_snapshots
+          WHERE source = ? AND instrument = ? AND external_round_id = ?
+          ORDER BY CASE WHEN horizon_seconds = 8 THEN 0 ELSE 1 END, id
+          LIMIT 1
+        `);
+        const storedTrajectoryRoundMetadata = this.sqlite.prepare(`
+          SELECT betting_closes_at
+          FROM round_trajectories
+          WHERE source = ? AND instrument = ? AND external_round_id = ?
+          LIMIT 1
+        `);
 
         for (const event of normalizedEvents) {
+          const finalBettingClosesAt = bettingClosesAtFromSerializedPayload(
+            event.rawPayload,
+          );
+          if (event.externalRoundId !== null && finalBettingClosesAt !== null) {
+            const storedMetadata = [
+              storedForecastRoundMetadata.get(
+                event.source,
+                event.instrument,
+                event.externalRoundId,
+              ),
+              storedTrajectoryRoundMetadata.get(
+                event.source,
+                event.instrument,
+                event.externalRoundId,
+              ),
+            ].find((metadata) => (
+              metadata
+              && metadata.betting_closes_at !== finalBettingClosesAt
+            ));
+            if (
+              storedMetadata
+            ) {
+              const conflictCreatedAt = new Date(Math.max(
+                Date.parse(now),
+                Date.parse(event.observedAt),
+              )).toISOString();
+              metadataConflictCount += Number(
+                this.#recordCurrentCellHorizonMetadataConflict({
+                  source: event.source,
+                  instrument: event.instrument,
+                  externalRoundId: event.externalRoundId,
+                  originalBettingClosesAt: storedMetadata.betting_closes_at,
+                  observedBettingClosesAt: finalBettingClosesAt,
+                  observedAt: event.observedAt,
+                  createdAt: conflictCreatedAt,
+                }),
+              );
+            }
+          }
           const streamKey = `${event.source}\u0000${event.instrument}`;
           let continuityEpoch = continuityEpochs.get(streamKey);
           if (continuityEpoch === undefined) {
@@ -10372,6 +10719,7 @@ export class RouletteDatabase {
           gapOutcome,
           gapOutcomes,
           historicalOutcome,
+          metadataConflictCount,
         };
       });
     } catch (error) {
@@ -10406,6 +10754,11 @@ export class RouletteDatabase {
           transactionResult.historicalOutcome.unknownWithinCoverage,
         afterCoverage: transactionResult.historicalOutcome.afterCoverage,
       },
+      metadataConflictCount: transactionResult.metadataConflictCount,
+      databaseChanged:
+        transactionResult.inserted > 0
+        || transactionResult.metadataConflictCount > 0
+        || transactionResult.gapOutcomes.length > 0,
       state: this.getDashboardState(),
     };
 
@@ -11438,6 +11791,131 @@ export class RouletteDatabase {
     return value;
   }
 
+  #recordCurrentCellHorizonMetadataConflict({
+    source,
+    instrument,
+    externalRoundId,
+    originalBettingClosesAt,
+    observedBettingClosesAt,
+    observedAt,
+    createdAt,
+  }) {
+    if (originalBettingClosesAt === observedBettingClosesAt) {
+      return false;
+    }
+    return Number(this.sqlite.prepare(`
+      INSERT INTO predictive_shadow_round_metadata_conflicts (
+        boundary_key, source, instrument, external_round_id, reason,
+        original_betting_closes_at, observed_betting_closes_at,
+        observed_at, created_at
+      )
+      SELECT
+        boundaries.boundary_key,
+        ?,
+        ?,
+        ?,
+        'metadata_conflict',
+        ?,
+        ?,
+        ?,
+        ?
+      FROM predictive_shadow_integrity_boundaries AS boundaries
+      JOIN current_cell_horizon_shadow_cohorts AS cohorts
+        ON cohorts.cohort_key = boundaries.current_cell_cohort_key
+      WHERE boundaries.boundary_key = 'predictive-shadow-metadata-integrity-v1'
+        AND cohorts.cohort_key = ?
+        AND cohorts.source = ?
+        AND cohorts.instrument = ?
+        AND ? >= boundaries.started_at
+        AND ? >= boundaries.started_at
+      ON CONFLICT(boundary_key, source, instrument, external_round_id) DO NOTHING
+    `).run(
+      source,
+      instrument,
+      externalRoundId,
+      originalBettingClosesAt,
+      observedBettingClosesAt,
+      observedAt,
+      createdAt,
+      CURRENT_CELL_HORIZON_SHADOW_COHORT_KEY,
+      source,
+      instrument,
+      observedAt,
+      createdAt,
+    ).changes) === 1;
+  }
+
+  recordCurrentCellHorizonMetadataConflict(
+    source = "buleto",
+    instrument = "default",
+    externalRoundId,
+    originalBettingClosesAt,
+    observedBettingClosesAt,
+    observedAt,
+  ) {
+    this.#assertOpen();
+    const safeSource = asNonEmptyText(source, undefined, "source");
+    const safeInstrument = asNonEmptyText(instrument, undefined, "instrument");
+    const safeRoundId = asNonEmptyText(
+      externalRoundId,
+      undefined,
+      "externalRoundId",
+    );
+    const safeOriginalBettingClosesAt = asTimestamp(
+      originalBettingClosesAt,
+      undefined,
+      "originalBettingClosesAt",
+    );
+    const safeObservedBettingClosesAt = asTimestamp(
+      observedBettingClosesAt,
+      undefined,
+      "observedBettingClosesAt",
+    );
+    const createdAt = asTimestamp(
+      this.clock(),
+      undefined,
+      "current-cell shadow void createdAt",
+    );
+    const safeObservedAt = asTimestamp(observedAt ?? createdAt, undefined, "observedAt");
+    if (safeObservedAt > createdAt) {
+      throw new RangeError("current-cell shadow conflict cannot be observed in the future");
+    }
+    return this.#transaction(() => {
+      if (safeOriginalBettingClosesAt === safeObservedBettingClosesAt) {
+        return { inserted: false, databaseChanged: false, reason: "metadata_matches" };
+      }
+      const inserted = this.#recordCurrentCellHorizonMetadataConflict({
+        source: safeSource,
+        instrument: safeInstrument,
+        externalRoundId: safeRoundId,
+        originalBettingClosesAt: safeOriginalBettingClosesAt,
+        observedBettingClosesAt: safeObservedBettingClosesAt,
+        observedAt: safeObservedAt,
+        createdAt,
+      });
+      const stored = this.sqlite.prepare(`
+        SELECT 1
+        FROM predictive_shadow_round_metadata_conflicts
+        WHERE boundary_key = 'predictive-shadow-metadata-integrity-v1'
+          AND source = ? AND instrument = ?
+          AND external_round_id = ?
+      `).get(
+        safeSource,
+        safeInstrument,
+        safeRoundId,
+      );
+      return {
+        inserted,
+        databaseChanged: inserted,
+        reason: inserted
+          ? "metadata_conflict_recorded"
+          : stored
+            ? "already_recorded"
+            : "outside_prospective_boundary",
+      };
+    });
+  }
+
   recordRoundTrajectory(event) {
     this.#assertOpen();
     const persistedAt = asTimestamp(
@@ -11498,6 +11976,25 @@ export class RouletteDatabase {
           Number(row.top_price) === input.topPrice &&
           row.bands_json === input.bandsJson;
         if (!immutableValuesMatch) {
+          if (row.betting_closes_at !== input.bettingClosesAt) {
+            const voidInserted = this.#recordCurrentCellHorizonMetadataConflict({
+              source: row.source,
+              instrument: row.instrument,
+              externalRoundId: row.external_round_id,
+              originalBettingClosesAt: row.betting_closes_at,
+              observedBettingClosesAt: input.bettingClosesAt,
+              observedAt: input.receivedAt,
+              createdAt: persistedAt,
+            });
+            return {
+              inserted: false,
+              ticksInserted: 0,
+              trajectoryId: Number(row.id),
+              metadataConflict: true,
+              voidInserted,
+              databaseChanged: voidInserted,
+            };
+          }
           throw new RangeError("round trajectory immutable metadata mismatch");
         }
         if (input.receivedAt < row.first_received_at) {
@@ -11547,13 +12044,28 @@ export class RouletteDatabase {
       undefined,
       "externalRoundId",
     );
-    return this.#transaction(() => {
+    const outcome = this.#transaction(() => {
       const cohort = mapCurrentCellHorizonCohort(this.sqlite.prepare(`
         SELECT *
         FROM current_cell_horizon_shadow_cohorts
         WHERE cohort_key = ?
       `).get(CURRENT_CELL_HORIZON_SHADOW_COHORT_KEY));
       if (!cohort) throw new Error("current-cell shadow cohort is invalid");
+      const boundary = this.sqlite.prepare(`
+        SELECT *
+        FROM predictive_shadow_integrity_boundaries
+        WHERE boundary_key = 'predictive-shadow-metadata-integrity-v1'
+          AND current_cell_cohort_key = ?
+      `).get(cohort.cohortKey);
+      if (
+        !boundary
+        || boundary.policy_version !== "metadata-conflict-void-v1"
+        || !Number.isSafeInteger(Number(boundary.first_trajectory_id))
+        || Number(boundary.first_trajectory_id) < 1
+        || boundary.started_at !== boundary.created_at
+      ) {
+        throw new Error("current-cell shadow v29 boundary is invalid");
+      }
       if (safeSource !== cohort.source || safeInstrument !== cohort.instrument) {
         return { inserted: false, reason: "outside_frozen_stream", retryable: false };
       }
@@ -11572,15 +12084,58 @@ export class RouletteDatabase {
       if (!trajectory) {
         return { inserted: false, reason: "trajectory_not_found", retryable: true };
       }
-      if (trajectory.betting_closes_at !== safeExpectedBettingClosesAt) {
-        return { inserted: false, reason: "metadata_conflict", retryable: false };
-      }
       const trajectoryId = Number(trajectory.id);
       if (
-        trajectoryId < cohort.firstTrajectoryId
-        || trajectory.created_at < cohort.startedAt
+        trajectoryId < Number(boundary.first_trajectory_id)
+        || trajectory.created_at < boundary.started_at
+        || new Date(
+          Date.parse(trajectory.betting_closes_at) - cohort.horizonSeconds * 1_000,
+        ).toISOString() < boundary.started_at
       ) {
-        return { inserted: false, reason: "outside_prospective_cohort", retryable: false };
+        return {
+          inserted: false,
+          reason: "outside_prospective_boundary",
+          retryable: false,
+        };
+      }
+      const existingVoid = this.sqlite.prepare(`
+        SELECT 1
+        FROM predictive_shadow_round_metadata_conflicts
+        WHERE boundary_key = 'predictive-shadow-metadata-integrity-v1'
+          AND source = ? AND instrument = ?
+          AND external_round_id = ?
+      `).get(safeSource, safeInstrument, safeRoundId);
+      if (existingVoid) {
+        return {
+          inserted: false,
+          reason: "metadata_conflict",
+          retryable: false,
+          voidInserted: false,
+          databaseChanged: false,
+        };
+      }
+      if (trajectory.betting_closes_at !== safeExpectedBettingClosesAt) {
+        const conflictAt = asTimestamp(
+          this.clock(),
+          undefined,
+          "current-cell shadow metadata conflict at",
+        );
+        const voidInserted = this.#recordCurrentCellHorizonMetadataConflict({
+          source: safeSource,
+          instrument: safeInstrument,
+          externalRoundId: safeRoundId,
+          originalBettingClosesAt: trajectory.betting_closes_at,
+          observedBettingClosesAt: safeExpectedBettingClosesAt,
+          observedAt: conflictAt,
+          createdAt: conflictAt,
+        });
+        return {
+          inserted: false,
+          reason: "metadata_conflict",
+          retryable: false,
+          voidInserted,
+          databaseChanged: voidInserted,
+        };
       }
       const existing = this.sqlite.prepare(`
         SELECT trajectory_id
@@ -11706,6 +12261,7 @@ export class RouletteDatabase {
         status: snapshot.status,
       };
     });
+    return outcome;
   }
 
   settleCurrentCellHorizonShadows(
@@ -11715,7 +12271,7 @@ export class RouletteDatabase {
     this.#assertOpen();
     const safeSource = asNonEmptyText(source, undefined, "source");
     const safeInstrument = asNonEmptyText(instrument, undefined, "instrument");
-    return this.#transaction(() => {
+    const outcome = this.#transaction(() => {
       const rows = this.sqlite.prepare(`
         SELECT
           snapshots.*,
@@ -11731,6 +12287,9 @@ export class RouletteDatabase {
         FROM round_trajectory_current_cell_horizon_snapshots AS snapshots
         JOIN round_trajectories AS trajectories
           ON trajectories.id = snapshots.trajectory_id
+        JOIN predictive_shadow_integrity_boundaries AS boundaries
+          ON boundaries.current_cell_cohort_key = snapshots.cohort_key
+         AND boundaries.boundary_key = 'predictive-shadow-metadata-integrity-v1'
         JOIN round_results AS results
           ON results.source = trajectories.source
          AND results.instrument = trajectories.instrument
@@ -11738,11 +12297,19 @@ export class RouletteDatabase {
         LEFT JOIN round_trajectory_current_cell_horizon_evaluations AS evaluations
           ON evaluations.trajectory_id = snapshots.trajectory_id
          AND evaluations.cohort_key = snapshots.cohort_key
+        LEFT JOIN predictive_shadow_round_metadata_conflicts AS voids
+          ON voids.boundary_key = boundaries.boundary_key
+         AND voids.source = trajectories.source
+         AND voids.instrument = trajectories.instrument
+         AND voids.external_round_id = trajectories.external_round_id
         WHERE trajectories.source = ?
           AND trajectories.instrument = ?
           AND snapshots.cohort_key = ?
           AND snapshots.status = 'ready'
+          AND trajectories.id >= boundaries.first_trajectory_id
+          AND trajectories.created_at >= boundaries.started_at
           AND evaluations.trajectory_id IS NULL
+          AND voids.external_round_id IS NULL
         ORDER BY trajectories.betting_closes_at, snapshots.trajectory_id
       `).all(
         safeSource,
@@ -11810,6 +12377,7 @@ export class RouletteDatabase {
       }
       return { settled };
     });
+    return outcome;
   }
 
   #roundTrajectoryPrefix(
@@ -13875,12 +14443,21 @@ export class RouletteDatabase {
       if (!cohort) {
         throw new Error("predictive leader v7 cohort is invalid");
       }
-      const existing = this.sqlite.prepare(`
-        SELECT forecast_id
-        FROM forecast_predictive_leader_v7_snapshots
-        WHERE forecast_id = ? AND candidate_key = ?
-      `).get(forecastId, cohort.candidateId);
-      if (existing) return { inserted: false, reason: "already_frozen" };
+      const boundary = this.sqlite.prepare(`
+        SELECT *
+        FROM predictive_shadow_integrity_boundaries
+        WHERE boundary_key = 'predictive-shadow-metadata-integrity-v1'
+          AND v7_candidate_key = ?
+      `).get(cohort.candidateId);
+      if (
+        !boundary
+        || boundary.policy_version !== "metadata-conflict-void-v1"
+        || !Number.isSafeInteger(Number(boundary.first_forecast_id))
+        || Number(boundary.first_forecast_id) < 1
+        || boundary.started_at !== boundary.created_at
+      ) {
+        throw new Error("predictive shadow v29 boundary is invalid");
+      }
 
       const parent = this.sqlite.prepare(`
         SELECT
@@ -13932,12 +14509,27 @@ export class RouletteDatabase {
         return { inserted: false, reason: "outside_frozen_stream" };
       }
       if (
-        forecastId < cohort.firstForecastId
+        forecastId < Number(boundary.first_forecast_id)
         || Number(parent.horizon_seconds) !== cohort.forecastHorizonSeconds
-        || parent.locked_at < cohort.startedAt
+        || parent.locked_at < boundary.started_at
       ) {
-        return { inserted: false, reason: "outside_prospective_cohort" };
+        return { inserted: false, reason: "outside_prospective_boundary" };
       }
+      const metadataConflict = this.sqlite.prepare(`
+        SELECT 1
+        FROM predictive_shadow_round_metadata_conflicts
+        WHERE boundary_key = 'predictive-shadow-metadata-integrity-v1'
+          AND source = ? AND instrument = ? AND external_round_id = ?
+      `).get(parent.source, parent.instrument, parent.external_round_id);
+      if (metadataConflict) {
+        return { inserted: false, reason: "metadata_conflict" };
+      }
+      const existing = this.sqlite.prepare(`
+        SELECT forecast_id
+        FROM forecast_predictive_leader_v7_snapshots
+        WHERE forecast_id = ? AND candidate_key = ?
+      `).get(forecastId, cohort.candidateId);
+      if (existing) return { inserted: false, reason: "already_frozen" };
       if (parent.settlement_forecast_id != null) {
         throw new Error("predictive leader v7 requires an unsettled frozen forecast");
       }
@@ -14518,7 +15110,9 @@ export class RouletteDatabase {
     const primaryOutcome = this.#transaction(() => {
       const existing = this.sqlite
         .prepare(`
-          SELECT forecasts.id AS forecast_id
+          SELECT
+            forecasts.id AS forecast_id,
+            snapshots.betting_closes_at
           FROM forecast_snapshots AS snapshots
           JOIN round_forecasts AS forecasts ON forecasts.snapshot_id = snapshots.id
           WHERE snapshots.source = ?
@@ -14529,8 +15123,28 @@ export class RouletteDatabase {
         `)
         .get(source, instrument, externalRoundId, horizonSeconds);
       if (existing) {
+        let voidInserted = false;
+        if (existing.betting_closes_at !== bettingClosesAt) {
+          const conflictAt = asTimestamp(
+            this.clock(),
+            undefined,
+            "predictive shadow metadata conflict at",
+          );
+          voidInserted = this.#recordCurrentCellHorizonMetadataConflict({
+            source,
+            instrument,
+            externalRoundId,
+            originalBettingClosesAt: existing.betting_closes_at,
+            observedBettingClosesAt: bettingClosesAt,
+            observedAt: conflictAt,
+            createdAt: conflictAt,
+          });
+        }
         return {
           inserted: false,
+          databaseChanged: voidInserted,
+          metadataConflict: existing.betting_closes_at !== bettingClosesAt,
+          voidInserted,
           roundId: externalRoundId,
           forecastId: Number(existing.forecast_id),
         };
@@ -14740,7 +15354,8 @@ export class RouletteDatabase {
     return {
       inserted: primaryOutcome.inserted,
       databaseChanged:
-        primaryOutcome.inserted
+        primaryOutcome.databaseChanged
+        || primaryOutcome.inserted
         || predictiveLeaderOutcome.inserted
         || predictiveLeaderV7Outcome.inserted,
       roundId: externalRoundId,
@@ -16338,6 +16953,21 @@ export class RouletteDatabase {
       WHERE candidate_key = ?
     `).get(PREDICTIVE_LEADER_V7_CANDIDATE_CONFIG.candidateId));
     if (!cohort) throw new Error("predictive leader v7 cohort is invalid");
+    const boundary = this.sqlite.prepare(`
+      SELECT *
+      FROM predictive_shadow_integrity_boundaries
+      WHERE boundary_key = 'predictive-shadow-metadata-integrity-v1'
+        AND v7_candidate_key = ?
+    `).get(cohort.candidateId);
+    if (
+      !boundary
+      || boundary.policy_version !== "metadata-conflict-void-v1"
+      || !Number.isSafeInteger(Number(boundary.first_forecast_id))
+      || Number(boundary.first_forecast_id) < 1
+      || boundary.started_at !== boundary.created_at
+    ) {
+      throw new Error("predictive shadow v29 boundary is invalid");
+    }
     if (safeSource !== cohort.source || safeInstrument !== cohort.instrument) {
       throw new RangeError("predictive leader v7 audit is pinned to its frozen stream");
     }
@@ -16380,6 +17010,11 @@ export class RouletteDatabase {
         v7.selected AS v7_selected,
         v7.snapshot_json AS v7_snapshot_json,
         v7.created_at AS v7_created_at,
+        conflicts.reason AS conflict_reason,
+        conflicts.original_betting_closes_at AS conflict_original_betting_closes_at,
+        conflicts.observed_betting_closes_at AS conflict_observed_betting_closes_at,
+        conflicts.observed_at AS conflict_observed_at,
+        conflicts.created_at AS conflict_created_at,
         leaders.forecast_id AS leader_forecast_id,
         leaders.schema_version AS leader_schema_version,
         leaders.algorithm_version AS leader_algorithm_version,
@@ -16405,6 +17040,11 @@ export class RouletteDatabase {
         ON results.id = settlements.round_result_id
       LEFT JOIN forecast_predictive_leader_v7_snapshots AS v7
         ON v7.forecast_id = forecasts.id AND v7.candidate_key = ?
+      LEFT JOIN predictive_shadow_round_metadata_conflicts AS conflicts
+        ON conflicts.boundary_key = 'predictive-shadow-metadata-integrity-v1'
+       AND conflicts.source = snapshots.source
+       AND conflicts.instrument = snapshots.instrument
+       AND conflicts.external_round_id = snapshots.external_round_id
       LEFT JOIN forecast_predictive_leader_snapshots AS leaders
         ON leaders.forecast_id = forecasts.id
       LEFT JOIN forecast_settlements AS leader_training_settlements
@@ -16421,12 +17061,15 @@ export class RouletteDatabase {
       safeSource,
       safeInstrument,
       cohort.forecastHorizonSeconds,
-      cohort.firstForecastId,
-      cohort.startedAt,
+      Number(boundary.first_forecast_id),
+      boundary.started_at,
     );
     const mapped = rows.map((row) => ({
       row,
-      v7: mapForecastPredictiveLeaderV7(row, cohort),
+      voided: row.conflict_reason != null,
+      v7: row.conflict_reason == null
+        ? mapForecastPredictiveLeaderV7(row, cohort)
+        : null,
       champion: mapForecastPredictiveLeader(row),
     }));
     const validV7 = mapped.map(({ v7 }) => v7).filter(Boolean);
@@ -16446,9 +17089,12 @@ export class RouletteDatabase {
       fixedSelected.length < PREDICTIVE_LEADER_V7_GATE_WINDOW_SIZE
         || Number(row.forecast_id) <= fixedWindowEndForecastId
     ));
+    const fixedValidSelectedCount = fixedSelected.filter(({ v7 }) => (
+      v7?.status === "ready" && v7.selection.eligible
+    )).length;
     const selectionCoverage = coverageRows.length === 0
       ? null
-      : fixedSelected.length / coverageRows.length;
+      : fixedValidSelectedCount / coverageRows.length;
     const fixedLeaders = fixedEvaluated.map(({ v7 }) => v7);
     const fixedSummary = summarizePredictiveLeaderV7(fixedLeaders);
     const hitRateInterval = wilsonInterval95(
@@ -16464,9 +17110,14 @@ export class RouletteDatabase {
     const fixedComplete =
       fixedSelected.length === PREDICTIVE_LEADER_V7_GATE_WINDOW_SIZE
       && fixedEvaluated.length === PREDICTIVE_LEADER_V7_GATE_WINDOW_SIZE;
+    const fixedWindowComplete =
+      fixedSelected.length === PREDICTIVE_LEADER_V7_GATE_WINDOW_SIZE;
+    const fixedMetadataIntegrity = fixedWindowComplete
+      && fixedSelected.every(({ voided, v7 }) => !voided && v7 !== null);
     const criterion = (value) => fixedComplete ? value : null;
     const gateCriteria = {
       fixedSampleComplete: fixedComplete,
+      metadataIntegrity: fixedWindowComplete ? fixedMetadataIntegrity : null,
       selectionCoverage: criterion(
         selectionCoverage !== null
           && selectionCoverage >= PREDICTIVE_LEADER_V7_MINIMUM_SELECTION_COVERAGE,
@@ -16511,6 +17162,18 @@ export class RouletteDatabase {
     const latestMapped = mapped.at(-1) ?? null;
     const latestCandidate = latestMapped === null
       ? null
+      : latestMapped.voided
+        ? {
+            availability: "void",
+            status: "void",
+            reason: latestMapped.row.conflict_reason,
+            originalBettingClosesAt:
+              latestMapped.row.conflict_original_betting_closes_at,
+            observedBettingClosesAt:
+              latestMapped.row.conflict_observed_betting_closes_at,
+            observedAt: latestMapped.row.conflict_observed_at,
+            createdAt: latestMapped.row.conflict_created_at,
+          }
       : latestMapped.v7
         ? {
             availability: latestMapped.v7.status,
@@ -16555,6 +17218,14 @@ export class RouletteDatabase {
       source: safeSource,
       instrument: safeInstrument,
       cohort,
+      integrityBoundary: {
+        boundaryKey: boundary.boundary_key,
+        policyVersion: boundary.policy_version,
+        firstForecastId: Number(boundary.first_forecast_id),
+        firstTrajectoryId: Number(boundary.first_trajectory_id),
+        startedAt: boundary.started_at,
+        createdAt: boundary.created_at,
+      },
       latest: latestMapped === null
         ? null
         : {
@@ -16576,11 +17247,16 @@ export class RouletteDatabase {
           },
       metrics: {
         cohortEligibleForecastCount: rows.length,
-        cohortSettledForecastCount: rows.filter((row) => row.actual_number != null).length,
+        cohortSettledForecastCount: mapped.filter(({ row, voided }) => (
+          row.actual_number != null && !voided
+        )).length,
         storedCount: mapped.filter(({ row }) => row.v7_forecast_id != null).length,
-        missingCount: mapped.filter(({ row }) => row.v7_forecast_id == null).length,
-        invalidCount: mapped.filter(({ row, v7 }) => (
-          row.v7_forecast_id != null && v7 === null
+        missingCount: mapped.filter(({ row, voided }) => (
+          row.v7_forecast_id == null && !voided
+        )).length,
+        voidCount: mapped.filter(({ voided }) => voided).length,
+        invalidCount: mapped.filter(({ row, v7, voided }) => (
+          row.v7_forecast_id != null && v7 === null && !voided
         )).length,
         readyCount: readyV7.length,
         unavailableCount: validV7.filter((leader) => leader.status === "unavailable").length,
@@ -16591,7 +17267,9 @@ export class RouletteDatabase {
       },
       qualityGateDiagnostic: {
         version: PREDICTIVE_LEADER_V7_GATE_VERSION,
-        status: !fixedComplete
+        status: fixedWindowComplete && !fixedMetadataIntegrity
+          ? "signals_failed"
+          : !fixedComplete
           ? "collecting"
           : statisticalSignalsPass
             ? "signals_pass"
@@ -16599,7 +17277,10 @@ export class RouletteDatabase {
         windowPolicy: "first-1000-selected-settled-prospective-no-roll",
         targetSampleSize: PREDICTIVE_LEADER_V7_GATE_WINDOW_SIZE,
         selectedCohortSize: fixedSelected.length,
+        validSelectedCohortSize: fixedValidSelectedCount,
         sampleSize: fixedEvaluated.length,
+        fixedWindowComplete,
+        settlementComplete: fixedComplete,
         windowStartForecastId: fixedSelected[0]?.row.forecast_id == null
           ? null
           : Number(fixedSelected[0].row.forecast_id),
@@ -16638,6 +17319,21 @@ export class RouletteDatabase {
       WHERE cohort_key = ?
     `).get(CURRENT_CELL_HORIZON_SHADOW_COHORT_KEY));
     if (!cohort) throw new Error("current-cell shadow cohort is invalid");
+    const boundary = this.sqlite.prepare(`
+      SELECT *
+      FROM predictive_shadow_integrity_boundaries
+      WHERE boundary_key = 'predictive-shadow-metadata-integrity-v1'
+        AND current_cell_cohort_key = ?
+    `).get(cohort.cohortKey);
+    if (
+      !boundary
+      || boundary.policy_version !== "metadata-conflict-void-v1"
+      || !Number.isSafeInteger(Number(boundary.first_trajectory_id))
+      || Number(boundary.first_trajectory_id) < 1
+      || boundary.started_at !== boundary.created_at
+    ) {
+      throw new Error("current-cell shadow v29 boundary is invalid");
+    }
     if (safeSource !== cohort.source || safeInstrument !== cohort.instrument) {
       throw new RangeError("current-cell shadow audit is pinned to its frozen stream");
     }
@@ -16668,6 +17364,11 @@ export class RouletteDatabase {
         shadows.margin AS shadow_margin,
         shadows.snapshot_json AS shadow_snapshot_json,
         shadows.created_at AS shadow_created_at,
+        voids.reason AS void_reason,
+        voids.original_betting_closes_at AS void_original_betting_closes_at,
+        voids.observed_betting_closes_at AS void_observed_betting_closes_at,
+        voids.observed_at AS void_observed_at,
+        voids.created_at AS void_created_at,
         evaluations.trajectory_id AS evaluation_trajectory_id,
         evaluations.cohort_key AS evaluation_cohort_key,
         evaluations.round_result_id AS evaluation_round_result_id,
@@ -16727,6 +17428,11 @@ export class RouletteDatabase {
       LEFT JOIN round_trajectory_current_cell_horizon_evaluations AS evaluations
         ON evaluations.trajectory_id = shadows.trajectory_id
        AND evaluations.cohort_key = shadows.cohort_key
+      LEFT JOIN predictive_shadow_round_metadata_conflicts AS voids
+        ON voids.boundary_key = 'predictive-shadow-metadata-integrity-v1'
+       AND voids.source = trajectories.source
+       AND voids.instrument = trajectories.instrument
+       AND voids.external_round_id = trajectories.external_round_id
       LEFT JOIN round_results AS results
         ON results.id = evaluations.round_result_id
       LEFT JOIN forecast_snapshots AS v5_snapshots
@@ -16754,12 +17460,15 @@ export class RouletteDatabase {
       cohort.cohortKey,
       safeSource,
       safeInstrument,
-      cohort.firstTrajectoryId,
-      cohort.startedAt,
+      Number(boundary.first_trajectory_id),
+      boundary.started_at,
     );
     const mapped = rows.map((row) => ({
       row,
-      current: mapCurrentCellHorizonSnapshot(row, cohort),
+      voided: row.void_reason != null,
+      current: row.void_reason == null
+        ? mapCurrentCellHorizonSnapshot(row, cohort)
+        : null,
       champion: mapCurrentCellPairedV5(row),
     }));
     const valid = mapped.map(({ current }) => current).filter(Boolean);
@@ -16777,7 +17486,7 @@ export class RouletteDatabase {
     const fixedEnd = fixedRows.at(-1)?.row ?? rows.at(-1) ?? null;
     const coverageRows = fixedEnd === null
       ? []
-      : rows.filter((row) => (
+      : mapped.filter(({ row }) => (
           row.betting_closes_at < fixedEnd.betting_closes_at
           || (
             row.betting_closes_at === fixedEnd.betting_closes_at
@@ -16786,8 +17495,10 @@ export class RouletteDatabase {
         ));
     const readyCoverage = coverageRows.length === 0
       ? null
-      : coverageRows.filter((row) => row.shadow_status === "ready").length
-        / coverageRows.length;
+        : coverageRows.filter(({ row, current }) => (
+            row.shadow_status === "ready" && current?.status === "ready"
+          )).length
+          / coverageRows.length;
     const fixedSummary = summarizeCurrentCellHorizonSnapshots(fixedSnapshots);
     const hitRateInterval = wilsonInterval95(
       fixedSummary.top1Hits,
@@ -16813,9 +17524,12 @@ export class RouletteDatabase {
       CURRENT_CELL_HORIZON_SHADOW_GATE_WINDOW_SIZE
         * CURRENT_CELL_HORIZON_SHADOW_MINIMUM_PAIRED_V5_COVERAGE,
     );
+    const fixedMetadataIntegrity = fixedWindowComplete
+      && fixedRows.every(({ voided, current }) => !voided && current !== null);
     const criterion = (value) => fixedSettlementComplete ? value : null;
     const gateCriteria = {
       fixedSampleComplete: fixedSettlementComplete,
+      metadataIntegrity: fixedWindowComplete ? fixedMetadataIntegrity : null,
       readyCoverage: criterion(
         readyCoverage !== null
           && readyCoverage >= CURRENT_CELL_HORIZON_SHADOW_MINIMUM_READY_COVERAGE,
@@ -16861,6 +17575,18 @@ export class RouletteDatabase {
     const latestMapped = mapped.at(-1) ?? null;
     const latestCurrent = latestMapped === null
       ? null
+      : latestMapped.voided
+        ? {
+            availability: "void",
+            status: "void",
+            reason: latestMapped.row.void_reason,
+            originalBettingClosesAt:
+              latestMapped.row.void_original_betting_closes_at,
+            observedBettingClosesAt:
+              latestMapped.row.void_observed_betting_closes_at,
+            observedAt: latestMapped.row.void_observed_at,
+            createdAt: latestMapped.row.void_created_at,
+          }
       : latestMapped.current
         ? {
             availability: latestMapped.current.status,
@@ -16905,6 +17631,14 @@ export class RouletteDatabase {
       source: safeSource,
       instrument: safeInstrument,
       cohort,
+      integrityBoundary: {
+        boundaryKey: boundary.boundary_key,
+        policyVersion: boundary.policy_version,
+        firstForecastId: Number(boundary.first_forecast_id),
+        firstTrajectoryId: Number(boundary.first_trajectory_id),
+        startedAt: boundary.started_at,
+        createdAt: boundary.created_at,
+      },
       latest: latestMapped === null
         ? null
         : {
@@ -16918,9 +17652,12 @@ export class RouletteDatabase {
       metrics: {
         cohortEligibleTrajectoryCount: rows.length,
         storedCount: mapped.filter(({ row }) => row.shadow_trajectory_id != null).length,
-        missingCount: mapped.filter(({ row }) => row.shadow_trajectory_id == null).length,
-        invalidCount: mapped.filter(({ row, current }) => (
-          row.shadow_trajectory_id != null && current === null
+        missingCount: mapped.filter(({ row, voided }) => (
+          row.shadow_trajectory_id == null && !voided
+        )).length,
+        voidCount: mapped.filter(({ voided }) => voided).length,
+        invalidCount: mapped.filter(({ row, current, voided }) => (
+          row.shadow_trajectory_id != null && current === null && !voided
         )).length,
         readyCount: ready.length,
         unavailableCount: valid.filter(
@@ -16933,7 +17670,9 @@ export class RouletteDatabase {
       },
       qualityGateDiagnostic: {
         version: CURRENT_CELL_HORIZON_SHADOW_GATE_VERSION,
-        status: !fixedSettlementComplete
+        status: fixedWindowComplete && !fixedMetadataIntegrity
+          ? "signals_failed"
+          : !fixedSettlementComplete
           ? "collecting"
           : statisticalSignalsPass
             ? "signals_pass"

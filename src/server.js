@@ -10,7 +10,10 @@ import { createServer } from 'node:http';
 import { dirname, extname, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { BuletoCollector } from './collector.js';
-import { createCurrentCellHorizonScheduler } from './current-cell-horizon-scheduler.js';
+import {
+  createCurrentCellHorizonScheduler,
+  createCurrentCellMetadataConflictRetryQueue,
+} from './current-cell-horizon-scheduler.js';
 import {
   createDatabase,
   PREDICTIVE_SHADOW_FROZEN_STREAM,
@@ -156,6 +159,7 @@ const DATABASE_WRITE_UPDATE_REASONS = new Set([
   'forecast-settled',
   'current-cell-horizon-captured',
   'current-cell-horizon-settled',
+  'predictive-shadow-metadata-conflict',
   'predictive-leader-signal-account',
   'predictive-leader-account',
 ]);
@@ -1011,13 +1015,56 @@ let pipelineFlushTimer = null;
 let pipelineRetryAttempt = 0;
 const MAX_PENDING_ROUND_TRAJECTORIES = 4_096;
 const MAX_ROUND_TRAJECTORY_RETRIES = 8;
+const MAX_PENDING_METADATA_CONFLICTS = 1_024;
 const pendingRoundTrajectories = [];
 let roundTrajectoryRetryTimer = null;
 let roundTrajectoryDrainActive = false;
 let roundTrajectoryOverflowLogged = false;
 
+function isTransientSqliteLock(error) {
+  return (
+    /^SQLITE_(?:BUSY|LOCKED)/.test(error?.code ?? '')
+    || (
+      error?.code === 'ERR_SQLITE_ERROR'
+      && (error.errcode === 5 || error.errcode === 6)
+    )
+  );
+}
+
+const metadataConflictRetryQueue = createCurrentCellMetadataConflictRetryQueue({
+  maxPending: MAX_PENDING_METADATA_CONFLICTS,
+  persist(conflict) {
+    return db.recordCurrentCellHorizonMetadataConflict(
+      conflict.source,
+      conflict.instrument,
+      conflict.externalRoundId,
+      conflict.originalBettingClosesAt,
+      conflict.observedBettingClosesAt,
+      conflict.observedAt,
+    );
+  },
+  isTransientError: isTransientSqliteLock,
+  shouldRetry: () => !shuttingDown,
+  onDatabaseChanged() {
+    broadcastUpdate('predictive-shadow-metadata-conflict');
+  },
+  onTransientError(error, conflict, failureCount) {
+    console.error(
+      `[current-cell-10s] metadata conflict for round ${conflict.externalRoundId} retained after transient persistence failure ${failureCount}`,
+      error,
+    );
+  },
+  onPermanentError(error, conflict) {
+    console.error(
+      `[current-cell-10s] metadata conflict for round ${conflict?.externalRoundId ?? 'unknown'} could not be persisted`,
+      error,
+    );
+  },
+});
+
 const currentCellHorizonScheduler = createCurrentCellHorizonScheduler({
   capture(attempt) {
+    if (!metadataConflictRetryQueue.drain()) return { reason: 'transient' };
     if (!drainRoundTrajectoryQueue()) return { reason: 'transient' };
     try {
       const outcome = db.recordCurrentCellHorizonShadow(
@@ -1031,10 +1078,14 @@ const currentCellHorizonScheduler = createCurrentCellHorizonScheduler({
           `[current-cell-10s] immutable close metadata conflict for round ${attempt.externalRoundId}; capture disabled`,
         );
       }
-      if (outcome.inserted) broadcastUpdate('current-cell-horizon-captured');
+      if (outcome.databaseChanged) {
+        broadcastUpdate('predictive-shadow-metadata-conflict');
+      } else if (outcome.inserted) {
+        broadcastUpdate('current-cell-horizon-captured');
+      }
       return outcome;
     } catch (error) {
-      if (/^SQLITE_(?:BUSY|LOCKED)/.test(error?.code ?? '')) {
+      if (isTransientSqliteLock(error)) {
         console.error('[current-cell-10s] transient capture failure; retrying', error);
         return { reason: 'transient' };
       }
@@ -1081,7 +1132,10 @@ function drainRoundTrajectoryQueue({ retry = true } = {}) {
     while (pendingRoundTrajectories.length > 0) {
       const pending = pendingRoundTrajectories[0];
       try {
-        db.recordRoundTrajectory(pending.trajectory);
+        const outcome = db.recordRoundTrajectory(pending.trajectory);
+        if (outcome.databaseChanged) {
+          broadcastUpdate('predictive-shadow-metadata-conflict');
+        }
       } catch (error) {
         pending.failureCount += 1;
         if (
@@ -1343,6 +1397,14 @@ collector.on('round', (round) => {
         console.error(
           `[current-cell-10s] round ${roundId} changed bettingClosesAt; capture cancelled`,
         );
+        metadataConflictRetryQueue.enqueue({
+          source: 'buleto',
+          instrument: config.instrument,
+          externalRoundId: roundId,
+          originalBettingClosesAt: scheduleOutcome.originalBettingClosesAt,
+          observedBettingClosesAt: scheduleOutcome.observedBettingClosesAt,
+          observedAt: new Date().toISOString(),
+        });
       }
     } catch (error) {
       console.error('[current-cell-10s] round could not be scheduled', error);
@@ -1392,6 +1454,7 @@ function shutdown(signal) {
   }
   collector.stop();
   currentCellHorizonScheduler.stop();
+  metadataConflictRetryQueue.cancelRetry();
   clearTimeout(roundTrajectoryRetryTimer);
   roundTrajectoryRetryTimer = null;
   clearTimeout(pipelineFlushTimer);
@@ -1406,6 +1469,7 @@ function shutdown(signal) {
   let forceExitTimer = null;
 
   const finish = (exitCode) => {
+    metadataConflictRetryQueue.cancelRetry();
     clearTimeout(roundTrajectoryRetryTimer);
     clearTimeout(persistenceRetryTimer);
     clearTimeout(forceExitTimer);
@@ -1419,11 +1483,17 @@ function shutdown(signal) {
   };
 
   const drainAndExit = () => {
+    const metadataConflictsPersisted = metadataConflictRetryQueue.drain({ retry: false });
     const trajectoriesPersisted = drainRoundTrajectoryQueue({ retry: false });
     try {
       publishPipelineOutcome(resultPipeline.drain());
       const pending = resultPipeline.getPendingCounts();
-      if (trajectoriesPersisted && pending.results === 0 && pending.gaps === 0) {
+      if (
+        metadataConflictsPersisted
+        && trajectoriesPersisted
+        && pending.results === 0
+        && pending.gaps === 0
+      ) {
         finish(0);
         return;
       }

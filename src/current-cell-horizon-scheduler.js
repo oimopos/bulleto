@@ -4,6 +4,8 @@ import {
 
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 const DEFAULT_RETRY_DELAY_MS = 250;
+const DEFAULT_METADATA_CONFLICT_RETRY_DELAY_MS = 1_000;
+const DEFAULT_METADATA_CONFLICT_MAX_RETRY_DELAY_MS = 30_000;
 const RETRYABLE_REASONS = new Set([
   "transient",
   "trajectory_not_found",
@@ -36,6 +38,161 @@ function positiveFiniteNumber(value, label) {
     throw new TypeError(`${label} must be a positive finite number`);
   }
   return value;
+}
+
+function positiveInteger(value, label) {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new TypeError(`${label} must be a positive safe integer`);
+  }
+  return value;
+}
+
+function metadataConflictIdentityKey(conflict) {
+  return JSON.stringify([
+    nonEmptyString(conflict?.source, "conflict.source"),
+    nonEmptyString(conflict?.instrument, "conflict.instrument"),
+    nonEmptyString(conflict?.externalRoundId, "conflict.externalRoundId"),
+  ]);
+}
+
+/**
+ * Keeps scheduler-detected close-metadata conflicts in a bounded FIFO until a
+ * synchronous persistence attempt succeeds or returns a non-transient error.
+ */
+export function createCurrentCellMetadataConflictRetryQueue({
+  persist,
+  isTransientError,
+  onDatabaseChanged = () => {},
+  onTransientError = () => {},
+  onPermanentError = () => {},
+  shouldRetry = () => true,
+  setTimeout: setTimeoutFn = globalThis.setTimeout,
+  clearTimeout: clearTimeoutFn = globalThis.clearTimeout,
+  maxPending = 1_024,
+  retryDelayMs = DEFAULT_METADATA_CONFLICT_RETRY_DELAY_MS,
+  maxRetryDelayMs = DEFAULT_METADATA_CONFLICT_MAX_RETRY_DELAY_MS,
+} = {}) {
+  if (typeof persist !== "function") throw new TypeError("persist must be a function");
+  if (typeof isTransientError !== "function") {
+    throw new TypeError("isTransientError must be a function");
+  }
+  for (const [label, callback] of [
+    ["onDatabaseChanged", onDatabaseChanged],
+    ["onTransientError", onTransientError],
+    ["onPermanentError", onPermanentError],
+    ["shouldRetry", shouldRetry],
+    ["setTimeout", setTimeoutFn],
+    ["clearTimeout", clearTimeoutFn],
+  ]) {
+    if (typeof callback !== "function") throw new TypeError(`${label} must be a function`);
+  }
+  const safeMaxPending = positiveInteger(maxPending, "maxPending");
+  const safeRetryDelayMs = positiveFiniteNumber(retryDelayMs, "retryDelayMs");
+  const safeMaxRetryDelayMs = positiveFiniteNumber(
+    maxRetryDelayMs,
+    "maxRetryDelayMs",
+  );
+  if (safeMaxRetryDelayMs < safeRetryDelayMs) {
+    throw new RangeError("maxRetryDelayMs cannot be less than retryDelayMs");
+  }
+
+  const pending = [];
+  const pendingIdentityKeys = new Set();
+  let retryTimer = null;
+  let draining = false;
+
+  function removeHead() {
+    const removed = pending.shift();
+    if (removed) pendingIdentityKeys.delete(removed.identityKey);
+  }
+
+  function cancelRetry() {
+    if (retryTimer === null) return;
+    clearTimeoutFn(retryTimer);
+    retryTimer = null;
+  }
+
+  function scheduleRetry() {
+    if (retryTimer !== null || pending.length === 0 || !shouldRetry()) return;
+    const failureCount = pending[0].failureCount;
+    const delayMs = Math.min(
+      safeMaxRetryDelayMs,
+      safeRetryDelayMs * 2 ** Math.min(Math.max(0, failureCount - 1), 5),
+    );
+    retryTimer = setTimeoutFn(() => {
+      retryTimer = null;
+      drain();
+    }, delayMs);
+    retryTimer?.unref?.();
+  }
+
+  function drain({ retry = true } = {}) {
+    if (draining) return pending.length === 0;
+    draining = true;
+    let transientFailure = null;
+    try {
+      while (pending.length > 0) {
+        const head = pending[0];
+        let outcome;
+        try {
+          outcome = persist(head.conflict);
+        } catch (error) {
+          head.failureCount += 1;
+          if (isTransientError(error)) {
+            transientFailure = error;
+            onTransientError(error, head.conflict, head.failureCount);
+            break;
+          }
+          removeHead();
+          onPermanentError(error, head.conflict, head.failureCount);
+          continue;
+        }
+        removeHead();
+        if (outcome?.databaseChanged) {
+          onDatabaseChanged(outcome, head.conflict);
+        }
+      }
+    } finally {
+      draining = false;
+    }
+
+    if (transientFailure !== null) {
+      if (retry) scheduleRetry();
+      return false;
+    }
+    cancelRetry();
+    return pending.length === 0;
+  }
+
+  function enqueue(conflict) {
+    const identityKey = metadataConflictIdentityKey(conflict);
+    if (pendingIdentityKeys.has(identityKey)) return pending.length === 0;
+    if (pending.length >= safeMaxPending) {
+      onPermanentError(
+        new RangeError(`metadata conflict retry queue reached ${safeMaxPending} entries`),
+        conflict,
+        0,
+      );
+      return false;
+    }
+    pending.push({
+      identityKey,
+      conflict: Object.freeze({ ...conflict }),
+      failureCount: 0,
+    });
+    pendingIdentityKeys.add(identityKey);
+    if (retryTimer === null) drain();
+    return pending.length === 0;
+  }
+
+  return Object.freeze({
+    enqueue,
+    drain,
+    cancelRetry,
+    get pendingCount() {
+      return pending.length;
+    },
+  });
 }
 
 function clockMilliseconds(clock) {
@@ -113,13 +270,14 @@ function retryableReason(value) {
   return null;
 }
 
-function scheduleResult(status, round) {
+function scheduleResult(status, round, details = {}) {
   return Object.freeze({
     status,
     roundKey: round.roundKey,
     externalRoundId: round.externalRoundId,
     cutoffAt: round.cutoffAt,
     deadlineAt: round.deadlineAt,
+    ...details,
   });
 }
 
@@ -158,7 +316,7 @@ export function createCurrentCellHorizonScheduler({
   let active = null;
   let generation = 0;
   let stopped = false;
-  const seenRoundKeys = new Map();
+  const seenRounds = new Map();
   const conflictedIdentities = new Set();
 
   function isCurrent(record) {
@@ -296,20 +454,26 @@ export function createCurrentCellHorizonScheduler({
     const round = normalizeRound(roundInput);
     if (stopped) return scheduleResult("stopped", round);
 
+    const seenRound = seenRounds.get(round.identityKey);
     if (conflictedIdentities.has(round.identityKey)) {
-      return scheduleResult("metadata_conflict", round);
+      return scheduleResult("metadata_conflict", round, {
+        originalBettingClosesAt: seenRound.bettingClosesAt,
+        observedBettingClosesAt: round.bettingClosesAt,
+      });
     }
-    const seenRoundKey = seenRoundKeys.get(round.identityKey);
-    if (seenRoundKey !== undefined && seenRoundKey !== round.roundKey) {
+    if (seenRound !== undefined && seenRound.roundKey !== round.roundKey) {
       conflictedIdentities.add(round.identityKey);
       if (active?.round.identityKey === round.identityKey) {
         retire(active, "metadata_conflict");
         active = null;
         generation += 1;
       }
-      return scheduleResult("metadata_conflict", round);
+      return scheduleResult("metadata_conflict", round, {
+        originalBettingClosesAt: seenRound.bettingClosesAt,
+        observedBettingClosesAt: round.bettingClosesAt,
+      });
     }
-    seenRoundKeys.set(round.identityKey, round.roundKey);
+    seenRounds.set(round.identityKey, round);
     if (active?.round.roundKey === round.roundKey) {
       return scheduleResult("deduplicated", active.round);
     }

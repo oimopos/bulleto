@@ -217,14 +217,19 @@ chronological train/tune, после выбора вероятность лид�
 development-части, а не дообучение по prospective-результатам.
 
 Кандидат жёстко привязан к `buleto / XPM/RUB` и тому же immutable production-
-export. Его когорта начинается с `MAX(round_trajectories.id) + 1`; backfill
-запрещён. Планировщик канонизирует исходный wire timestamp и запускает capture
-на `bcd - 10s`. Если для той же тройки source/instrument/round приходит другой
-`bcd`, активный capture отменяется и эта identity до перезапуска помечается
-`metadata_conflict`; она не перепланируется ни на более раннее, ни на более
-позднее время. При capture ожидаемый `bcd` дополнительно сверяется с первым
-immutable metadata в БД, поэтому несовпадение после перезапуска также закрывается
-без снимка. Запоздалое событие другого старого round не отменяет новый таймер.
+export. В v29 добавлена общая immutable-граница доказательств: новые окна v7 и
+current-cell начинаются соответственно с `MAX(round_forecasts.id) + 1` и
+`MAX(round_trajectories.id) + 1`; несколько уже собранных v27/v28 строк остаются
+неизменяемой legacy-историей, но не входят в новые gate-окна. Планировщик
+канонизирует исходный wire timestamp и запускает capture на `bcd - 10s`. Если для
+той же тройки source/instrument/round приходит другой `bcd`, активный capture
+отменяется, а конфликт навсегда записывается в SQLite даже до появления
+trajectory. Такой round не перепланируется ни на более раннее, ни на более
+позднее время. Конфликт, обнаруженный при повторном preclose, записи trajectory,
+capture или в финальном payload, также сохраняется. Если снимок v7/current-cell
+уже существовал, он не удаляется и не переписывается, но исключается из
+settlement, метрик, paper и gate; после перезапуска запрет сохраняется. Запоздалое
+событие другого старого round не отменяет новый таймер.
 Повторные попытки ограничены окном 2.5 секунды. Снимок использует только ticks, у которых `factor_at`,
 `received_at` и `created_at` не позже cutoff, и перед commit повторно требует
 минимум 5 секунд до закрытия ставок.
@@ -453,6 +458,8 @@ npm.cmd run backup -- ./data/buleto.sqlite ./seed/buleto.sqlite
 - `forecast_predictive_leader_v7_snapshots` — неизменяемые v7-решения только после границы когорты. Они ссылаются на замороженные causal источники v5, содержат selection-аудит, но не связаны с таблицами ставок или счетов.
 - `current_cell_horizon_shadow_cohorts` — immutable v28-когорта current-cell-10s с точной stream identity, frozen config/hash и export provenance.
 - `round_trajectory_current_cell_horizon_snapshots`, `round_trajectory_current_cell_horizon_evaluations` — append-only capture/evaluation current-cell; DB-триггеры запрещают backfill, подмену trajectory/result identity, settlement не позже capture, update и delete.
+- `predictive_shadow_integrity_boundaries` — immutable v29-граница новых доказательств сразу для v7 и current-cell; старые prospective-строки физически сохраняются, но не могут попасть в новые fixed gate-окна.
+- `predictive_shadow_round_metadata_conflicts` — общий append-only ledger смены `bcd`, привязанный к source/instrument/round даже до появления trajectory; конфликтные v7/current-cell решения fail-closed исключаются из settlement, метрик, paper и gate без удаления исходных снимков.
 - `predictive_leader_gated_fixed_bets` — основной проспективный fixed-stake счёт `1 000 / 10 / gross ×36`. Таблица содержит только сигналы, для которых замороженный gate разрешил `BET`; `pending`, авторитетный settlement и `void` переживают перезапуск и применяются идемпотентно.
 - `predictive_leader_accounts`, `predictive_leader_account_bets`, `predictive_leader_account_ladder_resets` — сохранённый без переписывания аудит прежнего лестничного счёта. Production больше не создаёт в нём новые ставки; существующие строки, resets и их связь с `forecast_settlements` остаются доступными как legacy-история.
 - `round_trajectories`, `round_trajectory_ticks`, `forecast_trajectory_shadows` — траектории с временем получения, замороженные Adaptive‑снимки, полный Rank‑37 и их проспективная проверка.

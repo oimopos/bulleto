@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import {
@@ -118,7 +121,7 @@ test("v28 creates an immutable, empty, no-backfill prospective cohort", () => {
     predictiveLeaderLegacyAccountEnabled: false,
   });
   try {
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 28);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 29);
     const cohort = database.sqlite.prepare(`
       SELECT * FROM current_cell_horizon_shadow_cohorts
     `).get();
@@ -211,19 +214,6 @@ test("v28 captures only causal ticks, enforces identity, then settles append-onl
     }]));
 
     nowMs = cutoffMs + 100;
-    assert.deepEqual(
-      database.recordCurrentCellHorizonShadow(
-        SOURCE,
-        INSTRUMENT,
-        "live-1",
-        iso(closesAtMs + 1_000),
-      ),
-      { inserted: false, reason: "metadata_conflict", retryable: false },
-    );
-    assert.equal(database.sqlite.prepare(`
-      SELECT COUNT(*) AS count
-      FROM round_trajectory_current_cell_horizon_snapshots
-    `).get().count, 0);
     assert.deepEqual(
       database.recordCurrentCellHorizonShadow(
         SOURCE,
@@ -524,6 +514,200 @@ test("v28 rolls back a capture if commit loses the execution buffer", () => {
       SELECT COUNT(*) AS count
       FROM round_trajectory_current_cell_horizon_snapshots
     `).get().count, 0);
+  } finally {
+    database.close();
+  }
+});
+
+test("v29 persists a scheduler metadata conflict before trajectory capture", () => {
+  let nowMs = BASE_MS;
+  const database = createDatabase({
+    path: ":memory:",
+    clock: () => new Date(nowMs),
+    logger: quietLogger,
+    predictiveLeaderLegacyAccountEnabled: false,
+  });
+  const startsAtMs = BASE_MS + 300_000;
+  const originalClosesAtMs = startsAtMs + 60_000;
+  const observedClosesAtMs = originalClosesAtMs + 1_000;
+  try {
+    nowMs = startsAtMs + 1_000;
+    assert.deepEqual(
+      database.recordCurrentCellHorizonMetadataConflict(
+        SOURCE,
+        INSTRUMENT,
+        "pre-capture-conflict",
+        iso(originalClosesAtMs),
+        iso(observedClosesAtMs),
+        iso(nowMs),
+      ),
+      {
+        inserted: true,
+        databaseChanged: true,
+        reason: "metadata_conflict_recorded",
+      },
+    );
+
+    const input = trajectory("pre-capture-conflict", startsAtMs, [{
+      atMs: startsAtMs + 500,
+      receivedAtMs: startsAtMs + 600,
+      price: 34.5,
+    }]);
+    input.round.bettingClosesAt = iso(observedClosesAtMs);
+    nowMs = observedClosesAtMs - 9_900;
+    database.recordRoundTrajectory(input);
+    assert.deepEqual(
+      database.recordCurrentCellHorizonShadow(
+        SOURCE,
+        INSTRUMENT,
+        "pre-capture-conflict",
+        iso(observedClosesAtMs),
+      ),
+      {
+        inserted: false,
+        reason: "metadata_conflict",
+        retryable: false,
+        voidInserted: false,
+        databaseChanged: false,
+      },
+    );
+    const audit = database.getCurrentCellHorizonShadowAuditState(SOURCE, INSTRUMENT);
+    assert.equal(audit.metrics.voidCount, 1);
+    assert.equal(audit.metrics.readyCount, 0);
+    assert.equal(audit.latest.candidate.availability, "void");
+    assert.equal(database.sqlite.prepare(`
+      SELECT COUNT(*) AS count
+      FROM round_trajectory_current_cell_horizon_snapshots
+    `).get().count, 0);
+  } finally {
+    database.close();
+  }
+});
+
+test("v29 voids an already captured snapshot and remains fail-closed after restart", () => {
+  const directory = mkdtempSync(join(tmpdir(), "current-cell-v29-conflict-"));
+  const path = join(directory, "state.sqlite");
+  let nowMs = BASE_MS;
+  let database = createDatabase({
+    path,
+    clock: () => new Date(nowMs),
+    logger: quietLogger,
+    predictiveLeaderLegacyAccountEnabled: false,
+  });
+  const startsAtMs = BASE_MS + 420_000;
+  const closesAtMs = startsAtMs + 60_000;
+  const cutoffMs = closesAtMs - 10_000;
+  try {
+    nowMs = cutoffMs - 100;
+    database.recordRoundTrajectory(trajectory("post-capture-conflict", startsAtMs, [{
+      atMs: cutoffMs - 1_000,
+      receivedAtMs: cutoffMs - 900,
+      price: 34.5,
+    }]));
+    nowMs = cutoffMs + 100;
+    assert.equal(database.recordCurrentCellHorizonShadow(
+      SOURCE,
+      INSTRUMENT,
+      "post-capture-conflict",
+      iso(closesAtMs),
+    ).inserted, true);
+
+    const correction = trajectory("post-capture-conflict", startsAtMs, [{
+      atMs: cutoffMs,
+      receivedAtMs: cutoffMs + 200,
+      price: 34.4,
+    }]);
+    correction.round.bettingClosesAt = iso(closesAtMs + 1_000);
+    nowMs = cutoffMs + 300;
+    assert.deepEqual(database.recordRoundTrajectory(correction), {
+      inserted: false,
+      ticksInserted: 0,
+      trajectoryId: 1,
+      metadataConflict: true,
+      voidInserted: true,
+      databaseChanged: true,
+    });
+
+    nowMs = closesAtMs + 30_000;
+    database.ingestBatch([resultEvent("post-capture-conflict", 3, closesAtMs + 20_000)]);
+    assert.deepEqual(
+      database.settleCurrentCellHorizonShadows(SOURCE, INSTRUMENT),
+      { settled: 0 },
+    );
+    let audit = database.getCurrentCellHorizonShadowAuditState(SOURCE, INSTRUMENT);
+    assert.equal(audit.metrics.voidCount, 1);
+    assert.equal(audit.metrics.overall.settledCount, 0);
+    assert.equal(audit.paperSimulation.attemptedCount, 0);
+    assert.equal(audit.latest.candidate.availability, "void");
+
+    database.close();
+    database = createDatabase({
+      path,
+      clock: () => new Date(nowMs),
+      logger: quietLogger,
+      predictiveLeaderLegacyAccountEnabled: false,
+    });
+    audit = database.getCurrentCellHorizonShadowAuditState(SOURCE, INSTRUMENT);
+    assert.equal(audit.metrics.voidCount, 1);
+    assert.equal(audit.metrics.overall.settledCount, 0);
+    assert.equal(database.sqlite.prepare(`
+      SELECT COUNT(*) AS count
+      FROM round_trajectory_current_cell_horizon_evaluations
+    `).get().count, 0);
+    assert.throws(() => database.sqlite.prepare(`
+      DELETE FROM predictive_shadow_round_metadata_conflicts
+    `).run(), /void is immutable/);
+  } finally {
+    database.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("v29 voids a captured snapshot when the final payload corrects bcd", () => {
+  let nowMs = BASE_MS;
+  const database = createDatabase({
+    path: ":memory:",
+    clock: () => new Date(nowMs),
+    logger: quietLogger,
+    predictiveLeaderLegacyAccountEnabled: false,
+  });
+  const startsAtMs = BASE_MS + 540_000;
+  const closesAtMs = startsAtMs + 60_000;
+  const cutoffMs = closesAtMs - 10_000;
+  try {
+    nowMs = cutoffMs - 100;
+    database.recordRoundTrajectory(trajectory("final-bcd-conflict", startsAtMs, [{
+      atMs: cutoffMs - 1_000,
+      receivedAtMs: cutoffMs - 900,
+      price: 34.5,
+    }]));
+    nowMs = cutoffMs + 100;
+    assert.equal(database.recordCurrentCellHorizonShadow(
+      SOURCE,
+      INSTRUMENT,
+      "final-bcd-conflict",
+      iso(closesAtMs),
+    ).inserted, true);
+
+    nowMs = closesAtMs + 30_000;
+    const finalResult = resultEvent(
+      "final-bcd-conflict",
+      3,
+      closesAtMs + 20_000,
+    );
+    finalResult.rawPayload.bcd = iso(closesAtMs + 1_000);
+    const ingestion = database.ingestBatch([finalResult]);
+    assert.equal(ingestion.inserted, 1);
+    assert.equal(ingestion.metadataConflictCount, 1);
+    assert.equal(ingestion.databaseChanged, true);
+    assert.deepEqual(
+      database.settleCurrentCellHorizonShadows(SOURCE, INSTRUMENT),
+      { settled: 0 },
+    );
+    const audit = database.getCurrentCellHorizonShadowAuditState(SOURCE, INSTRUMENT);
+    assert.equal(audit.metrics.voidCount, 1);
+    assert.equal(audit.metrics.overall.settledCount, 0);
+    assert.equal(audit.paperSimulation.attemptedCount, 0);
   } finally {
     database.close();
   }
