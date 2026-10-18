@@ -47,6 +47,8 @@ test("dashboard keeps the exact read-only fetch URL list", () => {
     "/api/forecasts/hits?limit=20",
     "/api/cycle-comparison",
     "/api/predictive-leader",
+    "/api/predictive-leader/v7-shadow",
+    "/api/predictive-leader/current-cell-10s-shadow",
   ]);
   assert.equal(
     [...app.matchAll(/\bfetchJson\(/g)].length,
@@ -296,9 +298,9 @@ test("quality-gated leader is the first dashboard block and separates candidate 
   assert.match(block, /При WAIT кандидат остаётся только наблюдением, ставка не фиксируется/);
   assert.match(block, /Текущий результат в проверку не попадает/);
   assert.match(block, /1 из 37 \(≈2,7%\)/);
-  assert.match(html, /<script type="module" src="\/app\.js\?v=47"><\/script>/);
+  assert.match(html, /<script type="module" src="\/app\.js\?v=48"><\/script>/);
 
-  assert.match(app, /from "\.\/combined-number\.js\?v=9"/);
+  assert.match(app, /from "\.\/combined-number\.js\?v=10"/);
   assert.match(app, /normalizePredictiveLeaderApiSnapshot/);
   assert.match(app, /predictiveLeaderNumberContext/);
   assert.match(combinedNumber, /export function normalizePredictiveLeaderApiSnapshot\(value\)/);
@@ -529,6 +531,52 @@ test("experimental forecast shows only the first three places of the full Rank-3
   assert.match(app, /const PRECLOSE_CAPTURE_MAX_LEAD_MS = 15_000/);
   assert.match(renderBlock, /closesMs - PRECLOSE_CAPTURE_MAX_LEAD_MS/);
   assert.doesNotMatch(renderBlock, /finalForecast\.numbers|price-start/);
+});
+
+test("experimental forecast block shows separate prospective gate countdowns", () => {
+  const rendererIds = [
+    "preclose-gate-progress",
+    "preclose-gate-progress-badge",
+    "preclose-gate-v7",
+    "preclose-gate-current-cell",
+  ];
+  for (const id of rendererIds) {
+    assert.match(html, new RegExp(`\\bid="${id}"`));
+    assert.match(app, new RegExp(`getElementById\\("${id}"\\)`));
+  }
+
+  const panelStart = html.indexOf('id="preclose-panel"');
+  const progressStart = html.indexOf('id="preclose-gate-progress"', panelStart);
+  const comparisonStart = html.indexOf('id="preclose-comparison"', panelStart);
+  assert.ok(panelStart >= 0 && progressStart > panelStart && comparisonStart > progressStart);
+  assert.match(html.slice(progressStart, comparisonStart), /До итоговой проверки/);
+  assert.match(html.slice(progressStart, comparisonStart), /не относятся к тройке Rank‑37/);
+  assert.match(html.slice(progressStart, comparisonStart), /Минимум 38 попаданий из 1 000 — только Wilson‑порог/);
+  assert.match(html.slice(progressStart, comparisonStart), /ставки автоматически не начнутся/);
+  assert.match(html, /Top‑3: проверено \(статистика\)/);
+
+  assert.match(app, /fetchJson\("\/api\/predictive-leader\/v7-shadow"\)/);
+  assert.match(app, /fetchJson\("\/api\/predictive-leader\/current-cell-10s-shadow"\)/);
+  assert.match(app, /normalizePredictiveShadowGateProgress\(requests\[8\]\.value\)/);
+  assert.match(app, /normalizePredictiveShadowGateProgress\(requests\[9\]\.value\)/);
+  assert.match(app, /function renderPredictiveShadowProgress\(\)/);
+  assert.match(app, /проверено \$\{formatRiskAmount\(progress\.sampleSize\)\} из/);
+  assert.match(app, /осталось \$\{formatRiskAmount\(progress\.remainingSampleSize\)\}/);
+  assert.match(app, /до минимума \$\{formatRiskAmount\(progress\.minimumHitCountAtTarget\)\}/);
+  assert.match(app, /проверка остановлена на/);
+  assert.match(app, /критерии не пройдены, ставки выключены/);
+  assert.match(app, /renderPredictiveShadowProgress\(\);/);
+
+  assert.match(combinedNumber, /export function normalizePredictiveShadowGateProgress\(value\)/);
+  assert.match(combinedNumber, /value\.executionEnabled !== false/);
+  assert.match(combinedNumber, /gate\.promotionEligible !== false/);
+  assert.match(combinedNumber, /remainingSampleSize: targetSampleSize - sampleSize/);
+  assert.match(combinedNumber, /minimumHitCountAtTarget/);
+  assert.match(styles, /\.preclose-gate-progress__items\s*\{/);
+  assert.match(
+    styles,
+    /@media \(max-width: 680px\)[\s\S]*?\.preclose-gate-progress__items\s*\{[\s\S]*?grid-template-columns: minmax\(0, 1fr\)/,
+  );
 });
 
 test("trajectory shadow is prospective and exposes the full Rank-37 contract", () => {
@@ -1100,8 +1148,8 @@ test("warm next-round forecast exposes a strict 5-percent walk-forward contract"
   );
   assert.match(html, /id="follower-dynamic-next-title"[^>]*>[^<]*≥5%/);
   assert.match(html, /id="follower-dynamic-next-note"[^>]*>[\s\S]*?5%/);
-  assert.match(html, /styles\.css\?v=30/);
-  assert.match(html, /app\.js\?v=47/);
+  assert.match(html, /styles\.css\?v=31/);
+  assert.match(html, /app\.js\?v=48/);
   assert.match(styles, /\.follower-dynamic-next\s*\{/);
   assert.match(styles, /\.follower-warm-current\s*\{/);
   assert.match(styles, /\.follower-warm-picks\s*\{/);
@@ -1348,8 +1396,8 @@ test("cycle comparison language is descriptive, responsive, and cache-busted", (
   assert.match(block, /не прогноз/);
   assert.match(block, /не предсказывает следующее число/);
   assert.doesNotMatch(block, /должн/iu);
-  assert.match(html, /href="\/styles\.css\?v=30"/);
-  assert.match(html, /src="\/app\.js\?v=47"/);
+  assert.match(html, /href="\/styles\.css\?v=31"/);
+  assert.match(html, /src="\/app\.js\?v=48"/);
   assert.match(styles, /\.cycle-sequence-list\s*\{[\s\S]*?repeat\(auto-fill, minmax\(50px, 1fr\)\)/);
   assert.match(
     styles,

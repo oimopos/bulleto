@@ -13,6 +13,7 @@ import {
   combinedVirtualRecencySources,
   combineNumberRankings,
   normalizePredictiveLeaderApiSnapshot,
+  normalizePredictiveShadowGateProgress,
   PREDICTIVE_LEADER_API_ALGORITHM_VERSION,
   PREDICTIVE_LEADER_API_SCHEMA_VERSION,
   predictiveLeaderNumberContext,
@@ -225,6 +226,105 @@ function predictiveLeaderApiSnapshot() {
     },
   };
 }
+
+function predictiveShadowAudit({
+  sampleSize = 5,
+  targetSampleSize = 1_000,
+  hitCount = 1,
+  status = "collecting",
+  statisticalSignalsPass = false,
+  fixedWindowComplete = sampleSize === targetSampleSize,
+} = {}) {
+  const settlementComplete = sampleSize === targetSampleSize;
+  return {
+    schemaVersion: 1,
+    mode: "prospective-shadow",
+    executionEnabled: false,
+    advisoryOnly: true,
+    qualityGateDiagnostic: {
+      status,
+      targetSampleSize,
+      sampleSize,
+      fixedWindowComplete,
+      settlementComplete,
+      economicBreakEvenTop1Rate: 1 / 36,
+      fixed: {
+        settledCount: sampleSize,
+        top1Hits: hitCount,
+      },
+      statisticalSignalsPass,
+      promotionEligible: false,
+      promotionPolicy: "manual-review-only-no-automatic-bet-or-promotion",
+    },
+  };
+}
+
+test("predictive shadow gate progress exposes the exact remaining fixed cohort", () => {
+  assert.deepEqual(
+    normalizePredictiveShadowGateProgress(predictiveShadowAudit()),
+    {
+      status: "collecting",
+      targetSampleSize: 1_000,
+      sampleSize: 5,
+      remainingSampleSize: 995,
+      hitCount: 1,
+      minimumHitCountAtTarget: 38,
+      additionalHitsNeededAtTarget: 37,
+      fixedWindowComplete: false,
+      settlementComplete: false,
+      statisticalSignalsPass: false,
+      promotionEligible: false,
+    },
+  );
+  assert.deepEqual(
+    normalizePredictiveShadowGateProgress(predictiveShadowAudit({
+      sampleSize: 1_000,
+      hitCount: 50,
+      status: "signals_pass",
+      statisticalSignalsPass: true,
+    })),
+    {
+      status: "signals_pass",
+      targetSampleSize: 1_000,
+      sampleSize: 1_000,
+      remainingSampleSize: 0,
+      hitCount: 50,
+      minimumHitCountAtTarget: 38,
+      additionalHitsNeededAtTarget: 0,
+      fixedWindowComplete: true,
+      settlementComplete: true,
+      statisticalSignalsPass: true,
+      promotionEligible: false,
+    },
+  );
+  assert.equal(
+    normalizePredictiveShadowGateProgress(predictiveShadowAudit({
+      sampleSize: 999,
+      hitCount: 37,
+      status: "signals_failed",
+      fixedWindowComplete: true,
+    }))?.status,
+    "signals_failed",
+  );
+});
+
+test("predictive shadow gate progress rejects unsafe or inconsistent payloads", () => {
+  for (const mutate of [
+    (value) => { value.executionEnabled = true; },
+    (value) => { value.qualityGateDiagnostic.promotionEligible = true; },
+    (value) => { value.qualityGateDiagnostic.sampleSize = 1_001; },
+    (value) => { value.qualityGateDiagnostic.settlementComplete = true; },
+    (value) => { value.qualityGateDiagnostic.fixed.top1Hits = 6; },
+    (value) => {
+      value.qualityGateDiagnostic.status = "signals_pass";
+      value.qualityGateDiagnostic.statisticalSignalsPass = false;
+    },
+  ]) {
+    const malformed = predictiveShadowAudit();
+    mutate(malformed);
+    assert.equal(normalizePredictiveShadowGateProgress(malformed), null);
+  }
+});
 
 test("combined freshness accepts one fully synchronized state snapshot", () => {
   assert.deepEqual(assessCombinedNumberFreshness(FRESH_STATE), {

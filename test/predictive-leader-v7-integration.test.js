@@ -319,6 +319,8 @@ test("v7 shadow stays frozen, causal, read-only, and evaluates only after settle
     assert.equal(audit.metrics.invalidCount, 0);
     assert.equal(audit.metrics.overall.pendingCount, 1);
     assert.equal(audit.qualityGateDiagnostic.status, "collecting");
+    assert.equal(audit.qualityGateDiagnostic.fixed.settledCount, 0);
+    assert.equal(audit.qualityGateDiagnostic.fixed.top1Hits, 0);
     assert.equal(audit.qualityGateDiagnostic.promotionEligible, false);
 
     assert.deepEqual(database.recordPrecloseForecast(forecast("107", LIVE_BASE)), {
@@ -332,6 +334,8 @@ test("v7 shadow stays frozen, causal, read-only, and evaluates only after settle
     audit = database.getPredictiveLeaderV7AuditState(SOURCE, INSTRUMENT);
     assert.equal(audit.metrics.overall.settledCount, 1);
     assert.equal(audit.metrics.overall.top1Hits, 1);
+    assert.equal(audit.qualityGateDiagnostic.fixed.settledCount, 0);
+    assert.equal(audit.qualityGateDiagnostic.fixed.top1Hits, 0);
     assert.equal(audit.latest.candidate.evaluation.actualNumber, 4);
     assert.equal(audit.latest.candidate.evaluation.top1Hit, true);
     assert.equal(

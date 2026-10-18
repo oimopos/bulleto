@@ -17291,6 +17291,7 @@ export class RouletteDatabase {
         minimumBrierImprovementVsUniform:
           PREDICTIVE_LEADER_V7_MINIMUM_BRIER_IMPROVEMENT,
         top1Wilson95: hitRateInterval,
+        fixed: fixedSummary,
         brierDeltaVsUniformHac95: uniformBrierHac95,
         pairedChampion: fixedPairedChampion,
         regimeBlocks,

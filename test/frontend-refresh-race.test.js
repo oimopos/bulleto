@@ -158,16 +158,16 @@ test('SSE revisions keep an in-flight response stale and queue a post-event refr
   });
 
   await import(`../public/app.js?refresh-race=${Date.now()}`);
-  assert.equal(fetchCount, 8, 'boot must start exactly one eight-request refresh');
+  assert.equal(fetchCount, 10, 'boot must start exactly one ten-request refresh');
   const source = FakeEventSource.instances[0];
   assert.ok(source);
 
   source.emit('open');
   source.emit('update', JSON.stringify({ reason: 'results' }));
-  pendingFetches.splice(0, 8).forEach(({ resolve }) => resolve(fakeResponse()));
+  pendingFetches.splice(0, 10).forEach(({ resolve }) => resolve(fakeResponse()));
 
   await waitFor(
-    () => fetchCount === 16,
+    () => fetchCount === 20,
     'an SSE event during the first refresh must queue a second complete refresh',
   );
   assert.equal(
@@ -176,7 +176,7 @@ test('SSE revisions keep an in-flight response stale and queue a post-event refr
     'the pre-event response must remain fail-closed while the queued refresh is pending',
   );
 
-  pendingFetches.splice(0, 8).forEach(({ resolve }) => resolve(fakeResponse()));
+  pendingFetches.splice(0, 10).forEach(({ resolve }) => resolve(fakeResponse()));
   await waitFor(
     () => element('preclose-panel').dataset.state === 'waiting',
     'the post-event response should become current while the same SSE revision stays open',
@@ -190,12 +190,12 @@ test('SSE revisions keep an in-flight response stale and queue a post-event refr
   );
 
   element('refresh-button').dispatch('click');
-  assert.equal(fetchCount, 24, 'manual recovery starts one refresh while SSE reconnects');
+  assert.equal(fetchCount, 30, 'manual recovery starts one refresh while SSE reconnects');
   source.emit('open');
-  pendingFetches.splice(0, 8).forEach(({ resolve }) => resolve(fakeResponse()));
+  pendingFetches.splice(0, 10).forEach(({ resolve }) => resolve(fakeResponse()));
 
   await waitFor(
-    () => fetchCount === 32,
+    () => fetchCount === 40,
     'an SSE reconnect during a request must queue a post-open refresh',
   );
   assert.equal(
@@ -204,7 +204,7 @@ test('SSE revisions keep an in-flight response stale and queue a post-event refr
     'a response started before reconnect must not be accepted as live-current',
   );
 
-  pendingFetches.splice(0, 8).forEach(({ resolve }) => resolve(fakeResponse()));
+  pendingFetches.splice(0, 10).forEach(({ resolve }) => resolve(fakeResponse()));
   await waitFor(
     () => element('preclose-panel').dataset.state === 'waiting',
     'only the response started after reconnect may clear the stale state',

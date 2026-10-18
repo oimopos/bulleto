@@ -355,6 +355,80 @@ function predictiveLeaderWilson95(hitCount, sampleSize) {
   };
 }
 
+export function normalizePredictiveShadowGateProgress(value) {
+  const gate = value?.qualityGateDiagnostic;
+  const fixed = gate?.fixed;
+  if (
+    !isPlainRecord(value)
+    || value.schemaVersion !== 1
+    || value.mode !== "prospective-shadow"
+    || value.executionEnabled !== false
+    || value.advisoryOnly !== true
+    || !isPlainRecord(gate)
+    || !["collecting", "signals_pass", "signals_failed"].includes(gate.status)
+    || typeof gate.fixedWindowComplete !== "boolean"
+    || typeof gate.settlementComplete !== "boolean"
+    || typeof gate.statisticalSignalsPass !== "boolean"
+    || !Number.isFinite(gate.economicBreakEvenTop1Rate)
+    || gate.economicBreakEvenTop1Rate <= 0
+    || gate.economicBreakEvenTop1Rate >= 1
+    || !isPlainRecord(fixed)
+    || gate.promotionEligible !== false
+    || gate.promotionPolicy !== "manual-review-only-no-automatic-bet-or-promotion"
+  ) {
+    return null;
+  }
+
+  const targetSampleSize = strictNonNegativeInteger(gate.targetSampleSize, 1);
+  const sampleSize = strictNonNegativeInteger(gate.sampleSize);
+  const settledCount = strictNonNegativeInteger(fixed?.settledCount);
+  const hitCount = strictNonNegativeInteger(fixed?.top1Hits);
+  let minimumHitCountAtTarget = null;
+  if (targetSampleSize !== null) {
+    for (let hits = 0; hits <= targetSampleSize; hits += 1) {
+      if (
+        predictiveLeaderWilson95(hits, targetSampleSize)?.lower
+          > gate.economicBreakEvenTop1Rate
+      ) {
+        minimumHitCountAtTarget = hits;
+        break;
+      }
+    }
+  }
+  if (
+    targetSampleSize === null
+    || sampleSize === null
+    || settledCount === null
+    || hitCount === null
+    || sampleSize > targetSampleSize
+    || settledCount !== sampleSize
+    || hitCount > settledCount
+    || minimumHitCountAtTarget === null
+    || gate.settlementComplete !== (sampleSize === targetSampleSize)
+    || (gate.settlementComplete && !gate.fixedWindowComplete)
+    || (gate.status === "collecting" && gate.settlementComplete)
+    || (gate.status === "signals_pass" && !gate.settlementComplete)
+    || (gate.status === "signals_failed" && !gate.fixedWindowComplete)
+    || (gate.status === "signals_pass") !== gate.statisticalSignalsPass
+  ) {
+    return null;
+  }
+
+  return {
+    status: gate.status,
+    targetSampleSize,
+    sampleSize,
+    remainingSampleSize: targetSampleSize - sampleSize,
+    hitCount,
+    minimumHitCountAtTarget,
+    additionalHitsNeededAtTarget: Math.max(0, minimumHitCountAtTarget - hitCount),
+    fixedWindowComplete: gate.fixedWindowComplete,
+    settlementComplete: gate.settlementComplete,
+    statisticalSignalsPass: gate.statisticalSignalsPass,
+    promotionEligible: false,
+  };
+}
+
 function normalizedPredictiveLeaderQualityGate(value, forecast) {
   if (
     !isPlainRecord(value)

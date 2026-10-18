@@ -6,8 +6,9 @@ import {
   TRAJECTORY_RANK37_VERSION,
   combinedTrajectorySignals,
   normalizePredictiveLeaderApiSnapshot,
+  normalizePredictiveShadowGateProgress,
   predictiveLeaderNumberContext,
-} from "./combined-number.js?v=9";
+} from "./combined-number.js?v=10";
 
 (() => {
   "use strict";
@@ -90,6 +91,10 @@ import {
     precloseProjectedPrice: document.getElementById("preclose-projected-price"),
     precloseSampleCount: document.getElementById("preclose-sample-count"),
     precloseTop3Rate: document.getElementById("preclose-top3-rate"),
+    precloseGateProgress: document.getElementById("preclose-gate-progress"),
+    precloseGateProgressBadge: document.getElementById("preclose-gate-progress-badge"),
+    precloseGateV7: document.getElementById("preclose-gate-v7"),
+    precloseGateCurrentCell: document.getElementById("preclose-gate-current-cell"),
     precloseComparison: document.getElementById("preclose-comparison"),
     precloseComparisonBadge: document.getElementById("preclose-comparison-badge"),
     precloseComparisonStatus: document.getElementById("preclose-comparison-status"),
@@ -269,6 +274,12 @@ import {
     predictiveLeaderLoaded: false,
     predictiveLeaderError: false,
     predictiveLeaderRequiresFreshSnapshot: true,
+    predictiveV7GateProgress: null,
+    predictiveV7GateProgressLoaded: false,
+    predictiveV7GateProgressError: false,
+    currentCellGateProgress: null,
+    currentCellGateProgressLoaded: false,
+    currentCellGateProgressError: false,
     triples: [],
     triplesLoaded: false,
     triplesError: false,
@@ -1255,7 +1266,9 @@ import {
       fetchJson("/api/pairs"),
       fetchJson("/api/forecasts/hits?limit=20"),
       fetchJson("/api/cycle-comparison"),
-      fetchJson("/api/predictive-leader")
+      fetchJson("/api/predictive-leader"),
+      fetchJson("/api/predictive-leader/v7-shadow"),
+      fetchJson("/api/predictive-leader/current-cell-10s-shadow")
     ]);
 
     let successfulRequests = 0;
@@ -1337,6 +1350,28 @@ import {
       store.predictiveLeaderError = true;
       store.predictiveLeaderRequiresFreshSnapshot = true;
     }
+    if (requests[8].status === "fulfilled") {
+      const progress = normalizePredictiveShadowGateProgress(requests[8].value);
+      store.predictiveV7GateProgress = progress;
+      store.predictiveV7GateProgressLoaded = true;
+      store.predictiveV7GateProgressError = progress === null;
+      if (progress) successfulRequests += 1;
+    } else {
+      store.predictiveV7GateProgress = null;
+      store.predictiveV7GateProgressLoaded = true;
+      store.predictiveV7GateProgressError = true;
+    }
+    if (requests[9].status === "fulfilled") {
+      const progress = normalizePredictiveShadowGateProgress(requests[9].value);
+      store.currentCellGateProgress = progress;
+      store.currentCellGateProgressLoaded = true;
+      store.currentCellGateProgressError = progress === null;
+      if (progress) successfulRequests += 1;
+    } else {
+      store.currentCellGateProgress = null;
+      store.currentCellGateProgressLoaded = true;
+      store.currentCellGateProgressError = true;
+    }
 
     if (successfulRequests > 0) {
       store.lastSyncAt = new Date();
@@ -1371,6 +1406,7 @@ import {
   function renderFetchFailure() {
     renderCombinedPick();
     renderPredictiveLeaderAccount();
+    renderPredictiveShadowProgress();
     if (!store.hasCompletedInitialRender) {
       elements.resultsBody.replaceChildren(emptyTableRow("Не удалось загрузить результаты. Повторим попытку автоматически."));
       elements.cyclesList.replaceChildren(createElement("li", "empty-state", "Не удалось загрузить архив циклов."));
@@ -1407,6 +1443,7 @@ import {
     renderCombinedPick();
     renderPredictiveLeaderAccount();
     renderLatestResult(latestResult);
+    renderPredictiveShadowProgress();
     renderPrecloseForecast();
     renderForecastHitHistory();
     renderFollowerTop5Tracker(store.state?.followerTop5Tracker || null);
@@ -2994,6 +3031,89 @@ import {
     );
   }
 
+  function renderPredictiveShadowProgressItem(
+    element,
+    label,
+    progress,
+    loaded,
+    error,
+  ) {
+    if (!loaded) {
+      element.dataset.state = "loading";
+      setTextIfChanged(element, `${label}: загружаем прогресс…`);
+      return;
+    }
+    if (error || !progress) {
+      element.dataset.state = "error";
+      setTextIfChanged(element, `${label}: прогресс временно недоступен`);
+      return;
+    }
+    if (progress.status === "collecting") {
+      element.dataset.state = "collecting";
+      setTextIfChanged(
+        element,
+        `${label}: проверено ${formatRiskAmount(progress.sampleSize)} из ${formatRiskAmount(progress.targetSampleSize)} · осталось ${formatRiskAmount(progress.remainingSampleSize)}. Попаданий ${formatRiskAmount(progress.hitCount)}; до минимума ${formatRiskAmount(progress.minimumHitCountAtTarget)} — ещё ${formatRiskAmount(progress.additionalHitsNeededAtTarget)}.`,
+      );
+      return;
+    }
+
+    element.dataset.state = "complete";
+    setTextIfChanged(
+      element,
+      progress.status === "signals_pass"
+        ? `${label}: окно ${formatRiskAmount(progress.targetSampleSize)} завершено · попаданий ${formatRiskAmount(progress.hitCount)} · сигналы прошли, ждём ручное решение`
+        : progress.remainingSampleSize > 0
+          ? `${label}: проверка остановлена на ${formatRiskAmount(progress.sampleSize)} из ${formatRiskAmount(progress.targetSampleSize)} · попаданий ${formatRiskAmount(progress.hitCount)} · критерии не пройдены, ставки выключены`
+          : `${label}: окно ${formatRiskAmount(progress.targetSampleSize)} завершено · попаданий ${formatRiskAmount(progress.hitCount)} · критерии не пройдены, ставки выключены`,
+    );
+  }
+
+  function renderPredictiveShadowProgress() {
+    renderPredictiveShadowProgressItem(
+      elements.precloseGateV7,
+      "V7 · одно число",
+      store.predictiveV7GateProgress,
+      store.predictiveV7GateProgressLoaded,
+      store.predictiveV7GateProgressError,
+    );
+    renderPredictiveShadowProgressItem(
+      elements.precloseGateCurrentCell,
+      "10 секунд · одно число",
+      store.currentCellGateProgress,
+      store.currentCellGateProgressLoaded,
+      store.currentCellGateProgressError,
+    );
+
+    const bothLoaded = store.predictiveV7GateProgressLoaded
+      && store.currentCellGateProgressLoaded;
+    const errorCount = Number(store.predictiveV7GateProgressError)
+      + Number(store.currentCellGateProgressError);
+    const progresses = [
+      store.predictiveV7GateProgress,
+      store.currentCellGateProgress,
+    ].filter(Boolean);
+    elements.precloseGateProgress.setAttribute("aria-busy", String(!bothLoaded));
+    if (!bothLoaded) {
+      elements.precloseGateProgress.dataset.state = "loading";
+      setTextIfChanged(elements.precloseGateProgressBadge, "Загрузка…");
+    } else if (errorCount === 2) {
+      elements.precloseGateProgress.dataset.state = "error";
+      setTextIfChanged(elements.precloseGateProgressBadge, "Нет данных");
+    } else if (errorCount > 0) {
+      elements.precloseGateProgress.dataset.state = "error";
+      setTextIfChanged(elements.precloseGateProgressBadge, "Частичные данные");
+    } else if (progresses.some((progress) => progress.status === "collecting")) {
+      elements.precloseGateProgress.dataset.state = "ready";
+      setTextIfChanged(elements.precloseGateProgressBadge, "Сбор данных");
+    } else if (progresses.some((progress) => progress.status === "signals_pass")) {
+      elements.precloseGateProgress.dataset.state = "ready";
+      setTextIfChanged(elements.precloseGateProgressBadge, "Ручная проверка");
+    } else {
+      elements.precloseGateProgress.dataset.state = "ready";
+      setTextIfChanged(elements.precloseGateProgressBadge, "Проверка завершена");
+    }
+  }
+
   function renderPrecloseForecast() {
     const stale = stateSnapshotIsStale();
     const forecastState = store.state?.precloseForecast || null;
@@ -3026,10 +3146,8 @@ import {
     const rankedTop3Hits = trajectoryMetrics?.rank37Top3Hits ?? 0;
     const rankedTop3Rate = trajectoryMetrics?.rank37Top3Rate ?? null;
 
-    elements.precloseSampleCount.textContent = rankedEvaluatedCount < 100
-      ? `${rankedEvaluatedCount} из 100`
-      : `${rankedEvaluatedCount} проверено`;
-    elements.precloseSampleCount.title = `Rank‑37: завершено ${rankedSettledCount}; ожидают результата ${rankedPendingCount}`;
+    elements.precloseSampleCount.textContent = `${rankedEvaluatedCount} проверено`;
+    elements.precloseSampleCount.title = `Rank‑37: завершено ${rankedSettledCount}; ожидают результата ${rankedPendingCount}. Частота показывается после 100 проверок; это не порог допуска к ставкам.`;
     elements.precloseTop3Rate.textContent = rankedEvaluatedCount >= 100 && Number.isFinite(rankedTop3Rate)
       ? `${rankedTop3Hits} из ${rankedEvaluatedCount} · ${(rankedTop3Rate * 100).toFixed(1).replace(".", ",")}%`
       : `${rankedTop3Hits} из ${rankedEvaluatedCount} · мало данных`;

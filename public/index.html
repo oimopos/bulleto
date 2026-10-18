@@ -7,8 +7,8 @@
     <meta name="color-scheme" content="dark">
     <meta name="description" content="Онлайн-монитор результатов рулетки и циклов исключения чисел от 0 до 36">
     <title>Круг 37 — монитор результатов</title>
-    <link rel="stylesheet" href="/styles.css?v=30">
-    <script type="module" src="/app.js?v=47"></script>
+    <link rel="stylesheet" href="/styles.css?v=31">
+    <script type="module" src="/app.js?v=48"></script>
   </head>
   <body>
     <a class="skip-link" href="#main-content">Перейти к содержимому</a>
@@ -257,10 +257,25 @@
           <dl class="preclose-facts">
             <div><dt>Последний factor</dt><dd id="preclose-live-price">—</dd></div>
             <div><dt>Типичная цена q50</dt><dd id="preclose-projected-price">—</dd></div>
-            <div><dt>Проверено Rank‑37</dt><dd id="preclose-sample-count">0</dd></div>
+            <div><dt>Top‑3: проверено (статистика)</dt><dd id="preclose-sample-count">0</dd></div>
             <div><dt>Совпадения Top‑3 Rank‑37</dt><dd id="preclose-top3-rate">—</dd></div>
           </dl>
         </div>
+
+        <section class="preclose-comparison preclose-gate-progress" id="preclose-gate-progress" data-state="loading" aria-labelledby="preclose-gate-progress-title" aria-describedby="preclose-gate-v7 preclose-gate-current-cell preclose-gate-progress-note" aria-busy="true">
+          <div class="preclose-comparison__header">
+            <div>
+              <p class="eyebrow">Отдельные одночисловые shadow‑проверки</p>
+              <h3 id="preclose-gate-progress-title">До итоговой проверки</h3>
+            </div>
+            <span class="preclose-comparison__badge" id="preclose-gate-progress-badge">Загрузка…</span>
+          </div>
+          <div class="preclose-gate-progress__items" role="status" aria-live="polite" aria-atomic="true">
+            <p class="preclose-gate-progress__item" id="preclose-gate-v7">V7 · одно число: загружаем прогресс…</p>
+            <p class="preclose-gate-progress__item" id="preclose-gate-current-cell">10 секунд · одно число: загружаем прогресс…</p>
+          </div>
+          <p class="preclose-comparison__note" id="preclose-gate-progress-note">Эти счётчики не относятся к тройке Rank‑37 выше. Минимум 38 попаданий из 1 000 — только Wilson‑порог: ещё должны пройти остальные критерии качества, включая Brier и парные сравнения. После 1 000 проверок ставки автоматически не начнутся — потребуется отдельное ручное решение.</p>
+        </section>
 
         <section class="preclose-comparison" id="preclose-comparison" data-state="waiting" aria-labelledby="preclose-comparison-title" aria-describedby="preclose-comparison-status preclose-comparison-warning preclose-comparison-note" aria-busy="true">
           <div class="preclose-comparison__header">

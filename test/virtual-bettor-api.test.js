@@ -262,6 +262,8 @@ test(
       assert.equal(v7Payload.latest, null);
       assert.equal(v7Payload.metrics.storedCount, 0);
       assert.equal(v7Payload.qualityGateDiagnostic.status, "collecting");
+      assert.equal(v7Payload.qualityGateDiagnostic.fixed.settledCount, 0);
+      assert.equal(v7Payload.qualityGateDiagnostic.fixed.top1Hits, 0);
       assert.equal(v7Payload.qualityGateDiagnostic.promotionEligible, false);
       assert.equal(v7Payload.qualityGateDiagnostic.experimentFamilySize, 2);
       assert.equal(v7Payload.qualityGateDiagnostic.perCandidateAlpha, 0.025);
@@ -291,6 +293,8 @@ test(
       assert.equal(currentCellPayload.metrics.storedCount, 0);
       assert.equal(currentCellPayload.metrics.pairedV5.pairedCount, 0);
       assert.equal(currentCellPayload.qualityGateDiagnostic.status, "collecting");
+      assert.equal(currentCellPayload.qualityGateDiagnostic.fixed.settledCount, 0);
+      assert.equal(currentCellPayload.qualityGateDiagnostic.fixed.top1Hits, 0);
       assert.equal(currentCellPayload.qualityGateDiagnostic.promotionEligible, false);
       assert.equal(currentCellPayload.qualityGateDiagnostic.experimentFamilySize, 2);
       assert.equal(currentCellPayload.qualityGateDiagnostic.perCandidateAlpha, 0.025);

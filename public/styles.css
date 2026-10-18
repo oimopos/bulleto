@@ -1259,6 +1259,35 @@ h2 {
   color: var(--muted-strong);
 }
 
+.preclose-gate-progress__items {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.preclose-gate-progress__item {
+  margin: 0;
+  padding: 11px 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: 11px;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.025);
+  font-size: 13px;
+  font-weight: 720;
+  line-height: 1.45;
+}
+
+.preclose-gate-progress__item[data-state="complete"] {
+  border-color: rgba(228, 189, 115, 0.3);
+  color: var(--gold-bright);
+  background: var(--gold-soft);
+}
+
+.preclose-gate-progress__item[data-state="error"] {
+  color: #edc78f;
+}
+
 .trajectory-shadow__range {
   margin-top: 14px;
   color: var(--text);
@@ -4506,6 +4535,10 @@ tbody tr:first-child {
   }
 
   .preclose-hit-history__list {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .preclose-gate-progress__items {
     grid-template-columns: minmax(0, 1fr);
   }
 
