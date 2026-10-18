@@ -41,6 +41,26 @@ test('trajectory listener is wired before primary forecast without gating it', (
   assert.doesNotMatch(forecastHandler, /same-frame trajectory|trajectory is not persisted/);
 });
 
+test('current-cell capture carries the scheduled close through the database boundary', () => {
+  const schedulerStart = server.indexOf(
+    'const currentCellHorizonScheduler = createCurrentCellHorizonScheduler',
+  );
+  const permanentErrorStart = server.indexOf(
+    'function isPermanentRoundTrajectoryError',
+    schedulerStart,
+  );
+  assert.ok(schedulerStart >= 0 && permanentErrorStart > schedulerStart);
+  const scheduler = server.slice(schedulerStart, permanentErrorStart);
+  assert.match(
+    scheduler,
+    /db\.recordCurrentCellHorizonShadow\(\s*attempt\.source,\s*attempt\.instrument,\s*attempt\.externalRoundId,\s*attempt\.bettingClosesAt,\s*\)/,
+  );
+  assert.match(scheduler, /outcome\.reason === 'metadata_conflict'/);
+
+  const roundListener = server.slice(server.indexOf("collector.on('round',"));
+  assert.match(roundListener, /scheduleOutcome\.status === 'metadata_conflict'/);
+});
+
 test('shutdown cancels trajectory backoff and joins the final FIFO drain', () => {
   const shutdown = server.slice(server.indexOf('function shutdown(signal)'));
   assert.match(shutdown, /clearTimeout\(roundTrajectoryRetryTimer\);/);

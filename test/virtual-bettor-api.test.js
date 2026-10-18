@@ -8,8 +8,13 @@ import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { createDatabase } from "../src/database.js";
+import {
+  PREDICTIVE_LEADER_V7_CANDIDATE_CONFIG,
+  createDatabase,
+} from "../src/database.js";
 import { LEARNED_LEADER_ALGORITHM_VERSION } from "../src/learned-leader.js";
+import { LEARNED_LEADER_V7_ALGORITHM_VERSION } from "../src/learned-leader-v7.js";
+import { CURRENT_CELL_HORIZON_SHADOW_ALGORITHM_VERSION } from "../src/current-cell-horizon-shadow.js";
 import { PREDICTIVE_LEADER_API_SCHEMA_VERSION } from "../src/predictive-leader-api.js";
 
 const ROOT_DIR = fileURLToPath(new URL("../", import.meta.url));
@@ -241,6 +246,75 @@ test(
       assert.equal(leaderPost.status, 405, logs());
       assert.equal(leaderPost.headers.get("cache-control"), "no-store");
       assert.deepEqual(await leaderPost.json(), { error: "Метод не разрешён" });
+
+      const v7Response = await fetch(
+        `${baseUrl}/api/predictive-leader/v7-shadow`,
+      );
+      assert.equal(v7Response.status, 200, logs());
+      assert.equal(v7Response.headers.get("cache-control"), "no-store");
+      const v7Payload = await v7Response.json();
+      assert.equal(v7Payload.schemaVersion, 1);
+      assert.equal(v7Payload.algorithmVersion, LEARNED_LEADER_V7_ALGORITHM_VERSION);
+      assert.equal(v7Payload.candidateId, PREDICTIVE_LEADER_V7_CANDIDATE_CONFIG.candidateId);
+      assert.equal(v7Payload.mode, "prospective-shadow");
+      assert.equal(v7Payload.executionEnabled, false);
+      assert.equal(v7Payload.advisoryOnly, true);
+      assert.equal(v7Payload.latest, null);
+      assert.equal(v7Payload.metrics.storedCount, 0);
+      assert.equal(v7Payload.qualityGateDiagnostic.status, "collecting");
+      assert.equal(v7Payload.qualityGateDiagnostic.promotionEligible, false);
+      assert.equal(v7Payload.qualityGateDiagnostic.experimentFamilySize, 2);
+      assert.equal(v7Payload.qualityGateDiagnostic.perCandidateAlpha, 0.025);
+
+      const v7Head = await fetch(`${baseUrl}/api/predictive-leader/v7-shadow`, {
+        method: "HEAD",
+      });
+      assert.equal(v7Head.status, 200, logs());
+      assert.equal(v7Head.headers.get("cache-control"), "no-store");
+      assert.equal(await v7Head.text(), "");
+
+      const currentCellResponse = await fetch(
+        `${baseUrl}/api/predictive-leader/current-cell-10s-shadow`,
+      );
+      assert.equal(currentCellResponse.status, 200, logs());
+      assert.equal(currentCellResponse.headers.get("cache-control"), "no-store");
+      const currentCellPayload = await currentCellResponse.json();
+      assert.equal(currentCellPayload.schemaVersion, 1);
+      assert.equal(
+        currentCellPayload.algorithmVersion,
+        CURRENT_CELL_HORIZON_SHADOW_ALGORITHM_VERSION,
+      );
+      assert.equal(currentCellPayload.mode, "prospective-shadow");
+      assert.equal(currentCellPayload.executionEnabled, false);
+      assert.equal(currentCellPayload.advisoryOnly, true);
+      assert.equal(currentCellPayload.latest, null);
+      assert.equal(currentCellPayload.metrics.storedCount, 0);
+      assert.equal(currentCellPayload.metrics.pairedV5.pairedCount, 0);
+      assert.equal(currentCellPayload.qualityGateDiagnostic.status, "collecting");
+      assert.equal(currentCellPayload.qualityGateDiagnostic.promotionEligible, false);
+      assert.equal(currentCellPayload.qualityGateDiagnostic.experimentFamilySize, 2);
+      assert.equal(currentCellPayload.qualityGateDiagnostic.perCandidateAlpha, 0.025);
+      assert.equal(
+        currentCellPayload.qualityGateDiagnostic.multiplicityPolicy,
+        "bonferroni-two-prospective-candidates",
+      );
+      assert.equal(currentCellPayload.paperSimulation.stakePerRound, 10);
+      assert.equal(currentCellPayload.paperSimulation.grossPayoutMultiplier, 36);
+
+      const currentCellHead = await fetch(
+        `${baseUrl}/api/predictive-leader/current-cell-10s-shadow`,
+        { method: "HEAD" },
+      );
+      assert.equal(currentCellHead.status, 200, logs());
+      assert.equal(currentCellHead.headers.get("cache-control"), "no-store");
+      assert.equal(await currentCellHead.text(), "");
+
+      const currentCellPost = await fetch(
+        `${baseUrl}/api/predictive-leader/current-cell-10s-shadow`,
+        { method: "POST" },
+      );
+      assert.equal(currentCellPost.status, 405, logs());
+      assert.deepEqual(await currentCellPost.json(), { error: "Метод не разрешён" });
 
       const backtestResponse = await fetch(
         `${baseUrl}/api/trajectory-range-backtest`,

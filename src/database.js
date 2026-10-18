@@ -40,6 +40,7 @@ import {
   TRAJECTORY_RANK37_EVIDENCE_MASS_THRESHOLD,
   TRAJECTORY_RANK37_MIN_EVIDENCE_CANDIDATES,
   TRAJECTORY_RANK37_MIN_TRAINING_COUNT,
+  TRAJECTORY_RANK37_SMOOTHING_WEIGHT,
   TRAJECTORY_RANK37_VERSION,
   buildTrajectoryRank37,
 } from "./trajectory-rank37.js";
@@ -53,6 +54,32 @@ import {
   evaluateLearnedLeaderDecision,
   normalizeLearnedLeaderDecision,
 } from "./learned-leader.js";
+import {
+  LEARNED_LEADER_V7_ALGORITHM_VERSION,
+  LEARNED_LEADER_V7_CONFIG_VERSION,
+  LEARNED_LEADER_V7_SCHEMA_VERSION,
+  LEARNED_LEADER_V7_TARGET_HORIZON,
+  LEARNED_LEADER_V7_UNIFORM_BRIER_LOSS,
+  buildLearnedLeaderV7Decision,
+  createLearnedLeaderV7Config,
+  evaluateLearnedLeaderV7Decision,
+  normalizeLearnedLeaderV7Decision,
+} from "./learned-leader-v7.js";
+import {
+  CURRENT_CELL_HORIZON_SHADOW_ALGORITHM_VERSION,
+  CURRENT_CELL_HORIZON_SHADOW_COHORT_KEY,
+  CURRENT_CELL_HORIZON_SHADOW_CONFIG,
+  CURRENT_CELL_HORIZON_SHADOW_CONFIG_VERSION,
+  CURRENT_CELL_HORIZON_SHADOW_INSTRUMENT,
+  CURRENT_CELL_HORIZON_SHADOW_SCHEMA_VERSION,
+  CURRENT_CELL_HORIZON_SHADOW_SOURCE,
+  CURRENT_CELL_HORIZON_SHADOW_UNIFORM_BRIER_LOSS,
+  CURRENT_CELL_HORIZON_SHADOW_UNIFORM_LOG_LOSS,
+  buildCurrentCellHorizonShadow,
+  currentCellHorizonClippedLogLoss,
+  evaluateCurrentCellHorizonShadow,
+  normalizeCurrentCellHorizonShadow,
+} from "./current-cell-horizon-shadow.js";
 import {
   PREDICTIVE_LEADER_QUALITY_GATE,
   evaluatePredictiveLeaderQualityGate,
@@ -93,6 +120,73 @@ const PREDICTIVE_LEADER_SIGNAL_ACCOUNT_STRATEGY_VERSION =
 const PREDICTIVE_LEADER_SIGNAL_ACCOUNT_STARTING_BALANCE = 1_000;
 const PREDICTIVE_LEADER_SIGNAL_STAKE = 10;
 const PREDICTIVE_LEADER_SIGNAL_GROSS_PAYOUT_MULTIPLIER = 36;
+const PREDICTIVE_LEADER_V7_GATE_WINDOW_SIZE = 1_000;
+const PREDICTIVE_LEADER_V7_BREAK_EVEN_RATE = 1 / 36;
+const PREDICTIVE_LEADER_V7_MINIMUM_BRIER_IMPROVEMENT = 1e-4;
+const PREDICTIVE_LEADER_V7_MINIMUM_SELECTION_COVERAGE = 0.9;
+const PREDICTIVE_LEADER_V7_GATE_VERSION = "fixed-first-1000-prospective-v1";
+const PREDICTIVE_LEADER_V7_FORECAST_HORIZON_SECONDS = 8;
+export const PREDICTIVE_LEADER_V7_CANDIDATE_CONFIG =
+  createLearnedLeaderV7Config({
+    version: LEARNED_LEADER_V7_CONFIG_VERSION,
+    candidateId: "v7-rank20-history80-uniform95-a740-b500-t5-20261018",
+    targetHorizon: LEARNED_LEADER_V7_TARGET_HORIZON,
+    price: {
+      temperature: 5,
+      baselineMix: 0,
+    },
+    history: {
+      pairPriorStrength: 740,
+      tripleBackoffStrength: 500,
+    },
+    blend: {
+      price: 0.01,
+      conditionalHistory: 0.04,
+      baseline: 0.95,
+    },
+    selection: {
+      minimumPriceEvidenceCandidates: 5,
+      minimumPairEffectiveSampleSize: 100,
+      minimumLeaderMass: 1 / 37,
+      minimumMargin: 0,
+    },
+  });
+const PREDICTIVE_LEADER_V7_CONFIG_JSON = JSON.stringify(
+  PREDICTIVE_LEADER_V7_CANDIDATE_CONFIG,
+);
+export const PREDICTIVE_LEADER_V7_CONFIG_SHA256 = createHash("sha256")
+  .update(PREDICTIVE_LEADER_V7_CONFIG_JSON)
+  .digest("hex");
+export const PREDICTIVE_LEADER_V7_SOURCE_EXPORT = Object.freeze({
+  artifact: "buleto-production-20261018T0030Z.sqlite",
+  sha256: "9149c55c6d77f8175ab65cd31b12f7b4b3bbb88bb8014c19c6c34ada6f523fbc",
+  // Maximum logical write timestamp observed in the immutable source export.
+  cutoffAt: "2026-10-18T00:32:03.908Z",
+});
+export const PREDICTIVE_SHADOW_FROZEN_STREAM = Object.freeze({
+  source: CURRENT_CELL_HORIZON_SHADOW_SOURCE,
+  instrument: CURRENT_CELL_HORIZON_SHADOW_INSTRUMENT,
+});
+const CURRENT_CELL_HORIZON_SHADOW_CONFIG_JSON = JSON.stringify(
+  CURRENT_CELL_HORIZON_SHADOW_CONFIG,
+);
+export const CURRENT_CELL_HORIZON_SHADOW_CONFIG_SHA256 = createHash("sha256")
+  .update(CURRENT_CELL_HORIZON_SHADOW_CONFIG_JSON)
+  .digest("hex");
+export const CURRENT_CELL_HORIZON_SHADOW_SOURCE_EXPORT = Object.freeze({
+  artifact: PREDICTIVE_LEADER_V7_SOURCE_EXPORT.artifact,
+  sha256: PREDICTIVE_LEADER_V7_SOURCE_EXPORT.sha256,
+  cutoffAt: PREDICTIVE_LEADER_V7_SOURCE_EXPORT.cutoffAt,
+});
+const CURRENT_CELL_HORIZON_SHADOW_GATE_WINDOW_SIZE = 1_000;
+const CURRENT_CELL_HORIZON_SHADOW_BREAK_EVEN_RATE = 1 / 36;
+const CURRENT_CELL_HORIZON_SHADOW_MINIMUM_READY_COVERAGE = 0.9;
+const CURRENT_CELL_HORIZON_SHADOW_MINIMUM_PAIRED_V5_COVERAGE = 0.9;
+const CURRENT_CELL_HORIZON_SHADOW_GATE_VERSION =
+  "fixed-first-1000-ready-prospective-v1";
+const CURRENT_CELL_HORIZON_SHADOW_PAPER_STARTING_BALANCE = 1_000;
+const CURRENT_CELL_HORIZON_SHADOW_PAPER_STAKE = 10;
+const CURRENT_CELL_HORIZON_SHADOW_PAPER_GROSS_MULTIPLIER = 36;
 const FOLLOWER_TOP5_HORIZONS = Object.freeze([1, 2, 3, 5, 10, 20]);
 const FOLLOWER_TOP5_ALL_HORIZONS = Object.freeze(
   Array.from({ length: 20 }, (_, index) => index + 1),
@@ -3929,6 +4023,813 @@ function buildPredictiveLeaderMetricFact(row) {
   };
 }
 
+function predictiveLeaderV7SmoothedPriceSource(
+  trajectoryShadow,
+  source,
+  { forecastId, lockedAt } = {},
+) {
+  const adaptive = trajectoryShadow?.integration?.adaptive;
+  const numberRanking = trajectoryShadow?.integration?.numberRanking;
+  const ranking = numberRanking?.ranking;
+  const smoothing = numberRanking?.smoothing;
+  if (
+    !Number.isSafeInteger(forecastId)
+    || forecastId < 1
+    || trajectoryShadow?.status !== "ready"
+    || trajectoryShadow.modelVersion !== TRAJECTORY_SHADOW_ADAPTIVE_VERSION
+    || trajectoryShadow.cutoffAt !== lockedAt
+    || !Number.isSafeInteger(adaptive?.trainingCount)
+    || adaptive.trainingCount < TRAJECTORY_RANK37_MIN_TRAINING_COUNT
+    || numberRanking?.version !== TRAJECTORY_RANK37_VERSION
+    || numberRanking?.basis !== TRAJECTORY_RANK37_BASIS
+    || numberRanking?.candidateCount !== 37
+    || !Number.isSafeInteger(numberRanking?.evidenceCandidateCount)
+    || numberRanking.evidenceCandidateCount < 0
+    || numberRanking.evidenceCandidateCount > 37
+    || numberRanking.evidenceMassThreshold
+      !== TRAJECTORY_RANK37_EVIDENCE_MASS_THRESHOLD
+    || smoothing?.version !== "uniform-mixture-v1"
+    || smoothing.weight !== TRAJECTORY_RANK37_SMOOTHING_WEIGHT
+    || smoothing.baselineMass !== 1 / 37
+    || !Array.isArray(ranking)
+    || ranking.length !== 37
+  ) {
+    return null;
+  }
+
+  const numbers = [];
+  const weights = [];
+  const rawMassByNumber = Array(37).fill(null);
+  const seen = new Set();
+  let rawTotal = 0;
+  let smoothedTotal = 0;
+  for (let index = 0; index < ranking.length; index += 1) {
+    const candidate = ranking[index];
+    const number = Number(candidate?.number);
+    const rawMass = Number(candidate?.rawMass);
+    const mass = Number(candidate?.mass);
+    const expectedMass = (1 - TRAJECTORY_RANK37_SMOOTHING_WEIGHT) * rawMass
+      + TRAJECTORY_RANK37_SMOOTHING_WEIGHT / 37;
+    if (
+      candidate?.rank !== index + 1
+      || !Number.isInteger(number)
+      || number < 0
+      || number > 36
+      || seen.has(number)
+      || !Number.isFinite(rawMass)
+      || rawMass < 0
+      || rawMass > 1
+      || !Number.isFinite(mass)
+      || mass < 0
+      || mass > 1
+      || Math.abs(mass - expectedMass) > 1e-9
+      || (index > 0 && mass - weights[index - 1] > 1e-12)
+    ) {
+      return null;
+    }
+    seen.add(number);
+    numbers.push(number);
+    weights.push(mass);
+    rawMassByNumber[number] = rawMass;
+    rawTotal += rawMass;
+    smoothedTotal += mass;
+  }
+  if (Math.abs(rawTotal - 1) > 1e-9 || Math.abs(smoothedTotal - 1) > 1e-9) {
+    return null;
+  }
+  const rawEvidenceCandidateCount = rawMassByNumber.filter(
+    (mass) => mass > TRAJECTORY_RANK37_EVIDENCE_MASS_THRESHOLD,
+  ).length;
+  if (rawEvidenceCandidateCount !== numberRanking.evidenceCandidateCount) return null;
+
+  if (source !== null && source !== undefined) {
+    if (
+      source.id !== "price-trajectory-rank37"
+      || source.family !== "price"
+      || source.cursor?.forecastId !== forecastId
+      || source.cursor?.cutoffAt !== lockedAt
+      || !Array.isArray(source.numbers)
+      || source.numbers.length !== 37
+      || !Array.isArray(source.weights)
+      || source.weights.length !== 37
+    ) return null;
+    const rawEvidenceTotal = rawMassByNumber.reduce((total, mass) => (
+      total + (mass > TRAJECTORY_RANK37_EVIDENCE_MASS_THRESHOLD ? mass : 0)
+    ), 0);
+    const championRawMassByNumber = Array(37).fill(null);
+    for (let index = 0; index < source.numbers.length; index += 1) {
+      const number = Number(source.numbers[index]);
+      const mass = Number(source.weights[index]);
+      if (
+        !Number.isInteger(number)
+        || number < 0
+        || number > 36
+        || championRawMassByNumber[number] !== null
+        || !Number.isFinite(mass)
+        || mass < 0
+        || mass > 1
+      ) return null;
+      championRawMassByNumber[number] = mass;
+    }
+    if (!(rawEvidenceTotal > 0) || championRawMassByNumber.some((mass, number) => {
+      const expected = rawMassByNumber[number] > TRAJECTORY_RANK37_EVIDENCE_MASS_THRESHOLD
+        ? rawMassByNumber[number] / rawEvidenceTotal
+        : 0;
+      return Math.abs(mass - expected) > 1e-9;
+    })) return null;
+  }
+
+  return {
+    id: "price-trajectory-rank37-smoothed",
+    family: "price",
+    numbers,
+    weights,
+    cursor: {
+      forecastId,
+      cutoffAt: lockedAt,
+      targetHorizon: LEARNED_LEADER_V7_TARGET_HORIZON,
+      scoreKind: "smoothed-rank37",
+      evidenceCandidateCount: numberRanking.evidenceCandidateCount,
+      rawEvidenceCandidateCount,
+      rawEvidenceMassThreshold: TRAJECTORY_RANK37_EVIDENCE_MASS_THRESHOLD,
+    },
+  };
+}
+
+export function predictiveLeaderV7SourcesFromChampion(
+  champion,
+  trajectoryShadow,
+  { forecastId, lockedAt } = {},
+) {
+  if (!champion || !Array.isArray(champion.sourceManifest)) return [];
+  const rank37Price = champion.sourceManifest.find(
+    (source) => source.id === "price-trajectory-rank37",
+  ) ?? null;
+  const smoothedPrice = predictiveLeaderV7SmoothedPriceSource(
+    trajectoryShadow,
+    rank37Price,
+    { forecastId, lockedAt },
+  );
+  const adapted = champion.sourceManifest.flatMap((source) => {
+    if (source.id === "price-trajectory-rank37") return [];
+    const weights = Array.isArray(source.weights) ? [...source.weights] : null;
+    const cursor = {
+      ...source.cursor,
+      targetHorizon: LEARNED_LEADER_V7_TARGET_HORIZON,
+    };
+    if (
+      source.family === "conditional-history"
+      && Number.isSafeInteger(cursor.sampleSize)
+      && cursor.sampleSize >= 0
+      && cursor.effectiveSampleSize === undefined
+    ) {
+      cursor.effectiveSampleSize = cursor.sampleSize;
+    }
+    return [{
+      id: source.id,
+      family: source.family,
+      numbers: [...source.numbers],
+      weights,
+      cursor,
+    }];
+  });
+  return smoothedPrice ? [smoothedPrice, ...adapted] : adapted;
+}
+
+function mapPredictiveLeaderV7Cohort(row) {
+  if (!row) return null;
+  const rawConfig = deserializeJson(row.config_json);
+  let config;
+  try {
+    config = createLearnedLeaderV7Config(rawConfig);
+  } catch {
+    return null;
+  }
+  const firstForecastId = Number(row.first_forecast_id);
+  const targetHorizon = Number(row.target_horizon);
+  const forecastHorizonSeconds = Number(row.forecast_horizon_seconds);
+  const startedMs = Date.parse(row.started_at);
+  const cutoffMs = Date.parse(row.source_export_cutoff_at);
+  if (
+    row.candidate_key !== PREDICTIVE_LEADER_V7_CANDIDATE_CONFIG.candidateId
+    || Number(row.schema_version) !== LEARNED_LEADER_V7_SCHEMA_VERSION
+    || row.algorithm_version !== LEARNED_LEADER_V7_ALGORITHM_VERSION
+    || row.config_version !== LEARNED_LEADER_V7_CONFIG_VERSION
+    || targetHorizon !== LEARNED_LEADER_V7_TARGET_HORIZON
+    || forecastHorizonSeconds !== PREDICTIVE_LEADER_V7_FORECAST_HORIZON_SECONDS
+    || row.mode !== "prospective-shadow"
+    || row.source !== PREDICTIVE_SHADOW_FROZEN_STREAM.source
+    || row.instrument !== PREDICTIVE_SHADOW_FROZEN_STREAM.instrument
+    || !Number.isSafeInteger(firstForecastId)
+    || firstForecastId < 1
+    || !Number.isFinite(startedMs)
+    || !Number.isFinite(cutoffMs)
+    || startedMs <= cutoffMs
+    || row.started_at !== row.created_at
+    || row.config_json !== PREDICTIVE_LEADER_V7_CONFIG_JSON
+    || JSON.stringify(config) !== PREDICTIVE_LEADER_V7_CONFIG_JSON
+    || row.config_sha256 !== PREDICTIVE_LEADER_V7_CONFIG_SHA256
+    || row.source_export_artifact !== PREDICTIVE_LEADER_V7_SOURCE_EXPORT.artifact
+    || row.source_export_sha256 !== PREDICTIVE_LEADER_V7_SOURCE_EXPORT.sha256
+    || row.source_export_cutoff_at !== PREDICTIVE_LEADER_V7_SOURCE_EXPORT.cutoffAt
+  ) return null;
+  return {
+    candidateId: row.candidate_key,
+    schemaVersion: Number(row.schema_version),
+    algorithmVersion: row.algorithm_version,
+    configVersion: row.config_version,
+    targetHorizon,
+    forecastHorizonSeconds,
+    mode: row.mode,
+    source: row.source,
+    instrument: row.instrument,
+    firstForecastId,
+    startedAt: row.started_at,
+    config,
+    configSha256: row.config_sha256,
+    sourceExport: {
+      artifact: row.source_export_artifact,
+      sha256: row.source_export_sha256,
+      cutoffAt: row.source_export_cutoff_at,
+    },
+    createdAt: row.created_at,
+  };
+}
+
+function mapForecastPredictiveLeaderV7(row, cohort) {
+  if (
+    !cohort
+    || row?.v7_forecast_id === null
+    || row?.v7_forecast_id === undefined
+  ) return null;
+  const decision = normalizeLearnedLeaderV7Decision(
+    deserializeJson(row.v7_snapshot_json),
+  );
+  const forecastId = Number(row.v7_forecast_id);
+  const historyMaxResultId = row.v7_history_max_result_id == null
+    ? null
+    : Number(row.v7_history_max_result_id);
+  const predictedNumber = row.v7_predicted_number == null
+    ? null
+    : Number(row.v7_predicted_number);
+  const leaderMass = row.v7_leader_mass == null
+    ? null
+    : Number(row.v7_leader_mass);
+  const margin = row.v7_margin == null ? null : Number(row.v7_margin);
+  if (
+    !decision
+    || forecastId !== Number(row.forecast_id)
+    || forecastId < cohort.firstForecastId
+    || Number(row.horizon_seconds) !== cohort.forecastHorizonSeconds
+    || row.locked_at < cohort.startedAt
+    || Number(row.v7_schema_version) !== cohort.schemaVersion
+    || row.v7_algorithm_version !== cohort.algorithmVersion
+    || row.v7_config_version !== cohort.configVersion
+    || Number(row.v7_target_horizon) !== cohort.targetHorizon
+    || row.v7_candidate_key !== cohort.candidateId
+    || row.v7_config_sha256 !== cohort.configSha256
+    || row.v7_status !== decision.status
+    || row.v7_locked_at !== decision.lockedAt
+    || row.locked_at !== decision.lockedAt
+    || predictedNumber !== decision.leaderNumber
+    || (leaderMass === null
+      ? decision.leaderMass !== null
+      : Math.abs(leaderMass - decision.leaderMass) > 1e-12)
+    || (margin === null
+      ? decision.margin !== null
+      : Math.abs(margin - decision.margin) > 1e-12)
+    || Boolean(row.v7_selected) !== decision.selection.eligible
+    || JSON.stringify(decision.config) !== PREDICTIVE_LEADER_V7_CONFIG_JSON
+    || !Number.isFinite(Date.parse(row.v7_created_at))
+    || Date.parse(row.v7_created_at) < Date.parse(decision.lockedAt)
+  ) return null;
+  for (const source of decision.sourceManifest) {
+    if (
+      source.family === "price"
+      && Number(source.cursor.forecastId) !== forecastId
+    ) return null;
+    if (
+      source.family === "conditional-history"
+      && (source.cursor.historyMaxResultId == null
+        ? historyMaxResultId !== null
+        : Number(source.cursor.historyMaxResultId) !== historyMaxResultId)
+    ) return null;
+  }
+
+  let evaluation = null;
+  if (
+    row.actual_number !== null
+    && row.actual_number !== undefined
+    && !validPredictiveLeaderV7SettlementRow(row)
+  ) return null;
+  if (
+    decision.status === "ready"
+    && row.actual_number !== null
+    && row.actual_number !== undefined
+  ) {
+    try {
+      evaluation = {
+        resultId: Number(row.round_result_id),
+        settledAt: row.settled_at,
+        createdAt: row.settlement_created_at,
+        ...evaluateLearnedLeaderV7Decision(decision, Number(row.actual_number)),
+      };
+    } catch {
+      return null;
+    }
+  }
+  return {
+    ...decision,
+    forecastId,
+    historyMaxResultId,
+    createdAt: row.v7_created_at,
+    evaluation,
+  };
+}
+
+function validPredictiveLeaderV7SettlementRow(row) {
+  if (row.actual_number === null || row.actual_number === undefined) return true;
+  const resultId = Number(row.result_id);
+  const actualNumber = Number(row.actual_number);
+  const resultNumber = Number(row.result_number);
+  const lockedMs = Date.parse(row.locked_at);
+  const capturedMs = Date.parse(row.v7_created_at);
+  const timestamps = [
+    row.settled_at,
+    row.settlement_created_at,
+    row.result_settled_at,
+    row.result_observed_at,
+    row.result_created_at,
+  ].map(Date.parse);
+  return Number.isSafeInteger(resultId)
+    && resultId >= 1
+    && resultId === Number(row.round_result_id)
+    && Number.isInteger(actualNumber)
+    && actualNumber >= 0
+    && actualNumber <= 36
+    && actualNumber === resultNumber
+    && row.result_source === row.source
+    && row.result_instrument === row.instrument
+    && row.result_external_round_id === row.external_round_id
+    && row.result_settled_at === row.settled_at
+    && Number.isFinite(lockedMs)
+    && Number.isFinite(capturedMs)
+    && timestamps.every((timestamp) => (
+      Number.isFinite(timestamp) && lockedMs < timestamp && capturedMs < timestamp
+    ));
+}
+
+function summarizePredictiveLeaderV7(leaders) {
+  const ready = leaders.filter((leader) => leader?.status === "ready");
+  const settled = ready.filter((leader) => leader.evaluation !== null);
+  const top1Hits = settled.reduce(
+    (total, leader) => total + Number(leader.evaluation.top1Hit),
+    0,
+  );
+  const top3Hits = settled.reduce(
+    (total, leader) => total + Number(leader.evaluation.top3Hit),
+    0,
+  );
+  const mean = (selector) => settled.length === 0
+    ? null
+    : settled.reduce((total, leader) => total + selector(leader), 0) / settled.length;
+  const meanBrierLoss = mean((leader) => leader.evaluation.combinedBrierLoss);
+  const meanLeaderMass = mean((leader) => leader.leaderMass);
+  const top1Rate = settled.length === 0 ? null : top1Hits / settled.length;
+  return {
+    readyCount: ready.length,
+    settledCount: settled.length,
+    pendingCount: Math.max(0, ready.length - settled.length),
+    top1Hits,
+    top1Rate,
+    top3Hits,
+    top3Rate: settled.length === 0 ? null : top3Hits / settled.length,
+    meanLeaderMass,
+    calibrationGap: top1Rate === null ? null : top1Rate - meanLeaderMass,
+    meanBrierLoss,
+    meanClippedLogLoss: mean(
+      (leader) => leader.evaluation.combinedClippedLogLoss,
+    ),
+    uniformBrierLoss: LEARNED_LEADER_V7_UNIFORM_BRIER_LOSS,
+    meanBrierImprovementVsUniform: meanBrierLoss === null
+      ? null
+      : LEARNED_LEADER_V7_UNIFORM_BRIER_LOSS - meanBrierLoss,
+  };
+}
+
+function wilsonInterval95(hitCount, sampleSize) {
+  if (!Number.isSafeInteger(sampleSize) || sampleSize < 1) return null;
+  const successes = Number(hitCount);
+  const z = 1.959963984540054;
+  const proportion = successes / sampleSize;
+  const denominator = 1 + z ** 2 / sampleSize;
+  const center = (proportion + z ** 2 / (2 * sampleSize)) / denominator;
+  const radius = z * Math.sqrt(
+    proportion * (1 - proportion) / sampleSize
+      + z ** 2 / (4 * sampleSize ** 2),
+  ) / denominator;
+  return { lower: Math.max(0, center - radius), upper: Math.min(1, center + radius) };
+}
+
+function hacMeanInterval95(values) {
+  if (!Array.isArray(values) || values.length < 1) return null;
+  const sampleSize = values.length;
+  const mean = values.reduce((total, value) => total + value, 0) / sampleSize;
+  if (sampleSize === 1) {
+    return { sampleSize, mean, bandwidth: 0, standardError: null, lower: null, upper: null };
+  }
+  const centered = values.map((value) => value - mean);
+  const bandwidth = Math.min(
+    sampleSize - 1,
+    Math.max(1, Math.floor(4 * (sampleSize / 100) ** (2 / 9))),
+  );
+  let longRunVariance = centered.reduce(
+    (total, value) => total + value ** 2,
+    0,
+  ) / sampleSize;
+  for (let lag = 1; lag <= bandwidth; lag += 1) {
+    let covariance = 0;
+    for (let index = lag; index < sampleSize; index += 1) {
+      covariance += centered[index] * centered[index - lag];
+    }
+    covariance /= sampleSize;
+    longRunVariance += 2 * (1 - lag / (bandwidth + 1)) * covariance;
+  }
+  const standardError = Math.sqrt(Math.max(0, longRunVariance) / sampleSize);
+  const radius = 1.959963984540054 * standardError;
+  return {
+    sampleSize,
+    mean,
+    bandwidth,
+    standardError,
+    lower: mean - radius,
+    upper: mean + radius,
+  };
+}
+
+function oneSidedExactBinomialPValue(successes, trials) {
+  if (!Number.isSafeInteger(trials) || trials < 0) return null;
+  if (!Number.isSafeInteger(successes) || successes < 0 || successes > trials) {
+    return null;
+  }
+  if (trials === 0) return 1;
+  let probability = 2 ** (-trials);
+  let tail = successes === 0 ? probability : 0;
+  for (let count = 0; count < trials; count += 1) {
+    probability *= (trials - count) / (count + 1);
+    if (count + 1 >= successes) tail += probability;
+  }
+  return Math.min(1, tail);
+}
+
+function summarizePredictiveLeaderV7Pairings(pairs) {
+  const evaluated = pairs.filter(({ v7, champion }) => (
+    v7?.evaluation != null && champion?.evaluation != null
+  ));
+  const bothCorrect = evaluated.filter(({ v7, champion }) => (
+    v7.evaluation.top1Hit && champion.evaluation.top1Hit
+  )).length;
+  const v7Only = evaluated.filter(({ v7, champion }) => (
+    v7.evaluation.top1Hit && !champion.evaluation.top1Hit
+  )).length;
+  const championOnly = evaluated.filter(({ v7, champion }) => (
+    !v7.evaluation.top1Hit && champion.evaluation.top1Hit
+  )).length;
+  const neitherCorrect = evaluated.length - bothCorrect - v7Only - championOnly;
+  const brierDeltas = evaluated.map(({ v7, champion }) => (
+    v7.evaluation.combinedBrierLoss - champion.evaluation.combinedBrierLoss
+  ));
+  const discordantCount = v7Only + championOnly;
+  return {
+    pairedCount: evaluated.length,
+    bothCorrect,
+    v7Only,
+    championOnly,
+    discordantCount,
+    v7BetterOneSidedExactPValue: oneSidedExactBinomialPValue(
+      v7Only,
+      discordantCount,
+    ),
+    neitherCorrect,
+    deltaTop1Rate: evaluated.length === 0
+      ? null
+      : (v7Only - championOnly) / evaluated.length,
+    meanBrierDelta: evaluated.length === 0
+      ? null
+      : brierDeltas.reduce((total, value) => total + value, 0) / evaluated.length,
+    brierDeltaHac95: hacMeanInterval95(brierDeltas),
+  };
+}
+
+function mapCurrentCellHorizonCohort(row) {
+  if (!row) return null;
+  const firstTrajectoryId = Number(row.first_trajectory_id);
+  if (
+    row.cohort_key !== CURRENT_CELL_HORIZON_SHADOW_COHORT_KEY
+    || Number(row.schema_version) !== CURRENT_CELL_HORIZON_SHADOW_SCHEMA_VERSION
+    || row.algorithm_version !== CURRENT_CELL_HORIZON_SHADOW_ALGORITHM_VERSION
+    || row.config_version !== CURRENT_CELL_HORIZON_SHADOW_CONFIG_VERSION
+    || Number(row.horizon_seconds) !== CURRENT_CELL_HORIZON_SHADOW_CONFIG.horizonSeconds
+    || row.mode !== CURRENT_CELL_HORIZON_SHADOW_CONFIG.mode
+    || row.source !== CURRENT_CELL_HORIZON_SHADOW_SOURCE
+    || row.instrument !== CURRENT_CELL_HORIZON_SHADOW_INSTRUMENT
+    || !Number.isSafeInteger(firstTrajectoryId)
+    || firstTrajectoryId < 1
+    || row.config_json !== CURRENT_CELL_HORIZON_SHADOW_CONFIG_JSON
+    || row.config_sha256 !== CURRENT_CELL_HORIZON_SHADOW_CONFIG_SHA256
+    || row.source_export_artifact
+      !== CURRENT_CELL_HORIZON_SHADOW_SOURCE_EXPORT.artifact
+    || row.source_export_sha256
+      !== CURRENT_CELL_HORIZON_SHADOW_SOURCE_EXPORT.sha256
+    || row.source_export_cutoff_at
+      !== CURRENT_CELL_HORIZON_SHADOW_SOURCE_EXPORT.cutoffAt
+    || !Number.isFinite(Date.parse(row.started_at))
+    || row.started_at !== row.created_at
+    || Date.parse(row.started_at) <= Date.parse(row.source_export_cutoff_at)
+  ) return null;
+  return {
+    cohortKey: row.cohort_key,
+    schemaVersion: Number(row.schema_version),
+    algorithmVersion: row.algorithm_version,
+    configVersion: row.config_version,
+    horizonSeconds: Number(row.horizon_seconds),
+    mode: row.mode,
+    source: row.source,
+    instrument: row.instrument,
+    firstTrajectoryId,
+    startedAt: row.started_at,
+    config: CURRENT_CELL_HORIZON_SHADOW_CONFIG,
+    configSha256: row.config_sha256,
+    sourceExport: {
+      artifact: row.source_export_artifact,
+      sha256: row.source_export_sha256,
+      cutoffAt: row.source_export_cutoff_at,
+    },
+    createdAt: row.created_at,
+  };
+}
+
+function mapCurrentCellHorizonSnapshot(row, cohort) {
+  if (!cohort || row?.shadow_trajectory_id == null) return null;
+  const snapshot = normalizeCurrentCellHorizonShadow(
+    deserializeJson(row.shadow_snapshot_json),
+  );
+  const trajectoryId = Number(row.shadow_trajectory_id);
+  const predictedNumber = row.shadow_predicted_number == null
+    ? null
+    : Number(row.shadow_predicted_number);
+  const leaderWireCell = row.shadow_leader_wire_cell == null
+    ? null
+    : Number(row.shadow_leader_wire_cell);
+  const leaderProbability = row.shadow_leader_probability == null
+    ? null
+    : Number(row.shadow_leader_probability);
+  const runnerUpProbability = row.shadow_runner_up_probability == null
+    ? null
+    : Number(row.shadow_runner_up_probability);
+  const margin = row.shadow_margin == null ? null : Number(row.shadow_margin);
+  if (
+    !snapshot
+    || trajectoryId !== Number(row.trajectory_id)
+    || trajectoryId < cohort.firstTrajectoryId
+    || snapshot.trajectoryId !== trajectoryId
+    || snapshot.source !== row.source
+    || snapshot.instrument !== row.instrument
+    || snapshot.externalRoundId !== row.external_round_id
+    || snapshot.bettingClosesAt !== row.betting_closes_at
+    || snapshot.cohortKey !== cohort.cohortKey
+    || Number(row.shadow_schema_version) !== cohort.schemaVersion
+    || row.shadow_algorithm_version !== cohort.algorithmVersion
+    || row.shadow_config_version !== cohort.configVersion
+    || row.shadow_config_sha256 !== cohort.configSha256
+    || row.shadow_status !== snapshot.status
+    || row.shadow_reason !== snapshot.reason
+    || row.shadow_cutoff_at !== snapshot.cutoffAt
+    || row.shadow_captured_at !== snapshot.capturedAt
+    || predictedNumber !== snapshot.leaderNumber
+    || leaderWireCell !== snapshot.leaderWireCell
+    || (leaderProbability === null
+      ? snapshot.leaderProbability !== null
+      : Math.abs(leaderProbability - snapshot.leaderProbability) > 1e-12)
+    || (runnerUpProbability === null
+      ? snapshot.runnerUpProbability !== null
+      : Math.abs(runnerUpProbability - snapshot.runnerUpProbability) > 1e-12)
+    || (margin === null
+      ? snapshot.margin !== null
+      : Math.abs(margin - snapshot.margin) > 1e-12)
+    || row.shadow_created_at < snapshot.capturedAt
+    || JSON.stringify(snapshot.config) !== CURRENT_CELL_HORIZON_SHADOW_CONFIG_JSON
+  ) return null;
+
+  let evaluation = null;
+  if (row.evaluation_trajectory_id != null) {
+    const actualNumber = Number(row.evaluation_actual_number);
+    let expected;
+    try {
+      expected = evaluateCurrentCellHorizonShadow(snapshot, actualNumber);
+    } catch {
+      return null;
+    }
+    const stored = deserializeJson(row.evaluation_json);
+    const resultTimes = [
+      row.result_settled_at,
+      row.result_observed_at,
+      row.result_created_at,
+    ].map(Date.parse);
+    if (
+      Number(row.evaluation_trajectory_id) !== trajectoryId
+      || row.evaluation_cohort_key !== cohort.cohortKey
+      || Number(row.evaluation_round_result_id) !== Number(row.result_id)
+      || actualNumber !== Number(row.result_number)
+      || row.result_source !== row.source
+      || row.result_instrument !== row.instrument
+      || row.result_external_round_id !== row.external_round_id
+      || resultTimes.some((time) => (
+        !Number.isFinite(time) || time <= Date.parse(snapshot.capturedAt)
+      ))
+      || row.evaluation_evaluated_at < row.result_created_at
+      || JSON.stringify(stored) !== JSON.stringify(expected)
+      || Boolean(row.evaluation_top1_hit) !== expected.top1Hit
+      || Math.abs(Number(row.evaluation_brier_loss) - expected.brierLoss) > 1e-12
+      || Math.abs(
+        Number(row.evaluation_clipped_log_loss) - expected.clippedLogLoss,
+      ) > 1e-12
+    ) return null;
+    evaluation = {
+      resultId: Number(row.result_id),
+      settledAt: row.result_settled_at,
+      evaluatedAt: row.evaluation_evaluated_at,
+      ...expected,
+    };
+  }
+  return {
+    ...snapshot,
+    createdAt: row.shadow_created_at,
+    evaluation,
+  };
+}
+
+function summarizeCurrentCellHorizonSnapshots(snapshots) {
+  const ready = snapshots.filter((snapshot) => snapshot?.status === "ready");
+  const settled = ready.filter((snapshot) => snapshot.evaluation !== null);
+  const top1Hits = settled.reduce(
+    (total, snapshot) => total + Number(snapshot.evaluation.top1Hit),
+    0,
+  );
+  const mean = (selector) => settled.length === 0
+    ? null
+    : settled.reduce((total, snapshot) => total + selector(snapshot), 0)
+      / settled.length;
+  const top1Rate = settled.length === 0 ? null : top1Hits / settled.length;
+  const meanLeaderProbability = mean((snapshot) => snapshot.leaderProbability);
+  const meanBrierLoss = mean((snapshot) => snapshot.evaluation.brierLoss);
+  return {
+    readyCount: ready.length,
+    settledCount: settled.length,
+    pendingCount: Math.max(0, ready.length - settled.length),
+    top1Hits,
+    top1Rate,
+    meanLeaderProbability,
+    calibrationGap: top1Rate === null
+      ? null
+      : top1Rate - meanLeaderProbability,
+    meanBrierLoss,
+    meanClippedLogLoss: mean(
+      (snapshot) => snapshot.evaluation.clippedLogLoss,
+    ),
+    uniformBrierLoss: CURRENT_CELL_HORIZON_SHADOW_UNIFORM_BRIER_LOSS,
+    uniformClippedLogLoss: CURRENT_CELL_HORIZON_SHADOW_UNIFORM_LOG_LOSS,
+    meanBrierImprovementVsUniform: meanBrierLoss === null
+      ? null
+      : CURRENT_CELL_HORIZON_SHADOW_UNIFORM_BRIER_LOSS - meanBrierLoss,
+  };
+}
+
+function summarizeCurrentCellV5Pairings(pairs) {
+  const evaluated = pairs.filter(({ current, champion }) => (
+    current?.evaluation != null && champion?.evaluation != null
+  ));
+  const bothCorrect = evaluated.filter(({ current, champion }) => (
+    current.evaluation.top1Hit && champion.evaluation.top1Hit
+  )).length;
+  const currentOnly = evaluated.filter(({ current, champion }) => (
+    current.evaluation.top1Hit && !champion.evaluation.top1Hit
+  )).length;
+  const v5Only = evaluated.filter(({ current, champion }) => (
+    !current.evaluation.top1Hit && champion.evaluation.top1Hit
+  )).length;
+  const neitherCorrect = evaluated.length - bothCorrect - currentOnly - v5Only;
+  const brierDeltas = evaluated.map(({ current, champion }) => (
+    current.evaluation.brierLoss - champion.evaluation.combinedBrierLoss
+  ));
+  const logLossDeltas = evaluated.map(({ current, champion }) => (
+    current.evaluation.clippedLogLoss
+      - currentCellHorizonClippedLogLoss(
+        champion.combinedDistribution,
+        champion.evaluation.actualNumber,
+      )
+  ));
+  const mean = (values) => values.length === 0
+    ? null
+    : values.reduce((total, value) => total + value, 0) / values.length;
+  const discordantCount = currentOnly + v5Only;
+  return {
+    pairedCount: evaluated.length,
+    bothCorrect,
+    currentOnly,
+    v5Only,
+    neitherCorrect,
+    discordantCount,
+    currentBetterOneSidedExactPValue: oneSidedExactBinomialPValue(
+      currentOnly,
+      discordantCount,
+    ),
+    deltaTop1Rate: evaluated.length === 0
+      ? null
+      : (currentOnly - v5Only) / evaluated.length,
+    meanBrierDelta: mean(brierDeltas),
+    brierDeltaHac95: hacMeanInterval95(brierDeltas),
+    meanClippedLogLossDelta: mean(logLossDeltas),
+    clippedLogLossDeltaHac95: hacMeanInterval95(logLossDeltas),
+  };
+}
+
+function mapCurrentCellPairedV5(row) {
+  const champion = mapForecastPredictiveLeader({
+    ...row,
+    round_result_id: row.v5_round_result_id,
+    actual_number: row.v5_actual_number,
+    settled_at: row.v5_settled_at,
+    settlement_created_at: row.v5_settlement_created_at,
+  });
+  if (!champion || row.v5_actual_number == null) return champion;
+  const lockedMs = Date.parse(row.locked_at);
+  const resultTimes = [
+    row.v5_settled_at,
+    row.v5_settlement_created_at,
+    row.v5_result_settled_at,
+    row.v5_result_observed_at,
+    row.v5_result_created_at,
+  ].map(Date.parse);
+  if (
+    Number(row.v5_settlement_forecast_id) !== Number(row.forecast_id)
+    || Number(row.v5_round_result_id) !== Number(row.v5_result_id)
+    || Number(row.v5_actual_number) !== Number(row.v5_result_number)
+    || row.v5_result_source !== row.source
+    || row.v5_result_instrument !== row.instrument
+    || row.v5_result_external_round_id !== row.external_round_id
+    || row.v5_result_settled_at !== row.v5_settled_at
+    || !Number.isFinite(lockedMs)
+    || resultTimes.some((time) => !Number.isFinite(time) || time <= lockedMs)
+  ) return null;
+  return champion;
+}
+
+function currentCellFlatPaperSimulation(snapshots) {
+  let balance = CURRENT_CELL_HORIZON_SHADOW_PAPER_STARTING_BALANCE;
+  let attemptedCount = 0;
+  let settledCount = 0;
+  let hitCount = 0;
+  let totalStaked = 0;
+  let grossPayout = 0;
+  let stoppedAtTrajectoryId = null;
+  for (const snapshot of snapshots) {
+    if (snapshot?.status !== "ready") continue;
+    if (balance < CURRENT_CELL_HORIZON_SHADOW_PAPER_STAKE) {
+      stoppedAtTrajectoryId = snapshot.trajectoryId;
+      break;
+    }
+    attemptedCount += 1;
+    totalStaked += CURRENT_CELL_HORIZON_SHADOW_PAPER_STAKE;
+    balance -= CURRENT_CELL_HORIZON_SHADOW_PAPER_STAKE;
+    if (snapshot.evaluation === null) continue;
+    settledCount += 1;
+    if (snapshot.evaluation.top1Hit) {
+      hitCount += 1;
+      const payout = CURRENT_CELL_HORIZON_SHADOW_PAPER_STAKE
+        * CURRENT_CELL_HORIZON_SHADOW_PAPER_GROSS_MULTIPLIER;
+      grossPayout += payout;
+      balance += payout;
+    }
+  }
+  return {
+    mode: "audit-only-flat-paper",
+    executionEnabled: false,
+    startingBalance: CURRENT_CELL_HORIZON_SHADOW_PAPER_STARTING_BALANCE,
+    stakePerRound: CURRENT_CELL_HORIZON_SHADOW_PAPER_STAKE,
+    grossPayoutMultiplier: CURRENT_CELL_HORIZON_SHADOW_PAPER_GROSS_MULTIPLIER,
+    attemptedCount,
+    settledCount,
+    pendingCount: attemptedCount - settledCount,
+    hitCount,
+    totalStaked,
+    grossPayout,
+    netResult: grossPayout - totalStaked,
+    currentBalance: balance,
+    stoppedAtTrajectoryId,
+  };
+}
+
 function mapPredictiveLeaderMetricFacts(rows) {
   const readyCount = rows.reduce(
     (total, row) => total + Number(row.ready_count),
@@ -4804,6 +5705,8 @@ export class RouletteDatabase {
     this.#finalizeSchemaVersionV24(startingVersion);
     this.#migrateTrajectoryMetricFactsV25(startingVersion);
     this.#migratePredictiveLeaderQualityAndSignalV26(startingVersion);
+    this.#migratePredictiveLeaderV7ShadowV27(startingVersion);
+    this.#migrateCurrentCellHorizonShadowV28(startingVersion);
   }
 
   #migratePrecloseForecastsV10() {
@@ -6517,6 +7420,689 @@ export class RouletteDatabase {
       throw error;
     }
     this.#backfillPredictiveLeaderEvaluationVoids();
+  }
+
+  #migratePredictiveLeaderV7ShadowV27(startingVersion) {
+    this.sqlite.exec("BEGIN IMMEDIATE");
+    try {
+      this.sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS predictive_leader_v7_cohorts (
+          candidate_key TEXT PRIMARY KEY CHECK (length(trim(candidate_key)) > 0),
+          schema_version INTEGER NOT NULL CHECK (
+            schema_version = ${LEARNED_LEADER_V7_SCHEMA_VERSION}
+          ),
+          algorithm_version TEXT NOT NULL CHECK (length(trim(algorithm_version)) > 0),
+          config_version TEXT NOT NULL CHECK (length(trim(config_version)) > 0),
+          target_horizon INTEGER NOT NULL CHECK (target_horizon = 1),
+          forecast_horizon_seconds INTEGER NOT NULL CHECK (
+            forecast_horizon_seconds BETWEEN 5 AND 60
+          ),
+          mode TEXT NOT NULL CHECK (mode = 'prospective-shadow'),
+          source TEXT NOT NULL DEFAULT 'buleto' CHECK (source = 'buleto'),
+          instrument TEXT NOT NULL DEFAULT 'XPM/RUB' CHECK (instrument = 'XPM/RUB'),
+          first_forecast_id INTEGER NOT NULL CHECK (first_forecast_id >= 1),
+          started_at TEXT NOT NULL,
+          config_json TEXT NOT NULL CHECK (
+            json_valid(config_json)
+            AND json_type(config_json) = 'object'
+          ),
+          config_sha256 TEXT NOT NULL CHECK (
+            length(config_sha256) = 64 AND config_sha256 = lower(config_sha256)
+          ),
+          source_export_artifact TEXT NOT NULL CHECK (
+            length(trim(source_export_artifact)) > 0
+          ),
+          source_export_sha256 TEXT NOT NULL CHECK (
+            length(source_export_sha256) = 64
+            AND source_export_sha256 = lower(source_export_sha256)
+          ),
+          source_export_cutoff_at TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          UNIQUE(algorithm_version),
+          UNIQUE(
+            candidate_key, schema_version, algorithm_version, config_version,
+            target_horizon, config_sha256
+          ),
+          CHECK (started_at = created_at),
+          CHECK (started_at > source_export_cutoff_at),
+          CHECK (json_extract(config_json, '$.candidateId') = candidate_key),
+          CHECK (json_extract(config_json, '$.version') = config_version),
+          CHECK (json_extract(config_json, '$.targetHorizon') = 1)
+        );
+
+        CREATE TABLE IF NOT EXISTS forecast_predictive_leader_v7_snapshots (
+          forecast_id INTEGER NOT NULL
+            REFERENCES round_forecasts(id) ON DELETE CASCADE,
+          candidate_key TEXT NOT NULL,
+          schema_version INTEGER NOT NULL CHECK (
+            schema_version = ${LEARNED_LEADER_V7_SCHEMA_VERSION}
+          ),
+          algorithm_version TEXT NOT NULL CHECK (length(trim(algorithm_version)) > 0),
+          config_version TEXT NOT NULL CHECK (length(trim(config_version)) > 0),
+          target_horizon INTEGER NOT NULL CHECK (target_horizon = 1),
+          config_sha256 TEXT NOT NULL CHECK (
+            length(config_sha256) = 64 AND config_sha256 = lower(config_sha256)
+          ),
+          status TEXT NOT NULL CHECK (status IN ('ready', 'unavailable')),
+          locked_at TEXT NOT NULL,
+          history_max_result_id INTEGER REFERENCES round_results(id),
+          predicted_number INTEGER CHECK (
+            predicted_number IS NULL OR predicted_number BETWEEN 0 AND 36
+          ),
+          leader_mass REAL CHECK (
+            leader_mass IS NULL OR leader_mass BETWEEN 0 AND 1
+          ),
+          margin REAL CHECK (margin IS NULL OR margin BETWEEN 0 AND 1),
+          selected INTEGER NOT NULL CHECK (selected IN (0, 1)),
+          snapshot_json TEXT NOT NULL CHECK (
+            json_valid(snapshot_json) AND json_type(snapshot_json) = 'object'
+          ),
+          created_at TEXT NOT NULL,
+          PRIMARY KEY (forecast_id, candidate_key),
+          FOREIGN KEY (
+            candidate_key, schema_version, algorithm_version, config_version,
+            target_horizon, config_sha256
+          ) REFERENCES predictive_leader_v7_cohorts(
+            candidate_key, schema_version, algorithm_version, config_version,
+            target_horizon, config_sha256
+          ),
+          CHECK (locked_at <= created_at),
+          CHECK (
+            (status = 'ready' AND predicted_number IS NOT NULL
+              AND leader_mass IS NOT NULL AND margin IS NOT NULL)
+            OR
+            (status = 'unavailable' AND predicted_number IS NULL
+              AND leader_mass IS NULL AND margin IS NULL AND selected = 0)
+          ),
+          CHECK (json_extract(snapshot_json, '$.schemaVersion') = schema_version),
+          CHECK (json_extract(snapshot_json, '$.algorithmVersion') = algorithm_version),
+          CHECK (json_extract(snapshot_json, '$.status') = status),
+          CHECK (json_extract(snapshot_json, '$.lockedAt') = locked_at),
+          CHECK (json_extract(snapshot_json, '$.leaderNumber') IS predicted_number),
+          CHECK (json_extract(snapshot_json, '$.leaderMass') IS leader_mass),
+          CHECK (json_extract(snapshot_json, '$.margin') IS margin),
+          CHECK (json_extract(snapshot_json, '$.selection.eligible') = selected),
+          CHECK (json_extract(snapshot_json, '$.config.candidateId') = candidate_key),
+          CHECK (json_extract(snapshot_json, '$.config.version') = config_version),
+          CHECK (json_extract(snapshot_json, '$.targetHorizon') = target_horizon),
+          CHECK (json_extract(snapshot_json, '$.shadow') = 1),
+          CHECK (json_extract(snapshot_json, '$.targetHorizon') = 1)
+        );
+
+        CREATE INDEX IF NOT EXISTS predictive_leader_v7_stream_idx
+          ON forecast_predictive_leader_v7_snapshots(
+            candidate_key, status, selected, forecast_id
+          );
+        CREATE INDEX IF NOT EXISTS predictive_leader_v7_history_idx
+          ON forecast_predictive_leader_v7_snapshots(
+            history_max_result_id, forecast_id
+          );
+
+        CREATE TRIGGER IF NOT EXISTS predictive_leader_v7_no_backfill_insert
+        BEFORE INSERT ON forecast_predictive_leader_v7_snapshots
+        WHEN NEW.forecast_id < (
+          SELECT first_forecast_id
+          FROM predictive_leader_v7_cohorts
+          WHERE candidate_key = NEW.candidate_key
+        ) OR NEW.locked_at < (
+          SELECT started_at
+          FROM predictive_leader_v7_cohorts
+          WHERE candidate_key = NEW.candidate_key
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'v7 shadow snapshots cannot be backfilled');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS predictive_leader_v7_no_backfill_update
+        BEFORE UPDATE OF forecast_id, candidate_key, locked_at
+          ON forecast_predictive_leader_v7_snapshots
+        WHEN NEW.forecast_id < (
+          SELECT first_forecast_id
+          FROM predictive_leader_v7_cohorts
+          WHERE candidate_key = NEW.candidate_key
+        ) OR NEW.locked_at < (
+          SELECT started_at
+          FROM predictive_leader_v7_cohorts
+          WHERE candidate_key = NEW.candidate_key
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'v7 shadow snapshots cannot be backfilled');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS predictive_leader_v7_cohort_immutable_update
+        BEFORE UPDATE ON predictive_leader_v7_cohorts
+        BEGIN
+          SELECT RAISE(ABORT, 'v7 shadow cohort is immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS predictive_leader_v7_cohort_immutable_delete
+        BEFORE DELETE ON predictive_leader_v7_cohorts
+        BEGIN
+          SELECT RAISE(ABORT, 'v7 shadow cohort is immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS predictive_leader_v7_snapshot_immutable_update
+        BEFORE UPDATE ON forecast_predictive_leader_v7_snapshots
+        BEGIN
+          SELECT RAISE(ABORT, 'v7 shadow snapshot is immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS predictive_leader_v7_snapshot_immutable_delete
+        BEFORE DELETE ON forecast_predictive_leader_v7_snapshots
+        BEGIN
+          SELECT RAISE(ABORT, 'v7 shadow snapshot is immutable');
+        END;
+      `);
+
+      const v7CohortColumns = this.sqlite.prepare(`
+        PRAGMA table_info(predictive_leader_v7_cohorts)
+      `).all();
+      if (!v7CohortColumns.some((column) => column.name === "source")) {
+        this.sqlite.exec(`
+          ALTER TABLE predictive_leader_v7_cohorts
+          ADD COLUMN source TEXT NOT NULL DEFAULT 'buleto' CHECK (source = 'buleto')
+        `);
+      }
+      if (!v7CohortColumns.some((column) => column.name === "instrument")) {
+        this.sqlite.exec(`
+          ALTER TABLE predictive_leader_v7_cohorts
+          ADD COLUMN instrument TEXT NOT NULL DEFAULT 'XPM/RUB'
+            CHECK (instrument = 'XPM/RUB')
+        `);
+      }
+      this.sqlite.exec(`
+        CREATE TRIGGER IF NOT EXISTS predictive_leader_v7_snapshot_stream_identity
+        BEFORE INSERT ON forecast_predictive_leader_v7_snapshots
+        WHEN NOT EXISTS (
+          SELECT 1
+          FROM round_forecasts AS forecasts
+          JOIN forecast_snapshots AS snapshots ON snapshots.id = forecasts.snapshot_id
+          JOIN predictive_leader_v7_cohorts AS cohorts
+            ON cohorts.candidate_key = NEW.candidate_key
+          WHERE forecasts.id = NEW.forecast_id
+            AND snapshots.source = cohorts.source
+            AND snapshots.instrument = cohorts.instrument
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'v7 shadow snapshot stream identity is invalid');
+        END;
+      `);
+
+      const firstForecastId = Number(this.sqlite.prepare(`
+        SELECT COALESCE(MAX(id), 0) + 1 AS first_forecast_id
+        FROM round_forecasts
+      `).get().first_forecast_id);
+      const existingCohort = this.sqlite.prepare(`
+        SELECT candidate_key
+        FROM predictive_leader_v7_cohorts
+        WHERE candidate_key = ?
+      `).get(PREDICTIVE_LEADER_V7_CANDIDATE_CONFIG.candidateId);
+      let cohortInsertionChanges = 0;
+      if (!existingCohort) {
+        const migrationClockAt = asTimestamp(
+          this.clock(),
+          undefined,
+          "predictive leader v7 cohort startedAt",
+        );
+        const startedAt = new Date(Math.max(
+          Date.parse(migrationClockAt),
+          Date.parse(PREDICTIVE_LEADER_V7_SOURCE_EXPORT.cutoffAt) + 1,
+        )).toISOString();
+        const cohortInsertion = this.sqlite.prepare(`
+          INSERT INTO predictive_leader_v7_cohorts (
+            candidate_key, schema_version, algorithm_version, config_version,
+            target_horizon, forecast_horizon_seconds, mode, source, instrument,
+            first_forecast_id,
+            started_at, config_json, config_sha256,
+            source_export_artifact, source_export_sha256,
+            source_export_cutoff_at, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, 'prospective-shadow', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          PREDICTIVE_LEADER_V7_CANDIDATE_CONFIG.candidateId,
+          LEARNED_LEADER_V7_SCHEMA_VERSION,
+          LEARNED_LEADER_V7_ALGORITHM_VERSION,
+          LEARNED_LEADER_V7_CONFIG_VERSION,
+          LEARNED_LEADER_V7_TARGET_HORIZON,
+          PREDICTIVE_LEADER_V7_FORECAST_HORIZON_SECONDS,
+          PREDICTIVE_SHADOW_FROZEN_STREAM.source,
+          PREDICTIVE_SHADOW_FROZEN_STREAM.instrument,
+          firstForecastId,
+          startedAt,
+          PREDICTIVE_LEADER_V7_CONFIG_JSON,
+          PREDICTIVE_LEADER_V7_CONFIG_SHA256,
+          PREDICTIVE_LEADER_V7_SOURCE_EXPORT.artifact,
+          PREDICTIVE_LEADER_V7_SOURCE_EXPORT.sha256,
+          PREDICTIVE_LEADER_V7_SOURCE_EXPORT.cutoffAt,
+          startedAt,
+        );
+        cohortInsertionChanges = Number(cohortInsertion.changes);
+      }
+      const cohort = this.sqlite.prepare(`
+        SELECT * FROM predictive_leader_v7_cohorts WHERE candidate_key = ?
+      `).get(PREDICTIVE_LEADER_V7_CANDIDATE_CONFIG.candidateId);
+      if (
+        !cohort
+        || Number(cohort.schema_version) !== LEARNED_LEADER_V7_SCHEMA_VERSION
+        || cohort.algorithm_version !== LEARNED_LEADER_V7_ALGORITHM_VERSION
+        || cohort.config_version !== LEARNED_LEADER_V7_CONFIG_VERSION
+        || Number(cohort.target_horizon) !== LEARNED_LEADER_V7_TARGET_HORIZON
+        || Number(cohort.forecast_horizon_seconds)
+          !== PREDICTIVE_LEADER_V7_FORECAST_HORIZON_SECONDS
+        || cohort.mode !== "prospective-shadow"
+        || cohort.source !== PREDICTIVE_SHADOW_FROZEN_STREAM.source
+        || cohort.instrument !== PREDICTIVE_SHADOW_FROZEN_STREAM.instrument
+        || cohort.config_json !== PREDICTIVE_LEADER_V7_CONFIG_JSON
+        || cohort.config_sha256 !== PREDICTIVE_LEADER_V7_CONFIG_SHA256
+        || cohort.source_export_artifact
+          !== PREDICTIVE_LEADER_V7_SOURCE_EXPORT.artifact
+        || cohort.source_export_sha256 !== PREDICTIVE_LEADER_V7_SOURCE_EXPORT.sha256
+        || cohort.source_export_cutoff_at
+          !== PREDICTIVE_LEADER_V7_SOURCE_EXPORT.cutoffAt
+        || !Number.isSafeInteger(Number(cohort.first_forecast_id))
+        || Number(cohort.first_forecast_id) < 1
+        || (cohortInsertionChanges === 1
+          && Number(cohort.first_forecast_id) !== firstForecastId)
+        || !Number.isFinite(Date.parse(cohort.started_at))
+        || cohort.started_at !== cohort.created_at
+        || Date.parse(cohort.started_at)
+          <= Date.parse(cohort.source_export_cutoff_at)
+      ) {
+        throw new Error("predictive leader v7 cohort is incompatible");
+      }
+      this.sqlite.exec(`
+        PRAGMA user_version = ${Math.max(27, startingVersion)};
+        COMMIT;
+      `);
+    } catch (error) {
+      try {
+        this.sqlite.exec("ROLLBACK");
+      } catch {
+        // Preserve the migration error.
+      }
+      throw error;
+    }
+  }
+
+  #migrateCurrentCellHorizonShadowV28(startingVersion) {
+    this.sqlite.exec("BEGIN IMMEDIATE");
+    try {
+      this.sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS current_cell_horizon_shadow_cohorts (
+          cohort_key TEXT PRIMARY KEY CHECK (length(trim(cohort_key)) > 0),
+          schema_version INTEGER NOT NULL CHECK (
+            schema_version = ${CURRENT_CELL_HORIZON_SHADOW_SCHEMA_VERSION}
+          ),
+          algorithm_version TEXT NOT NULL UNIQUE CHECK (
+            length(trim(algorithm_version)) > 0
+          ),
+          config_version TEXT NOT NULL CHECK (length(trim(config_version)) > 0),
+          horizon_seconds INTEGER NOT NULL CHECK (horizon_seconds = 10),
+          mode TEXT NOT NULL CHECK (mode = 'prospective-shadow'),
+          source TEXT NOT NULL CHECK (source = 'buleto'),
+          instrument TEXT NOT NULL CHECK (instrument = 'XPM/RUB'),
+          first_trajectory_id INTEGER NOT NULL CHECK (first_trajectory_id >= 1),
+          started_at TEXT NOT NULL,
+          config_json TEXT NOT NULL CHECK (
+            json_valid(config_json) AND json_type(config_json) = 'object'
+          ),
+          config_sha256 TEXT NOT NULL CHECK (
+            length(config_sha256) = 64 AND config_sha256 = lower(config_sha256)
+          ),
+          source_export_artifact TEXT NOT NULL CHECK (
+            length(trim(source_export_artifact)) > 0
+          ),
+          source_export_sha256 TEXT NOT NULL CHECK (
+            length(source_export_sha256) = 64
+            AND source_export_sha256 = lower(source_export_sha256)
+          ),
+          source_export_cutoff_at TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          UNIQUE(
+            cohort_key, schema_version, algorithm_version, config_version,
+            config_sha256
+          ),
+          CHECK (started_at = created_at),
+          CHECK (started_at > source_export_cutoff_at),
+          CHECK (json_extract(config_json, '$.version') = config_version),
+          CHECK (json_extract(config_json, '$.horizonSeconds') = horizon_seconds),
+          CHECK (json_extract(config_json, '$.mode') = mode),
+          CHECK (json_extract(config_json, '$.executionEnabled') = 0),
+          CHECK (json_extract(config_json, '$.advisoryOnly') = 1)
+        );
+
+        CREATE TABLE IF NOT EXISTS round_trajectory_current_cell_horizon_snapshots (
+          trajectory_id INTEGER NOT NULL REFERENCES round_trajectories(id),
+          cohort_key TEXT NOT NULL,
+          schema_version INTEGER NOT NULL CHECK (
+            schema_version = ${CURRENT_CELL_HORIZON_SHADOW_SCHEMA_VERSION}
+          ),
+          algorithm_version TEXT NOT NULL CHECK (length(trim(algorithm_version)) > 0),
+          config_version TEXT NOT NULL CHECK (length(trim(config_version)) > 0),
+          config_sha256 TEXT NOT NULL CHECK (
+            length(config_sha256) = 64 AND config_sha256 = lower(config_sha256)
+          ),
+          status TEXT NOT NULL CHECK (status IN ('ready', 'unavailable')),
+          reason TEXT NOT NULL CHECK (length(trim(reason)) > 0),
+          cutoff_at TEXT NOT NULL,
+          captured_at TEXT NOT NULL,
+          predicted_number INTEGER CHECK (
+            predicted_number IS NULL OR predicted_number BETWEEN 0 AND 36
+          ),
+          leader_wire_cell INTEGER CHECK (
+            leader_wire_cell IS NULL OR leader_wire_cell BETWEEN 0 AND 37
+          ),
+          leader_probability REAL CHECK (
+            leader_probability IS NULL
+            OR leader_probability BETWEEN 0 AND 1
+          ),
+          runner_up_probability REAL CHECK (
+            runner_up_probability IS NULL
+            OR runner_up_probability BETWEEN 0 AND 1
+          ),
+          margin REAL CHECK (margin IS NULL OR margin BETWEEN 0 AND 1),
+          snapshot_json TEXT NOT NULL CHECK (
+            json_valid(snapshot_json) AND json_type(snapshot_json) = 'object'
+          ),
+          created_at TEXT NOT NULL,
+          PRIMARY KEY (trajectory_id, cohort_key),
+          FOREIGN KEY (
+            cohort_key, schema_version, algorithm_version, config_version,
+            config_sha256
+          ) REFERENCES current_cell_horizon_shadow_cohorts(
+            cohort_key, schema_version, algorithm_version, config_version,
+            config_sha256
+          ),
+          CHECK (cutoff_at <= captured_at AND captured_at <= created_at),
+          CHECK (
+            (status = 'ready' AND predicted_number IS NOT NULL
+              AND leader_wire_cell IS NOT NULL AND leader_probability IS NOT NULL
+              AND runner_up_probability IS NOT NULL AND margin IS NOT NULL)
+            OR
+            (status = 'unavailable' AND predicted_number IS NULL
+              AND leader_wire_cell IS NULL AND leader_probability IS NULL
+              AND runner_up_probability IS NULL AND margin IS NULL)
+          ),
+          CHECK (json_extract(snapshot_json, '$.trajectoryId') = trajectory_id),
+          CHECK (json_extract(snapshot_json, '$.cohortKey') = cohort_key),
+          CHECK (json_extract(snapshot_json, '$.schemaVersion') = schema_version),
+          CHECK (json_extract(snapshot_json, '$.algorithmVersion') = algorithm_version),
+          CHECK (json_extract(snapshot_json, '$.config.version') = config_version),
+          CHECK (json_extract(snapshot_json, '$.status') = status),
+          CHECK (json_extract(snapshot_json, '$.reason') = reason),
+          CHECK (json_extract(snapshot_json, '$.cutoffAt') = cutoff_at),
+          CHECK (json_extract(snapshot_json, '$.capturedAt') = captured_at),
+          CHECK (json_extract(snapshot_json, '$.leaderNumber') IS predicted_number),
+          CHECK (json_extract(snapshot_json, '$.leaderWireCell') IS leader_wire_cell),
+          CHECK (json_extract(snapshot_json, '$.leaderProbability') IS leader_probability),
+          CHECK (
+            json_extract(snapshot_json, '$.runnerUpProbability')
+              IS runner_up_probability
+          ),
+          CHECK (json_extract(snapshot_json, '$.margin') IS margin),
+          CHECK (json_extract(snapshot_json, '$.executionEnabled') = 0),
+          CHECK (json_extract(snapshot_json, '$.advisoryOnly') = 1)
+        );
+
+        CREATE INDEX IF NOT EXISTS current_cell_horizon_snapshot_stream_idx
+          ON round_trajectory_current_cell_horizon_snapshots(
+            cohort_key, status, trajectory_id
+          );
+        CREATE INDEX IF NOT EXISTS current_cell_horizon_snapshot_cutoff_idx
+          ON round_trajectory_current_cell_horizon_snapshots(
+            cohort_key, cutoff_at, trajectory_id
+          );
+
+        CREATE TABLE IF NOT EXISTS round_trajectory_current_cell_horizon_evaluations (
+          trajectory_id INTEGER NOT NULL,
+          cohort_key TEXT NOT NULL,
+          round_result_id INTEGER NOT NULL REFERENCES round_results(id),
+          actual_number INTEGER NOT NULL CHECK (actual_number BETWEEN 0 AND 36),
+          top1_hit INTEGER NOT NULL CHECK (top1_hit IN (0, 1)),
+          brier_loss REAL NOT NULL CHECK (brier_loss BETWEEN 0 AND 1),
+          clipped_log_loss REAL NOT NULL CHECK (clipped_log_loss >= 0),
+          evaluation_json TEXT NOT NULL CHECK (
+            json_valid(evaluation_json) AND json_type(evaluation_json) = 'object'
+          ),
+          evaluated_at TEXT NOT NULL,
+          PRIMARY KEY (trajectory_id, cohort_key),
+          UNIQUE(round_result_id, cohort_key),
+          FOREIGN KEY (trajectory_id, cohort_key)
+            REFERENCES round_trajectory_current_cell_horizon_snapshots(
+              trajectory_id, cohort_key
+            ),
+          CHECK (json_extract(evaluation_json, '$.actualNumber') = actual_number),
+          CHECK (json_extract(evaluation_json, '$.top1Hit') = top1_hit),
+          CHECK (json_extract(evaluation_json, '$.brierLoss') = brier_loss),
+          CHECK (
+            json_extract(evaluation_json, '$.clippedLogLoss') = clipped_log_loss
+          )
+        );
+
+        CREATE INDEX IF NOT EXISTS current_cell_horizon_evaluation_result_idx
+          ON round_trajectory_current_cell_horizon_evaluations(
+            cohort_key, round_result_id
+          );
+
+        CREATE TRIGGER IF NOT EXISTS current_cell_horizon_snapshot_no_backfill
+        BEFORE INSERT ON round_trajectory_current_cell_horizon_snapshots
+        WHEN NEW.trajectory_id < (
+          SELECT first_trajectory_id
+          FROM current_cell_horizon_shadow_cohorts
+          WHERE cohort_key = NEW.cohort_key
+        ) OR NEW.cutoff_at < (
+          SELECT started_at
+          FROM current_cell_horizon_shadow_cohorts
+          WHERE cohort_key = NEW.cohort_key
+        ) OR NEW.captured_at < (
+          SELECT started_at
+          FROM current_cell_horizon_shadow_cohorts
+          WHERE cohort_key = NEW.cohort_key
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'current-cell shadow snapshots cannot be backfilled');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS current_cell_horizon_snapshot_identity
+        BEFORE INSERT ON round_trajectory_current_cell_horizon_snapshots
+        WHEN NOT EXISTS (
+          SELECT 1
+          FROM round_trajectories AS trajectories
+          JOIN current_cell_horizon_shadow_cohorts AS cohorts
+            ON cohorts.cohort_key = NEW.cohort_key
+          WHERE trajectories.id = NEW.trajectory_id
+            AND json_extract(NEW.snapshot_json, '$.source') = trajectories.source
+            AND json_extract(NEW.snapshot_json, '$.instrument')
+              = trajectories.instrument
+            AND json_extract(NEW.snapshot_json, '$.externalRoundId')
+              = trajectories.external_round_id
+            AND trajectories.source = cohorts.source
+            AND trajectories.instrument = cohorts.instrument
+            AND NEW.cutoff_at = strftime(
+              '%Y-%m-%dT%H:%M:%fZ', trajectories.betting_closes_at, '-10 seconds'
+            )
+            AND NEW.captured_at >= NEW.cutoff_at
+            AND NEW.captured_at <= strftime(
+              '%Y-%m-%dT%H:%M:%fZ', NEW.cutoff_at, '+2.5 seconds'
+            )
+            AND NEW.captured_at <= strftime(
+              '%Y-%m-%dT%H:%M:%fZ', trajectories.betting_closes_at, '-5 seconds'
+            )
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'current-cell shadow snapshot identity is invalid');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS current_cell_horizon_snapshot_chronological
+        BEFORE INSERT ON round_trajectory_current_cell_horizon_snapshots
+        WHEN EXISTS (
+          SELECT 1
+          FROM round_trajectory_current_cell_horizon_snapshots AS prior
+          JOIN round_trajectories AS prior_trajectory
+            ON prior_trajectory.id = prior.trajectory_id
+          JOIN round_trajectories AS next_trajectory
+            ON next_trajectory.id = NEW.trajectory_id
+          WHERE prior.cohort_key = NEW.cohort_key
+            AND prior_trajectory.source = next_trajectory.source
+            AND prior_trajectory.instrument = next_trajectory.instrument
+            AND (
+              prior_trajectory.betting_closes_at
+                > next_trajectory.betting_closes_at
+              OR (
+                prior_trajectory.betting_closes_at
+                  = next_trajectory.betting_closes_at
+                AND prior.trajectory_id > NEW.trajectory_id
+              )
+            )
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'current-cell shadow chronological backfill is forbidden');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS current_cell_horizon_evaluation_identity
+        BEFORE INSERT ON round_trajectory_current_cell_horizon_evaluations
+        WHEN NOT EXISTS (
+          SELECT 1
+          FROM round_trajectory_current_cell_horizon_snapshots AS snapshots
+          JOIN round_trajectories AS trajectories
+            ON trajectories.id = snapshots.trajectory_id
+          JOIN round_results AS results
+            ON results.id = NEW.round_result_id
+          WHERE snapshots.trajectory_id = NEW.trajectory_id
+            AND snapshots.cohort_key = NEW.cohort_key
+            AND snapshots.status = 'ready'
+            AND results.source = trajectories.source
+            AND results.instrument = trajectories.instrument
+            AND results.external_round_id = trajectories.external_round_id
+            AND results.result_number = NEW.actual_number
+            AND results.settled_at > snapshots.captured_at
+            AND results.observed_at > snapshots.captured_at
+            AND results.created_at > snapshots.captured_at
+            AND NEW.evaluated_at >= results.created_at
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'current-cell shadow evaluation identity is invalid');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS current_cell_horizon_cohort_immutable_update
+        BEFORE UPDATE ON current_cell_horizon_shadow_cohorts
+        BEGIN
+          SELECT RAISE(ABORT, 'current-cell shadow cohort is immutable');
+        END;
+        CREATE TRIGGER IF NOT EXISTS current_cell_horizon_cohort_immutable_delete
+        BEFORE DELETE ON current_cell_horizon_shadow_cohorts
+        BEGIN
+          SELECT RAISE(ABORT, 'current-cell shadow cohort is immutable');
+        END;
+        CREATE TRIGGER IF NOT EXISTS current_cell_horizon_snapshot_immutable_update
+        BEFORE UPDATE ON round_trajectory_current_cell_horizon_snapshots
+        BEGIN
+          SELECT RAISE(ABORT, 'current-cell shadow snapshot is immutable');
+        END;
+        CREATE TRIGGER IF NOT EXISTS current_cell_horizon_snapshot_immutable_delete
+        BEFORE DELETE ON round_trajectory_current_cell_horizon_snapshots
+        BEGIN
+          SELECT RAISE(ABORT, 'current-cell shadow snapshot is immutable');
+        END;
+        CREATE TRIGGER IF NOT EXISTS current_cell_horizon_evaluation_immutable_update
+        BEFORE UPDATE ON round_trajectory_current_cell_horizon_evaluations
+        BEGIN
+          SELECT RAISE(ABORT, 'current-cell shadow evaluation is immutable');
+        END;
+        CREATE TRIGGER IF NOT EXISTS current_cell_horizon_evaluation_immutable_delete
+        BEFORE DELETE ON round_trajectory_current_cell_horizon_evaluations
+        BEGIN
+          SELECT RAISE(ABORT, 'current-cell shadow evaluation is immutable');
+        END;
+      `);
+
+      const firstTrajectoryId = Number(this.sqlite.prepare(`
+        SELECT COALESCE(MAX(id), 0) + 1 AS first_trajectory_id
+        FROM round_trajectories
+      `).get().first_trajectory_id);
+      const existing = this.sqlite.prepare(`
+        SELECT cohort_key
+        FROM current_cell_horizon_shadow_cohorts
+        WHERE cohort_key = ?
+      `).get(CURRENT_CELL_HORIZON_SHADOW_COHORT_KEY);
+      let inserted = 0;
+      if (!existing) {
+        const migrationClockAt = asTimestamp(
+          this.clock(),
+          undefined,
+          "current-cell shadow cohort startedAt",
+        );
+        const startedAt = new Date(Math.max(
+          Date.parse(migrationClockAt),
+          Date.parse(CURRENT_CELL_HORIZON_SHADOW_SOURCE_EXPORT.cutoffAt) + 1,
+        )).toISOString();
+        inserted = Number(this.sqlite.prepare(`
+          INSERT INTO current_cell_horizon_shadow_cohorts (
+            cohort_key, schema_version, algorithm_version, config_version,
+            horizon_seconds, mode, source, instrument, first_trajectory_id, started_at,
+            config_json, config_sha256, source_export_artifact,
+            source_export_sha256, source_export_cutoff_at, created_at
+          ) VALUES (?, ?, ?, ?, 10, 'prospective-shadow', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          CURRENT_CELL_HORIZON_SHADOW_COHORT_KEY,
+          CURRENT_CELL_HORIZON_SHADOW_SCHEMA_VERSION,
+          CURRENT_CELL_HORIZON_SHADOW_ALGORITHM_VERSION,
+          CURRENT_CELL_HORIZON_SHADOW_CONFIG_VERSION,
+          CURRENT_CELL_HORIZON_SHADOW_SOURCE,
+          CURRENT_CELL_HORIZON_SHADOW_INSTRUMENT,
+          firstTrajectoryId,
+          startedAt,
+          CURRENT_CELL_HORIZON_SHADOW_CONFIG_JSON,
+          CURRENT_CELL_HORIZON_SHADOW_CONFIG_SHA256,
+          CURRENT_CELL_HORIZON_SHADOW_SOURCE_EXPORT.artifact,
+          CURRENT_CELL_HORIZON_SHADOW_SOURCE_EXPORT.sha256,
+          CURRENT_CELL_HORIZON_SHADOW_SOURCE_EXPORT.cutoffAt,
+          startedAt,
+        ).changes);
+      }
+      const cohort = this.sqlite.prepare(`
+        SELECT * FROM current_cell_horizon_shadow_cohorts WHERE cohort_key = ?
+      `).get(CURRENT_CELL_HORIZON_SHADOW_COHORT_KEY);
+      if (
+        !cohort
+        || Number(cohort.schema_version)
+          !== CURRENT_CELL_HORIZON_SHADOW_SCHEMA_VERSION
+        || cohort.algorithm_version
+          !== CURRENT_CELL_HORIZON_SHADOW_ALGORITHM_VERSION
+        || cohort.config_version !== CURRENT_CELL_HORIZON_SHADOW_CONFIG_VERSION
+        || Number(cohort.horizon_seconds) !== 10
+        || cohort.mode !== "prospective-shadow"
+        || cohort.source !== CURRENT_CELL_HORIZON_SHADOW_SOURCE
+        || cohort.instrument !== CURRENT_CELL_HORIZON_SHADOW_INSTRUMENT
+        || cohort.config_json !== CURRENT_CELL_HORIZON_SHADOW_CONFIG_JSON
+        || cohort.config_sha256 !== CURRENT_CELL_HORIZON_SHADOW_CONFIG_SHA256
+        || cohort.source_export_artifact
+          !== CURRENT_CELL_HORIZON_SHADOW_SOURCE_EXPORT.artifact
+        || cohort.source_export_sha256
+          !== CURRENT_CELL_HORIZON_SHADOW_SOURCE_EXPORT.sha256
+        || cohort.source_export_cutoff_at
+          !== CURRENT_CELL_HORIZON_SHADOW_SOURCE_EXPORT.cutoffAt
+        || !Number.isSafeInteger(Number(cohort.first_trajectory_id))
+        || Number(cohort.first_trajectory_id) < 1
+        || (inserted === 1
+          && Number(cohort.first_trajectory_id) !== firstTrajectoryId)
+        || cohort.started_at !== cohort.created_at
+        || Date.parse(cohort.started_at)
+          <= Date.parse(cohort.source_export_cutoff_at)
+      ) {
+        throw new Error("current-cell shadow cohort is incompatible");
+      }
+      this.sqlite.exec(`
+        PRAGMA user_version = ${Math.max(28, startingVersion)};
+        COMMIT;
+      `);
+    } catch (error) {
+      try {
+        this.sqlite.exec("ROLLBACK");
+      } catch {
+        // Preserve the migration error.
+      }
+      throw error;
+    }
   }
 
   #migrateContinuityReconciliationV9() {
@@ -9947,6 +11533,285 @@ export class RouletteDatabase {
     });
   }
 
+  recordCurrentCellHorizonShadow(
+    source = "buleto",
+    instrument = "default",
+    externalRoundId,
+    expectedBettingClosesAt,
+  ) {
+    this.#assertOpen();
+    const safeSource = asNonEmptyText(source, undefined, "source");
+    const safeInstrument = asNonEmptyText(instrument, undefined, "instrument");
+    const safeRoundId = asNonEmptyText(
+      externalRoundId,
+      undefined,
+      "externalRoundId",
+    );
+    return this.#transaction(() => {
+      const cohort = mapCurrentCellHorizonCohort(this.sqlite.prepare(`
+        SELECT *
+        FROM current_cell_horizon_shadow_cohorts
+        WHERE cohort_key = ?
+      `).get(CURRENT_CELL_HORIZON_SHADOW_COHORT_KEY));
+      if (!cohort) throw new Error("current-cell shadow cohort is invalid");
+      if (safeSource !== cohort.source || safeInstrument !== cohort.instrument) {
+        return { inserted: false, reason: "outside_frozen_stream", retryable: false };
+      }
+      const safeExpectedBettingClosesAt = asTimestamp(
+        expectedBettingClosesAt,
+        undefined,
+        "expectedBettingClosesAt",
+      );
+
+      const trajectory = this.sqlite.prepare(`
+        SELECT *
+        FROM round_trajectories
+        WHERE source = ? AND instrument = ? AND external_round_id = ?
+        LIMIT 1
+      `).get(safeSource, safeInstrument, safeRoundId);
+      if (!trajectory) {
+        return { inserted: false, reason: "trajectory_not_found", retryable: true };
+      }
+      if (trajectory.betting_closes_at !== safeExpectedBettingClosesAt) {
+        return { inserted: false, reason: "metadata_conflict", retryable: false };
+      }
+      const trajectoryId = Number(trajectory.id);
+      if (
+        trajectoryId < cohort.firstTrajectoryId
+        || trajectory.created_at < cohort.startedAt
+      ) {
+        return { inserted: false, reason: "outside_prospective_cohort", retryable: false };
+      }
+      const existing = this.sqlite.prepare(`
+        SELECT trajectory_id
+        FROM round_trajectory_current_cell_horizon_snapshots
+        WHERE trajectory_id = ? AND cohort_key = ?
+      `).get(trajectoryId, cohort.cohortKey);
+      if (existing) {
+        return { inserted: false, reason: "already_frozen", retryable: false };
+      }
+
+      const capturedAt = asTimestamp(
+        this.clock(),
+        undefined,
+        "current-cell shadow capturedAt",
+      );
+      const closesMs = Date.parse(trajectory.betting_closes_at);
+      const cutoffMs = closesMs - cohort.horizonSeconds * 1_000;
+      const cutoffAt = new Date(cutoffMs).toISOString();
+      const capturedMs = Date.parse(capturedAt);
+      if (capturedMs < cutoffMs) {
+        return { inserted: false, reason: "cutoff_not_reached", retryable: true };
+      }
+      if (
+        capturedMs > cutoffMs + CURRENT_CELL_HORIZON_SHADOW_CONFIG.captureGraceMs
+        || closesMs - capturedMs
+          < CURRENT_CELL_HORIZON_SHADOW_CONFIG.minimumExecutionBufferMs
+      ) {
+        return { inserted: false, reason: "capture_window_missed", retryable: false };
+      }
+      const knownTarget = this.sqlite.prepare(`
+        SELECT id
+        FROM round_results
+        WHERE source = ? AND instrument = ? AND external_round_id = ?
+        LIMIT 1
+      `).get(safeSource, safeInstrument, safeRoundId);
+      if (knownTarget) {
+        return { inserted: false, reason: "target_already_known", retryable: false };
+      }
+
+      const ticks = this.sqlite.prepare(`
+        SELECT factor_at, received_at, created_at, price
+        FROM round_trajectory_ticks
+        WHERE trajectory_id = ?
+          AND factor_at <= ?
+          AND received_at <= ?
+          AND created_at <= ?
+        ORDER BY factor_at, received_at, created_at, id
+      `).all(trajectoryId, cutoffAt, cutoffAt, cutoffAt).map((tick) => ({
+        factorAt: tick.factor_at,
+        receivedAt: tick.received_at,
+        createdAt: tick.created_at,
+        price: Number(tick.price),
+      }));
+      const snapshot = normalizeCurrentCellHorizonShadow(
+        buildCurrentCellHorizonShadow({
+          trajectoryId,
+          source: safeSource,
+          instrument: safeInstrument,
+          cohortKey: cohort.cohortKey,
+          externalRoundId: safeRoundId,
+          bettingClosesAt: trajectory.betting_closes_at,
+          capturedAt,
+          bands: deserializeJson(trajectory.bands_json),
+          ticks,
+        }),
+      );
+      if (!snapshot) {
+        throw new Error("current-cell shadow builder returned an invalid snapshot");
+      }
+      if (
+        snapshot.status === "unavailable"
+        && !["no_causal_tick", "ambiguous_latest_tick"].includes(snapshot.reason)
+      ) {
+        return { inserted: false, reason: snapshot.reason, retryable: false };
+      }
+
+      const commitCheckedAt = asTimestamp(
+        this.clock(),
+        undefined,
+        "current-cell shadow commitCheckedAt",
+      );
+      const commitCheckedMs = Date.parse(commitCheckedAt);
+      if (
+        commitCheckedMs < capturedMs
+        || closesMs - commitCheckedMs
+          < CURRENT_CELL_HORIZON_SHADOW_CONFIG.minimumExecutionBufferMs
+      ) {
+        throw new RangeError(
+          "current-cell shadow transaction must finish at least five seconds before betting closes",
+        );
+      }
+      this.sqlite.prepare(`
+        INSERT INTO round_trajectory_current_cell_horizon_snapshots (
+          trajectory_id, cohort_key, schema_version, algorithm_version,
+          config_version, config_sha256, status, reason, cutoff_at, captured_at,
+          predicted_number, leader_wire_cell, leader_probability,
+          runner_up_probability, margin, snapshot_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        trajectoryId,
+        cohort.cohortKey,
+        cohort.schemaVersion,
+        cohort.algorithmVersion,
+        cohort.configVersion,
+        cohort.configSha256,
+        snapshot.status,
+        snapshot.reason,
+        snapshot.cutoffAt,
+        snapshot.capturedAt,
+        snapshot.leaderNumber,
+        snapshot.leaderWireCell,
+        snapshot.leaderProbability,
+        snapshot.runnerUpProbability,
+        snapshot.margin,
+        JSON.stringify(snapshot),
+        commitCheckedAt,
+      );
+      return {
+        inserted: true,
+        reason: snapshot.status === "ready" ? "frozen" : snapshot.reason,
+        retryable: false,
+        trajectoryId,
+        status: snapshot.status,
+      };
+    });
+  }
+
+  settleCurrentCellHorizonShadows(
+    source = "buleto",
+    instrument = "default",
+  ) {
+    this.#assertOpen();
+    const safeSource = asNonEmptyText(source, undefined, "source");
+    const safeInstrument = asNonEmptyText(instrument, undefined, "instrument");
+    return this.#transaction(() => {
+      const rows = this.sqlite.prepare(`
+        SELECT
+          snapshots.*,
+          trajectories.source,
+          trajectories.instrument,
+          trajectories.external_round_id,
+          trajectories.betting_closes_at,
+          results.id AS result_id,
+          results.result_number,
+          results.settled_at AS result_settled_at,
+          results.observed_at AS result_observed_at,
+          results.created_at AS result_created_at
+        FROM round_trajectory_current_cell_horizon_snapshots AS snapshots
+        JOIN round_trajectories AS trajectories
+          ON trajectories.id = snapshots.trajectory_id
+        JOIN round_results AS results
+          ON results.source = trajectories.source
+         AND results.instrument = trajectories.instrument
+         AND results.external_round_id = trajectories.external_round_id
+        LEFT JOIN round_trajectory_current_cell_horizon_evaluations AS evaluations
+          ON evaluations.trajectory_id = snapshots.trajectory_id
+         AND evaluations.cohort_key = snapshots.cohort_key
+        WHERE trajectories.source = ?
+          AND trajectories.instrument = ?
+          AND snapshots.cohort_key = ?
+          AND snapshots.status = 'ready'
+          AND evaluations.trajectory_id IS NULL
+        ORDER BY trajectories.betting_closes_at, snapshots.trajectory_id
+      `).all(
+        safeSource,
+        safeInstrument,
+        CURRENT_CELL_HORIZON_SHADOW_COHORT_KEY,
+      );
+      const insert = this.sqlite.prepare(`
+        INSERT INTO round_trajectory_current_cell_horizon_evaluations (
+          trajectory_id, cohort_key, round_result_id, actual_number, top1_hit,
+          brier_loss, clipped_log_loss, evaluation_json, evaluated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      let settled = 0;
+      for (const row of rows) {
+        const snapshot = normalizeCurrentCellHorizonShadow(
+          deserializeJson(row.snapshot_json),
+        );
+        const trajectoryId = Number(row.trajectory_id);
+        const actualNumber = Number(row.result_number);
+        const capturedMs = Date.parse(snapshot?.capturedAt);
+        const resultTimes = [
+          row.result_settled_at,
+          row.result_observed_at,
+          row.result_created_at,
+        ].map(Date.parse);
+        if (
+          !snapshot
+          || snapshot.status !== "ready"
+          || snapshot.trajectoryId !== trajectoryId
+          || snapshot.source !== row.source
+          || snapshot.instrument !== row.instrument
+          || snapshot.externalRoundId !== row.external_round_id
+          || snapshot.bettingClosesAt !== row.betting_closes_at
+          || snapshot.cohortKey !== row.cohort_key
+          || !Number.isInteger(actualNumber)
+          || actualNumber < 0
+          || actualNumber > 36
+          || !Number.isFinite(capturedMs)
+          || resultTimes.some((time) => !Number.isFinite(time) || time <= capturedMs)
+        ) {
+          throw new Error("current-cell shadow settlement identity is invalid");
+        }
+        const evaluation = evaluateCurrentCellHorizonShadow(snapshot, actualNumber);
+        const evaluatedAt = asTimestamp(
+          this.clock(),
+          undefined,
+          "current-cell shadow evaluatedAt",
+        );
+        if (evaluatedAt < row.result_created_at) {
+          throw new RangeError(
+            "current-cell shadow evaluation cannot predate its result",
+          );
+        }
+        settled += Number(insert.run(
+          trajectoryId,
+          row.cohort_key,
+          Number(row.result_id),
+          evaluation.actualNumber,
+          Number(evaluation.top1Hit),
+          evaluation.brierLoss,
+          evaluation.clippedLogLoss,
+          JSON.stringify(evaluation),
+          evaluatedAt,
+        ).changes);
+      }
+      return { settled };
+    });
+  }
+
   #roundTrajectoryPrefix(
     trajectoryId,
     startsAt,
@@ -12000,6 +13865,165 @@ export class RouletteDatabase {
     });
   }
 
+  #recordPredictiveLeaderV7Snapshot(forecastId, trajectoryShadow) {
+    return this.#transaction(() => {
+      const cohort = mapPredictiveLeaderV7Cohort(this.sqlite.prepare(`
+        SELECT *
+        FROM predictive_leader_v7_cohorts
+        WHERE candidate_key = ?
+      `).get(PREDICTIVE_LEADER_V7_CANDIDATE_CONFIG.candidateId));
+      if (!cohort) {
+        throw new Error("predictive leader v7 cohort is invalid");
+      }
+      const existing = this.sqlite.prepare(`
+        SELECT forecast_id
+        FROM forecast_predictive_leader_v7_snapshots
+        WHERE forecast_id = ? AND candidate_key = ?
+      `).get(forecastId, cohort.candidateId);
+      if (existing) return { inserted: false, reason: "already_frozen" };
+
+      const parent = this.sqlite.prepare(`
+        SELECT
+          forecasts.id AS forecast_id,
+          snapshots.source,
+          snapshots.instrument,
+          snapshots.external_round_id,
+          snapshots.horizon_seconds,
+          snapshots.locked_at,
+          snapshots.betting_closes_at,
+          settlements.forecast_id AS settlement_forecast_id,
+          settlements.round_result_id,
+          settlements.actual_number,
+          settlements.settled_at,
+          settlements.created_at AS settlement_created_at,
+          leaders.forecast_id AS leader_forecast_id,
+          leaders.schema_version AS leader_schema_version,
+          leaders.algorithm_version AS leader_algorithm_version,
+          leaders.status AS leader_status,
+          leaders.locked_at AS leader_locked_at,
+          leaders.history_max_result_id AS leader_history_max_result_id,
+          leaders.training_through_forecast_id
+            AS leader_training_through_forecast_id,
+          leaders.training_through_result_id
+            AS leader_training_through_result_id,
+          leader_training_settlements.round_result_id
+            AS leader_expected_training_result_id,
+          leaders.training_count AS leader_training_count,
+          leaders.predicted_number AS leader_predicted_number,
+          leaders.score AS leader_score,
+          leaders.snapshot_json AS leader_snapshot_json,
+          leaders.created_at AS leader_created_at
+        FROM round_forecasts AS forecasts
+        JOIN forecast_snapshots AS snapshots ON snapshots.id = forecasts.snapshot_id
+        LEFT JOIN forecast_settlements AS settlements
+          ON settlements.forecast_id = forecasts.id
+        LEFT JOIN forecast_predictive_leader_snapshots AS leaders
+          ON leaders.forecast_id = forecasts.id
+        LEFT JOIN forecast_settlements AS leader_training_settlements
+          ON leader_training_settlements.forecast_id =
+            leaders.training_through_forecast_id
+        WHERE forecasts.id = ?
+      `).get(forecastId);
+      if (!parent) throw new Error("predictive leader v7 parent forecast is missing");
+      if (
+        parent.source !== cohort.source
+        || parent.instrument !== cohort.instrument
+      ) {
+        return { inserted: false, reason: "outside_frozen_stream" };
+      }
+      if (
+        forecastId < cohort.firstForecastId
+        || Number(parent.horizon_seconds) !== cohort.forecastHorizonSeconds
+        || parent.locked_at < cohort.startedAt
+      ) {
+        return { inserted: false, reason: "outside_prospective_cohort" };
+      }
+      if (parent.settlement_forecast_id != null) {
+        throw new Error("predictive leader v7 requires an unsettled frozen forecast");
+      }
+      const knownTarget = this.sqlite.prepare(`
+        SELECT id
+        FROM round_results
+        WHERE source = ? AND instrument = ? AND external_round_id = ?
+        LIMIT 1
+      `).get(parent.source, parent.instrument, parent.external_round_id);
+      if (knownTarget) {
+        throw new Error("predictive leader v7 cannot be captured after its result");
+      }
+      const champion = mapForecastPredictiveLeader(parent);
+      if (!champion) {
+        return { inserted: false, reason: "champion_snapshot_unavailable" };
+      }
+      const createdAt = asTimestamp(
+        this.clock(),
+        undefined,
+        "predictive leader v7 createdAt",
+      );
+      if (
+        Date.parse(createdAt) < Date.parse(parent.locked_at)
+        || Date.parse(parent.betting_closes_at) - Date.parse(createdAt) < 5_000
+      ) {
+        throw new RangeError(
+          "predictive leader v7 must be stored at least five seconds before betting closes",
+        );
+      }
+      const decision = buildLearnedLeaderV7Decision({
+        sources: predictiveLeaderV7SourcesFromChampion(champion, trajectoryShadow, {
+          forecastId,
+          lockedAt: parent.locked_at,
+        }),
+        config: cohort.config,
+        lockedAt: parent.locked_at,
+        tieSeed: champion.tieSeed,
+      });
+      const normalized = normalizeLearnedLeaderV7Decision(decision);
+      if (
+        !normalized
+        || JSON.stringify(normalized.config) !== PREDICTIVE_LEADER_V7_CONFIG_JSON
+      ) {
+        throw new Error("predictive leader v7 builder returned an invalid snapshot");
+      }
+      this.sqlite.prepare(`
+        INSERT INTO forecast_predictive_leader_v7_snapshots (
+          forecast_id, candidate_key, schema_version, algorithm_version,
+          config_version, target_horizon, config_sha256, status, locked_at,
+          history_max_result_id, predicted_number, leader_mass, margin,
+          selected, snapshot_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        forecastId,
+        cohort.candidateId,
+        cohort.schemaVersion,
+        cohort.algorithmVersion,
+        cohort.configVersion,
+        cohort.targetHorizon,
+        cohort.configSha256,
+        normalized.status,
+        normalized.lockedAt,
+        champion.historyMaxResultId,
+        normalized.leaderNumber,
+        normalized.leaderMass,
+        normalized.margin,
+        Number(normalized.selection.eligible),
+        JSON.stringify(normalized),
+        createdAt,
+      );
+      const commitCheckedAt = asTimestamp(
+        this.clock(),
+        undefined,
+        "predictive leader v7 commitCheckedAt",
+      );
+      if (
+        Date.parse(parent.betting_closes_at) - Date.parse(commitCheckedAt) < 5_000
+      ) {
+        throw new RangeError(
+          "predictive leader v7 transaction must finish at least five seconds before betting closes",
+        );
+      }
+      return { inserted: true, reason: "frozen" };
+    });
+  }
+
   #buildForecastPairSnapshot({
     source,
     instrument,
@@ -12692,9 +14716,33 @@ export class RouletteDatabase {
       );
     }
 
+    let predictiveLeaderV7Outcome = { inserted: false };
+    try {
+      predictiveLeaderV7Outcome = this.#recordPredictiveLeaderV7Snapshot(
+        primaryOutcome.forecastId,
+        trajectoryShadow,
+      );
+    } catch (error) {
+      emitLog(
+        this.logger,
+        "error",
+        {
+          error,
+          source,
+          instrument,
+          externalRoundId,
+          forecastId: primaryOutcome.forecastId,
+        },
+        "predictive leader v7 shadow persistence failed without affecting champion",
+      );
+    }
+
     return {
       inserted: primaryOutcome.inserted,
-      databaseChanged: primaryOutcome.inserted || predictiveLeaderOutcome.inserted,
+      databaseChanged:
+        primaryOutcome.inserted
+        || predictiveLeaderOutcome.inserted
+        || predictiveLeaderV7Outcome.inserted,
       roundId: externalRoundId,
     };
   }
@@ -14278,6 +16326,656 @@ export class RouletteDatabase {
       await yieldControl();
       this.#assertOpen();
     }
+  }
+
+  getPredictiveLeaderV7AuditState(source = "buleto", instrument = "default") {
+    this.#assertOpen();
+    const safeSource = asNonEmptyText(source, undefined, "source");
+    const safeInstrument = asNonEmptyText(instrument, undefined, "instrument");
+    const cohort = mapPredictiveLeaderV7Cohort(this.sqlite.prepare(`
+      SELECT *
+      FROM predictive_leader_v7_cohorts
+      WHERE candidate_key = ?
+    `).get(PREDICTIVE_LEADER_V7_CANDIDATE_CONFIG.candidateId));
+    if (!cohort) throw new Error("predictive leader v7 cohort is invalid");
+    if (safeSource !== cohort.source || safeInstrument !== cohort.instrument) {
+      throw new RangeError("predictive leader v7 audit is pinned to its frozen stream");
+    }
+
+    const rows = this.sqlite.prepare(`
+      SELECT
+        forecasts.id AS forecast_id,
+        snapshots.source,
+        snapshots.instrument,
+        snapshots.external_round_id,
+        snapshots.horizon_seconds,
+        snapshots.betting_closes_at,
+        snapshots.round_ends_at,
+        snapshots.locked_at,
+        settlements.round_result_id,
+        settlements.actual_number,
+        settlements.settled_at,
+        settlements.created_at AS settlement_created_at,
+        results.id AS result_id,
+        results.source AS result_source,
+        results.instrument AS result_instrument,
+        results.external_round_id AS result_external_round_id,
+        results.result_number,
+        results.settled_at AS result_settled_at,
+        results.observed_at AS result_observed_at,
+        results.created_at AS result_created_at,
+        v7.forecast_id AS v7_forecast_id,
+        v7.candidate_key AS v7_candidate_key,
+        v7.schema_version AS v7_schema_version,
+        v7.algorithm_version AS v7_algorithm_version,
+        v7.config_version AS v7_config_version,
+        v7.target_horizon AS v7_target_horizon,
+        v7.config_sha256 AS v7_config_sha256,
+        v7.status AS v7_status,
+        v7.locked_at AS v7_locked_at,
+        v7.history_max_result_id AS v7_history_max_result_id,
+        v7.predicted_number AS v7_predicted_number,
+        v7.leader_mass AS v7_leader_mass,
+        v7.margin AS v7_margin,
+        v7.selected AS v7_selected,
+        v7.snapshot_json AS v7_snapshot_json,
+        v7.created_at AS v7_created_at,
+        leaders.forecast_id AS leader_forecast_id,
+        leaders.schema_version AS leader_schema_version,
+        leaders.algorithm_version AS leader_algorithm_version,
+        leaders.status AS leader_status,
+        leaders.locked_at AS leader_locked_at,
+        leaders.history_max_result_id AS leader_history_max_result_id,
+        leaders.training_through_forecast_id
+          AS leader_training_through_forecast_id,
+        leaders.training_through_result_id
+          AS leader_training_through_result_id,
+        leader_training_settlements.round_result_id
+          AS leader_expected_training_result_id,
+        leaders.training_count AS leader_training_count,
+        leaders.predicted_number AS leader_predicted_number,
+        leaders.score AS leader_score,
+        leaders.snapshot_json AS leader_snapshot_json,
+        leaders.created_at AS leader_created_at
+      FROM round_forecasts AS forecasts
+      JOIN forecast_snapshots AS snapshots ON snapshots.id = forecasts.snapshot_id
+      LEFT JOIN forecast_settlements AS settlements
+        ON settlements.forecast_id = forecasts.id
+      LEFT JOIN round_results AS results
+        ON results.id = settlements.round_result_id
+      LEFT JOIN forecast_predictive_leader_v7_snapshots AS v7
+        ON v7.forecast_id = forecasts.id AND v7.candidate_key = ?
+      LEFT JOIN forecast_predictive_leader_snapshots AS leaders
+        ON leaders.forecast_id = forecasts.id
+      LEFT JOIN forecast_settlements AS leader_training_settlements
+        ON leader_training_settlements.forecast_id =
+          leaders.training_through_forecast_id
+      WHERE snapshots.source = ?
+        AND snapshots.instrument = ?
+        AND snapshots.horizon_seconds = ?
+        AND forecasts.id >= ?
+        AND snapshots.locked_at >= ?
+      ORDER BY forecasts.id
+    `).all(
+      cohort.candidateId,
+      safeSource,
+      safeInstrument,
+      cohort.forecastHorizonSeconds,
+      cohort.firstForecastId,
+      cohort.startedAt,
+    );
+    const mapped = rows.map((row) => ({
+      row,
+      v7: mapForecastPredictiveLeaderV7(row, cohort),
+      champion: mapForecastPredictiveLeader(row),
+    }));
+    const validV7 = mapped.map(({ v7 }) => v7).filter(Boolean);
+    const readyV7 = validV7.filter((leader) => leader.status === "ready");
+    const selectedV7 = readyV7.filter((leader) => leader.selection.eligible);
+    const allPairings = mapped.map(({ v7, champion }) => ({ v7, champion }));
+    const fixedSelected = mapped.filter(({ row }) => (
+      row.v7_forecast_id != null && Boolean(row.v7_selected)
+    )).slice(0, PREDICTIVE_LEADER_V7_GATE_WINDOW_SIZE);
+    const fixedEvaluated = fixedSelected.filter(({ v7 }) => (
+      v7?.status === "ready"
+      && v7.selection.eligible
+      && v7.evaluation !== null
+    ));
+    const fixedWindowEndForecastId = fixedSelected.at(-1)?.row.forecast_id ?? null;
+    const coverageRows = mapped.filter(({ row }) => (
+      fixedSelected.length < PREDICTIVE_LEADER_V7_GATE_WINDOW_SIZE
+        || Number(row.forecast_id) <= fixedWindowEndForecastId
+    ));
+    const selectionCoverage = coverageRows.length === 0
+      ? null
+      : fixedSelected.length / coverageRows.length;
+    const fixedLeaders = fixedEvaluated.map(({ v7 }) => v7);
+    const fixedSummary = summarizePredictiveLeaderV7(fixedLeaders);
+    const hitRateInterval = wilsonInterval95(
+      fixedSummary.top1Hits,
+      fixedSummary.settledCount,
+    );
+    const uniformBrierDeltas = fixedLeaders.map((leader) => (
+      leader.evaluation.combinedBrierLoss - LEARNED_LEADER_V7_UNIFORM_BRIER_LOSS
+    ));
+    const uniformBrierHac95 = hacMeanInterval95(uniformBrierDeltas);
+    const fixedPairings = fixedEvaluated.map(({ v7, champion }) => ({ v7, champion }));
+    const fixedPairedChampion = summarizePredictiveLeaderV7Pairings(fixedPairings);
+    const fixedComplete =
+      fixedSelected.length === PREDICTIVE_LEADER_V7_GATE_WINDOW_SIZE
+      && fixedEvaluated.length === PREDICTIVE_LEADER_V7_GATE_WINDOW_SIZE;
+    const criterion = (value) => fixedComplete ? value : null;
+    const gateCriteria = {
+      fixedSampleComplete: fixedComplete,
+      selectionCoverage: criterion(
+        selectionCoverage !== null
+          && selectionCoverage >= PREDICTIVE_LEADER_V7_MINIMUM_SELECTION_COVERAGE,
+      ),
+      exactHitRate: criterion(
+        hitRateInterval !== null
+          && hitRateInterval.lower > PREDICTIVE_LEADER_V7_BREAK_EVEN_RATE,
+      ),
+      brierVsUniform: criterion(
+        uniformBrierHac95 !== null
+          && uniformBrierHac95.mean
+            <= -PREDICTIVE_LEADER_V7_MINIMUM_BRIER_IMPROVEMENT
+          && uniformBrierHac95.upper < 0,
+      ),
+      pairedBrierVsChampion: criterion(
+        fixedPairedChampion.pairedCount === PREDICTIVE_LEADER_V7_GATE_WINDOW_SIZE
+          && fixedPairedChampion.meanBrierDelta
+            <= -PREDICTIVE_LEADER_V7_MINIMUM_BRIER_IMPROVEMENT
+          && fixedPairedChampion.brierDeltaHac95?.upper < 0,
+      ),
+      pairedExactVsChampion: criterion(
+        fixedPairedChampion.pairedCount === PREDICTIVE_LEADER_V7_GATE_WINDOW_SIZE
+          && fixedPairedChampion.v7Only > fixedPairedChampion.championOnly
+          && fixedPairedChampion.v7BetterOneSidedExactPValue < 0.025,
+      ),
+    };
+    const statisticalSignalsPass = fixedComplete
+      && Object.entries(gateCriteria)
+        .filter(([key]) => key !== "fixedSampleComplete")
+        .every(([, value]) => value === true);
+    const regimeBlocks = fixedComplete
+      ? Array.from({ length: 4 }, (_, index) => {
+          const block = fixedLeaders.slice(index * 250, (index + 1) * 250);
+          return {
+            index: index + 1,
+            startForecastId: block[0].forecastId,
+            endForecastId: block.at(-1).forecastId,
+            ...summarizePredictiveLeaderV7(block),
+          };
+        })
+      : [];
+    const latestMapped = mapped.at(-1) ?? null;
+    const latestCandidate = latestMapped === null
+      ? null
+      : latestMapped.v7
+        ? {
+            availability: latestMapped.v7.status,
+            status: latestMapped.v7.status,
+            reason: latestMapped.v7.reason,
+            leaderNumber: latestMapped.v7.leaderNumber,
+            leaderMass: latestMapped.v7.leaderMass,
+            runnerUpMass: latestMapped.v7.runnerUpMass,
+            margin: latestMapped.v7.margin,
+            selected: latestMapped.v7.selection.eligible,
+            selection: latestMapped.v7.selection,
+            evidence: latestMapped.v7.evidence,
+            sourceAudit: latestMapped.v7.sourceAudit,
+            evaluation: latestMapped.v7.evaluation,
+            createdAt: latestMapped.v7.createdAt,
+          }
+        : {
+            availability: latestMapped.row.v7_forecast_id == null
+              ? "missing"
+              : "invalid",
+          };
+    const latestChampion = latestMapped?.champion
+      ? {
+          availability: latestMapped.champion.status,
+          status: latestMapped.champion.status,
+          leaderNumber: latestMapped.champion.leaderNumber,
+          leaderMass: latestMapped.champion.leaderMass,
+          evaluation: latestMapped.champion.evaluation,
+        }
+      : latestMapped === null
+        ? null
+        : { availability: "missing_or_invalid" };
+
+    return {
+      schemaVersion: LEARNED_LEADER_V7_SCHEMA_VERSION,
+      candidateId: cohort.candidateId,
+      algorithmVersion: cohort.algorithmVersion,
+      configVersion: cohort.configVersion,
+      mode: cohort.mode,
+      executionEnabled: false,
+      advisoryOnly: true,
+      source: safeSource,
+      instrument: safeInstrument,
+      cohort,
+      latest: latestMapped === null
+        ? null
+        : {
+            forecastId: Number(latestMapped.row.forecast_id),
+            roundId: latestMapped.row.external_round_id,
+            lockedAt: latestMapped.row.locked_at,
+            bettingClosesAt: latestMapped.row.betting_closes_at,
+            roundEndsAt: latestMapped.row.round_ends_at,
+            candidate: latestCandidate,
+            champion: latestChampion,
+            settlement: latestMapped.row.actual_number == null
+              ? null
+              : {
+                  resultId: Number(latestMapped.row.round_result_id),
+                  actualNumber: Number(latestMapped.row.actual_number),
+                  settledAt: latestMapped.row.settled_at,
+                  createdAt: latestMapped.row.settlement_created_at,
+                },
+          },
+      metrics: {
+        cohortEligibleForecastCount: rows.length,
+        cohortSettledForecastCount: rows.filter((row) => row.actual_number != null).length,
+        storedCount: mapped.filter(({ row }) => row.v7_forecast_id != null).length,
+        missingCount: mapped.filter(({ row }) => row.v7_forecast_id == null).length,
+        invalidCount: mapped.filter(({ row, v7 }) => (
+          row.v7_forecast_id != null && v7 === null
+        )).length,
+        readyCount: readyV7.length,
+        unavailableCount: validV7.filter((leader) => leader.status === "unavailable").length,
+        selectedCount: selectedV7.length,
+        overall: summarizePredictiveLeaderV7(validV7),
+        selected: summarizePredictiveLeaderV7(selectedV7),
+        pairedChampion: summarizePredictiveLeaderV7Pairings(allPairings),
+      },
+      qualityGateDiagnostic: {
+        version: PREDICTIVE_LEADER_V7_GATE_VERSION,
+        status: !fixedComplete
+          ? "collecting"
+          : statisticalSignalsPass
+            ? "signals_pass"
+            : "signals_failed",
+        windowPolicy: "first-1000-selected-settled-prospective-no-roll",
+        targetSampleSize: PREDICTIVE_LEADER_V7_GATE_WINDOW_SIZE,
+        selectedCohortSize: fixedSelected.length,
+        sampleSize: fixedEvaluated.length,
+        windowStartForecastId: fixedSelected[0]?.row.forecast_id == null
+          ? null
+          : Number(fixedSelected[0].row.forecast_id),
+        windowEndForecastId: fixedWindowEndForecastId,
+        selectionCoverage,
+        minimumSelectionCoverage: PREDICTIVE_LEADER_V7_MINIMUM_SELECTION_COVERAGE,
+        economicBreakEvenTop1Rate: PREDICTIVE_LEADER_V7_BREAK_EVEN_RATE,
+        minimumBrierImprovementVsUniform:
+          PREDICTIVE_LEADER_V7_MINIMUM_BRIER_IMPROVEMENT,
+        top1Wilson95: hitRateInterval,
+        brierDeltaVsUniformHac95: uniformBrierHac95,
+        pairedChampion: fixedPairedChampion,
+        regimeBlocks,
+        experimentFamilySize: 2,
+        familywiseAlpha: 0.05,
+        perCandidateAlpha: 0.025,
+        multiplicityPolicy: "bonferroni-two-prospective-candidates",
+        criteria: gateCriteria,
+        statisticalSignalsPass,
+        promotionEligible: false,
+        promotionPolicy: "manual-review-only-no-automatic-bet-or-promotion",
+      },
+    };
+  }
+
+  getCurrentCellHorizonShadowAuditState(
+    source = "buleto",
+    instrument = "default",
+  ) {
+    this.#assertOpen();
+    const safeSource = asNonEmptyText(source, undefined, "source");
+    const safeInstrument = asNonEmptyText(instrument, undefined, "instrument");
+    const cohort = mapCurrentCellHorizonCohort(this.sqlite.prepare(`
+      SELECT *
+      FROM current_cell_horizon_shadow_cohorts
+      WHERE cohort_key = ?
+    `).get(CURRENT_CELL_HORIZON_SHADOW_COHORT_KEY));
+    if (!cohort) throw new Error("current-cell shadow cohort is invalid");
+    if (safeSource !== cohort.source || safeInstrument !== cohort.instrument) {
+      throw new RangeError("current-cell shadow audit is pinned to its frozen stream");
+    }
+
+    const rows = this.sqlite.prepare(`
+      SELECT
+        trajectories.id AS trajectory_id,
+        trajectories.source,
+        trajectories.instrument,
+        trajectories.external_round_id,
+        trajectories.betting_closes_at,
+        trajectories.round_ends_at,
+        trajectories.created_at AS trajectory_created_at,
+        shadows.trajectory_id AS shadow_trajectory_id,
+        shadows.cohort_key AS shadow_cohort_key,
+        shadows.schema_version AS shadow_schema_version,
+        shadows.algorithm_version AS shadow_algorithm_version,
+        shadows.config_version AS shadow_config_version,
+        shadows.config_sha256 AS shadow_config_sha256,
+        shadows.status AS shadow_status,
+        shadows.reason AS shadow_reason,
+        shadows.cutoff_at AS shadow_cutoff_at,
+        shadows.captured_at AS shadow_captured_at,
+        shadows.predicted_number AS shadow_predicted_number,
+        shadows.leader_wire_cell AS shadow_leader_wire_cell,
+        shadows.leader_probability AS shadow_leader_probability,
+        shadows.runner_up_probability AS shadow_runner_up_probability,
+        shadows.margin AS shadow_margin,
+        shadows.snapshot_json AS shadow_snapshot_json,
+        shadows.created_at AS shadow_created_at,
+        evaluations.trajectory_id AS evaluation_trajectory_id,
+        evaluations.cohort_key AS evaluation_cohort_key,
+        evaluations.round_result_id AS evaluation_round_result_id,
+        evaluations.actual_number AS evaluation_actual_number,
+        evaluations.top1_hit AS evaluation_top1_hit,
+        evaluations.brier_loss AS evaluation_brier_loss,
+        evaluations.clipped_log_loss AS evaluation_clipped_log_loss,
+        evaluations.evaluation_json,
+        evaluations.evaluated_at AS evaluation_evaluated_at,
+        results.id AS result_id,
+        results.source AS result_source,
+        results.instrument AS result_instrument,
+        results.external_round_id AS result_external_round_id,
+        results.result_number,
+        results.settled_at AS result_settled_at,
+        results.observed_at AS result_observed_at,
+        results.created_at AS result_created_at,
+        evaluations.round_result_id AS round_result_id,
+        evaluations.actual_number AS actual_number,
+        results.settled_at AS settled_at,
+        results.created_at AS settlement_created_at,
+        v5_forecasts.id AS forecast_id,
+        v5_snapshots.locked_at,
+        v5_settlements.forecast_id AS v5_settlement_forecast_id,
+        v5_settlements.round_result_id AS v5_round_result_id,
+        v5_settlements.actual_number AS v5_actual_number,
+        v5_settlements.settled_at AS v5_settled_at,
+        v5_settlements.created_at AS v5_settlement_created_at,
+        v5_results.id AS v5_result_id,
+        v5_results.source AS v5_result_source,
+        v5_results.instrument AS v5_result_instrument,
+        v5_results.external_round_id AS v5_result_external_round_id,
+        v5_results.result_number AS v5_result_number,
+        v5_results.settled_at AS v5_result_settled_at,
+        v5_results.observed_at AS v5_result_observed_at,
+        v5_results.created_at AS v5_result_created_at,
+        leaders.forecast_id AS leader_forecast_id,
+        leaders.schema_version AS leader_schema_version,
+        leaders.algorithm_version AS leader_algorithm_version,
+        leaders.status AS leader_status,
+        leaders.locked_at AS leader_locked_at,
+        leaders.history_max_result_id AS leader_history_max_result_id,
+        leaders.training_through_forecast_id
+          AS leader_training_through_forecast_id,
+        leaders.training_through_result_id AS leader_training_through_result_id,
+        leader_training_settlements.round_result_id
+          AS leader_expected_training_result_id,
+        leaders.training_count AS leader_training_count,
+        leaders.predicted_number AS leader_predicted_number,
+        leaders.score AS leader_score,
+        leaders.snapshot_json AS leader_snapshot_json,
+        leaders.created_at AS leader_created_at
+      FROM round_trajectories AS trajectories
+      LEFT JOIN round_trajectory_current_cell_horizon_snapshots AS shadows
+        ON shadows.trajectory_id = trajectories.id
+       AND shadows.cohort_key = ?
+      LEFT JOIN round_trajectory_current_cell_horizon_evaluations AS evaluations
+        ON evaluations.trajectory_id = shadows.trajectory_id
+       AND evaluations.cohort_key = shadows.cohort_key
+      LEFT JOIN round_results AS results
+        ON results.id = evaluations.round_result_id
+      LEFT JOIN forecast_snapshots AS v5_snapshots
+        ON v5_snapshots.source = trajectories.source
+       AND v5_snapshots.instrument = trajectories.instrument
+       AND v5_snapshots.external_round_id = trajectories.external_round_id
+       AND v5_snapshots.horizon_seconds = 8
+      LEFT JOIN round_forecasts AS v5_forecasts
+        ON v5_forecasts.snapshot_id = v5_snapshots.id
+      LEFT JOIN forecast_settlements AS v5_settlements
+        ON v5_settlements.forecast_id = v5_forecasts.id
+      LEFT JOIN round_results AS v5_results
+        ON v5_results.id = v5_settlements.round_result_id
+      LEFT JOIN forecast_predictive_leader_snapshots AS leaders
+        ON leaders.forecast_id = v5_forecasts.id
+      LEFT JOIN forecast_settlements AS leader_training_settlements
+        ON leader_training_settlements.forecast_id
+          = leaders.training_through_forecast_id
+      WHERE trajectories.source = ?
+        AND trajectories.instrument = ?
+        AND trajectories.id >= ?
+        AND trajectories.created_at >= ?
+      ORDER BY trajectories.betting_closes_at, trajectories.id
+    `).all(
+      cohort.cohortKey,
+      safeSource,
+      safeInstrument,
+      cohort.firstTrajectoryId,
+      cohort.startedAt,
+    );
+    const mapped = rows.map((row) => ({
+      row,
+      current: mapCurrentCellHorizonSnapshot(row, cohort),
+      champion: mapCurrentCellPairedV5(row),
+    }));
+    const valid = mapped.map(({ current }) => current).filter(Boolean);
+    const ready = valid.filter((snapshot) => snapshot.status === "ready");
+    const rawReady = mapped.filter(({ row }) => row.shadow_status === "ready");
+    const fixedRows = rawReady.slice(0, CURRENT_CELL_HORIZON_SHADOW_GATE_WINDOW_SIZE);
+    const fixedSnapshots = fixedRows.map(({ current }) => current).filter(Boolean);
+    const fixedEvaluated = fixedSnapshots.filter(
+      (snapshot) => snapshot.status === "ready" && snapshot.evaluation !== null,
+    );
+    const fixedWindowComplete =
+      fixedRows.length === CURRENT_CELL_HORIZON_SHADOW_GATE_WINDOW_SIZE;
+    const fixedSettlementComplete = fixedWindowComplete
+      && fixedEvaluated.length === CURRENT_CELL_HORIZON_SHADOW_GATE_WINDOW_SIZE;
+    const fixedEnd = fixedRows.at(-1)?.row ?? rows.at(-1) ?? null;
+    const coverageRows = fixedEnd === null
+      ? []
+      : rows.filter((row) => (
+          row.betting_closes_at < fixedEnd.betting_closes_at
+          || (
+            row.betting_closes_at === fixedEnd.betting_closes_at
+            && Number(row.trajectory_id) <= Number(fixedEnd.trajectory_id)
+          )
+        ));
+    const readyCoverage = coverageRows.length === 0
+      ? null
+      : coverageRows.filter((row) => row.shadow_status === "ready").length
+        / coverageRows.length;
+    const fixedSummary = summarizeCurrentCellHorizonSnapshots(fixedSnapshots);
+    const hitRateInterval = wilsonInterval95(
+      fixedSummary.top1Hits,
+      fixedSummary.settledCount,
+    );
+    const uniformBrierDeltas = fixedEvaluated.map(
+      (snapshot) => snapshot.evaluation.brierLoss
+        - CURRENT_CELL_HORIZON_SHADOW_UNIFORM_BRIER_LOSS,
+    );
+    const uniformLogLossDeltas = fixedEvaluated.map(
+      (snapshot) => snapshot.evaluation.clippedLogLoss
+        - CURRENT_CELL_HORIZON_SHADOW_UNIFORM_LOG_LOSS,
+    );
+    const fixedPairings = fixedRows.map(({ current, champion }) => ({
+      current,
+      champion,
+    }));
+    const pairedV5 = summarizeCurrentCellV5Pairings(fixedPairings);
+    const pairedV5Coverage = fixedEvaluated.length === 0
+      ? null
+      : pairedV5.pairedCount / fixedEvaluated.length;
+    const minimumPairedV5Count = Math.ceil(
+      CURRENT_CELL_HORIZON_SHADOW_GATE_WINDOW_SIZE
+        * CURRENT_CELL_HORIZON_SHADOW_MINIMUM_PAIRED_V5_COVERAGE,
+    );
+    const criterion = (value) => fixedSettlementComplete ? value : null;
+    const gateCriteria = {
+      fixedSampleComplete: fixedSettlementComplete,
+      readyCoverage: criterion(
+        readyCoverage !== null
+          && readyCoverage >= CURRENT_CELL_HORIZON_SHADOW_MINIMUM_READY_COVERAGE,
+      ),
+      exactHitRate: criterion(
+        hitRateInterval !== null
+          && hitRateInterval.lower > CURRENT_CELL_HORIZON_SHADOW_BREAK_EVEN_RATE,
+      ),
+      brierVsUniform: criterion(
+        hacMeanInterval95(uniformBrierDeltas)?.upper < 0,
+      ),
+      pairedV5Coverage: criterion(
+        pairedV5Coverage !== null
+          && pairedV5Coverage
+            >= CURRENT_CELL_HORIZON_SHADOW_MINIMUM_PAIRED_V5_COVERAGE
+          && pairedV5.pairedCount >= minimumPairedV5Count,
+      ),
+      pairedBrierVsV5: criterion(
+        pairedV5.pairedCount >= minimumPairedV5Count
+          && pairedV5.brierDeltaHac95?.upper < 0,
+      ),
+      pairedExactVsV5: criterion(
+        pairedV5.pairedCount >= minimumPairedV5Count
+          && pairedV5.currentOnly > pairedV5.v5Only
+          && pairedV5.currentBetterOneSidedExactPValue < 0.025,
+      ),
+    };
+    const statisticalSignalsPass = fixedSettlementComplete
+      && Object.entries(gateCriteria)
+        .filter(([key]) => key !== "fixedSampleComplete")
+        .every(([, value]) => value === true);
+    const regimeBlocks = fixedSettlementComplete
+      ? Array.from({ length: 4 }, (_, index) => {
+          const block = fixedSnapshots.slice(index * 250, (index + 1) * 250);
+          return {
+            index: index + 1,
+            startTrajectoryId: block[0].trajectoryId,
+            endTrajectoryId: block.at(-1).trajectoryId,
+            ...summarizeCurrentCellHorizonSnapshots(block),
+          };
+        })
+      : [];
+    const latestMapped = mapped.at(-1) ?? null;
+    const latestCurrent = latestMapped === null
+      ? null
+      : latestMapped.current
+        ? {
+            availability: latestMapped.current.status,
+            status: latestMapped.current.status,
+            reason: latestMapped.current.reason,
+            leaderNumber: latestMapped.current.leaderNumber,
+            leaderWireCell: latestMapped.current.leaderWireCell,
+            leaderProbability: latestMapped.current.leaderProbability,
+            runnerUpProbability: latestMapped.current.runnerUpProbability,
+            margin: latestMapped.current.margin,
+            selectedTick: latestMapped.current.selectedTick,
+            audit: latestMapped.current.audit,
+            evaluation: latestMapped.current.evaluation,
+            capturedAt: latestMapped.current.capturedAt,
+            createdAt: latestMapped.current.createdAt,
+          }
+        : {
+            availability: latestMapped.row.shadow_trajectory_id == null
+              ? "missing"
+              : "invalid",
+          };
+    const latestChampion = latestMapped?.champion
+      ? {
+          availability: latestMapped.champion.status,
+          status: latestMapped.champion.status,
+          leaderNumber: latestMapped.champion.leaderNumber,
+          leaderMass: latestMapped.champion.leaderMass,
+          evaluation: latestMapped.champion.evaluation,
+        }
+      : latestMapped === null
+        ? null
+        : { availability: "missing_or_invalid" };
+
+    return {
+      schemaVersion: cohort.schemaVersion,
+      cohortKey: cohort.cohortKey,
+      algorithmVersion: cohort.algorithmVersion,
+      configVersion: cohort.configVersion,
+      mode: cohort.mode,
+      executionEnabled: false,
+      advisoryOnly: true,
+      source: safeSource,
+      instrument: safeInstrument,
+      cohort,
+      latest: latestMapped === null
+        ? null
+        : {
+            trajectoryId: Number(latestMapped.row.trajectory_id),
+            roundId: latestMapped.row.external_round_id,
+            bettingClosesAt: latestMapped.row.betting_closes_at,
+            roundEndsAt: latestMapped.row.round_ends_at,
+            candidate: latestCurrent,
+            championV5: latestChampion,
+          },
+      metrics: {
+        cohortEligibleTrajectoryCount: rows.length,
+        storedCount: mapped.filter(({ row }) => row.shadow_trajectory_id != null).length,
+        missingCount: mapped.filter(({ row }) => row.shadow_trajectory_id == null).length,
+        invalidCount: mapped.filter(({ row, current }) => (
+          row.shadow_trajectory_id != null && current === null
+        )).length,
+        readyCount: ready.length,
+        unavailableCount: valid.filter(
+          (snapshot) => snapshot.status === "unavailable",
+        ).length,
+        overall: summarizeCurrentCellHorizonSnapshots(valid),
+        pairedV5: summarizeCurrentCellV5Pairings(
+          mapped.map(({ current, champion }) => ({ current, champion })),
+        ),
+      },
+      qualityGateDiagnostic: {
+        version: CURRENT_CELL_HORIZON_SHADOW_GATE_VERSION,
+        status: !fixedSettlementComplete
+          ? "collecting"
+          : statisticalSignalsPass
+            ? "signals_pass"
+            : "signals_failed",
+        windowPolicy: "first-1000-ready-prospective-no-roll",
+        targetSampleSize: CURRENT_CELL_HORIZON_SHADOW_GATE_WINDOW_SIZE,
+        readyCohortSize: fixedRows.length,
+        sampleSize: fixedEvaluated.length,
+        fixedWindowComplete,
+        settlementComplete: fixedSettlementComplete,
+        windowStartTrajectoryId: fixedRows[0]?.row.trajectory_id == null
+          ? null
+          : Number(fixedRows[0].row.trajectory_id),
+        windowEndTrajectoryId: fixedRows.at(-1)?.row.trajectory_id == null
+          ? null
+          : Number(fixedRows.at(-1).row.trajectory_id),
+        readyCoverage,
+        minimumReadyCoverage: CURRENT_CELL_HORIZON_SHADOW_MINIMUM_READY_COVERAGE,
+        economicBreakEvenTop1Rate:
+          CURRENT_CELL_HORIZON_SHADOW_BREAK_EVEN_RATE,
+        top1Wilson95: hitRateInterval,
+        brierDeltaVsUniformHac95: hacMeanInterval95(uniformBrierDeltas),
+        clippedLogLossDeltaVsUniformHac95:
+          hacMeanInterval95(uniformLogLossDeltas),
+        pairedV5,
+        pairedV5Coverage,
+        minimumPairedV5Coverage:
+          CURRENT_CELL_HORIZON_SHADOW_MINIMUM_PAIRED_V5_COVERAGE,
+        minimumPairedV5Count,
+        fixed: fixedSummary,
+        regimeBlocks,
+        experimentFamilySize: 2,
+        familywiseAlpha: 0.05,
+        perCandidateAlpha: 0.025,
+        multiplicityPolicy: "bonferroni-two-prospective-candidates",
+        criteria: gateCriteria,
+        statisticalSignalsPass,
+        promotionEligible: false,
+        promotionPolicy: "manual-review-only-no-automatic-bet-or-promotion",
+      },
+      paperSimulation: currentCellFlatPaperSimulation(valid),
+    };
   }
 
   getPredictiveLeaderReadState(source = "buleto", instrument = "default") {

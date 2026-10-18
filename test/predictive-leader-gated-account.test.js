@@ -227,7 +227,7 @@ test("v26 creates gated tables without backfilling historical leader rows", () =
       clock: () => new Date(BASE_TIME + clockOffset * 1_000),
       predictiveLeaderLegacyAccountEnabled: false,
     });
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 26);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 28);
     const tables = database.sqlite.prepare(`
       SELECT name FROM sqlite_master
       WHERE type = 'table' AND name IN (

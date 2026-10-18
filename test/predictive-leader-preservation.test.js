@@ -14,7 +14,7 @@ import { createDatabase } from "../src/database.js";
 const ROOT_DIR = fileURLToPath(new URL("../", import.meta.url));
 const BASE_TIME = Date.parse("2026-10-10T00:00:00.000Z");
 const SOURCE = "buleto";
-const INSTRUMENT = "PRIMECOIN(XPM)/RUB";
+const INSTRUMENT = "XPM/RUB";
 const quietLogger = { info() {}, warn() {}, error() {} };
 const TRAJECTORY_VALIDATOR_SQL_FUNCTION =
   "trajectory_adaptive_snapshot_valid_v2";

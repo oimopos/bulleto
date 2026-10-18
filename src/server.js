@@ -10,7 +10,11 @@ import { createServer } from 'node:http';
 import { dirname, extname, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { BuletoCollector } from './collector.js';
-import { createDatabase } from './database.js';
+import { createCurrentCellHorizonScheduler } from './current-cell-horizon-scheduler.js';
+import {
+  createDatabase,
+  PREDICTIVE_SHADOW_FROZEN_STREAM,
+} from './database.js';
 import { followerTop5GatedSnapshotForApi } from './follower-top5-gated-api.js';
 import { predictiveLeaderSnapshotForApi } from './predictive-leader-api.js';
 import { runPredictiveLeaderNeighborBacktest } from './predictive-leader-neighbor-backtest.js';
@@ -76,6 +80,11 @@ const config = {
 if (config.reconnectMaxMs < config.reconnectMinMs) {
   throw new Error('RECONNECT_MAX_MS не может быть меньше RECONNECT_MIN_MS');
 }
+if (config.instrument !== PREDICTIVE_SHADOW_FROZEN_STREAM.instrument) {
+  throw new Error(
+    `BULETO_INSTRUMENT должен совпадать с frozen shadow stream: ${PREDICTIVE_SHADOW_FROZEN_STREAM.instrument}`,
+  );
+}
 
 if (config.databasePath !== ':memory:') {
   mkdirSync(dirname(config.databasePath), { recursive: true });
@@ -134,6 +143,7 @@ console.info(
     + `${followerTop5Deposit.amount}; afterResultId=${followerTop5Deposit.afterResultId ?? 'none'}`,
 );
 db.settlePrecloseForecasts('buleto', config.instrument);
+db.settleCurrentCellHorizonShadows('buleto', config.instrument);
 db.settlePredictiveLeaderSignalAccount('buleto', config.instrument);
 db.settlePredictiveLeaderAccount('buleto', config.instrument);
 db.applyPredictiveLeaderAccountReset('buleto', config.instrument);
@@ -144,6 +154,8 @@ const DATABASE_WRITE_UPDATE_REASONS = new Set([
   'results',
   'forecast',
   'forecast-settled',
+  'current-cell-horizon-captured',
+  'current-cell-horizon-settled',
   'predictive-leader-signal-account',
   'predictive-leader-account',
 ]);
@@ -606,6 +618,32 @@ function predictiveLeaderForApi() {
   });
 }
 
+function predictiveLeaderV7ShadowForApi() {
+  const source = 'buleto';
+  const instrument = config.instrument;
+  const state = cachedDatabaseRead(
+    'predictive-leader-v7-shadow-state',
+    () => db.getPredictiveLeaderV7AuditState(source, instrument),
+  );
+  return {
+    ...state,
+    serverTime: new Date().toISOString(),
+  };
+}
+
+function currentCellHorizonShadowForApi() {
+  const source = 'buleto';
+  const instrument = config.instrument;
+  const state = cachedDatabaseRead(
+    'current-cell-horizon-shadow-state',
+    () => db.getCurrentCellHorizonShadowAuditState(source, instrument),
+  );
+  return {
+    ...state,
+    serverTime: new Date().toISOString(),
+  };
+}
+
 function clampLimit(rawValue, fallback, max) {
   if (rawValue === null || rawValue === '') return fallback;
   const value = Number(rawValue);
@@ -804,6 +842,16 @@ const server = createServer((request, response) => {
       return;
     }
 
+    if (pathname === '/api/predictive-leader/v7-shadow') {
+      sendJson(response, 200, predictiveLeaderV7ShadowForApi());
+      return;
+    }
+
+    if (pathname === '/api/predictive-leader/current-cell-10s-shadow') {
+      sendJson(response, 200, currentCellHorizonShadowForApi());
+      return;
+    }
+
     if (pathname === '/api/predictive-leader') {
       sendJson(
         response,
@@ -968,6 +1016,39 @@ let roundTrajectoryRetryTimer = null;
 let roundTrajectoryDrainActive = false;
 let roundTrajectoryOverflowLogged = false;
 
+const currentCellHorizonScheduler = createCurrentCellHorizonScheduler({
+  capture(attempt) {
+    if (!drainRoundTrajectoryQueue()) return { reason: 'transient' };
+    try {
+      const outcome = db.recordCurrentCellHorizonShadow(
+        attempt.source,
+        attempt.instrument,
+        attempt.externalRoundId,
+        attempt.bettingClosesAt,
+      );
+      if (outcome.reason === 'metadata_conflict') {
+        console.error(
+          `[current-cell-10s] immutable close metadata conflict for round ${attempt.externalRoundId}; capture disabled`,
+        );
+      }
+      if (outcome.inserted) broadcastUpdate('current-cell-horizon-captured');
+      return outcome;
+    } catch (error) {
+      if (/^SQLITE_(?:BUSY|LOCKED)/.test(error?.code ?? '')) {
+        console.error('[current-cell-10s] transient capture failure; retrying', error);
+        return { reason: 'transient' };
+      }
+      throw error;
+    }
+  },
+  onError(error, attempt) {
+    console.error(
+      `[current-cell-10s] capture failed for round ${attempt?.externalRoundId ?? 'unknown'}`,
+      error,
+    );
+  },
+});
+
 function isPermanentRoundTrajectoryError(error) {
   return (
     error instanceof TypeError ||
@@ -1081,6 +1162,18 @@ function publishPipelineOutcome(outcome) {
       '[predictive-leader] gated signal settlement failed; it will be retried',
       error,
     );
+    retryError ??= error;
+  }
+  try {
+    const shadowOutcome = db.settleCurrentCellHorizonShadows(
+      'buleto',
+      config.instrument,
+    );
+    if (shadowOutcome.settled > 0) {
+      broadcastUpdate('current-cell-horizon-settled');
+    }
+  } catch (error) {
+    console.error('[current-cell-10s] settlement failed; it will be retried', error);
     retryError ??= error;
   }
   try {
@@ -1234,9 +1327,31 @@ collector.on('preclose-forecast', (forecast) => {
 let lastBroadcastRoundId = null;
 collector.on('round', (round) => {
   const roundId = round?.id == null ? null : String(round.id);
-  if (roundId === null || roundId === lastBroadcastRoundId) return;
-  lastBroadcastRoundId = roundId;
-  broadcastUpdate('round');
+  if (
+    roundId !== null
+    && round?.status === 2
+    && typeof round.bettingClosesAt === 'string'
+  ) {
+    try {
+      const scheduleOutcome = currentCellHorizonScheduler.scheduleRound({
+        source: 'buleto',
+        instrument: config.instrument,
+        externalRoundId: roundId,
+        bettingClosesAt: round.bettingClosesAt,
+      });
+      if (scheduleOutcome.status === 'metadata_conflict') {
+        console.error(
+          `[current-cell-10s] round ${roundId} changed bettingClosesAt; capture cancelled`,
+        );
+      }
+    } catch (error) {
+      console.error('[current-cell-10s] round could not be scheduled', error);
+    }
+  }
+  if (roundId !== null && roundId !== lastBroadcastRoundId) {
+    lastBroadcastRoundId = roundId;
+    broadcastUpdate('round');
+  }
 });
 
 collector.on('status', () => broadcastUpdate('collector-status'));
@@ -1276,6 +1391,7 @@ function shutdown(signal) {
     console.error('[collector] failed to expose pending shutdown results', error);
   }
   collector.stop();
+  currentCellHorizonScheduler.stop();
   clearTimeout(roundTrajectoryRetryTimer);
   roundTrajectoryRetryTimer = null;
   clearTimeout(pipelineFlushTimer);

@@ -172,6 +172,75 @@ SQLite при forecast lock текущего ещё не завершённог�
 созданием новых legacy-ставок; уже записанная история, resets, settlement и
 `void` не удаляются и не переписываются.
 
+Отдельно от действующего v5 работает кандидат
+`learned-predictive-exact-calibrated-v7-shadow`. Это только проспективный
+shadow: он не создаёт `BET`, не меняет ни один бумажный счёт и не подменяет
+число v5. Конфигурация заранее зафиксирована как 1% температурно сглаженной
+исходной Rank‑37 массы, 4% иерархической истории pair/triple и 95%
+равномерной базы. Pair стягивается к базе с силой `740`, triple — к pair с
+силой `500`, температура price равна `5`. Селективная метка требует не менее
+5 ценовых кандидатов, effective pair sample не менее `100`, массу лидера не
+ниже `1/37`; минимальная маржа равна нулю. Эта метка остаётся аудитом и сама
+по себе не разрешает ставку.
+
+Когорта v7 начинается только после миграции v27 с
+`firstForecastId = MAX(round_forecasts.id) + 1`. Исторические строки не
+заполняются. Как и v28 current-cell, она жёстко привязана к потоку
+`buleto / XPM/RUB`. Граница эксперимента привязана к read-only export
+`buleto-production-20261018T0030Z.sqlite`, SHA‑256
+`9149c55c6d77f8175ab65cd31b12f7b4b3bbb88bb8014c19c6c34ada6f523fbc` и
+максимальному логическому времени записи `2026-10-18T00:32:03.908Z`.
+Каждый v7-снимок строится только из уже замороженных данных того же lock:
+pair/triple берутся из causal `sourceManifest` v5, а price — из полного
+сглаженного `numberRanking[].mass` frozen trajectory. Число ценовых evidence-
+кандидатов отдельно сверяется с ненулевой `rawMass`; история по будущим
+результатам не пересчитывается.
+
+Диагностический gate v7 использует первые `1 000` выбранных и завершённых
+проспективных снимков как одно фиксированное окно, которое не сдвигается после
+неудачной проверки. Он требует покрытие не ниже 90%, Wilson95 выше `1/36`,
+улучшение Brier минимум на `0.0001` одновременно против равномерной базы и v5
+с верхней HAC95-границей ниже нуля, а также преимущество над v5 по discordant
+Top‑1 с односторонним exact McNemar/binomial `p < 0.025`. Учитываются два
+заранее объявленных prospective-кандидата на одном потоке результатов:
+familywise alpha `0.05` делится Bonferroni до `0.025` на кандидата;
+независимость кандидатов для этой поправки не требуется. Даже статус `signals_pass` не
+включает исполнение: promotion остаётся только ручным решением после проверки.
+
+В v28 добавлен второй, полностью отдельный prospective shadow
+`current-cell-10s-calibrated-v1`. Он проверяет узкую frozen-гипотезу: ровно за
+10 секунд до `bcd` выбрать текущую ценовую ячейку и прогнозировать только её
+канонический номер (`wire 37` также означает `0`). Горизонт 10 секунд выбран на
+chronological train/tune, после выбора вероятность лидера зафиксирована как
+`172 / 5 942` на объединённой pre-test development-когорте train+tune; test в
+настройке и калибровке не использовался. Это post-selection refit только на
+development-части, а не дообучение по prospective-результатам.
+
+Кандидат жёстко привязан к `buleto / XPM/RUB` и тому же immutable production-
+export. Его когорта начинается с `MAX(round_trajectories.id) + 1`; backfill
+запрещён. Планировщик канонизирует исходный wire timestamp и запускает capture
+на `bcd - 10s`. Если для той же тройки source/instrument/round приходит другой
+`bcd`, активный capture отменяется и эта identity до перезапуска помечается
+`metadata_conflict`; она не перепланируется ни на более раннее, ни на более
+позднее время. При capture ожидаемый `bcd` дополнительно сверяется с первым
+immutable metadata в БД, поэтому несовпадение после перезапуска также закрывается
+без снимка. Запоздалое событие другого старого round не отменяет новый таймер.
+Повторные попытки ограничены окном 2.5 секунды. Снимок использует только ticks, у которых `factor_at`,
+`received_at` и `created_at` не позже cutoff, и перед commit повторно требует
+минимум 5 секунд до закрытия ставок.
+
+Диагностический gate current-cell навсегда фиксирует первые `1 000` ready-
+снимков и не прокручивает окно после неудачи. Требуются ready coverage не ниже
+90%, нижняя Wilson95-граница Top‑1 выше экономического `1/36`, верхняя HAC95-
+граница Brier-разницы ниже нуля против uniform и v5, а также односторонний exact
+paired-тест против v5 с `p < 0.025`. Парные метрики считаются внутри того же
+фиксированного окна при наличии минимум `900` валидных v5-пар (90%). Для этого
+сильно стянутого frozen-распределения намеренно нет абсолютного Brier-порога
+`0.0001`: он потребовал бы около 7.87% Top‑1 и не соответствует зафиксированной
+модели. Gate не включает ставки или автопромоушен. Отдельная flat-paper
+диагностика (`1 000`, по `10` на одно число, gross `×36`) также не является gate
+и ничего не исполняет.
+
 Блок «Экспериментальный прогноз» показывает первые три места полного анализа
 всех 37 чисел, а не отдельный старый Top‑3. Примерно за 8–15 секунд до `bcd`
 система замораживает доступную траекторию текущего раунда. Помимо входящих
@@ -380,6 +449,10 @@ npm.cmd run backup -- ./data/buleto.sqlite ./seed/buleto.sqlite
 - `forecast_predictive_leader_snapshots` — неизменяемый серверный снимок обучаемого лидера: полные массы двух прогнозных групп, обученные веса, курсоры и единственное число, выбранное до результата; старые прогнозы задним числом не заполняются.
 - `forecast_predictive_leader_quality_snapshots` — замороженное для каждого нового лидера решение rolling quality gate: causal cutoff, последние максимум `1 000` оценок, Top‑1/Wilson95, средний Brier, границы окна и digest использованного evidence. Миграция не создаёт такие решения для старых прогнозов.
 - `forecast_predictive_leader_evaluation_voids` — идемпотентный аудит прогнозов, исход которых нельзя восстановить после подтверждённого gap; такие строки не остаются вечным `pending` в метриках, а поздний авторитетный settlement по-прежнему имеет приоритет.
+- `predictive_leader_v7_cohorts` — единственная заранее зафиксированная prospective-shadow когорта v7: граница первого forecast, точная конфигурация и её SHA‑256, capture horizon и provenance проверенного production-export.
+- `forecast_predictive_leader_v7_snapshots` — неизменяемые v7-решения только после границы когорты. Они ссылаются на замороженные causal источники v5, содержат selection-аудит, но не связаны с таблицами ставок или счетов.
+- `current_cell_horizon_shadow_cohorts` — immutable v28-когорта current-cell-10s с точной stream identity, frozen config/hash и export provenance.
+- `round_trajectory_current_cell_horizon_snapshots`, `round_trajectory_current_cell_horizon_evaluations` — append-only capture/evaluation current-cell; DB-триггеры запрещают backfill, подмену trajectory/result identity, settlement не позже capture, update и delete.
 - `predictive_leader_gated_fixed_bets` — основной проспективный fixed-stake счёт `1 000 / 10 / gross ×36`. Таблица содержит только сигналы, для которых замороженный gate разрешил `BET`; `pending`, авторитетный settlement и `void` переживают перезапуск и применяются идемпотентно.
 - `predictive_leader_accounts`, `predictive_leader_account_bets`, `predictive_leader_account_ladder_resets` — сохранённый без переписывания аудит прежнего лестничного счёта. Production больше не создаёт в нём новые ставки; существующие строки, resets и их связь с `forecast_settlements` остаются доступными как legacy-история.
 - `round_trajectories`, `round_trajectory_ticks`, `forecast_trajectory_shadows` — траектории с временем получения, замороженные Adaptive‑снимки, полный Rank‑37 и их проспективная проверка.
@@ -418,6 +491,8 @@ npm.cmd run backup -- ./data/buleto.sqlite ./seed/buleto.sqlite
 - `GET /api/trajectory-range-backtest?limit=100` — точный read-only прогон лестницы по последним сохранённым результатам (максимум `500`). Для каждого раунда используются только шесть или меньше чисел участка Adaptive v2, замороженные до результата; отсутствующий или невалидный участок пропускается и явно учитывается в `coverage`. Модель: банк `1 000`, старт и шаг `10` на число, максимум `2 500` на число, gross-выплата `×36`, после попадания лестница сбрасывается. При разрыве непрерывности лестница сбрасывается без изменения банка, а при недостатке денег симуляция останавливается до ставки. Денежное `hit` считается по каноническому номеру рулетки (оба wire-cell нуля означают ставку на `0`); исход позиционной метрики участка отдельно сохранён как `forecastDisplayHit`. `executionEnabled: false` и `advisoryOnly: true`: endpoint не выполняет реальных ставок.
 - `GET /api/predictive-leader-neighbor-backtest?since=2026-10-16T19:00:00.000Z` — точный read-only прогон лестницы по каждому сохранённому до результата кандидату predictive leader, начиная с обязательной UTC-метки `since` (в примере это 17 октября 00:00 по `Asia/Qyzylorda`). Диапазон ограничен 48 часами; quality gate не фильтрует кандидатов, потому что endpoint проверяет гипотезу «ставить на лидера и числовых соседей». Для лидера `n` выбираются `n−1, n, n+1` по модулю 37: `0 → 36,0,1`, `36 → 35,36,0`. Модель: банк `1 000`, старт и шаг `10` на каждое из трёх чисел, максимум `2 500` на число, gross-выплата `×36`, сброс лестницы после попадания или разрыва непрерывности и остановка перед неподъёмным билетом. Раунды без валидного замороженного лидера не скрываются, а учитываются в `coverage`; реальные ставки не выполняются (`executionEnabled: false`, `advisoryOnly: true`).
 - `GET /api/predictive-leader` — отдельный fail-closed GET с `schemaVersion: 4` для блока «Одно число по прогнозным блокам». Верхнеуровневый safety-контракт остаётся обратно совместимым: `mode: "observation"`, `executionEnabled: false`, `advisoryOnly: true`; отдельное поле `strategyMode: "quality-gated-simulation"` описывает используемую стратегию. `candidateNumber` — заранее замороженный лидер модели для наблюдения и последующей оценки; его наличие само по себе не разрешает ставку. Поля `action: "BET"` и `number`, равный кандидату, появляются только для свежего незавершённого раунда с синхронными cursors, замороженным `qualityGate.status: "confirmed"`, обеими семьями и уже сохранённой `pending` ставкой основного счёта. Во всех остальных случаях endpoint возвращает `action: "WAIT"` и `number: null`; валидный `candidateNumber` и gate при этом могут оставаться в ответе, чтобы явно отличать слабый кандидат от отсутствующих данных.
+- `GET /api/predictive-leader/v7-shadow` — read-only аудит отдельной prospective-когорты v7. Возвращает frozen config/hash/export provenance, последний кандидат без полного массива из 37 масс, coverage и метрики overall/selected, парное сравнение с v5, fixed-window gate с Wilson/HAC/McNemar и regime blocks. Контракт всегда содержит `executionEnabled: false`, `advisoryOnly: true`, `qualityGateDiagnostic.promotionEligible: false`; endpoint ничего не записывает и не выполняет ставок.
+- `GET /api/predictive-leader/current-cell-10s-shadow` — read-only аудит v28 current-cell: frozen cohort/config/provenance, coverage, Top‑1/Brier/logloss, paired v5, fixed-first-1000 gate, regime blocks и audit-only flat-paper результат. Всегда `executionEnabled: false`, `advisoryOnly: true`, `qualityGateDiagnostic.promotionEligible: false`; endpoint не выполняет ставок и не меняет БД.
 
   Поле `qualityGate` раскрывает rolling-окно, Wilson95, Brier, causal cutoff и digest evidence. `account` — основной fixed-stake счёт `1 000 / 10 / gross ×36` с `reservedStake`, `pendingBet`, `voidCount` и `latestVoid`; `legacyAccount` — неизменённый аудит старой лестницы без новых production-ставок. `BET` остаётся только информационным сигналом: `advisoryOnly` равно `true`, `executionEnabled` — `false`, endpoint ничего не отправляет на Buleto. При gap, очереди сохранения, несовпадении раунда, неготовом gate или повреждённом evidence ответ остаётся `WAIT` со статусом `waiting` либо `paused`, но накопленные оба счёта доступны для аудита.
 - `GET /api/forecasts/hits?limit=20` — архив прежних попаданий сохранённого Top‑3. Эти записи помечены версией модели и не участвуют в новом Rank‑37 или верхнем едином лидере.
