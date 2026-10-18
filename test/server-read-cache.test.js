@@ -85,13 +85,14 @@ test('cache invalidates only for persisted database update reasons', () => {
     'forecast',
     'forecast-settled',
     'predictive-leader-account',
+    'predictive-leader-v7-paper',
   ]) {
     const generation = cache.generation();
     cache.broadcastUpdate(reason);
     assert.equal(cache.generation(), generation + 1, `${reason} must invalidate DB snapshots`);
     assert.equal(cache.cachedDatabaseRead('state', read).revision, reads);
   }
-  assert.equal(reads, 6);
+  assert.equal(reads, 7);
 });
 
 test('read cache is bounded and keeps recently used snapshots', () => {

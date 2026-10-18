@@ -16,6 +16,10 @@ import { LEARNED_LEADER_ALGORITHM_VERSION } from "../src/learned-leader.js";
 import { LEARNED_LEADER_V7_ALGORITHM_VERSION } from "../src/learned-leader-v7.js";
 import { CURRENT_CELL_HORIZON_SHADOW_ALGORITHM_VERSION } from "../src/current-cell-horizon-shadow.js";
 import { PREDICTIVE_LEADER_API_SCHEMA_VERSION } from "../src/predictive-leader-api.js";
+import {
+  PREDICTIVE_LEADER_V7_PAPER_API_SCHEMA_VERSION,
+  PREDICTIVE_LEADER_V7_PAPER_STRATEGY_VERSION,
+} from "../src/predictive-leader-v7-paper-api.js";
 
 const ROOT_DIR = fileURLToPath(new URL("../", import.meta.url));
 const SOURCE = "buleto";
@@ -274,6 +278,50 @@ test(
       assert.equal(v7Head.status, 200, logs());
       assert.equal(v7Head.headers.get("cache-control"), "no-store");
       assert.equal(await v7Head.text(), "");
+
+      const v7PaperResponse = await fetch(
+        `${baseUrl}/api/predictive-leader/v7-paper`,
+      );
+      assert.equal(v7PaperResponse.status, 200, logs());
+      assert.equal(v7PaperResponse.headers.get("cache-control"), "no-store");
+      const v7PaperPayload = await v7PaperResponse.json();
+      assert.equal(
+        v7PaperPayload.schemaVersion,
+        PREDICTIVE_LEADER_V7_PAPER_API_SCHEMA_VERSION,
+      );
+      assert.equal(
+        v7PaperPayload.strategyVersion,
+        PREDICTIVE_LEADER_V7_PAPER_STRATEGY_VERSION,
+      );
+      assert.equal(v7PaperPayload.strategyMode, "manual-override-paper");
+      assert.equal(v7PaperPayload.executionEnabled, false);
+      assert.equal(v7PaperPayload.advisoryOnly, true);
+      assert.equal(v7PaperPayload.promotionEligible, false);
+      assert.equal(v7PaperPayload.action, "WAIT");
+      assert.equal(v7PaperPayload.number, null);
+      assert.equal(v7PaperPayload.account.currentBalance, 1_000);
+      assert.equal(v7PaperPayload.account.deficit, 0);
+      assert.equal(v7PaperPayload.stats.betCount, 0);
+      assert.equal(v7PaperPayload.pendingBet, null);
+      assert.equal(v7PaperPayload.qualityGateDiagnostic.role, "audit-only");
+      assert.equal(
+        v7PaperPayload.qualityGateDiagnostic.controlsPaperAction,
+        false,
+      );
+
+      const v7PaperHead = await fetch(
+        `${baseUrl}/api/predictive-leader/v7-paper`,
+        { method: "HEAD" },
+      );
+      assert.equal(v7PaperHead.status, 200, logs());
+      assert.equal(v7PaperHead.headers.get("cache-control"), "no-store");
+      assert.equal(await v7PaperHead.text(), "");
+
+      const v7PaperPost = await fetch(
+        `${baseUrl}/api/predictive-leader/v7-paper`,
+        { method: "POST" },
+      );
+      assert.equal(v7PaperPost.status, 405, logs());
 
       const currentCellResponse = await fetch(
         `${baseUrl}/api/predictive-leader/current-cell-10s-shadow`,

@@ -449,6 +449,9 @@ test("schema contains all persistence tables", () => {
       "predictive_leader_accounts",
       "predictive_leader_gated_fixed_bets",
       "predictive_leader_v7_cohorts",
+      "predictive_leader_v7_paper_bets",
+      "predictive_leader_v7_paper_campaigns",
+      "predictive_leader_v7_paper_voids",
       "predictive_shadow_integrity_boundaries",
       "predictive_shadow_round_metadata_conflicts",
       "round_forecasts",
@@ -462,7 +465,7 @@ test("schema contains all persistence tables", () => {
       "virtual_bet_sessions",
       "virtual_bets",
     ]);
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 29);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 30);
     assert.equal(
       database.sqlite
         .prepare(`
@@ -779,7 +782,7 @@ test("version 25 keeps the Top-5 deposit and retained v20-v22 tables", () => {
     database = createDatabase({ path });
     assert.equal(
       database.sqlite.prepare("PRAGMA user_version").get().user_version,
-      29,
+      30,
     );
     assert.equal(
       database.sqlite
@@ -844,7 +847,7 @@ test("version 24 repairs stale stream state before accepting another result", ()
         .map((row) => Number(row.continuity_epoch)),
       [0, 1, 1],
     );
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 29);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 30);
   } finally {
     database.close();
     rmSync(directory, { recursive: true, force: true });
@@ -986,7 +989,7 @@ test("version 13 creates one live follower tracker at the current tail", () => {
       "buleto",
       "PRIMECOIN(XPM)/RUB",
     );
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 29);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 30);
     assert.equal(migrated.status, "armed");
     assert.equal(migrated.currentSession.sourceNumber, 9);
     assert.deepEqual(migrated.currentSession.fixedNumbers, [5, 4, 3, 2, 1]);
@@ -4660,7 +4663,7 @@ test("versions 11 and 12 do not backfill derived snapshots for version 10 foreca
       path,
       clock: () => new Date(BASE_TIME + 52_000),
     });
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 29);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 30);
     assert.equal(
       Number(
         database.sqlite
@@ -4739,7 +4742,7 @@ test("version 12 does not backfill consensus for legacy version 11 forecasts", (
       path,
       clock: () => new Date(BASE_TIME + 52_000),
     });
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 29);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 30);
     assert.equal(
       database.sqlite
         .prepare("SELECT COUNT(*) AS count FROM forecast_consensus_snapshots")
@@ -4801,7 +4804,7 @@ test("version 14 migration preserves a legacy Borda consensus row exactly", () =
       clock: () => new Date(BASE_TIME + 52_000),
     });
 
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 29);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 30);
     const migratedRow = {
       ...database.sqlite.prepare("SELECT * FROM forecast_consensus_snapshots").get(),
     };
@@ -4855,7 +4858,7 @@ test("versions 15 through 19 add empty prospective tables without backfilling le
       path,
       clock: () => new Date(BASE_TIME + 52_000),
     });
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 29);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 30);
     assert.equal(
       database.sqlite.prepare("SELECT COUNT(*) AS count FROM round_trajectories").get()
         .count,
@@ -4951,7 +4954,7 @@ test("version 17 never backfills an existing version 16 leader into the paper ac
       path,
       clock: () => new Date(BASE_TIME + 52_000),
     });
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 29);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 30);
     assert.equal(
       database.sqlite
         .prepare("SELECT COUNT(*) AS count FROM forecast_predictive_leader_snapshots")
@@ -5102,7 +5105,7 @@ test("version 18 preserves version 17 bet rows and adds nullable void audit fiel
       path,
       clock: () => new Date(clockMs),
     });
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 29);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 30);
     const after = database.sqlite
       .prepare("SELECT * FROM predictive_leader_account_bets ORDER BY forecast_id")
       .all();
@@ -5476,7 +5479,7 @@ test("version 5 history is backfilled into continuity epochs before migration co
 
   const database = createDatabase({ path });
   try {
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 29);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 30);
     assert.deepEqual(
       database.sqlite
         .prepare("SELECT continuity_epoch FROM round_results ORDER BY settled_at, id")
@@ -5536,7 +5539,7 @@ test("version 9 reconciles a proven contiguous shutdown boundary without deletin
 
     database = createDatabase({ path, gapThresholdSeconds: 135 });
     const state = database.getDashboardState();
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 29);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 30);
     assert.equal(state.totals.results, 5, "raw results are never recreated or deleted");
     assert.equal(state.totals.cycles, 1);
     assert.equal(state.totals.invalidCycles, 0);
@@ -7765,7 +7768,7 @@ test("v7 paper history initializes v8 bankroll with all known net results exactl
       "buleto",
       "PRIMECOIN(XPM)/RUB",
     );
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 29);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 30);
     assert.equal(state.testBank.initialBalance, 87_700);
     assert.equal(state.testBank.currentBalance, 87_910);
     assert.equal(state.testBank.netResult, 210);

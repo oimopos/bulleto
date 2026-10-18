@@ -126,6 +126,22 @@ const PREDICTIVE_LEADER_V7_MINIMUM_BRIER_IMPROVEMENT = 1e-4;
 const PREDICTIVE_LEADER_V7_MINIMUM_SELECTION_COVERAGE = 0.9;
 const PREDICTIVE_LEADER_V7_GATE_VERSION = "fixed-first-1000-prospective-v1";
 const PREDICTIVE_LEADER_V7_FORECAST_HORIZON_SECONDS = 8;
+export const PREDICTIVE_LEADER_V7_PAPER_CAMPAIGN = Object.freeze({
+  campaignKey: "v7-manual-override-paper-20261019",
+  schemaVersion: 1,
+  strategyVersion: "predictive-leader-v7-manual-override-paper-v1",
+  mode: "manual-override-paper",
+  initialBalance: 1_000,
+  fixedStake: 10,
+  grossPayoutMultiplier: 36,
+  payoutIncludesStake: true,
+  minimumPlacementLeadMs: 5_000,
+  executionEnabled: false,
+  advisoryOnly: true,
+  promotionEligible: false,
+  promotionPolicy: "manual-override-paper-not-promoted",
+  authorizationReason: "operator-requested-virtual-api-2026-10-19",
+});
 export const PREDICTIVE_LEADER_V7_CANDIDATE_CONFIG =
   createLearnedLeaderV7Config({
     version: LEARNED_LEADER_V7_CONFIG_VERSION,
@@ -5717,6 +5733,7 @@ export class RouletteDatabase {
     this.#migratePredictiveLeaderV7ShadowV27(startingVersion);
     this.#migrateCurrentCellHorizonShadowV28(startingVersion);
     this.#migrateCurrentCellHorizonMetadataVoidsV29(startingVersion);
+    this.#migratePredictiveLeaderV7PaperCampaignV30(startingVersion);
   }
 
   #migratePrecloseForecastsV10() {
@@ -8399,6 +8416,441 @@ export class RouletteDatabase {
     }
   }
 
+  #migratePredictiveLeaderV7PaperCampaignV30(startingVersion) {
+    this.sqlite.exec("BEGIN IMMEDIATE");
+    try {
+      this.sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS predictive_leader_v7_paper_campaigns (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          campaign_key TEXT NOT NULL UNIQUE CHECK (length(trim(campaign_key)) > 0),
+          schema_version INTEGER NOT NULL CHECK (
+            schema_version = ${PREDICTIVE_LEADER_V7_PAPER_CAMPAIGN.schemaVersion}
+          ),
+          strategy_version TEXT NOT NULL CHECK (length(trim(strategy_version)) > 0),
+          candidate_key TEXT NOT NULL REFERENCES predictive_leader_v7_cohorts(
+            candidate_key
+          ),
+          algorithm_version TEXT NOT NULL CHECK (length(trim(algorithm_version)) > 0),
+          mode TEXT NOT NULL CHECK (mode = 'manual-override-paper'),
+          execution_enabled INTEGER NOT NULL CHECK (execution_enabled = 0),
+          advisory_only INTEGER NOT NULL CHECK (advisory_only = 1),
+          promotion_eligible INTEGER NOT NULL CHECK (promotion_eligible = 0),
+          promotion_policy TEXT NOT NULL CHECK (
+            promotion_policy = 'manual-override-paper-not-promoted'
+          ),
+          authorization_reason TEXT NOT NULL CHECK (
+            authorization_reason = 'operator-requested-virtual-api-2026-10-19'
+          ),
+          source TEXT NOT NULL,
+          instrument TEXT NOT NULL,
+          first_forecast_id INTEGER NOT NULL CHECK (first_forecast_id >= 1),
+          status TEXT NOT NULL CHECK (status IN ('running', 'exhausted')),
+          initial_balance INTEGER NOT NULL CHECK (initial_balance = 1000),
+          current_balance INTEGER NOT NULL CHECK (current_balance >= 0),
+          ledger_deficit INTEGER NOT NULL DEFAULT 0 CHECK (ledger_deficit >= 0),
+          fixed_stake INTEGER NOT NULL CHECK (fixed_stake = 10),
+          gross_payout_multiplier INTEGER NOT NULL CHECK (
+            gross_payout_multiplier = 36
+          ),
+          payout_includes_stake INTEGER NOT NULL CHECK (payout_includes_stake = 1),
+          last_continuity_epoch INTEGER NOT NULL CHECK (last_continuity_epoch >= 0),
+          continuity_gap_count INTEGER NOT NULL DEFAULT 0 CHECK (
+            continuity_gap_count >= 0
+          ),
+          started_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          exhausted_at TEXT,
+          created_at TEXT NOT NULL,
+          UNIQUE(candidate_key, strategy_version),
+          CHECK (started_at = created_at),
+          CHECK (started_at <= updated_at),
+          CHECK (current_balance = 0 OR ledger_deficit = 0),
+          CHECK (
+            (status = 'running' AND exhausted_at IS NULL)
+            OR
+            (status = 'exhausted' AND exhausted_at IS NOT NULL
+              AND (current_balance < fixed_stake OR ledger_deficit > 0))
+          )
+        );
+
+        CREATE TABLE IF NOT EXISTS predictive_leader_v7_paper_bets (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          campaign_id INTEGER NOT NULL REFERENCES
+            predictive_leader_v7_paper_campaigns(id),
+          forecast_id INTEGER NOT NULL,
+          candidate_key TEXT NOT NULL,
+          external_round_id TEXT NOT NULL CHECK (
+            length(trim(external_round_id)) > 0
+          ),
+          continuity_epoch INTEGER NOT NULL CHECK (continuity_epoch >= 0),
+          target_number INTEGER NOT NULL CHECK (target_number BETWEEN 0 AND 36),
+          stake INTEGER NOT NULL CHECK (stake = 10),
+          balance_before INTEGER NOT NULL CHECK (balance_before >= stake),
+          locked_at TEXT NOT NULL,
+          betting_closes_at TEXT NOT NULL,
+          status TEXT NOT NULL CHECK (status IN ('pending', 'settled', 'void')),
+          round_result_id INTEGER REFERENCES round_results(id),
+          result_number INTEGER CHECK (
+            result_number IS NULL OR result_number BETWEEN 0 AND 36
+          ),
+          outcome TEXT CHECK (outcome IS NULL OR outcome IN ('hit', 'miss')),
+          gross_payout INTEGER CHECK (gross_payout IS NULL OR gross_payout >= 0),
+          balance_after INTEGER CHECK (balance_after IS NULL OR balance_after >= 0),
+          void_reason TEXT CHECK (
+            void_reason IS NULL OR void_reason IN (
+              'integrity_gap', 'round_metadata_conflict'
+            )
+          ),
+          void_incident_id INTEGER REFERENCES incidents(id),
+          void_continuity_epoch INTEGER CHECK (
+            void_continuity_epoch IS NULL OR void_continuity_epoch >= 1
+          ),
+          placed_at TEXT NOT NULL,
+          settled_at TEXT,
+          voided_at TEXT,
+          updated_at TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          UNIQUE(campaign_id, forecast_id),
+          UNIQUE(campaign_id, round_result_id),
+          FOREIGN KEY (forecast_id, candidate_key) REFERENCES
+            forecast_predictive_leader_v7_snapshots(forecast_id, candidate_key),
+          CHECK (locked_at <= placed_at),
+          CHECK (placed_at = created_at),
+          CHECK (placed_at <= updated_at),
+          CHECK (
+            (status = 'pending' AND round_result_id IS NULL
+              AND result_number IS NULL AND outcome IS NULL
+              AND gross_payout IS NULL AND balance_after IS NULL
+              AND void_reason IS NULL AND void_incident_id IS NULL
+              AND void_continuity_epoch IS NULL AND settled_at IS NULL
+              AND voided_at IS NULL)
+            OR
+            (status = 'settled' AND round_result_id IS NOT NULL
+              AND result_number IS NOT NULL AND outcome IS NOT NULL
+              AND gross_payout IS NOT NULL AND balance_after IS NOT NULL
+              AND void_reason IS NULL AND void_incident_id IS NULL
+              AND void_continuity_epoch IS NULL AND settled_at IS NOT NULL
+              AND voided_at IS NULL
+              AND placed_at <= settled_at
+              AND balance_after = balance_before - stake + gross_payout
+              AND (outcome = 'hit') = (target_number = result_number)
+              AND gross_payout = CASE
+                WHEN outcome = 'hit' THEN stake * 36 ELSE 0 END)
+            OR
+            (status = 'void' AND round_result_id IS NULL
+              AND result_number IS NULL AND outcome IS NULL
+              AND gross_payout IS NULL AND balance_after IS NULL
+              AND void_reason IS NOT NULL AND settled_at IS NULL
+              AND voided_at IS NOT NULL
+              AND ((void_reason = 'integrity_gap'
+                AND void_incident_id IS NOT NULL
+                AND void_continuity_epoch IS NOT NULL)
+              OR (void_reason = 'round_metadata_conflict'
+                AND void_incident_id IS NULL
+                AND void_continuity_epoch IS NULL)))
+          )
+        );
+
+        CREATE TABLE IF NOT EXISTS predictive_leader_v7_paper_voids (
+          bet_id INTEGER PRIMARY KEY REFERENCES
+            predictive_leader_v7_paper_bets(id),
+          campaign_id INTEGER NOT NULL REFERENCES
+            predictive_leader_v7_paper_campaigns(id),
+          prior_status TEXT NOT NULL CHECK (prior_status IN ('pending', 'settled')),
+          reason TEXT NOT NULL CHECK (
+            reason IN ('integrity_gap', 'round_metadata_conflict')
+          ),
+          balance_adjustment INTEGER NOT NULL,
+          incident_id INTEGER REFERENCES incidents(id),
+          continuity_epoch INTEGER CHECK (
+            continuity_epoch IS NULL OR continuity_epoch >= 1
+          ),
+          voided_at TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          CHECK (voided_at = created_at),
+          CHECK (
+            (reason = 'integrity_gap' AND incident_id IS NOT NULL
+              AND continuity_epoch IS NOT NULL)
+            OR
+            (reason = 'round_metadata_conflict' AND incident_id IS NULL
+              AND continuity_epoch IS NULL)
+          )
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS predictive_leader_v7_paper_pending_idx
+          ON predictive_leader_v7_paper_bets(campaign_id)
+          WHERE status = 'pending';
+        CREATE INDEX IF NOT EXISTS predictive_leader_v7_paper_history_idx
+          ON predictive_leader_v7_paper_bets(campaign_id, forecast_id DESC);
+        CREATE INDEX IF NOT EXISTS predictive_leader_v7_paper_void_history_idx
+          ON predictive_leader_v7_paper_voids(campaign_id, voided_at DESC, bet_id DESC);
+
+        CREATE TRIGGER IF NOT EXISTS predictive_leader_v7_paper_campaign_config_immutable
+        BEFORE UPDATE OF
+          campaign_key, schema_version, strategy_version, candidate_key,
+          algorithm_version, mode, execution_enabled, advisory_only,
+          promotion_eligible, promotion_policy, authorization_reason,
+          source, instrument,
+          first_forecast_id, initial_balance, fixed_stake,
+          gross_payout_multiplier, payout_includes_stake, started_at, created_at
+        ON predictive_leader_v7_paper_campaigns
+        BEGIN
+          SELECT RAISE(ABORT, 'v7 paper campaign configuration is immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS predictive_leader_v7_paper_campaign_no_delete
+        BEFORE DELETE ON predictive_leader_v7_paper_campaigns
+        BEGIN
+          SELECT RAISE(ABORT, 'v7 paper campaign cannot be deleted');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS predictive_leader_v7_paper_no_backfill
+        BEFORE INSERT ON predictive_leader_v7_paper_bets
+        WHEN NOT EXISTS (
+          SELECT 1
+          FROM predictive_leader_v7_paper_campaigns AS campaigns
+          WHERE campaigns.id = NEW.campaign_id
+            AND campaigns.candidate_key = NEW.candidate_key
+            AND NEW.forecast_id >= campaigns.first_forecast_id
+            AND NEW.placed_at >= campaigns.started_at
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'v7 paper bets cannot be backfilled');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS predictive_leader_v7_paper_valid_pending
+        BEFORE INSERT ON predictive_leader_v7_paper_bets
+        WHEN NEW.status <> 'pending' OR NOT EXISTS (
+          SELECT 1
+          FROM predictive_leader_v7_paper_campaigns AS campaigns
+          JOIN forecast_predictive_leader_v7_snapshots AS leaders
+            ON leaders.forecast_id = NEW.forecast_id
+           AND leaders.candidate_key = NEW.candidate_key
+          JOIN round_forecasts AS forecasts ON forecasts.id = leaders.forecast_id
+          JOIN forecast_snapshots AS snapshots ON snapshots.id = forecasts.snapshot_id
+          WHERE campaigns.id = NEW.campaign_id
+            AND campaigns.status = 'running'
+            AND campaigns.candidate_key = leaders.candidate_key
+            AND campaigns.algorithm_version = leaders.algorithm_version
+            AND campaigns.source = snapshots.source
+            AND campaigns.instrument = snapshots.instrument
+            AND campaigns.current_balance >= NEW.stake
+            AND campaigns.ledger_deficit = 0
+            AND NEW.balance_before = campaigns.current_balance
+            AND leaders.status = 'ready'
+            AND leaders.selected = 1
+            AND leaders.locked_at >= campaigns.started_at
+            AND leaders.created_at >= campaigns.started_at
+            AND leaders.predicted_number = NEW.target_number
+            AND leaders.locked_at = NEW.locked_at
+            AND snapshots.external_round_id = NEW.external_round_id
+            AND snapshots.locked_at = NEW.locked_at
+            AND snapshots.betting_closes_at = NEW.betting_closes_at
+            AND NEW.placed_at >= NEW.locked_at
+            AND (julianday(NEW.betting_closes_at) - julianday(NEW.placed_at))
+              * 86400000 >= 4999
+            AND NOT EXISTS (
+              SELECT 1 FROM forecast_settlements
+              WHERE forecast_id = NEW.forecast_id
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM round_results AS results
+              WHERE results.source = campaigns.source
+                AND results.instrument = campaigns.instrument
+                AND results.external_round_id = NEW.external_round_id
+            )
+            AND NOT EXISTS (
+              SELECT 1
+              FROM predictive_shadow_round_metadata_conflicts AS conflicts
+              WHERE conflicts.boundary_key = 'predictive-shadow-metadata-integrity-v1'
+                AND conflicts.source = campaigns.source
+                AND conflicts.instrument = campaigns.instrument
+                AND conflicts.external_round_id = NEW.external_round_id
+            )
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'v7 paper pending bet is not eligible');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS predictive_leader_v7_paper_bet_placement_immutable
+        BEFORE UPDATE OF
+          campaign_id, forecast_id, candidate_key, external_round_id,
+          continuity_epoch, target_number, stake, balance_before, locked_at,
+          betting_closes_at, placed_at, created_at
+        ON predictive_leader_v7_paper_bets
+        BEGIN
+          SELECT RAISE(ABORT, 'v7 paper bet placement is immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS predictive_leader_v7_paper_bet_terminal_immutable
+        BEFORE UPDATE ON predictive_leader_v7_paper_bets
+        WHEN OLD.status <> 'pending' OR NEW.status NOT IN ('settled', 'void')
+        BEGIN
+          SELECT RAISE(ABORT, 'v7 paper terminal bet is immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS predictive_leader_v7_paper_bet_no_delete
+        BEFORE DELETE ON predictive_leader_v7_paper_bets
+        BEGIN
+          SELECT RAISE(ABORT, 'v7 paper bet cannot be deleted');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS predictive_leader_v7_paper_void_valid
+        BEFORE INSERT ON predictive_leader_v7_paper_voids
+        WHEN NOT EXISTS (
+          SELECT 1
+          FROM predictive_leader_v7_paper_bets AS bets
+          WHERE bets.id = NEW.bet_id
+            AND bets.campaign_id = NEW.campaign_id
+            AND bets.status = NEW.prior_status
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'v7 paper void identity is invalid');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS predictive_leader_v7_paper_void_immutable_update
+        BEFORE UPDATE ON predictive_leader_v7_paper_voids
+        BEGIN
+          SELECT RAISE(ABORT, 'v7 paper void is immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS predictive_leader_v7_paper_void_immutable_delete
+        BEFORE DELETE ON predictive_leader_v7_paper_voids
+        BEGIN
+          SELECT RAISE(ABORT, 'v7 paper void cannot be deleted');
+        END;
+      `);
+
+      const cohort = this.sqlite.prepare(`
+        SELECT *
+        FROM predictive_leader_v7_cohorts
+        WHERE candidate_key = ?
+      `).get(PREDICTIVE_LEADER_V7_CANDIDATE_CONFIG.candidateId);
+      if (!cohort) throw new Error("predictive leader v7 paper cohort is missing");
+      const continuityEpoch = Number(this.sqlite.prepare(`
+        SELECT continuity_epoch
+        FROM stream_state
+        WHERE source = ? AND instrument = ?
+      `).get(cohort.source, cohort.instrument)?.continuity_epoch ?? 0);
+      const firstForecastId = Number(this.sqlite.prepare(`
+        SELECT COALESCE(MAX(id), 0) + 1 AS first_forecast_id
+        FROM round_forecasts
+      `).get().first_forecast_id);
+      const existing = this.sqlite.prepare(`
+        SELECT id
+        FROM predictive_leader_v7_paper_campaigns
+        WHERE campaign_key = ?
+      `).get(PREDICTIVE_LEADER_V7_PAPER_CAMPAIGN.campaignKey);
+      let inserted = 0;
+      if (!existing) {
+        const migrationClockAt = startingVersion >= 29
+          ? asTimestamp(
+              this.clock(),
+              undefined,
+              "predictive leader v7 paper campaign startedAt",
+            )
+          : cohort.started_at;
+        const startedAt = new Date(Math.max(
+          Date.parse(migrationClockAt),
+          Date.parse(cohort.started_at),
+        )).toISOString();
+        inserted = Number(this.sqlite.prepare(`
+          INSERT INTO predictive_leader_v7_paper_campaigns (
+            campaign_key, schema_version, strategy_version, candidate_key,
+            algorithm_version, mode, execution_enabled, advisory_only,
+            promotion_eligible, promotion_policy, authorization_reason,
+            source, instrument,
+            first_forecast_id, status, initial_balance, current_balance,
+            ledger_deficit,
+            fixed_stake, gross_payout_multiplier, payout_includes_stake,
+            last_continuity_epoch, continuity_gap_count, started_at, updated_at,
+            exhausted_at, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, 0, 1, 0, ?, ?, ?, ?, ?, 'running',
+            ?, ?, 0, ?, ?, 1, ?, 0, ?, ?, NULL, ?)
+        `).run(
+          PREDICTIVE_LEADER_V7_PAPER_CAMPAIGN.campaignKey,
+          PREDICTIVE_LEADER_V7_PAPER_CAMPAIGN.schemaVersion,
+          PREDICTIVE_LEADER_V7_PAPER_CAMPAIGN.strategyVersion,
+          cohort.candidate_key,
+          cohort.algorithm_version,
+          PREDICTIVE_LEADER_V7_PAPER_CAMPAIGN.mode,
+          PREDICTIVE_LEADER_V7_PAPER_CAMPAIGN.promotionPolicy,
+          PREDICTIVE_LEADER_V7_PAPER_CAMPAIGN.authorizationReason,
+          cohort.source,
+          cohort.instrument,
+          firstForecastId,
+          PREDICTIVE_LEADER_V7_PAPER_CAMPAIGN.initialBalance,
+          PREDICTIVE_LEADER_V7_PAPER_CAMPAIGN.initialBalance,
+          PREDICTIVE_LEADER_V7_PAPER_CAMPAIGN.fixedStake,
+          PREDICTIVE_LEADER_V7_PAPER_CAMPAIGN.grossPayoutMultiplier,
+          continuityEpoch,
+          startedAt,
+          startedAt,
+          startedAt,
+        ).changes);
+      }
+      const campaign = this.sqlite.prepare(`
+        SELECT *
+        FROM predictive_leader_v7_paper_campaigns
+        WHERE campaign_key = ?
+      `).get(PREDICTIVE_LEADER_V7_PAPER_CAMPAIGN.campaignKey);
+      if (
+        !campaign
+        || Number(campaign.schema_version)
+          !== PREDICTIVE_LEADER_V7_PAPER_CAMPAIGN.schemaVersion
+        || campaign.strategy_version
+          !== PREDICTIVE_LEADER_V7_PAPER_CAMPAIGN.strategyVersion
+        || campaign.candidate_key !== cohort.candidate_key
+        || campaign.algorithm_version !== cohort.algorithm_version
+        || campaign.mode !== PREDICTIVE_LEADER_V7_PAPER_CAMPAIGN.mode
+        || Boolean(campaign.execution_enabled)
+          !== PREDICTIVE_LEADER_V7_PAPER_CAMPAIGN.executionEnabled
+        || Boolean(campaign.advisory_only)
+          !== PREDICTIVE_LEADER_V7_PAPER_CAMPAIGN.advisoryOnly
+        || Boolean(campaign.promotion_eligible)
+          !== PREDICTIVE_LEADER_V7_PAPER_CAMPAIGN.promotionEligible
+        || campaign.promotion_policy
+          !== PREDICTIVE_LEADER_V7_PAPER_CAMPAIGN.promotionPolicy
+        || campaign.authorization_reason
+          !== PREDICTIVE_LEADER_V7_PAPER_CAMPAIGN.authorizationReason
+        || campaign.source !== cohort.source
+        || campaign.instrument !== cohort.instrument
+        || Number(campaign.initial_balance)
+          !== PREDICTIVE_LEADER_V7_PAPER_CAMPAIGN.initialBalance
+        || !Number.isSafeInteger(Number(campaign.current_balance))
+        || Number(campaign.current_balance) < 0
+        || !Number.isSafeInteger(Number(campaign.ledger_deficit))
+        || Number(campaign.ledger_deficit) < 0
+        || (Number(campaign.current_balance) > 0
+          && Number(campaign.ledger_deficit) > 0)
+        || Number(campaign.fixed_stake)
+          !== PREDICTIVE_LEADER_V7_PAPER_CAMPAIGN.fixedStake
+        || Number(campaign.gross_payout_multiplier)
+          !== PREDICTIVE_LEADER_V7_PAPER_CAMPAIGN.grossPayoutMultiplier
+        || !Boolean(campaign.payout_includes_stake)
+        || !Number.isSafeInteger(Number(campaign.first_forecast_id))
+        || Number(campaign.first_forecast_id) < 1
+        || campaign.started_at !== campaign.created_at
+        || campaign.started_at < cohort.started_at
+        || (inserted === 1
+          && Number(campaign.first_forecast_id) !== firstForecastId)
+      ) {
+        throw new Error("predictive leader v7 paper campaign is incompatible");
+      }
+      this.sqlite.exec(`
+        PRAGMA user_version = ${Math.max(30, startingVersion)};
+        COMMIT;
+      `);
+    } catch (error) {
+      try {
+        this.sqlite.exec("ROLLBACK");
+      } catch {
+        // Preserve the migration error.
+      }
+      throw error;
+    }
+  }
+
   #migrateContinuityReconciliationV9() {
     this.sqlite.exec("BEGIN IMMEDIATE");
     try {
@@ -10277,6 +10729,15 @@ export class RouletteDatabase {
                 continuityEpoch,
                 voidedAt: now,
               }),
+          predictiveLeaderV7PaperVoid: deferPredictiveLeaderVoid
+            ? null
+            : this.#voidPredictiveLeaderV7PaperForGapInTransaction({
+                source: incident.source,
+                instrument: incident.instrument,
+                incidentId: Number(existing.id),
+                continuityEpoch,
+                voidedAt: now,
+              }),
         };
       }
     }
@@ -10356,6 +10817,15 @@ export class RouletteDatabase {
       predictiveLeaderVoid: deferPredictiveLeaderVoid
         ? null
         : this.#voidPredictiveLeaderPendingBetForGapInTransaction({
+            source: incident.source,
+            instrument: incident.instrument,
+            incidentId,
+            continuityEpoch,
+            voidedAt: now,
+          }),
+      predictiveLeaderV7PaperVoid: deferPredictiveLeaderVoid
+        ? null
+        : this.#voidPredictiveLeaderV7PaperForGapInTransaction({
             source: incident.source,
             instrument: incident.instrument,
             incidentId,
@@ -10702,6 +11172,14 @@ export class RouletteDatabase {
             });
           outcome.predictiveLeaderVoid =
             this.#voidPredictiveLeaderPendingBetForGapInTransaction({
+              source: outcome.row.source,
+              instrument: outcome.row.instrument,
+              incidentId: Number(outcome.row.id),
+              continuityEpoch: outcome.continuityEpoch,
+              voidedAt: now,
+            });
+          outcome.predictiveLeaderV7PaperVoid =
+            this.#voidPredictiveLeaderV7PaperForGapInTransaction({
               source: outcome.row.source,
               instrument: outcome.row.instrument,
               incidentId: Number(outcome.row.id),
@@ -11803,7 +12281,7 @@ export class RouletteDatabase {
     if (originalBettingClosesAt === observedBettingClosesAt) {
       return false;
     }
-    return Number(this.sqlite.prepare(`
+    const inserted = Number(this.sqlite.prepare(`
       INSERT INTO predictive_shadow_round_metadata_conflicts (
         boundary_key, source, instrument, external_round_id, reason,
         original_betting_closes_at, observed_betting_closes_at,
@@ -11843,6 +12321,21 @@ export class RouletteDatabase {
       observedAt,
       createdAt,
     ).changes) === 1;
+    const stored = inserted || Boolean(this.sqlite.prepare(`
+      SELECT 1
+      FROM predictive_shadow_round_metadata_conflicts
+      WHERE boundary_key = 'predictive-shadow-metadata-integrity-v1'
+        AND source = ? AND instrument = ? AND external_round_id = ?
+    `).get(source, instrument, externalRoundId));
+    if (stored) {
+      this.#voidPredictiveLeaderV7PaperForMetadataConflictInTransaction({
+        source,
+        instrument,
+        externalRoundId,
+        voidedAt: createdAt,
+      });
+    }
+    return inserted;
   }
 
   recordCurrentCellHorizonMetadataConflict(
@@ -14433,6 +14926,694 @@ export class RouletteDatabase {
     });
   }
 
+  #predictiveLeaderV7PaperCampaignRow(source, instrument) {
+    const campaign = this.sqlite.prepare(`
+      SELECT *
+      FROM predictive_leader_v7_paper_campaigns
+      WHERE campaign_key = ?
+    `).get(PREDICTIVE_LEADER_V7_PAPER_CAMPAIGN.campaignKey);
+    if (!campaign) {
+      throw new Error("predictive leader v7 paper campaign is missing");
+    }
+    if (campaign.source !== source || campaign.instrument !== instrument) {
+      return null;
+    }
+    if (
+      Number(campaign.schema_version)
+        !== PREDICTIVE_LEADER_V7_PAPER_CAMPAIGN.schemaVersion
+      || campaign.strategy_version
+        !== PREDICTIVE_LEADER_V7_PAPER_CAMPAIGN.strategyVersion
+      || campaign.candidate_key
+        !== PREDICTIVE_LEADER_V7_CANDIDATE_CONFIG.candidateId
+      || campaign.algorithm_version !== LEARNED_LEADER_V7_ALGORITHM_VERSION
+      || campaign.mode !== PREDICTIVE_LEADER_V7_PAPER_CAMPAIGN.mode
+      || Boolean(campaign.execution_enabled)
+        !== PREDICTIVE_LEADER_V7_PAPER_CAMPAIGN.executionEnabled
+      || Boolean(campaign.advisory_only)
+        !== PREDICTIVE_LEADER_V7_PAPER_CAMPAIGN.advisoryOnly
+      || Boolean(campaign.promotion_eligible)
+        !== PREDICTIVE_LEADER_V7_PAPER_CAMPAIGN.promotionEligible
+      || campaign.promotion_policy
+        !== PREDICTIVE_LEADER_V7_PAPER_CAMPAIGN.promotionPolicy
+      || campaign.authorization_reason
+        !== PREDICTIVE_LEADER_V7_PAPER_CAMPAIGN.authorizationReason
+      || Number(campaign.initial_balance)
+        !== PREDICTIVE_LEADER_V7_PAPER_CAMPAIGN.initialBalance
+      || Number(campaign.fixed_stake)
+        !== PREDICTIVE_LEADER_V7_PAPER_CAMPAIGN.fixedStake
+      || Number(campaign.gross_payout_multiplier)
+        !== PREDICTIVE_LEADER_V7_PAPER_CAMPAIGN.grossPayoutMultiplier
+      || !Boolean(campaign.payout_includes_stake)
+      || !["running", "exhausted"].includes(campaign.status)
+      || !Number.isSafeInteger(Number(campaign.current_balance))
+      || Number(campaign.current_balance) < 0
+      || !Number.isSafeInteger(Number(campaign.ledger_deficit))
+      || Number(campaign.ledger_deficit) < 0
+      || (Number(campaign.current_balance) > 0
+        && Number(campaign.ledger_deficit) > 0)
+      || !Number.isSafeInteger(Number(campaign.first_forecast_id))
+      || Number(campaign.first_forecast_id) < 1
+      || !Number.isSafeInteger(Number(campaign.last_continuity_epoch))
+      || Number(campaign.last_continuity_epoch) < 0
+      || !Number.isSafeInteger(Number(campaign.continuity_gap_count))
+      || Number(campaign.continuity_gap_count) < 0
+      || campaign.started_at !== campaign.created_at
+      || !Number.isFinite(Date.parse(campaign.started_at))
+      || !Number.isFinite(Date.parse(campaign.updated_at))
+      || campaign.updated_at < campaign.started_at
+    ) {
+      throw new Error("predictive leader v7 paper campaign cursor is invalid");
+    }
+    return campaign;
+  }
+
+  #requirePredictiveLeaderV7PaperCampaign(source, instrument) {
+    const campaign = this.#predictiveLeaderV7PaperCampaignRow(source, instrument);
+    if (!campaign) {
+      throw new RangeError("predictive leader v7 paper campaign is pinned to its frozen stream");
+    }
+    return campaign;
+  }
+
+  #voidPredictiveLeaderV7PaperBetInTransaction({
+    campaign,
+    bet,
+    reason,
+    incidentId = null,
+    continuityEpoch = null,
+    voidedAt,
+  }) {
+    const existingVoid = this.sqlite.prepare(`
+      SELECT bet_id
+      FROM predictive_leader_v7_paper_voids
+      WHERE bet_id = ?
+    `).get(Number(bet.id));
+    if (existingVoid) {
+      return { voided: 0, reason: "already_void", forecastId: Number(bet.forecast_id) };
+    }
+    if (!["pending", "settled"].includes(bet.status)) {
+      throw new Error("predictive leader v7 paper void source status is invalid");
+    }
+    if (!PREDICTIVE_LEADER_V7_PAPER_CAMPAIGN.payoutIncludesStake) {
+      throw new Error("predictive leader v7 paper payout model is invalid");
+    }
+    const safeVoidedAt = asTimestamp(
+      voidedAt,
+      undefined,
+      "predictive leader v7 paper voidedAt",
+    );
+    if (Date.parse(safeVoidedAt) < Date.parse(bet.placed_at)) {
+      throw new Error("predictive leader v7 paper bet cannot be voided before placement");
+    }
+    const balanceAdjustment = bet.status === "pending"
+      ? Number(bet.stake)
+      : Number(bet.stake) - Number(bet.gross_payout);
+    const insertion = this.sqlite.prepare(`
+      INSERT INTO predictive_leader_v7_paper_voids (
+        bet_id, campaign_id, prior_status, reason, balance_adjustment,
+        incident_id, continuity_epoch, voided_at, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(bet_id) DO NOTHING
+    `).run(
+      Number(bet.id),
+      Number(campaign.id),
+      bet.status,
+      reason,
+      balanceAdjustment,
+      incidentId,
+      continuityEpoch,
+      safeVoidedAt,
+      safeVoidedAt,
+    );
+    if (Number(insertion.changes) !== 1) {
+      return { voided: 0, reason: "already_void", forecastId: Number(bet.forecast_id) };
+    }
+    if (bet.status === "pending") {
+      const update = this.sqlite.prepare(`
+        UPDATE predictive_leader_v7_paper_bets
+        SET status = 'void', void_reason = ?, void_incident_id = ?,
+          void_continuity_epoch = ?, voided_at = ?, updated_at = ?
+        WHERE id = ? AND status = 'pending'
+      `).run(
+        reason,
+        incidentId,
+        continuityEpoch,
+        safeVoidedAt,
+        safeVoidedAt,
+        Number(bet.id),
+      );
+      if (Number(update.changes) !== 1) {
+        throw new Error("predictive leader v7 paper pending bet was not voided exactly once");
+      }
+    }
+    const effectiveBalance = Number(campaign.current_balance)
+      - Number(campaign.ledger_deficit)
+      + balanceAdjustment;
+    const currentBalance = Math.max(0, effectiveBalance);
+    const ledgerDeficit = Math.max(0, -effectiveBalance);
+    const pendingAfterVoid = this.sqlite.prepare(`
+      SELECT 1
+      FROM predictive_leader_v7_paper_bets AS bets
+      LEFT JOIN predictive_leader_v7_paper_voids AS voids ON voids.bet_id = bets.id
+      WHERE bets.campaign_id = ? AND bets.status = 'pending'
+        AND voids.bet_id IS NULL
+      LIMIT 1
+    `).get(Number(campaign.id));
+    const exhausted = ledgerDeficit > 0
+      || (!pendingAfterVoid && currentBalance < Number(campaign.fixed_stake));
+    const updatedAt = campaign.updated_at > safeVoidedAt
+      ? campaign.updated_at
+      : safeVoidedAt;
+    const campaignUpdate = this.sqlite.prepare(`
+      UPDATE predictive_leader_v7_paper_campaigns
+      SET status = ?, current_balance = ?, ledger_deficit = ?,
+        last_continuity_epoch = ?,
+        continuity_gap_count = continuity_gap_count + ?, updated_at = ?,
+        exhausted_at = ?
+      WHERE id = ? AND current_balance = ? AND ledger_deficit = ?
+    `).run(
+      exhausted ? "exhausted" : "running",
+      currentBalance,
+      ledgerDeficit,
+      reason === "integrity_gap"
+        ? Number(continuityEpoch)
+        : Number(campaign.last_continuity_epoch),
+      reason === "integrity_gap" ? 1 : 0,
+      updatedAt,
+      exhausted ? campaign.exhausted_at ?? safeVoidedAt : null,
+      Number(campaign.id),
+      Number(campaign.current_balance),
+      Number(campaign.ledger_deficit),
+    );
+    if (Number(campaignUpdate.changes) !== 1) {
+      throw new Error("predictive leader v7 paper campaign void adjustment failed");
+    }
+    return {
+      voided: 1,
+      reason,
+      forecastId: Number(bet.forecast_id),
+      balanceAdjustment,
+    };
+  }
+
+  #voidPredictiveLeaderV7PaperForMetadataConflictInTransaction({
+    source,
+    instrument,
+    externalRoundId,
+    voidedAt,
+  }) {
+    const campaign = this.#predictiveLeaderV7PaperCampaignRow(source, instrument);
+    if (!campaign) return { voided: 0, reason: "outside_frozen_stream" };
+    const conflict = this.sqlite.prepare(`
+      SELECT 1
+      FROM predictive_shadow_round_metadata_conflicts
+      WHERE boundary_key = 'predictive-shadow-metadata-integrity-v1'
+        AND source = ? AND instrument = ? AND external_round_id = ?
+    `).get(source, instrument, externalRoundId);
+    if (!conflict) return { voided: 0, reason: "metadata_matches" };
+    const bet = this.sqlite.prepare(`
+      SELECT bets.*
+      FROM predictive_leader_v7_paper_bets AS bets
+      LEFT JOIN predictive_leader_v7_paper_voids AS voids ON voids.bet_id = bets.id
+      WHERE bets.campaign_id = ? AND bets.external_round_id = ?
+        AND bets.status IN ('pending', 'settled')
+        AND voids.bet_id IS NULL
+      ORDER BY bets.id DESC
+      LIMIT 1
+    `).get(Number(campaign.id), externalRoundId);
+    if (!bet) return { voided: 0, reason: "no_affected_bet" };
+    return this.#voidPredictiveLeaderV7PaperBetInTransaction({
+      campaign,
+      bet,
+      reason: "round_metadata_conflict",
+      voidedAt,
+    });
+  }
+
+  #predictiveLeaderV7PaperBetHasResolvableResult({ source, instrument, bet }) {
+    const durableResult = this.sqlite.prepare(`
+      SELECT results.id
+      FROM round_results AS results
+      WHERE results.source = ? AND results.instrument = ?
+        AND results.external_round_id = ?
+      UNION ALL
+      SELECT settlements.round_result_id AS id
+      FROM forecast_settlements AS settlements
+      WHERE settlements.forecast_id = ?
+      LIMIT 1
+    `).get(
+      source,
+      instrument,
+      bet.external_round_id,
+      Number(bet.forecast_id),
+    );
+    if (durableResult) return true;
+
+    const forecast = this.sqlite.prepare(`
+      SELECT snapshots.round_ends_at
+      FROM round_forecasts AS forecasts
+      JOIN forecast_snapshots AS snapshots ON snapshots.id = forecasts.snapshot_id
+      WHERE forecasts.id = ?
+        AND snapshots.source = ? AND snapshots.instrument = ?
+        AND snapshots.external_round_id = ?
+    `).get(
+      Number(bet.forecast_id),
+      source,
+      instrument,
+      bet.external_round_id,
+    );
+    const expectedEndMs = Date.parse(forecast?.round_ends_at);
+    if (!Number.isFinite(expectedEndMs)) return false;
+    const anonymousCandidates = this.sqlite.prepare(`
+      SELECT results.id
+      FROM round_results AS results
+      WHERE results.source = ? AND results.instrument = ?
+        AND results.external_round_id IS NULL
+        AND results.settled_at >= ? AND results.settled_at <= ?
+        AND NOT EXISTS (
+          SELECT 1
+          FROM forecast_settlements AS settlements
+          WHERE settlements.round_result_id = results.id
+        )
+      ORDER BY results.settled_at, results.id
+      LIMIT 2
+    `).all(
+      source,
+      instrument,
+      new Date(expectedEndMs - 3_000).toISOString(),
+      new Date(expectedEndMs + 1_000).toISOString(),
+    );
+    if (anonymousCandidates.length !== 1) return false;
+    const unsettledCount = Number(this.sqlite.prepare(`
+      SELECT COUNT(*) AS count
+      FROM round_forecasts AS forecasts
+      JOIN forecast_snapshots AS snapshots ON snapshots.id = forecasts.snapshot_id
+      LEFT JOIN forecast_settlements AS settlements
+        ON settlements.forecast_id = forecasts.id
+      WHERE snapshots.source = ? AND snapshots.instrument = ?
+        AND snapshots.round_ends_at = ?
+        AND settlements.forecast_id IS NULL
+    `).get(source, instrument, forecast.round_ends_at).count);
+    return unsettledCount === 1;
+  }
+
+  #voidPredictiveLeaderV7PaperForGapInTransaction({
+    source,
+    instrument,
+    incidentId,
+    continuityEpoch,
+    voidedAt,
+  }) {
+    const campaign = this.#predictiveLeaderV7PaperCampaignRow(source, instrument);
+    if (!campaign) return { voided: 0, reason: "outside_frozen_stream" };
+    const incident = this.sqlite.prepare(`
+      SELECT incidents.*, incident_resolutions.incident_id AS resolved_incident_id
+      FROM incidents
+      LEFT JOIN incident_resolutions
+        ON incident_resolutions.incident_id = incidents.id
+      WHERE incidents.id = ? AND incidents.source = ?
+        AND incidents.instrument = ? AND incidents.kind = 'gap'
+    `).get(incidentId, source, instrument);
+    if (!incident) throw new Error("predictive leader v7 paper gap cursor is invalid");
+    if (incident.resolved_incident_id !== null) {
+      return { voided: 0, reason: "incident_resolved" };
+    }
+    const nextEpoch = Number(continuityEpoch);
+    if (!Number.isSafeInteger(nextEpoch) || nextEpoch < 1) {
+      throw new Error("predictive leader v7 paper continuity cursor is invalid");
+    }
+    const bet = this.sqlite.prepare(`
+      SELECT bets.*
+      FROM predictive_leader_v7_paper_bets AS bets
+      LEFT JOIN predictive_leader_v7_paper_voids AS voids ON voids.bet_id = bets.id
+      WHERE bets.campaign_id = ? AND bets.status = 'pending'
+        AND bets.continuity_epoch < ? AND voids.bet_id IS NULL
+      ORDER BY bets.id
+      LIMIT 1
+    `).get(Number(campaign.id), nextEpoch);
+    if (!bet) return { voided: 0, reason: "no_pending_bet" };
+    if (this.#predictiveLeaderV7PaperBetHasResolvableResult({
+      source,
+      instrument,
+      bet,
+    })) return { voided: 0, reason: "result_resolvable" };
+    return this.#voidPredictiveLeaderV7PaperBetInTransaction({
+      campaign,
+      bet,
+      reason: "integrity_gap",
+      incidentId: Number(incident.id),
+      continuityEpoch: nextEpoch,
+      voidedAt,
+    });
+  }
+
+  #settlePredictiveLeaderV7PaperInTransaction(source, instrument, updatedAt) {
+    let campaign = this.#predictiveLeaderV7PaperCampaignRow(source, instrument);
+    if (!campaign) return { settled: 0, voided: 0, reason: "outside_frozen_stream" };
+    const pending = this.sqlite.prepare(`
+      SELECT
+        bets.*,
+        settlements.round_result_id AS settlement_result_id,
+        settlements.actual_number AS settlement_actual_number,
+        settlements.settled_at AS settlement_occurred_at,
+        results.source AS result_source,
+        results.instrument AS result_instrument,
+        results.external_round_id AS result_external_round_id,
+        results.result_number AS stored_result_number,
+        results.settled_at AS result_occurred_at,
+        conflicts.reason AS conflict_reason
+      FROM predictive_leader_v7_paper_bets AS bets
+      JOIN round_forecasts AS forecasts ON forecasts.id = bets.forecast_id
+      JOIN forecast_snapshots AS snapshots ON snapshots.id = forecasts.snapshot_id
+      LEFT JOIN forecast_settlements AS settlements
+        ON settlements.forecast_id = bets.forecast_id
+      LEFT JOIN round_results AS results ON results.id = settlements.round_result_id
+      LEFT JOIN predictive_shadow_round_metadata_conflicts AS conflicts
+        ON conflicts.boundary_key = 'predictive-shadow-metadata-integrity-v1'
+       AND conflicts.source = snapshots.source
+       AND conflicts.instrument = snapshots.instrument
+       AND conflicts.external_round_id = snapshots.external_round_id
+      LEFT JOIN predictive_leader_v7_paper_voids AS voids ON voids.bet_id = bets.id
+      WHERE bets.campaign_id = ? AND bets.status = 'pending'
+        AND voids.bet_id IS NULL
+      LIMIT 1
+    `).get(Number(campaign.id));
+    if (!pending) return { settled: 0, voided: 0, reason: "no_pending_bet" };
+    if (pending.conflict_reason !== null) {
+      const outcome = this.#voidPredictiveLeaderV7PaperForMetadataConflictInTransaction({
+        source,
+        instrument,
+        externalRoundId: pending.external_round_id,
+        voidedAt: updatedAt,
+      });
+      return { settled: 0, ...outcome };
+    }
+    if (pending.settlement_result_id === null) {
+      return { settled: 0, voided: 0, reason: "awaiting_authoritative_result" };
+    }
+    if (
+      pending.result_source !== source
+      || pending.result_instrument !== instrument
+      || (pending.result_external_round_id !== null
+        && pending.result_external_round_id !== pending.external_round_id)
+      || Number(pending.settlement_actual_number)
+        !== Number(pending.stored_result_number)
+      || pending.settlement_occurred_at !== pending.result_occurred_at
+    ) {
+      throw new Error("predictive leader v7 paper settlement is not authoritative");
+    }
+    if (Date.parse(pending.result_occurred_at) < Date.parse(pending.placed_at)) {
+      throw new Error("predictive leader v7 paper result predates its placement");
+    }
+    const effectiveUpdatedAt = new Date(Math.max(
+      Date.parse(campaign.updated_at),
+      Date.parse(updatedAt),
+      Date.parse(pending.result_occurred_at),
+    )).toISOString();
+    const resultNumber = Number(pending.stored_result_number);
+    const hit = resultNumber === Number(pending.target_number);
+    const grossPayout = hit
+      ? Number(pending.stake) * PREDICTIVE_LEADER_V7_PAPER_CAMPAIGN.grossPayoutMultiplier
+      : 0;
+    const historicalBalanceAfter = Number(pending.balance_before)
+      - Number(pending.stake)
+      + grossPayout;
+    const betUpdate = this.sqlite.prepare(`
+      UPDATE predictive_leader_v7_paper_bets
+      SET status = 'settled', round_result_id = ?, result_number = ?, outcome = ?,
+        gross_payout = ?, balance_after = ?, settled_at = ?, updated_at = ?
+      WHERE id = ? AND status = 'pending'
+    `).run(
+      Number(pending.settlement_result_id),
+      resultNumber,
+      hit ? "hit" : "miss",
+      grossPayout,
+      historicalBalanceAfter,
+      pending.result_occurred_at,
+      effectiveUpdatedAt,
+      Number(pending.id),
+    );
+    if (Number(betUpdate.changes) !== 1) {
+      throw new Error("predictive leader v7 paper bet was not settled exactly once");
+    }
+    const effectiveBalance = Number(campaign.current_balance)
+      - Number(campaign.ledger_deficit)
+      + grossPayout;
+    const currentBalance = Math.max(0, effectiveBalance);
+    const ledgerDeficit = Math.max(0, -effectiveBalance);
+    const exhausted = ledgerDeficit > 0
+      || currentBalance < Number(campaign.fixed_stake);
+    const campaignUpdate = this.sqlite.prepare(`
+      UPDATE predictive_leader_v7_paper_campaigns
+      SET status = ?, current_balance = ?, ledger_deficit = ?, updated_at = ?,
+        exhausted_at = ?
+      WHERE id = ? AND current_balance = ? AND ledger_deficit = ?
+    `).run(
+      exhausted ? "exhausted" : "running",
+      currentBalance,
+      ledgerDeficit,
+      effectiveUpdatedAt,
+      exhausted ? campaign.exhausted_at ?? effectiveUpdatedAt : null,
+      Number(campaign.id),
+      Number(campaign.current_balance),
+      Number(campaign.ledger_deficit),
+    );
+    if (Number(campaignUpdate.changes) !== 1) {
+      throw new Error("predictive leader v7 paper campaign settlement failed");
+    }
+    return {
+      settled: 1,
+      voided: 0,
+      reason: hit ? "hit" : "miss",
+      forecastId: Number(pending.forecast_id),
+    };
+  }
+
+  #reconcilePredictiveLeaderV7PaperInTransaction(source, instrument, updatedAt) {
+    const campaign = this.#predictiveLeaderV7PaperCampaignRow(source, instrument);
+    if (!campaign) return { settled: 0, voided: 0, reason: "outside_frozen_stream" };
+    const pending = this.sqlite.prepare(`
+      SELECT bets.*
+      FROM predictive_leader_v7_paper_bets AS bets
+      LEFT JOIN predictive_leader_v7_paper_voids AS voids ON voids.bet_id = bets.id
+      WHERE bets.campaign_id = ? AND bets.status = 'pending'
+        AND voids.bet_id IS NULL
+      LIMIT 1
+    `).get(Number(campaign.id));
+    if (pending) {
+      const conflict = this.sqlite.prepare(`
+        SELECT 1
+        FROM predictive_shadow_round_metadata_conflicts
+        WHERE boundary_key = 'predictive-shadow-metadata-integrity-v1'
+          AND source = ? AND instrument = ? AND external_round_id = ?
+      `).get(source, instrument, pending.external_round_id);
+      if (conflict) {
+        const outcome = this.#voidPredictiveLeaderV7PaperForMetadataConflictInTransaction({
+          source,
+          instrument,
+          externalRoundId: pending.external_round_id,
+          voidedAt: updatedAt,
+        });
+        return { settled: 0, ...outcome };
+      }
+      const currentEpoch = this.#continuityEpoch(source, instrument);
+      if (Number(pending.continuity_epoch) < currentEpoch) {
+        if (!this.#predictiveLeaderV7PaperBetHasResolvableResult({
+          source,
+          instrument,
+          bet: pending,
+        })) {
+          const incident = this.sqlite.prepare(`
+            SELECT incidents.id, incidents.created_at
+            FROM incidents
+            LEFT JOIN incident_resolutions
+              ON incident_resolutions.incident_id = incidents.id
+            WHERE incidents.source = ? AND incidents.instrument = ?
+              AND incidents.kind = 'gap'
+              AND incidents.created_at >= ?
+              AND incident_resolutions.incident_id IS NULL
+            ORDER BY incidents.id
+            LIMIT 1
+          `).get(source, instrument, pending.placed_at);
+          if (!incident) {
+            throw new Error("predictive leader v7 paper gap incident is missing");
+          }
+          const outcome = this.#voidPredictiveLeaderV7PaperForGapInTransaction({
+            source,
+            instrument,
+            incidentId: Number(incident.id),
+            continuityEpoch: currentEpoch,
+            voidedAt: incident.created_at > updatedAt ? incident.created_at : updatedAt,
+          });
+          return { settled: 0, ...outcome };
+        }
+      }
+    }
+    return this.#settlePredictiveLeaderV7PaperInTransaction(
+      source,
+      instrument,
+      updatedAt,
+    );
+  }
+
+  #placePredictiveLeaderV7PaperBetInTransaction({
+    source,
+    instrument,
+    forecastId,
+    placedAt,
+  }) {
+    const campaign = this.#requirePredictiveLeaderV7PaperCampaign(source, instrument);
+    const safeForecastId = Number(forecastId);
+    if (!Number.isSafeInteger(safeForecastId) || safeForecastId < 1) {
+      throw new TypeError("forecastId must be a positive safe integer");
+    }
+    const existing = this.sqlite.prepare(`
+      SELECT id
+      FROM predictive_leader_v7_paper_bets
+      WHERE campaign_id = ? AND forecast_id = ?
+    `).get(Number(campaign.id), safeForecastId);
+    if (existing) return { placed: 0, reason: "already_recorded", forecastId: safeForecastId };
+    const pending = this.sqlite.prepare(`
+      SELECT id
+      FROM predictive_leader_v7_paper_bets
+      WHERE campaign_id = ? AND status = 'pending'
+    `).get(Number(campaign.id));
+    if (pending) return { placed: 0, reason: "prior_pending", forecastId: safeForecastId };
+    if (campaign.status === "exhausted"
+      || Number(campaign.ledger_deficit) > 0
+      || Number(campaign.current_balance) < Number(campaign.fixed_stake)) {
+      return { placed: 0, reason: "bankroll_exhausted", forecastId: safeForecastId };
+    }
+    const candidate = this.sqlite.prepare(`
+      SELECT
+        leaders.*,
+        snapshots.source,
+        snapshots.instrument,
+        snapshots.external_round_id,
+        snapshots.locked_at AS forecast_locked_at,
+        snapshots.betting_closes_at,
+        settlements.forecast_id AS settlement_forecast_id,
+        conflicts.reason AS conflict_reason,
+        results.id AS known_result_id
+      FROM forecast_predictive_leader_v7_snapshots AS leaders
+      JOIN round_forecasts AS forecasts ON forecasts.id = leaders.forecast_id
+      JOIN forecast_snapshots AS snapshots ON snapshots.id = forecasts.snapshot_id
+      LEFT JOIN forecast_settlements AS settlements
+        ON settlements.forecast_id = leaders.forecast_id
+      LEFT JOIN predictive_shadow_round_metadata_conflicts AS conflicts
+        ON conflicts.boundary_key = 'predictive-shadow-metadata-integrity-v1'
+       AND conflicts.source = snapshots.source
+       AND conflicts.instrument = snapshots.instrument
+       AND conflicts.external_round_id = snapshots.external_round_id
+      LEFT JOIN round_results AS results
+        ON results.source = snapshots.source
+       AND results.instrument = snapshots.instrument
+       AND results.external_round_id = snapshots.external_round_id
+      WHERE leaders.forecast_id = ? AND leaders.candidate_key = ?
+    `).get(safeForecastId, campaign.candidate_key);
+    if (!candidate) {
+      return { placed: 0, reason: "v7_snapshot_unavailable", forecastId: safeForecastId };
+    }
+    if (
+      safeForecastId < Number(campaign.first_forecast_id)
+      || candidate.locked_at < campaign.started_at
+      || candidate.created_at < campaign.started_at
+    ) {
+      return { placed: 0, reason: "outside_prospective_boundary", forecastId: safeForecastId };
+    }
+    if (candidate.source !== source || candidate.instrument !== instrument) {
+      throw new Error("predictive leader v7 paper forecast stream is invalid");
+    }
+    if (candidate.conflict_reason !== null) {
+      return { placed: 0, reason: "round_metadata_conflict", forecastId: safeForecastId };
+    }
+    if (candidate.settlement_forecast_id !== null || candidate.known_result_id !== null) {
+      return { placed: 0, reason: "result_already_known", forecastId: safeForecastId };
+    }
+    const decision = normalizeLearnedLeaderV7Decision(
+      deserializeJson(candidate.snapshot_json),
+    );
+    if (
+      !decision
+      || candidate.status !== "ready"
+      || Number(candidate.selected) !== 1
+      || decision.status !== "ready"
+      || decision.selection.eligible !== true
+      || decision.algorithmVersion !== campaign.algorithm_version
+      || decision.config.candidateId !== campaign.candidate_key
+      || JSON.stringify(decision.config) !== PREDICTIVE_LEADER_V7_CONFIG_JSON
+      || Number(decision.leaderNumber) !== Number(candidate.predicted_number)
+      || decision.lockedAt !== candidate.locked_at
+      || candidate.locked_at !== candidate.forecast_locked_at
+    ) {
+      return { placed: 0, reason: "v7_not_ready_selected", forecastId: safeForecastId };
+    }
+    const safePlacedAt = asTimestamp(
+      placedAt,
+      undefined,
+      "predictive leader v7 paper placedAt",
+    );
+    if (
+      Date.parse(safePlacedAt) < Date.parse(candidate.locked_at)
+      || Date.parse(candidate.betting_closes_at) - Date.parse(safePlacedAt)
+        < PREDICTIVE_LEADER_V7_PAPER_CAMPAIGN.minimumPlacementLeadMs
+    ) {
+      return { placed: 0, reason: "outside_safe_preclose", forecastId: safeForecastId };
+    }
+    const continuityEpoch = this.#continuityEpoch(source, instrument);
+    const insertion = this.sqlite.prepare(`
+      INSERT INTO predictive_leader_v7_paper_bets (
+        campaign_id, forecast_id, candidate_key, external_round_id,
+        continuity_epoch, target_number, stake, balance_before, locked_at,
+        betting_closes_at, status, placed_at, updated_at, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+    `).run(
+      Number(campaign.id),
+      safeForecastId,
+      campaign.candidate_key,
+      candidate.external_round_id,
+      continuityEpoch,
+      Number(candidate.predicted_number),
+      Number(campaign.fixed_stake),
+      Number(campaign.current_balance),
+      candidate.locked_at,
+      candidate.betting_closes_at,
+      safePlacedAt,
+      safePlacedAt,
+      safePlacedAt,
+    );
+    const campaignUpdate = this.sqlite.prepare(`
+      UPDATE predictive_leader_v7_paper_campaigns
+      SET current_balance = current_balance - fixed_stake,
+        last_continuity_epoch = ?, updated_at = ?
+      WHERE id = ? AND status = 'running' AND current_balance = ?
+        AND ledger_deficit = 0
+    `).run(
+      continuityEpoch,
+      safePlacedAt,
+      Number(campaign.id),
+      Number(campaign.current_balance),
+    );
+    if (Number(insertion.changes) !== 1 || Number(campaignUpdate.changes) !== 1) {
+      throw new Error("predictive leader v7 paper placement was not committed exactly once");
+    }
+    const commitCheckedAt = asTimestamp(
+      this.clock(),
+      undefined,
+      "predictive leader v7 paper commitCheckedAt",
+    );
+    if (
+      Date.parse(commitCheckedAt) < Date.parse(safePlacedAt)
+      || Date.parse(candidate.betting_closes_at) - Date.parse(commitCheckedAt)
+        < PREDICTIVE_LEADER_V7_PAPER_CAMPAIGN.minimumPlacementLeadMs
+    ) {
+      throw new RangeError(
+        "predictive leader v7 paper transaction must finish at least five seconds before betting closes",
+      );
+    }
+    return { placed: 1, reason: "bet_frozen", forecastId: safeForecastId };
+  }
+
   #recordPredictiveLeaderV7Snapshot(forecastId, trajectoryShadow) {
     return this.#transaction(() => {
       const cohort = mapPredictiveLeaderV7Cohort(this.sqlite.prepare(`
@@ -15351,14 +16532,483 @@ export class RouletteDatabase {
       );
     }
 
+    let predictiveLeaderV7PaperOutcome = { placed: 0 };
+    if (
+      source === PREDICTIVE_SHADOW_FROZEN_STREAM.source
+      && instrument === PREDICTIVE_SHADOW_FROZEN_STREAM.instrument
+    ) {
+      try {
+        predictiveLeaderV7PaperOutcome = this.placePredictiveLeaderV7PaperBet(
+          source,
+          instrument,
+          primaryOutcome.forecastId,
+        );
+      } catch (error) {
+        emitLog(
+          this.logger,
+          "error",
+          {
+            error,
+            source,
+            instrument,
+            externalRoundId,
+            forecastId: primaryOutcome.forecastId,
+          },
+          "predictive leader v7 paper placement failed without affecting shadow",
+        );
+      }
+    }
+
     return {
       inserted: primaryOutcome.inserted,
       databaseChanged:
         primaryOutcome.databaseChanged
         || primaryOutcome.inserted
         || predictiveLeaderOutcome.inserted
-        || predictiveLeaderV7Outcome.inserted,
+        || predictiveLeaderV7Outcome.inserted
+        || predictiveLeaderV7PaperOutcome.placed === 1
+        || predictiveLeaderV7PaperOutcome.voided > 0
+        || predictiveLeaderV7PaperOutcome.settled > 0,
       roundId: externalRoundId,
+    };
+  }
+
+  initializePredictiveLeaderV7PaperCampaign(
+    source = PREDICTIVE_SHADOW_FROZEN_STREAM.source,
+    instrument = PREDICTIVE_SHADOW_FROZEN_STREAM.instrument,
+  ) {
+    this.#assertOpen();
+    const safeSource = asNonEmptyText(source, undefined, "source");
+    const safeInstrument = asNonEmptyText(instrument, undefined, "instrument");
+    this.#requirePredictiveLeaderV7PaperCampaign(safeSource, safeInstrument);
+    const now = asTimestamp(
+      this.clock(),
+      undefined,
+      "predictive leader v7 paper initializedAt",
+    );
+    return this.#transaction(() => {
+      const outcome = this.#reconcilePredictiveLeaderV7PaperInTransaction(
+        safeSource,
+        safeInstrument,
+        now,
+      );
+      const recoverable = this.sqlite.prepare(`
+        SELECT leaders.forecast_id
+        FROM forecast_predictive_leader_v7_snapshots AS leaders
+        JOIN round_forecasts AS forecasts ON forecasts.id = leaders.forecast_id
+        JOIN forecast_snapshots AS snapshots ON snapshots.id = forecasts.snapshot_id
+        JOIN predictive_leader_v7_paper_campaigns AS campaigns
+          ON campaigns.candidate_key = leaders.candidate_key
+        LEFT JOIN predictive_leader_v7_paper_bets AS bets
+          ON bets.campaign_id = campaigns.id
+         AND bets.forecast_id = leaders.forecast_id
+        LEFT JOIN forecast_settlements AS settlements
+          ON settlements.forecast_id = leaders.forecast_id
+        LEFT JOIN round_results AS results
+          ON results.source = snapshots.source
+         AND results.instrument = snapshots.instrument
+         AND results.external_round_id = snapshots.external_round_id
+        LEFT JOIN predictive_shadow_round_metadata_conflicts AS conflicts
+          ON conflicts.boundary_key = 'predictive-shadow-metadata-integrity-v1'
+         AND conflicts.source = snapshots.source
+         AND conflicts.instrument = snapshots.instrument
+         AND conflicts.external_round_id = snapshots.external_round_id
+        WHERE campaigns.campaign_key = ?
+          AND campaigns.source = ? AND campaigns.instrument = ?
+          AND campaigns.status = 'running'
+          AND campaigns.ledger_deficit = 0
+          AND campaigns.current_balance >= campaigns.fixed_stake
+          AND leaders.forecast_id >= campaigns.first_forecast_id
+          AND leaders.status = 'ready' AND leaders.selected = 1
+          AND leaders.locked_at >= campaigns.started_at
+          AND leaders.created_at >= campaigns.started_at
+          AND leaders.locked_at <= ?
+          AND (julianday(snapshots.betting_closes_at) - julianday(?))
+            * 86400000 >= 4999
+          AND bets.id IS NULL
+          AND settlements.forecast_id IS NULL
+          AND results.id IS NULL
+          AND conflicts.external_round_id IS NULL
+        ORDER BY leaders.forecast_id DESC
+        LIMIT 1
+      `).get(
+        PREDICTIVE_LEADER_V7_PAPER_CAMPAIGN.campaignKey,
+        safeSource,
+        safeInstrument,
+        now,
+        now,
+      );
+      const placement = recoverable
+        ? this.#placePredictiveLeaderV7PaperBetInTransaction({
+            source: safeSource,
+            instrument: safeInstrument,
+            forecastId: Number(recoverable.forecast_id),
+            placedAt: now,
+          })
+        : { placed: 0, reason: "no_recoverable_forecast" };
+      return {
+        initialized: 1,
+        placed: placement.placed,
+        settled: outcome.settled,
+        voided: outcome.voided,
+        reason: placement.placed > 0 ? placement.reason : outcome.reason,
+        databaseChanged:
+          placement.placed > 0 || outcome.settled > 0 || outcome.voided > 0,
+      };
+    });
+  }
+
+  placePredictiveLeaderV7PaperBet(
+    source = PREDICTIVE_SHADOW_FROZEN_STREAM.source,
+    instrument = PREDICTIVE_SHADOW_FROZEN_STREAM.instrument,
+    forecastId,
+  ) {
+    this.#assertOpen();
+    const safeSource = asNonEmptyText(source, undefined, "source");
+    const safeInstrument = asNonEmptyText(instrument, undefined, "instrument");
+    this.#requirePredictiveLeaderV7PaperCampaign(safeSource, safeInstrument);
+    const now = asTimestamp(
+      this.clock(),
+      undefined,
+      "predictive leader v7 paper placement at",
+    );
+    return this.#transaction(() => {
+      const reconciled = this.#reconcilePredictiveLeaderV7PaperInTransaction(
+        safeSource,
+        safeInstrument,
+        now,
+      );
+      const placement = this.#placePredictiveLeaderV7PaperBetInTransaction({
+        source: safeSource,
+        instrument: safeInstrument,
+        forecastId,
+        placedAt: now,
+      });
+      return {
+        ...placement,
+        settled: reconciled.settled,
+        voided: reconciled.voided,
+        databaseChanged:
+          placement.placed > 0 || reconciled.settled > 0 || reconciled.voided > 0,
+      };
+    });
+  }
+
+  settlePredictiveLeaderV7PaperCampaign(
+    source = PREDICTIVE_SHADOW_FROZEN_STREAM.source,
+    instrument = PREDICTIVE_SHADOW_FROZEN_STREAM.instrument,
+  ) {
+    this.#assertOpen();
+    const safeSource = asNonEmptyText(source, undefined, "source");
+    const safeInstrument = asNonEmptyText(instrument, undefined, "instrument");
+    this.#requirePredictiveLeaderV7PaperCampaign(safeSource, safeInstrument);
+    const now = asTimestamp(
+      this.clock(),
+      undefined,
+      "predictive leader v7 paper settlement at",
+    );
+    return this.#transaction(() => {
+      const outcome = this.#settlePredictiveLeaderV7PaperInTransaction(
+        safeSource,
+        safeInstrument,
+        now,
+      );
+      return {
+        placed: 0,
+        ...outcome,
+        databaseChanged: outcome.settled > 0 || outcome.voided > 0,
+      };
+    });
+  }
+
+  reconcilePredictiveLeaderV7PaperCampaign(
+    source = PREDICTIVE_SHADOW_FROZEN_STREAM.source,
+    instrument = PREDICTIVE_SHADOW_FROZEN_STREAM.instrument,
+  ) {
+    this.#assertOpen();
+    const safeSource = asNonEmptyText(source, undefined, "source");
+    const safeInstrument = asNonEmptyText(instrument, undefined, "instrument");
+    this.#requirePredictiveLeaderV7PaperCampaign(safeSource, safeInstrument);
+    const now = asTimestamp(
+      this.clock(),
+      undefined,
+      "predictive leader v7 paper reconciledAt",
+    );
+    return this.#transaction(() => {
+      const outcome = this.#reconcilePredictiveLeaderV7PaperInTransaction(
+        safeSource,
+        safeInstrument,
+        now,
+      );
+      return {
+        placed: 0,
+        ...outcome,
+        databaseChanged: outcome.settled > 0 || outcome.voided > 0,
+      };
+    });
+  }
+
+  getPredictiveLeaderV7PaperState(
+    source = PREDICTIVE_SHADOW_FROZEN_STREAM.source,
+    instrument = PREDICTIVE_SHADOW_FROZEN_STREAM.instrument,
+  ) {
+    this.#assertOpen();
+    const safeSource = asNonEmptyText(source, undefined, "source");
+    const safeInstrument = asNonEmptyText(instrument, undefined, "instrument");
+    const campaign = this.#requirePredictiveLeaderV7PaperCampaign(
+      safeSource,
+      safeInstrument,
+    );
+    const rows = this.sqlite.prepare(`
+      SELECT
+        bets.*,
+        snapshots.external_round_id AS forecast_round_id,
+        snapshots.locked_at AS forecast_locked_at,
+        snapshots.betting_closes_at AS forecast_betting_closes_at,
+        settlements.round_result_id AS authoritative_result_id,
+        settlements.actual_number AS authoritative_actual_number,
+        settlements.settled_at AS authoritative_settled_at,
+        results.source AS result_source,
+        results.instrument AS result_instrument,
+        results.external_round_id AS result_round_id,
+        results.result_number AS authoritative_result_number,
+        results.settled_at AS result_settled_at,
+        voids.campaign_id AS overlay_campaign_id,
+        voids.prior_status AS overlay_prior_status,
+        voids.reason AS overlay_reason,
+        voids.balance_adjustment AS overlay_balance_adjustment,
+        voids.incident_id AS overlay_incident_id,
+        voids.continuity_epoch AS overlay_continuity_epoch,
+        voids.voided_at AS overlay_voided_at
+      FROM predictive_leader_v7_paper_bets AS bets
+      JOIN round_forecasts AS forecasts ON forecasts.id = bets.forecast_id
+      JOIN forecast_snapshots AS snapshots ON snapshots.id = forecasts.snapshot_id
+      LEFT JOIN forecast_settlements AS settlements
+        ON settlements.forecast_id = bets.forecast_id
+      LEFT JOIN round_results AS results ON results.id = settlements.round_result_id
+      LEFT JOIN predictive_leader_v7_paper_voids AS voids ON voids.bet_id = bets.id
+      WHERE bets.campaign_id = ?
+      ORDER BY bets.id
+    `).all(Number(campaign.id));
+    let accountingBalance = Number(campaign.initial_balance);
+    let peakBalance = accountingBalance;
+    let minimumBalance = accountingBalance;
+    let maximumDrawdown = 0;
+    let totalStaked = 0;
+    let totalGrossPayout = 0;
+    let hitCount = 0;
+    let missCount = 0;
+    let pendingBet = null;
+    let latestOutcome = null;
+    let latestVoid = null;
+    let voidCount = 0;
+    let gapVoidCount = 0;
+    for (const row of rows) {
+      if (
+        row.candidate_key !== campaign.candidate_key
+        || Number(row.stake) !== Number(campaign.fixed_stake)
+        || row.external_round_id !== row.forecast_round_id
+        || row.locked_at !== row.forecast_locked_at
+        || row.betting_closes_at !== row.forecast_betting_closes_at
+      ) {
+        throw new Error("predictive leader v7 paper bet audit is invalid");
+      }
+      const overlaid = row.overlay_reason !== null;
+      if (overlaid) {
+        const expectedAdjustment = row.overlay_prior_status === "pending"
+          ? Number(row.stake)
+          : row.overlay_prior_status === "settled"
+            ? Number(row.stake) - Number(row.gross_payout)
+            : null;
+        if (
+          !["integrity_gap", "round_metadata_conflict"].includes(row.overlay_reason)
+          || Number(row.overlay_campaign_id) !== Number(campaign.id)
+          || Number(row.overlay_balance_adjustment) !== expectedAdjustment
+          || (row.overlay_prior_status === "pending" && row.status !== "void")
+          || (row.overlay_prior_status === "settled" && row.status !== "settled")
+          || (row.overlay_prior_status === "pending"
+            && (
+              row.void_reason !== row.overlay_reason
+              || row.void_incident_id !== row.overlay_incident_id
+              || row.void_continuity_epoch !== row.overlay_continuity_epoch
+              || row.voided_at !== row.overlay_voided_at
+            ))
+        ) {
+          throw new Error("predictive leader v7 paper void overlay is invalid");
+        }
+        voidCount += 1;
+        if (row.overlay_reason === "integrity_gap") gapVoidCount += 1;
+        const mappedVoid = {
+          betId: Number(row.id),
+          forecastId: Number(row.forecast_id),
+          roundId: row.external_round_id,
+          targetNumber: Number(row.target_number),
+          stake: Number(row.stake),
+          reason: row.overlay_reason,
+          voidedAt: row.overlay_voided_at,
+        };
+        if (
+          latestVoid === null
+          || mappedVoid.voidedAt > latestVoid.voidedAt
+          || (mappedVoid.voidedAt === latestVoid.voidedAt
+            && mappedVoid.betId > latestVoid.betId)
+        ) latestVoid = mappedVoid;
+        continue;
+      }
+      if (row.status === "void") {
+        throw new Error("predictive leader v7 paper void overlay is missing");
+      }
+      accountingBalance -= Number(row.stake);
+      totalStaked += Number(row.stake);
+      minimumBalance = Math.min(minimumBalance, accountingBalance);
+      maximumDrawdown = Math.max(maximumDrawdown, peakBalance - accountingBalance);
+      if (row.status === "pending") {
+        if (pendingBet !== null) {
+          throw new Error("predictive leader v7 paper has multiple pending bets");
+        }
+        pendingBet = {
+          id: Number(row.id),
+          forecastId: Number(row.forecast_id),
+          roundId: row.external_round_id,
+          targetNumber: Number(row.target_number),
+          stake: Number(row.stake),
+          lockedAt: row.locked_at,
+          bettingClosesAt: row.betting_closes_at,
+          placedAt: row.placed_at,
+        };
+        continue;
+      }
+      if (row.status !== "settled") {
+        throw new Error("predictive leader v7 paper bet status is invalid");
+      }
+      const expectedOutcome = Number(row.target_number) === Number(row.result_number)
+        ? "hit"
+        : "miss";
+      const expectedGross = expectedOutcome === "hit"
+        ? Number(row.stake) * Number(campaign.gross_payout_multiplier)
+        : 0;
+      if (
+        row.outcome !== expectedOutcome
+        || Number(row.gross_payout) !== expectedGross
+        || Number(row.balance_after)
+          !== Number(row.balance_before) - Number(row.stake) + expectedGross
+        || Number(row.round_result_id) !== Number(row.authoritative_result_id)
+        || Number(row.result_number) !== Number(row.authoritative_actual_number)
+        || Number(row.result_number) !== Number(row.authoritative_result_number)
+        || row.settled_at !== row.authoritative_settled_at
+        || row.settled_at !== row.result_settled_at
+        || row.result_source !== safeSource
+        || row.result_instrument !== safeInstrument
+        || (row.result_round_id !== null
+          && row.result_round_id !== row.external_round_id)
+      ) {
+        throw new Error("predictive leader v7 paper settled bet audit is invalid");
+      }
+      accountingBalance += expectedGross;
+      totalGrossPayout += expectedGross;
+      if (expectedOutcome === "hit") hitCount += 1;
+      else missCount += 1;
+      peakBalance = Math.max(peakBalance, accountingBalance);
+      minimumBalance = Math.min(minimumBalance, accountingBalance);
+      maximumDrawdown = Math.max(maximumDrawdown, peakBalance - accountingBalance);
+      latestOutcome = {
+        betId: Number(row.id),
+        forecastId: Number(row.forecast_id),
+        resultId: Number(row.round_result_id),
+        roundId: row.external_round_id,
+        targetNumber: Number(row.target_number),
+        resultNumber: Number(row.result_number),
+        outcome: row.outcome,
+        stake: Number(row.stake),
+        grossPayout: expectedGross,
+        balanceAfter: Number(row.balance_after),
+        occurredAt: row.settled_at,
+      };
+    }
+    const persistedEffectiveBalance = Number(campaign.current_balance)
+      - Number(campaign.ledger_deficit);
+    if (
+      accountingBalance !== persistedEffectiveBalance
+      || gapVoidCount !== Number(campaign.continuity_gap_count)
+    ) {
+      throw new Error("predictive leader v7 paper campaign ledger is invalid");
+    }
+    const settledCount = hitCount + missCount;
+    const affordabilityExhausted = Number(campaign.ledger_deficit) > 0
+      || Number(campaign.current_balance) < Number(campaign.fixed_stake);
+    const campaignShouldBeExhausted = pendingBet
+      ? Number(campaign.ledger_deficit) > 0
+      : affordabilityExhausted;
+    if (
+      (campaign.status === "exhausted") !== campaignShouldBeExhausted
+      || (campaignShouldBeExhausted
+        ? campaign.exhausted_at === null
+        : campaign.exhausted_at !== null)
+    ) {
+      throw new Error("predictive leader v7 paper campaign status is invalid");
+    }
+    return {
+      schemaVersion: Number(campaign.schema_version),
+      campaignKey: campaign.campaign_key,
+      strategyVersion: campaign.strategy_version,
+      candidateId: campaign.candidate_key,
+      algorithmVersion: campaign.algorithm_version,
+      mode: campaign.mode,
+      executionEnabled: Boolean(campaign.execution_enabled),
+      advisoryOnly: Boolean(campaign.advisory_only),
+      promotionEligible: Boolean(campaign.promotion_eligible),
+      promotionPolicy: campaign.promotion_policy,
+      authorizationReason: campaign.authorization_reason,
+      source: safeSource,
+      instrument: safeInstrument,
+      activationBoundary: {
+        firstForecastId: Number(campaign.first_forecast_id),
+        startedAt: campaign.started_at,
+      },
+      status: pendingBet ? "pending" : affordabilityExhausted ? "exhausted" : "waiting",
+      reason: pendingBet
+        ? "bet_frozen"
+        : affordabilityExhausted
+          ? "bankroll_exhausted"
+          : "waiting_next_frozen_v7",
+      initialBalance: Number(campaign.initial_balance),
+      currentBalance: Number(campaign.current_balance),
+      deficit: Number(campaign.ledger_deficit),
+      accountingBalance,
+      availableBalance: Number(campaign.current_balance),
+      reservedStake: pendingBet?.stake ?? 0,
+      profit: accountingBalance - Number(campaign.initial_balance),
+      model: {
+        fixedStake: Number(campaign.fixed_stake),
+        grossPayoutMultiplier: Number(campaign.gross_payout_multiplier),
+        payoutIncludesStake: Boolean(campaign.payout_includes_stake),
+      },
+      nextStake: Number(campaign.fixed_stake),
+      canAffordNext: pendingBet === null && !affordabilityExhausted
+        && Number(campaign.current_balance) >= Number(campaign.fixed_stake),
+      shortfall: Math.max(
+        0,
+        Number(campaign.fixed_stake) - accountingBalance,
+      ),
+      betCount: rows.length,
+      settledCount,
+      pendingCount: Number(pendingBet !== null),
+      voidCount,
+      hitCount,
+      missCount,
+      hitRate: settledCount === 0 ? null : hitCount / settledCount,
+      totalStaked,
+      totalGrossPayout,
+      peakBalance,
+      minimumBalance,
+      maximumDrawdown,
+      continuityGapCount: Number(campaign.continuity_gap_count),
+      pendingBet,
+      latestOutcome,
+      latestVoid,
+      startedAt: campaign.started_at,
+      updatedAt: campaign.updated_at,
+      exhaustedAt: campaign.exhausted_at,
     };
   }
 
@@ -15812,7 +17462,7 @@ export class RouletteDatabase {
     const safeSource = asNonEmptyText(source, undefined, "source");
     const safeInstrument = asNonEmptyText(instrument, undefined, "instrument");
     const now = new Date().toISOString();
-    return this.#transaction(() => {
+    const outcome = this.#transaction(() => {
       const rows = this.sqlite
         .prepare(`
           SELECT
@@ -15920,6 +17570,22 @@ export class RouletteDatabase {
       }
       return { settled: inserted };
     });
+    if (
+      safeSource === PREDICTIVE_SHADOW_FROZEN_STREAM.source
+      && safeInstrument === PREDICTIVE_SHADOW_FROZEN_STREAM.instrument
+    ) {
+      try {
+        this.reconcilePredictiveLeaderV7PaperCampaign(safeSource, safeInstrument);
+      } catch (error) {
+        emitLog(
+          this.logger,
+          "error",
+          { error, source: safeSource, instrument: safeInstrument },
+          "predictive leader v7 paper settlement failed without affecting forecasts",
+        );
+      }
+    }
+    return outcome;
   }
 
   #writePredictiveLeaderMetricFacts(rows) {

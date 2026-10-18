@@ -104,7 +104,7 @@ test("v27 freezes the production v7 config and export provenance in new tables",
     predictiveLeaderLegacyAccountEnabled: false,
   });
   try {
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 29);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 30);
     const cohort = database.sqlite.prepare(`
       SELECT * FROM predictive_leader_v7_cohorts
     `).get();
@@ -173,6 +173,9 @@ test("v27 starts at MAX(forecast)+1 and never backfills an older forecast", () =
     nowMs = oldBase + 52_000;
     assert.equal(database.recordPrecloseForecast(forecast("legacy", oldBase)).inserted, true);
     database.sqlite.exec(`
+      DROP TABLE predictive_leader_v7_paper_voids;
+      DROP TABLE predictive_leader_v7_paper_bets;
+      DROP TABLE predictive_leader_v7_paper_campaigns;
       DROP TABLE predictive_shadow_round_metadata_conflicts;
       DROP TABLE predictive_shadow_integrity_boundaries;
       DROP TABLE forecast_predictive_leader_v7_snapshots;

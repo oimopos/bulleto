@@ -173,9 +173,11 @@ SQLite при forecast lock текущего ещё не завершённог�
 `void` не удаляются и не переписываются.
 
 Отдельно от действующего v5 работает кандидат
-`learned-predictive-exact-calibrated-v7-shadow`. Это только проспективный
-shadow: он не создаёт `BET`, не меняет ни один бумажный счёт и не подменяет
-число v5. Конфигурация заранее зафиксирована как 1% температурно сглаженной
+`learned-predictive-exact-calibrated-v7-shadow`. Сам кандидат остаётся
+проспективным shadow: он не подменяет число v5, не получает production-
+promotion и не имеет канала реального исполнения. Отдельная явно разрешённая
+paper-кампания может использовать его frozen ready+selected решение только для
+виртуального счёта. Конфигурация заранее зафиксирована как 1% температурно сглаженной
 исходной Rank‑37 массы, 4% иерархической истории pair/triple и 95%
 равномерной базы. Pair стягивается к базе с силой `740`, triple — к pair с
 силой `500`, температура price равна `5`. Селективная метка требует не менее
@@ -206,6 +208,15 @@ Top‑1 с односторонним exact McNemar/binomial `p < 0.025`. Учи
 familywise alpha `0.05` делится Bonferroni до `0.025` на кандидата;
 независимость кандидатов для этой поправки не требуется. Даже статус `signals_pass` не
 включает исполнение: promotion остаётся только ручным решением после проверки.
+
+Независимо от результата gate, миграция v30 включает отдельную durable-
+кампанию `manual-override-paper`: стартовый банк `1 000`, ставка `10` на одно
+число и gross-выплата `×36`. Она автоматически записывает только новую
+виртуальную ставку по уже замороженному ready+selected v7-снимку в безопасном
+preclose-окне. Pending, settlement и void сохраняются в SQLite; gap или смена
+`bcd` аннулируют ставку, а поздняя отмена уже рассчитанного выигрыша учитывается
+через явный дефицит. Это ручное разрешение paper-эксперимента, а не прохождение
+gate, promotion модели или разрешение реальных ставок.
 
 В v28 добавлен второй, полностью отдельный prospective shadow
 `current-cell-10s-calibrated-v1`. Он проверяет узкую frozen-гипотезу: ровно за
@@ -252,8 +263,8 @@ paired-тест против v5 с `p < 0.025`. Парные метрики сч
 Top‑1 попаданий и минимальные `38` попаданий для Wilson-компонента. Эти счётчики
 не являются gate тройки Rank‑37. Даже `38/1 000` недостаточно без остальных
 критериев качества, включая Brier и парные сравнения. Завершение окна означает
-только переход к итоговой статистической и ручной проверке; автоматического
-запуска ставок нет.
+только переход к итоговой статистической и ручной проверке; сам gate не
+запускает ставки.
 
 Блок «Экспериментальный прогноз» показывает первые три места полного анализа
 всех 37 чисел, а не отдельный старый Top‑3. Примерно за 8–15 секунд до `bcd`
@@ -464,7 +475,8 @@ npm.cmd run backup -- ./data/buleto.sqlite ./seed/buleto.sqlite
 - `forecast_predictive_leader_quality_snapshots` — замороженное для каждого нового лидера решение rolling quality gate: causal cutoff, последние максимум `1 000` оценок, Top‑1/Wilson95, средний Brier, границы окна и digest использованного evidence. Миграция не создаёт такие решения для старых прогнозов.
 - `forecast_predictive_leader_evaluation_voids` — идемпотентный аудит прогнозов, исход которых нельзя восстановить после подтверждённого gap; такие строки не остаются вечным `pending` в метриках, а поздний авторитетный settlement по-прежнему имеет приоритет.
 - `predictive_leader_v7_cohorts` — единственная заранее зафиксированная prospective-shadow когорта v7: граница первого forecast, точная конфигурация и её SHA‑256, capture horizon и provenance проверенного production-export.
-- `forecast_predictive_leader_v7_snapshots` — неизменяемые v7-решения только после границы когорты. Они ссылаются на замороженные causal источники v5, содержат selection-аудит, но не связаны с таблицами ставок или счетов.
+- `forecast_predictive_leader_v7_snapshots` — неизменяемые v7-решения только после границы когорты. Они ссылаются на замороженные causal источники v5 и содержат selection-аудит; отдельная paper-кампания использует их только как неизменяемое входное доказательство.
+- `predictive_leader_v7_paper_campaigns`, `predictive_leader_v7_paper_bets`, `predictive_leader_v7_paper_voids` — durable manual-override paper-кампания v7 с банком `1 000`, фиксированной ставкой `10` и gross-выплатой `×36`. Ставка сохраняется только для нового ready+selected v7-снимка минимум за 5 секунд до `bcd`; settlement, gap/metadata void и дефицит после поздней отмены переживают перезапуск. Кампания не имеет канала реального исполнения и не продвигает модель в production.
 - `current_cell_horizon_shadow_cohorts` — immutable v28-когорта current-cell-10s с точной stream identity, frozen config/hash и export provenance.
 - `round_trajectory_current_cell_horizon_snapshots`, `round_trajectory_current_cell_horizon_evaluations` — append-only capture/evaluation current-cell; DB-триггеры запрещают backfill, подмену trajectory/result identity, settlement не позже capture, update и delete.
 - `predictive_shadow_integrity_boundaries` — immutable v29-граница новых доказательств сразу для v7 и current-cell; старые prospective-строки физически сохраняются, но не могут попасть в новые fixed gate-окна.
@@ -508,6 +520,7 @@ npm.cmd run backup -- ./data/buleto.sqlite ./seed/buleto.sqlite
 - `GET /api/predictive-leader-neighbor-backtest?since=2026-10-16T19:00:00.000Z` — точный read-only прогон лестницы по каждому сохранённому до результата кандидату predictive leader, начиная с обязательной UTC-метки `since` (в примере это 17 октября 00:00 по `Asia/Qyzylorda`). Диапазон ограничен 48 часами; quality gate не фильтрует кандидатов, потому что endpoint проверяет гипотезу «ставить на лидера и числовых соседей». Для лидера `n` выбираются `n−1, n, n+1` по модулю 37: `0 → 36,0,1`, `36 → 35,36,0`. Модель: банк `1 000`, старт и шаг `10` на каждое из трёх чисел, максимум `2 500` на число, gross-выплата `×36`, сброс лестницы после попадания или разрыва непрерывности и остановка перед неподъёмным билетом. Раунды без валидного замороженного лидера не скрываются, а учитываются в `coverage`; реальные ставки не выполняются (`executionEnabled: false`, `advisoryOnly: true`).
 - `GET /api/predictive-leader` — отдельный fail-closed GET с `schemaVersion: 4` для блока «Одно число по прогнозным блокам». Верхнеуровневый safety-контракт остаётся обратно совместимым: `mode: "observation"`, `executionEnabled: false`, `advisoryOnly: true`; отдельное поле `strategyMode: "quality-gated-simulation"` описывает используемую стратегию. `candidateNumber` — заранее замороженный лидер модели для наблюдения и последующей оценки; его наличие само по себе не разрешает ставку. Поля `action: "BET"` и `number`, равный кандидату, появляются только для свежего незавершённого раунда с синхронными cursors, замороженным `qualityGate.status: "confirmed"`, обеими семьями и уже сохранённой `pending` ставкой основного счёта. Во всех остальных случаях endpoint возвращает `action: "WAIT"` и `number: null`; валидный `candidateNumber` и gate при этом могут оставаться в ответе, чтобы явно отличать слабый кандидат от отсутствующих данных.
 - `GET /api/predictive-leader/v7-shadow` — read-only аудит отдельной prospective-когорты v7. Возвращает frozen config/hash/export provenance, последний кандидат без полного массива из 37 масс, coverage и метрики overall/selected, парное сравнение с v5, fixed-window gate с Wilson/HAC/McNemar и regime blocks. Контракт всегда содержит `executionEnabled: false`, `advisoryOnly: true`, `qualityGateDiagnostic.promotionEligible: false`; endpoint ничего не записывает и не выполняет ставок.
+- `GET /api/predictive-leader/v7-paper` — read-only представление отдельно разрешённой virtual paper-кампании v7 (`strategyMode: "manual-override-paper"`). Возвращает баланс, дефицит, статистику, сохранённую pending-ставку, последний исход/void и диагностический gate. `BET` появляется только как отображение уже записанной pending-ставки для совпадающего свежего раунда при синхронных collector/result cursors, пустой очереди сохранения и ещё открытом окне; иначе возвращается `WAIT` с причиной. Gate остаётся audit-only и не управляет ставкой или promotion. На старте сервер выполняет идемпотентную инициализацию/reconcile, а дальнейшие placement и settlement происходят внутри существующего транзакционного forecast lifecycle. Endpoint не принимает команды и не отправляет ставки на Buleto: `executionEnabled: false`, `advisoryOnly: true`.
 - `GET /api/predictive-leader/current-cell-10s-shadow` — read-only аудит v28 current-cell: frozen cohort/config/provenance, coverage, Top‑1/Brier/logloss, paired v5, fixed-first-1000 gate, regime blocks и audit-only flat-paper результат. Всегда `executionEnabled: false`, `advisoryOnly: true`, `qualityGateDiagnostic.promotionEligible: false`; endpoint не выполняет ставок и не меняет БД.
 
   Поле `qualityGate` раскрывает rolling-окно, Wilson95, Brier, causal cutoff и digest evidence. `account` — основной fixed-stake счёт `1 000 / 10 / gross ×36` с `reservedStake`, `pendingBet`, `voidCount` и `latestVoid`; `legacyAccount` — неизменённый аудит старой лестницы без новых production-ставок. `BET` остаётся только информационным сигналом: `advisoryOnly` равно `true`, `executionEnabled` — `false`, endpoint ничего не отправляет на Buleto. При gap, очереди сохранения, несовпадении раунда, неготовом gate или повреждённом evidence ответ остаётся `WAIT` со статусом `waiting` либо `paused`, но накопленные оба счёта доступны для аудита.
