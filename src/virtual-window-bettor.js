@@ -4,8 +4,8 @@ import {
 } from './virtual-bettor.js';
 
 export const VIRTUAL_WINDOW_BET_MODEL = Object.freeze({
-  strategyKey: 'virtual-overdue-window-150-200-v1',
-  triggerThreshold: 150,
+  strategyKey: 'virtual-overdue-window-160-200-v1',
+  triggerThreshold: 160,
   stopThreshold: 200,
   initialStake: 10,
   stakeStep: 10,
@@ -24,7 +24,7 @@ export function virtualWindowAttemptBudget(triggerAge) {
     triggerAge < VIRTUAL_WINDOW_BET_MODEL.triggerThreshold
     || triggerAge >= VIRTUAL_WINDOW_BET_MODEL.stopThreshold
   ) {
-    throw new RangeError('triggerAge must be inside the 150..199 window');
+    throw new RangeError('triggerAge must be inside the 160..199 window');
   }
   return VIRTUAL_WINDOW_BET_MODEL.stopThreshold - triggerAge;
 }

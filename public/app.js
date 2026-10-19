@@ -836,10 +836,10 @@ import {
             : "Ожидаем данные безопасного режима симуляции."
       );
       elements.virtualProgressLabel.textContent = "Прогресс до условия запуска";
-      elements.virtualProgress.max = 150;
+      elements.virtualProgress.max = 160;
       elements.virtualProgress.value = 0;
       elements.virtualProgress.setAttribute("aria-valuetext", "Данных пока нет");
-      elements.virtualProgressValue.textContent = "— из 150";
+      elements.virtualProgressValue.textContent = "— из 160";
       elements.virtualCandidate.hidden = true;
       elements.virtualSession.hidden = true;
       renderVirtualModel(null);
@@ -861,7 +861,7 @@ import {
         "Сервер не подтвердил одновременно режим simulation и запрет исполнения. Эта панель не показывает и не предоставляет действий со ставками."
       );
       elements.virtualProgressLabel.textContent = "Прогресс недоступен";
-      elements.virtualProgress.max = 150;
+      elements.virtualProgress.max = 160;
       elements.virtualProgress.value = 0;
       elements.virtualProgress.setAttribute("aria-valuetext", "Безопасный режим не подтверждён");
       elements.virtualProgressValue.textContent = "—";
@@ -876,7 +876,7 @@ import {
     const triggerThresholdValue = asOptionalNonNegativeInteger(virtualBettor.triggerThreshold);
     const triggerThreshold = triggerThresholdValue && triggerThresholdValue > 0
       ? triggerThresholdValue
-      : 150;
+      : 160;
     const candidate = virtualBettor.longestCandidate && typeof virtualBettor.longestCandidate === "object"
       ? virtualBettor.longestCandidate
       : null;

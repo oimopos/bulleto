@@ -493,10 +493,10 @@ test(
       assert.deepEqual(payload, {
         mode: "simulation",
         executionEnabled: false,
-        strategyKey: "virtual-overdue-window-150-200-v1",
+        strategyKey: "virtual-overdue-window-160-200-v1",
         modelVersion: "2.0.0",
         status: "waiting",
-        triggerThreshold: 150,
+        triggerThreshold: 160,
         stopThreshold: 200,
         currentBalance: STARTING_BALANCE,
         profit: 0,
@@ -521,7 +521,7 @@ test(
         longestSeries: {
           number: 0,
           progress: 3,
-          target: 150,
+          target: 160,
         },
         activeSession: null,
         lifetime: {

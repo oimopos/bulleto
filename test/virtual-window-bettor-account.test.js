@@ -21,21 +21,21 @@ function event(number, index) {
   };
 }
 
-test('window strategy arms at 150 and places the first bet on the next result', () => {
+test('window strategy arms at 160 and places the first bet on the next result', () => {
   const database = createDatabase({
     path: ':memory:',
     virtualWindowStartingBalance: 10_000,
   });
   try {
-    database.ingestBatch(Array.from({ length: 150 }, (_, index) => event(1, index)));
+    database.ingestBatch(Array.from({ length: 160 }, (_, index) => event(1, index)));
     let state = database.getVirtualWindowBettorState(SOURCE, INSTRUMENT);
     assert.equal(state.testBank.initialBalance, 10_000);
     assert.equal(state.activeSession.status, 'armed');
-    assert.equal(state.activeSession.triggerRoundsMissed, 150);
-    assert.equal(state.activeSession.attemptBudget, 50);
+    assert.equal(state.activeSession.triggerRoundsMissed, 160);
+    assert.equal(state.activeSession.attemptBudget, 40);
     assert.equal(state.lifetime.totalBets, 0);
 
-    database.ingestBatch([event(2, 150)]);
+    database.ingestBatch([event(2, 160)]);
     state = database.getVirtualWindowBettorState(SOURCE, INSTRUMENT);
     assert.equal(state.activeSession.status, 'active');
     assert.equal(state.activeSession.attemptCount, 1);
@@ -47,19 +47,19 @@ test('window strategy arms at 150 and places the first bet on the next result', 
   }
 });
 
-test('window expiry after fifty misses closes the session at age 200', () => {
+test('window expiry after forty misses closes the session at age 200', () => {
   const database = createDatabase({ path: ':memory:' });
   try {
     database.ingestBatch([
-      ...Array.from({ length: 150 }, (_, index) => event(1, index)),
-      ...Array.from({ length: 50 }, (_, index) => event(1, 150 + index)),
+      ...Array.from({ length: 160 }, (_, index) => event(1, index)),
+      ...Array.from({ length: 40 }, (_, index) => event(1, 160 + index)),
     ]);
     const state = database.getVirtualWindowBettorState(SOURCE, INSTRUMENT);
     assert.equal(state.activeSession, null);
     assert.equal(state.recentSessions[0].endReason, 'window_expired');
-    assert.equal(state.recentSessions[0].attemptCount, 50);
-    assert.equal(state.testBank.currentBalance, 9_360);
-    assert.equal(state.lifetime.totalBets, 50);
+    assert.equal(state.recentSessions[0].attemptCount, 40);
+    assert.equal(state.testBank.currentBalance, 9_560);
+    assert.equal(state.lifetime.totalBets, 40);
   } finally {
     database.close();
   }

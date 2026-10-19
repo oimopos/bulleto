@@ -9946,7 +9946,7 @@ export class RouletteDatabase {
           continuity_epoch INTEGER NOT NULL CHECK (continuity_epoch >= 0),
           target_number INTEGER NOT NULL CHECK (target_number BETWEEN 0 AND 36),
           status TEXT NOT NULL CHECK (status IN ('armed', 'active', 'completed', 'invalid_gap')),
-          trigger_rounds_missed INTEGER NOT NULL CHECK (trigger_rounds_missed BETWEEN 150 AND 199),
+          trigger_rounds_missed INTEGER NOT NULL CHECK (trigger_rounds_missed BETWEEN 160 AND 199),
           attempt_budget INTEGER NOT NULL CHECK (attempt_budget BETWEEN 1 AND 50),
           activated_after_result_id INTEGER NOT NULL REFERENCES round_results(id),
           model_version TEXT NOT NULL CHECK (model_version = '${VIRTUAL_WINDOW_BET_MODEL.modelVersion}'),
