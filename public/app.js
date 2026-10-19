@@ -5,10 +5,10 @@ import {
   TRAJECTORY_RANK37_BASIS,
   TRAJECTORY_RANK37_VERSION,
   combinedTrajectorySignals,
-  normalizePredictiveLeaderApiSnapshot,
+  normalizePredictiveLeaderV7PaperApiSnapshot,
   normalizePredictiveShadowGateProgress,
-  predictiveLeaderNumberContext,
-} from "./combined-number.js?v=10";
+  predictiveLeaderV7PaperContext,
+} from "./combined-number.js?v=11";
 
 (() => {
   "use strict";
@@ -270,10 +270,10 @@ import {
     cycleComparisonError: false,
     stateLoaded: false,
     stateError: false,
-    predictiveLeaderSnapshot: null,
-    predictiveLeaderLoaded: false,
-    predictiveLeaderError: false,
-    predictiveLeaderRequiresFreshSnapshot: true,
+    predictiveV7PaperSnapshot: null,
+    predictiveV7PaperLoaded: false,
+    predictiveV7PaperError: false,
+    predictiveV7PaperRequiresFreshSnapshot: true,
     predictiveV7GateProgress: null,
     predictiveV7GateProgressLoaded: false,
     predictiveV7GateProgressError: false,
@@ -304,6 +304,7 @@ import {
     eventSource: null,
     eventRevision: 0,
     stateRequiresFreshSnapshot: true,
+    predictiveV7PaperCutoffRefreshActionId: null,
     lastRenderedResultKey: null,
     hasCompletedInitialRender: false,
     serverClockMs: null,
@@ -1070,11 +1071,27 @@ import {
     return formatDateTime(date, { alwaysShowDate: true });
   }
 
-  function captureServerClock(value) {
+  function captureServerClock(value, observedAt = window.performance.now()) {
     const date = parseDate(value);
-    if (!date) return;
+    const nowPerformance = window.performance.now();
+    if (
+      !date
+      || !Number.isFinite(observedAt)
+      || observedAt > nowPerformance
+    ) {
+      return;
+    }
+    const candidateNowMs = date.getTime() + (nowPerformance - observedAt);
+    if (
+      Number.isFinite(store.serverClockMs)
+      && Number.isFinite(store.serverClockCapturedAt)
+      && candidateNowMs < store.serverClockMs
+        + (nowPerformance - store.serverClockCapturedAt)
+    ) {
+      return;
+    }
     store.serverClockMs = date.getTime();
-    store.serverClockCapturedAt = window.performance.now();
+    store.serverClockCapturedAt = observedAt;
   }
 
   function currentTimeMs() {
@@ -1254,6 +1271,7 @@ import {
     store.refreshing = true;
     const eventSourceAtRequest = store.eventSource;
     const eventRevisionAtRequest = store.eventRevision;
+    const refreshClockStartedAt = window.performance.now();
     elements.refreshButton.classList.add("is-loading");
     elements.refreshButton.disabled = true;
     elements.main.setAttribute("aria-busy", "true");
@@ -1266,7 +1284,7 @@ import {
       fetchJson("/api/pairs"),
       fetchJson("/api/forecasts/hits?limit=20"),
       fetchJson("/api/cycle-comparison"),
-      fetchJson("/api/predictive-leader"),
+      fetchJson("/api/predictive-leader/v7-paper"),
       fetchJson("/api/predictive-leader/v7-shadow"),
       fetchJson("/api/predictive-leader/current-cell-10s-shadow")
     ]);
@@ -1281,7 +1299,7 @@ import {
       store.stateLoaded = true;
       store.stateError = false;
       store.stateRequiresFreshSnapshot = !liveSnapshotIsCurrent;
-      captureServerClock(store.state?.serverTime);
+      captureServerClock(store.state?.serverTime, refreshClockStartedAt);
       successfulRequests += 1;
     } else {
       store.stateError = true;
@@ -1331,24 +1349,24 @@ import {
       store.cycleComparisonError = true;
     }
     if (requests[7].status === "fulfilled") {
-      const snapshot = normalizePredictiveLeaderApiSnapshot(requests[7].value);
-      store.predictiveLeaderLoaded = true;
+      const snapshot = normalizePredictiveLeaderV7PaperApiSnapshot(requests[7].value);
+      store.predictiveV7PaperLoaded = true;
       if (snapshot) {
-        store.predictiveLeaderSnapshot = snapshot;
-        store.predictiveLeaderError = false;
-        store.predictiveLeaderRequiresFreshSnapshot = !liveSnapshotIsCurrent;
-        captureServerClock(snapshot.serverTime);
+        store.predictiveV7PaperSnapshot = snapshot;
+        store.predictiveV7PaperError = false;
+        store.predictiveV7PaperRequiresFreshSnapshot = !liveSnapshotIsCurrent;
+        captureServerClock(snapshot.serverTime, refreshClockStartedAt);
         successfulRequests += 1;
       } else {
-        store.predictiveLeaderSnapshot = null;
-        store.predictiveLeaderError = true;
-        store.predictiveLeaderRequiresFreshSnapshot = true;
+        store.predictiveV7PaperSnapshot = null;
+        store.predictiveV7PaperError = true;
+        store.predictiveV7PaperRequiresFreshSnapshot = true;
       }
     } else {
-      store.predictiveLeaderSnapshot = null;
-      store.predictiveLeaderLoaded = true;
-      store.predictiveLeaderError = true;
-      store.predictiveLeaderRequiresFreshSnapshot = true;
+      store.predictiveV7PaperSnapshot = null;
+      store.predictiveV7PaperLoaded = true;
+      store.predictiveV7PaperError = true;
+      store.predictiveV7PaperRequiresFreshSnapshot = true;
     }
     if (requests[8].status === "fulfilled") {
       const progress = normalizePredictiveShadowGateProgress(requests[8].value);
@@ -1399,13 +1417,13 @@ import {
     schedulePollingRefresh({
       retry: successfulRequests < requests.length
         || store.stateRequiresFreshSnapshot
-        || store.predictiveLeaderRequiresFreshSnapshot,
+        || store.predictiveV7PaperRequiresFreshSnapshot,
     });
   }
 
   function renderFetchFailure() {
     renderCombinedPick();
-    renderPredictiveLeaderAccount();
+    renderPredictiveV7PaperAccount();
     renderPredictiveShadowProgress();
     if (!store.hasCompletedInitialRender) {
       elements.resultsBody.replaceChildren(emptyTableRow("Не удалось загрузить результаты. Повторим попытку автоматически."));
@@ -1441,7 +1459,7 @@ import {
     renderCollector(store.state?.collector);
     renderGapWarning(store.state);
     renderCombinedPick();
-    renderPredictiveLeaderAccount();
+    renderPredictiveV7PaperAccount();
     renderLatestResult(latestResult);
     renderPredictiveShadowProgress();
     renderPrecloseForecast();
@@ -2571,61 +2589,63 @@ import {
     };
   }
 
-  function currentPredictiveLeaderAccountContext() {
-    if (store.predictiveLeaderError) return { state: "error" };
-    if (!store.predictiveLeaderLoaded) return { state: "loading" };
-    if (store.predictiveLeaderRequiresFreshSnapshot) return { state: "stale" };
-    const account = store.predictiveLeaderSnapshot?.account ?? null;
-    return account ? { state: "ready", account } : { state: "unavailable" };
+  function currentPredictiveV7PaperContext() {
+    return predictiveLeaderV7PaperContext({
+      loaded: store.predictiveV7PaperLoaded,
+      error: store.predictiveV7PaperError,
+      requiresFreshSnapshot: store.predictiveV7PaperRequiresFreshSnapshot,
+      snapshot: store.predictiveV7PaperSnapshot,
+      nowMs: currentTimeMs(),
+    });
   }
 
-  function renderPredictiveLeaderAccount() {
-    const context = currentPredictiveLeaderAccountContext();
+  function renderPredictiveV7PaperAccount() {
+    const context = currentPredictiveV7PaperContext();
+    const snapshot = context.snapshot ?? null;
     elements.combinedPickAccountBalanceCard.classList.remove("is-positive", "is-loss");
 
-    if (context.state !== "ready") {
+    if (!snapshot?.account || !snapshot.campaign || !snapshot.stats || !snapshot.ladder) {
       const messages = {
         loading: "Загрузка…",
-        error: "Свежий снимок счёта недоступен",
-        stale: "Счёт и ставка скрыты до свежего снимка",
-        unavailable: "Контракт счёта не подтверждён",
+        error: "Свежий снимок V7 paper-счёта недоступен",
+        paused: "Счёт и ставка скрыты до свежего live-снимка",
+        waiting: "V7 paper-кампания ещё не инициализирована",
       };
       elements.combinedPickAccount.dataset.state = context.state;
       elements.combinedPickAccount.setAttribute("aria-busy", String(context.state === "loading"));
       setTextIfChanged(
         elements.combinedPickAccountStatus,
-        messages[context.state] || messages.unavailable,
+        messages[context.state] || "Контракт V7 paper-счёта не подтверждён",
       );
       setTextIfChanged(elements.combinedPickAccountBalance, "—");
-      setTextIfChanged(elements.combinedPickAccountProfit, "старт 1 000 · результат —");
+      setTextIfChanged(elements.combinedPickAccountProfit, "старт 10 000 · результат —");
       setTextIfChanged(elements.combinedPickAccountRecord, "— / —");
       setTextIfChanged(elements.combinedPickAccountSettled, "завершено —");
-      setTextIfChanged(elements.combinedPickAccountRate, "—");
+      setTextIfChanged(elements.combinedPickAccountRate, "— / 1 000");
       setTextIfChanged(
         elements.combinedPickAccountRateDetail,
-        "по завершённым · не вероятность; база 1/37 ≈2,7%",
+        "цикл — · промахов — · сбросов —",
       );
-      setTextIfChanged(elements.combinedPickAccountStakeLabel, "Фиксированная ставка");
+      setTextIfChanged(elements.combinedPickAccountStakeLabel, "Следующая ступень");
       setTextIfChanged(elements.combinedPickAccountStake, "—");
       setTextIfChanged(
         elements.combinedPickAccountModel,
-        "по 10 на подтверждённый сигнал · без повышения",
+        "динамическая recovery-лестница · gross ×36",
       );
       return;
     }
 
-    const { account } = context;
+    const { account, campaign, ladder, pendingBet, stats } = snapshot;
+    const model = campaign.model;
     elements.combinedPickAccount.dataset.state = account.status;
     elements.combinedPickAccount.setAttribute("aria-busy", "false");
     const statusText = account.status === "pending"
-      ? `Условная ставка ${formatRiskAmount(account.pendingBet.stake)} на число ${account.pendingBet.targetNumber} зафиксирована до результата`
+      ? context.state === "ready"
+        ? `BET · paper-ставка ${formatRiskAmount(pendingBet.stake)} на число ${pendingBet.targetNumber} уже сохранена`
+        : `Pending · ${formatRiskAmount(pendingBet.stake)} на число ${pendingBet.targetNumber} сохранено; API сейчас WAIT`
       : account.status === "exhausted"
         ? `Стоп · не хватает ${formatRiskAmount(account.shortfall)}`
-        : account.latestVoid
-          ? "Последний сигнал аннулирован из-за разрыва данных · ждём подтверждение качества"
-          : account.reason === "waiting_first_eligible_signal"
-            ? "WAIT · ещё не было сигнала с подтверждённым качеством"
-            : "WAIT · фильтр качества не разрешил новую ставку";
+        : "WAIT · сохранённой pending paper-ставки нет";
     setTextIfChanged(elements.combinedPickAccountStatus, statusText);
     setTextIfChanged(
       elements.combinedPickAccountBalance,
@@ -2633,47 +2653,65 @@ import {
     );
     setTextIfChanged(
       elements.combinedPickAccountProfit,
-      `старт ${formatRiskAmount(account.initialBalance)} · результат ${formatSignedRiskAmount(account.profit)}`,
+      `старт ${formatRiskAmount(account.initialBalance)} · P&L ${formatSignedRiskAmount(account.profit)}${account.deficit > 0 ? ` · дефицит ${formatRiskAmount(account.deficit)}` : ""}`,
     );
     if (account.profit > 0) elements.combinedPickAccountBalanceCard.classList.add("is-positive");
     if (account.profit < 0) elements.combinedPickAccountBalanceCard.classList.add("is-loss");
 
     setTextIfChanged(
       elements.combinedPickAccountRecord,
-      `${formatRiskAmount(account.hitCount)} / ${formatRiskAmount(account.missCount)}`,
+      `${formatRiskAmount(stats.hitCount)} / ${formatRiskAmount(stats.missCount)}`,
     );
-    const pendingText = account.pendingCount === 1 ? " · 1 ждёт результата" : "";
-    const voidText = account.voidCount > 0
-      ? ` · ${formatRiskAmount(account.voidCount)} аннулировано из-за разрыва`
+    const pendingText = stats.pendingCount === 1 ? " · 1 pending" : "";
+    const voidText = stats.voidCount > 0
+      ? ` · ${formatRiskAmount(stats.voidCount)} void`
       : "";
     setTextIfChanged(
       elements.combinedPickAccountSettled,
-      `${formatRiskAmount(account.settledCount)} ${pluralForm(account.settledCount, "завершён", "завершено", "завершено")}${pendingText}${voidText}`,
+      `${formatRiskAmount(stats.settledCount)} ${pluralForm(stats.settledCount, "завершён", "завершено", "завершено")}${pendingText}${voidText}`,
     );
     setTextIfChanged(
       elements.combinedPickAccountRate,
-      account.hitRate === null ? "—" : trajectoryShadowShareFormatter.format(account.hitRate),
+      `${formatRiskAmount(ladder.cycleStaked)} / ${formatRiskAmount(model.cycleSpendLimit)}`,
     );
     setTextIfChanged(
       elements.combinedPickAccountRateDetail,
-      account.settledCount > 0
-        ? `${formatRiskAmount(account.hitCount)} из ${formatRiskAmount(account.settledCount)} · не вероятность; база 1/37 ≈2,7%`
-        : "нет завершённых · не вероятность; база 1/37 ≈2,7%",
+      `цикл ${formatRiskAmount(ladder.cycleNumber)} · ${formatRiskAmount(ladder.missCount)} ${pluralForm(ladder.missCount, "промах", "промаха", "промахов")} · ${formatRiskAmount(ladder.resetCount)} reset`,
     );
 
+    const displayedStake = pendingBet?.stake ?? account.nextStake;
     setTextIfChanged(
       elements.combinedPickAccountStakeLabel,
-      account.status === "pending"
-        ? "Текущая ставка"
+      pendingBet
+        ? "Сохранённая ставка"
         : account.status === "exhausted"
           ? "Недоступная ставка"
-          : "Фиксированная ставка",
+          : "Следующая ступень",
     );
-    setTextIfChanged(elements.combinedPickAccountStake, formatRiskAmount(account.nextStake));
+    setTextIfChanged(elements.combinedPickAccountStake, formatRiskAmount(displayedStake));
     setTextIfChanged(
       elements.combinedPickAccountModel,
-      `фиксированные ${formatRiskAmount(account.model.fixedStake)} · без повышения · выплата ×${formatRiskAmount(account.model.grossPayoutMultiplier)}`,
+      pendingBet
+        ? `raw ${formatRiskAmount(pendingBet.rawStake)} · gross ${formatRiskAmount(pendingBet.stake * model.grossPayoutMultiplier)} · выплата ×${formatRiskAmount(model.grossPayoutMultiplier)}${ladder.pendingReset === "cycle_spend_cap" ? ` · при MISS новый цикл со ставки ${formatRiskAmount(model.initialStake)}` : ""}`
+        : `убыток серии ${formatRiskAmount(ladder.ladderLoss)} · шаг ${formatRiskAmount(model.stakeStep)} · выплата ×${formatRiskAmount(model.grossPayoutMultiplier)}`,
     );
+  }
+
+  function refreshPredictiveV7PaperAtCutoff() {
+    const snapshot = store.predictiveV7PaperSnapshot;
+    if (
+      !snapshot
+      || snapshot.action !== "BET"
+      || !snapshot.actionId
+      || currentPredictiveV7PaperContext().reason !== "betting_closed"
+    ) {
+      return;
+    }
+    renderCombinedPick();
+    renderPredictiveV7PaperAccount();
+    if (store.predictiveV7PaperCutoffRefreshActionId === snapshot.actionId) return;
+    store.predictiveV7PaperCutoffRefreshActionId = snapshot.actionId;
+    refreshAll();
   }
 
   function currentPriceTrajectorySignals(latestForecast) {
@@ -2681,17 +2719,8 @@ import {
     return combinedTrajectorySignals(shadow);
   }
 
-  function currentCombinedNumberContext() {
-    return predictiveLeaderNumberContext({
-      loaded: store.predictiveLeaderLoaded,
-      error: store.predictiveLeaderError,
-      requiresFreshSnapshot: store.predictiveLeaderRequiresFreshSnapshot,
-      snapshot: store.predictiveLeaderSnapshot,
-    });
-  }
-
   function renderCombinedPick() {
-    const context = currentCombinedNumberContext();
+    const context = currentPredictiveV7PaperContext();
     const snapshot = context.snapshot ?? null;
     const setNumber = (number, label, ariaLabel) => {
       elements.combinedPickLabel.textContent = label;
@@ -2710,45 +2739,31 @@ import {
         "Ставка не разрешена",
       );
     };
-    const modelSummary = (model) => {
-      const priceWeight = model.learnedFamilyWeights.price;
-      const historyWeight = model.learnedFamilyWeights["conditional-history"];
-      return `${model.sourceCount} ${pluralForm(model.sourceCount, "источник", "источника", "источников")} · ${model.familyCount} ${pluralForm(model.familyCount, "семья", "семьи", "семей")} · обучение ${model.trainingCount} · вес цены ${trajectoryShadowShareFormatter.format(priceWeight)} · истории ${trajectoryShadowShareFormatter.format(historyWeight)}`;
-    };
-    const gateSummary = (gate) => {
-      if (!gate) return "фильтр качества не зафиксирован";
-      if (gate.status === "collecting") {
-        return `окно качества ${formatRiskAmount(gate.sampleSize)}/${formatRiskAmount(gate.windowSize)}`;
-      }
-      const hitRate = gate.hitRate === null
-        ? "—"
-        : trajectoryShadowShareFormatter.format(gate.hitRate);
-      const lowerBound = gate.lowerBound === null
-        ? "—"
-        : trajectoryShadowShareFormatter.format(gate.lowerBound);
-      const brier = gate.meanBrierLoss === null
-        ? "—"
-        : gate.meanBrierLoss.toFixed(4);
-      return `окно ${formatRiskAmount(gate.sampleSize)} · Top‑1 ${hitRate} · нижняя граница Wilson ${lowerBound} · Brier ${brier}`;
+    const paperSummary = (paper) => {
+      if (!paper?.campaign || !paper.ladder) return "V7 paper-счёт недоступен";
+      const model = paper.campaign.model;
+      return `цикл ${formatRiskAmount(paper.ladder.cycleNumber)} · расход ${formatRiskAmount(paper.ladder.cycleStaked)}/${formatRiskAmount(model.cycleSpendLimit)} · следующая ступень ${formatRiskAmount(paper.account.nextStake)}`;
     };
 
     if (context.state !== "ready") {
       const reasonMessages = {
-        betting_closed: "WAIT · окно условной ставки уже закрыто.",
-        quality_not_frozen: "WAIT · ставка не фиксируется: проверка качества не сохранена.",
-        quality_collecting: "WAIT · ставка не фиксируется: для скользящего окна ещё недостаточно завершённых прогнозов.",
-        quality_not_proven: "WAIT · ставка не фиксируется: преимущество над базовой моделью не доказано одновременно по Top‑1 и Brier.",
-        quality_evidence_invalid: "WAIT · ставка не фиксируется: доказательства качества повреждены или не согласованы.",
-        signal_account_invalid: "WAIT · ставка не фиксируется: состояние фиксированного виртуального счёта не подтверждено.",
-        bankroll_exhausted: "WAIT · ставка не фиксируется: виртуальный счёт исчерпан.",
-        signal_pending_previous: "WAIT · ставка не фиксируется: предыдущий сигнал ещё ожидает результата.",
-        signal_not_recorded: "WAIT · ставка не фиксируется: сервер не сохранил условную ставку для этого сигнала.",
-        integrity_gap: "WAIT · есть разрыв данных, поэтому действие запрещено.",
+        betting_closed: "WAIT · окно этой сохранённой paper-ставки уже закрыто.",
+        bankroll_exhausted: "WAIT · виртуальный V7 paper-счёт исчерпан.",
+        paper_bet_not_pending: "WAIT · сохранённой pending paper-ставки сейчас нет.",
+        paper_pending_previous: "WAIT · сохранённая paper-ставка относится к предыдущему раунду.",
+        paper_round_mismatch: "WAIT · round сохранённой ставки не совпадает с live-раундом.",
+        round_metadata_mismatch: "WAIT · метаданные окна ставки не совпадают.",
         forecast_settled: "WAIT · раунд уже завершён.",
-        leader_not_frozen: "WAIT · кандидат текущего раунда ещё не зафиксирован.",
-        no_valid_family: "WAIT · недостаточно корректных прогнозных семей.",
+        forecast_not_locked: "WAIT · V7 evidence ещё не зафиксирован.",
+        candidate_unavailable: "WAIT · готового выбранного кандидата V7 пока нет.",
+        collector_pending: "WAIT · коллектор ещё подтверждает результат.",
+        persistence_pending: "WAIT · сохранение результатов ещё не завершено.",
+        result_cursor_mismatch: "WAIT · курсор результатов не синхронизирован.",
+        round_cursor_mismatch: "WAIT · live-раунд не синхронизирован.",
+        paper_evidence_mismatch: "WAIT · сохранённая ставка не совпадает с V7 evidence.",
       };
       const candidateNumber = snapshot?.candidateNumber ?? null;
+      const pendingBet = snapshot?.pendingBet ?? null;
       elements.combinedPick.dataset.state = context.state;
       elements.combinedPick.setAttribute(
         "aria-busy",
@@ -2758,53 +2773,60 @@ import {
         elements.combinedPickStatus,
         reasonMessages[context.reason]
           || (context.state === "loading"
-            ? "Загружаем зафиксированное решение текущего раунда."
+            ? "Загружаем V7 paper-кампанию и сохранённую ставку."
             : context.state === "error"
-              ? "WAIT · свежие данные недоступны, действие запрещено."
+              ? "WAIT · строгий контракт V7 paper API не подтверждён."
               : context.state === "paused"
                 ? "WAIT · целостность свежего снимка не подтверждена."
-                : "WAIT · сервер не разрешил условную ставку."),
+                : "WAIT · новой сохранённой paper-ставки нет."),
       );
-      if (candidateNumber !== null) {
+      if (pendingBet !== null) {
         setNumber(
-          candidateNumber,
-          "Кандидат · WAIT",
-          `Кандидат наблюдения: число ${candidateNumber}, ${rouletteColorLabel(candidateNumber)}. Ставка не разрешена`,
+          pendingBet.targetNumber,
+          "Pending paper · WAIT",
+          `Сохранённая виртуальная ставка на число ${pendingBet.targetNumber}, ${rouletteColorLabel(pendingBet.targetNumber)}. API сейчас WAIT; повторять ставку не нужно`,
         );
         setTextIfChanged(
           elements.combinedPickSources,
-          `${modelSummary(snapshot.model)} · ${gateSummary(snapshot.qualityGate)} · кандидат не является ставкой`,
+          `Сохранено ${formatRiskAmount(pendingBet.stake)} · ${paperSummary(snapshot)} · это аудит pending, не команда`,
+        );
+      } else if (candidateNumber !== null) {
+        setNumber(
+          candidateNumber,
+          "V7 кандидат · WAIT",
+          `Кандидат V7: число ${candidateNumber}, ${rouletteColorLabel(candidateNumber)}. Paper-ставка не сохранена`,
+        );
+        setTextIfChanged(
+          elements.combinedPickSources,
+          `${paperSummary(snapshot)} · кандидат без pending не является ставкой`,
         );
       } else {
         resetNumber();
         setTextIfChanged(
           elements.combinedPickSources,
           context.state === "loading"
-            ? "Загружаем снимок"
-            : "Действующего сигнала для ставки нет",
+            ? "Загружаем paper ledger"
+            : "Сохранённой paper-ставки нет",
         );
       }
       return;
     }
 
-    const { model, metrics, number, qualityGate } = snapshot;
+    const { number, pendingBet, stake } = snapshot;
     elements.combinedPick.dataset.state = "ready";
     elements.combinedPick.setAttribute("aria-busy", "false");
     setNumber(
       number,
-      "Условная ставка · BET",
-      `Условная ставка: число ${number}, ${rouletteColorLabel(number)}`,
+      "V7 paper · BET",
+      `Сохранённая V7 paper-ставка: число ${number}, ${rouletteColorLabel(number)}`,
     );
     setTextIfChanged(
       elements.combinedPickStatus,
-      "BET · фильтр качества подтверждён на прошлых данных, фиксированная условная ставка 10 сохранена до результата.",
+      `BET · виртуальная ставка ${formatRiskAmount(stake)} на число ${number} уже сохранена до результата. Это отображение ledger, а не команда на реальную ставку.`,
     );
-    const metricText = metrics?.settledCount > 0
-      ? ` · все снимки Top‑1 ${metrics.top1Hits}/${metrics.settledCount} (${trajectoryShadowShareFormatter.format(metrics.top1Rate)})`
-      : "";
     setTextIfChanged(
       elements.combinedPickSources,
-      `${modelSummary(model)} · ${gateSummary(qualityGate)}${metricText}`,
+      `${paperSummary(snapshot)} · raw ${formatRiskAmount(pendingBet.rawStake)} · pending id ${formatRiskAmount(pendingBet.id)}`,
     );
   }
 
@@ -6796,10 +6818,10 @@ import {
 
   function invalidateLiveSnapshots() {
     store.eventRevision += 1;
-    store.predictiveLeaderRequiresFreshSnapshot = true;
+    store.predictiveV7PaperRequiresFreshSnapshot = true;
     store.stateRequiresFreshSnapshot = true;
     renderCombinedPick();
-    renderPredictiveLeaderAccount();
+    renderPredictiveV7PaperAccount();
     renderPrecloseForecast();
     renderFollowerHitCurve();
     renderFollowerTop5Tracker(store.state?.followerTop5Tracker || null);
@@ -6843,7 +6865,7 @@ import {
 
     source.addEventListener("error", () => {
       if (store.eventSource !== source) return;
-      const hadFreshSnapshot = !store.predictiveLeaderRequiresFreshSnapshot
+      const hadFreshSnapshot = !store.predictiveV7PaperRequiresFreshSnapshot
         || !store.stateRequiresFreshSnapshot;
       invalidateLiveSnapshots();
       if (hadFreshSnapshot) scheduleRefresh();
@@ -6893,6 +6915,7 @@ import {
   refreshAll();
   window.setInterval(() => {
     if (store.stateLoaded) renderPrecloseForecast();
+    refreshPredictiveV7PaperAtCutoff();
   }, 1_000);
   window.setInterval(() => {
     updateLastSync();

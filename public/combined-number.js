@@ -14,6 +14,13 @@ export const PREDICTIVE_LEADER_QUALITY_GATE_VERSION =
 export const PREDICTIVE_LEADER_QUALITY_GATE_WINDOW_SIZE = 1_000;
 export const PREDICTIVE_LEADER_SIGNAL_ACCOUNT_STRATEGY_VERSION =
   "quality-gated-fixed10-v1";
+export const PREDICTIVE_LEADER_V7_PAPER_API_SCHEMA_VERSION = 2;
+export const PREDICTIVE_LEADER_V7_PAPER_STRATEGY_VERSION =
+  "predictive-leader-v7-manual-override-paper-ladder-v2";
+export const PREDICTIVE_LEADER_V7_PAPER_ALGORITHM_VERSION =
+  "learned-predictive-exact-calibrated-v7-shadow";
+export const PREDICTIVE_LEADER_V7_PAPER_CAMPAIGN_KEY =
+  "v7-manual-override-paper-ladder-20261019";
 
 const SCORE_EPSILON = 1e-12;
 const PREDICTIVE_LEADER_SUM_TOLERANCE = 1e-9;
@@ -102,6 +109,57 @@ const PREDICTIVE_LEADER_QUALITY_GATE_REASONS = Object.freeze({
 });
 const PREDICTIVE_LEADER_SIGNAL_ACCOUNT_REASONS = Object.freeze({
   waiting: new Set(["waiting_first_eligible_signal", "waiting_quality_gate"]),
+  pending: new Set(["bet_frozen"]),
+  exhausted: new Set(["bankroll_exhausted"]),
+});
+const PREDICTIVE_LEADER_V7_PAPER_REASONS = Object.freeze({
+  ready: new Set(["ready"]),
+  waiting: new Set([
+    "state_unavailable",
+    "paper_state_unavailable",
+    "audit_unavailable",
+    "cursor_unavailable",
+    "bankroll_exhausted",
+    "paper_bet_not_pending",
+    "forecast_unavailable",
+    "paper_pending_previous",
+    "forecast_settled",
+    "betting_closed",
+    "candidate_unavailable",
+  ]),
+  paused: new Set([
+    "paper_state_invalid",
+    "audit_invalid",
+    "collector_unavailable",
+    "cursor_invalid",
+    "collector_pending",
+    "persistence_pending",
+    "result_cursor_mismatch",
+    "round_cursor_mismatch",
+    "paper_round_mismatch",
+    "round_metadata_mismatch",
+    "forecast_not_locked",
+    "paper_record_time_invalid",
+    "paper_evidence_mismatch",
+  ]),
+});
+const PREDICTIVE_LEADER_V7_PAPER_MODEL = Object.freeze({
+  kind: "loss-recovery-ladder",
+  initialBalance: 10_000,
+  initialStake: 10,
+  stakeStep: 10,
+  maxStake: 2_500,
+  cycleSpendLimit: 1_000,
+  resetPolicy: "clamp-final-stake-reset-at-cycle-cap-v1",
+  grossPayoutMultiplier: 36,
+  payoutIncludesStake: true,
+});
+const PREDICTIVE_LEADER_V7_PAPER_ACCOUNT_REASONS = Object.freeze({
+  waiting: new Set([
+    "waiting_first_frozen_v7",
+    "waiting_next_frozen_v7",
+    "waiting_next_frozen_leader",
+  ]),
   pending: new Set(["bet_frozen"]),
   exhausted: new Set(["bankroll_exhausted"]),
 });
@@ -962,6 +1020,391 @@ export function normalizePredictiveLeaderApiSnapshot(value) {
     metrics,
     freshness,
   };
+}
+
+function strictText(value) {
+  return typeof value === "string" && value.trim() !== "" && value === value.trim()
+    ? value
+    : null;
+}
+
+function normalizedPredictiveLeaderV7PaperModel(value) {
+  if (!isPlainRecord(value)) return null;
+  for (const [key, expected] of Object.entries(PREDICTIVE_LEADER_V7_PAPER_MODEL)) {
+    if (value[key] !== expected) return null;
+  }
+  return { ...PREDICTIVE_LEADER_V7_PAPER_MODEL };
+}
+
+function predictiveLeaderV7PaperRawStake(ladderLoss, model) {
+  const netMultiplier = model.grossPayoutMultiplier - 1;
+  return Math.min(
+    model.maxStake,
+    Math.max(
+      model.initialStake,
+      Math.ceil(ladderLoss / (netMultiplier * model.stakeStep)) * model.stakeStep,
+    ),
+  );
+}
+
+function normalizedPredictiveLeaderV7PaperLadder(value, model) {
+  if (!isPlainRecord(value)) return null;
+  const cycleNumber = strictNonNegativeInteger(value.cycleNumber, 1);
+  const cycleStaked = strictNonNegativeInteger(value.cycleStaked);
+  const ladderLoss = strictNonNegativeInteger(value.ladderLoss);
+  const missCount = strictNonNegativeInteger(value.missCount);
+  const resetCount = strictNonNegativeInteger(value.resetCount);
+  const nextStake = strictNonNegativeInteger(value.nextStake, model.initialStake);
+  const pendingReset = value.pendingReset;
+  if (
+    cycleNumber === null
+    || cycleStaked === null
+    || ladderLoss === null
+    || missCount === null
+    || resetCount === null
+    || nextStake === null
+    || cycleStaked >= model.cycleSpendLimit
+    || ladderLoss !== cycleStaked
+    || resetCount !== cycleNumber - 1
+    || ![null, "cycle_spend_cap"].includes(pendingReset)
+  ) {
+    return null;
+  }
+  const rawStake = predictiveLeaderV7PaperRawStake(ladderLoss, model);
+  const expectedNextStake = Math.min(rawStake, model.cycleSpendLimit - cycleStaked);
+  if (nextStake !== expectedNextStake) return null;
+  return {
+    cycleNumber,
+    cycleStaked,
+    ladderLoss,
+    missCount,
+    resetCount,
+    nextStake,
+    pendingReset,
+  };
+}
+
+function normalizedPredictiveLeaderV7PaperPendingBet(value, model) {
+  if (!isPlainRecord(value)) return null;
+  const id = strictNonNegativeInteger(value.id, 1);
+  const forecastId = strictNonNegativeInteger(value.forecastId, 1);
+  const roundId = Number.isSafeInteger(value.roundId) && value.roundId >= 0
+    ? value.roundId
+    : strictText(value.roundId);
+  const targetNumber = strictNonNegativeInteger(value.targetNumber);
+  const stake = strictNonNegativeInteger(value.stake, model.initialStake);
+  const rawStake = strictNonNegativeInteger(value.rawStake, model.initialStake);
+  const balanceBefore = strictNonNegativeInteger(value.balanceBefore);
+  const cycleNumber = strictNonNegativeInteger(value.cycleNumber, 1);
+  const cycleStakedBefore = strictNonNegativeInteger(value.cycleStakedBefore);
+  const ladderLossBefore = strictNonNegativeInteger(value.ladderLossBefore);
+  const missCountBefore = strictNonNegativeInteger(value.missCountBefore);
+  const lockedAt = nullableInstant(value.lockedAt);
+  const bettingClosesAt = nullableInstant(value.bettingClosesAt);
+  const placedAt = nullableInstant(value.placedAt);
+  if (
+    id === null
+    || forecastId === null
+    || roundId === null
+    || targetNumber === null
+    || targetNumber > 36
+    || stake === null
+    || rawStake === null
+    || rawStake < stake
+    || balanceBefore === null
+    || balanceBefore < stake
+    || cycleNumber === null
+    || cycleStakedBefore === null
+    || ladderLossBefore === null
+    || missCountBefore === null
+    || lockedAt === null
+    || lockedAt === undefined
+    || bettingClosesAt === null
+    || bettingClosesAt === undefined
+    || placedAt === null
+    || placedAt === undefined
+  ) {
+    return null;
+  }
+  return {
+    id,
+    forecastId,
+    roundId,
+    targetNumber,
+    stake,
+    rawStake,
+    balanceBefore,
+    cycleNumber,
+    cycleStakedBefore,
+    ladderLossBefore,
+    missCountBefore,
+    lockedAt,
+    bettingClosesAt,
+    placedAt,
+  };
+}
+
+function normalizedPredictiveLeaderV7PaperStats(value) {
+  if (!isPlainRecord(value)) return null;
+  const integerKeys = [
+    "betCount",
+    "settledCount",
+    "pendingCount",
+    "voidCount",
+    "hitCount",
+    "missCount",
+    "totalStaked",
+    "totalGrossPayout",
+    "peakBalance",
+    "maximumDrawdown",
+    "continuityGapCount",
+  ];
+  if (
+    integerKeys.some((key) => strictNonNegativeInteger(value[key]) === null)
+    || !Number.isSafeInteger(value.minimumBalance)
+  ) {
+    return null;
+  }
+  if (
+    value.settledCount !== value.hitCount + value.missCount
+    || value.betCount !== value.settledCount + value.pendingCount + value.voidCount
+    || value.pendingCount > 1
+    || (value.settledCount === 0
+      ? value.hitRate !== null
+      : typeof value.hitRate !== "number"
+        || !Number.isFinite(value.hitRate)
+        || Math.abs(value.hitRate - value.hitCount / value.settledCount) > 1e-12)
+  ) {
+    return null;
+  }
+  return Object.fromEntries([
+    ...integerKeys.map((key) => [key, value[key]]),
+    ["minimumBalance", value.minimumBalance],
+    ["hitRate", value.hitRate],
+  ]);
+}
+
+function normalizedPredictiveLeaderV7PaperAccount(value, ladder, stats, pendingBet, model) {
+  if (!isPlainRecord(value)) return null;
+  const integerKeys = [
+    "currentBalance",
+    "deficit",
+    "availableBalance",
+    "reservedStake",
+    "nextStake",
+    "shortfall",
+    "ledgerRevision",
+  ];
+  if (
+    value.initialBalance !== model.initialBalance
+    || !PREDICTIVE_LEADER_V7_PAPER_ACCOUNT_REASONS[value.status]?.has(value.reason)
+    || integerKeys.some((key) => strictNonNegativeInteger(value[key]) === null)
+    || !Number.isSafeInteger(value.accountingBalance)
+    || !Number.isSafeInteger(value.profit)
+    || typeof value.canAffordNext !== "boolean"
+  ) {
+    return null;
+  }
+  const expectedReservedStake = pendingBet?.stake ?? 0;
+  const expectedCanAfford = pendingBet === null
+    && value.deficit === 0
+    && value.currentBalance >= ladder.nextStake;
+  if (
+    value.availableBalance !== value.currentBalance
+    || value.currentBalance - value.deficit !== value.accountingBalance
+    || value.accountingBalance !== value.initialBalance
+      - stats.totalStaked
+      + stats.totalGrossPayout
+    || value.profit !== value.accountingBalance - value.initialBalance
+    || value.reservedStake !== expectedReservedStake
+    || value.nextStake !== ladder.nextStake
+    || value.shortfall !== Math.max(0, ladder.nextStake - value.accountingBalance)
+    || value.canAffordNext !== expectedCanAfford
+    || (pendingBet !== null) !== (stats.pendingCount === 1)
+    || (value.status === "pending") !== (pendingBet !== null)
+    || (value.status === "exhausted") !== (
+      pendingBet === null && (value.deficit > 0 || value.currentBalance < ladder.nextStake)
+    )
+  ) {
+    return null;
+  }
+  return {
+    status: value.status,
+    reason: value.reason,
+    initialBalance: value.initialBalance,
+    currentBalance: value.currentBalance,
+    deficit: value.deficit,
+    accountingBalance: value.accountingBalance,
+    availableBalance: value.availableBalance,
+    reservedStake: value.reservedStake,
+    profit: value.profit,
+    nextStake: value.nextStake,
+    canAffordNext: value.canAffordNext,
+    shortfall: value.shortfall,
+    ledgerRevision: value.ledgerRevision,
+  };
+}
+
+export function normalizePredictiveLeaderV7PaperApiSnapshot(value) {
+  if (
+    !isPlainRecord(value)
+    || value.schemaVersion !== PREDICTIVE_LEADER_V7_PAPER_API_SCHEMA_VERSION
+    || value.strategyVersion !== PREDICTIVE_LEADER_V7_PAPER_STRATEGY_VERSION
+    || value.algorithmVersion !== PREDICTIVE_LEADER_V7_PAPER_ALGORITHM_VERSION
+    || value.mode !== "simulation"
+    || value.strategyMode !== "manual-override-paper"
+    || value.executionEnabled !== false
+    || value.advisoryOnly !== true
+    || value.promotionEligible !== false
+    || value.promotionPolicy !== "manual-override-paper-not-promoted"
+    || !isPlainRecord(value.manualOverride)
+    || value.manualOverride.authorized !== true
+    || value.manualOverride.qualityGateRequired !== false
+    || value.manualOverride.automaticPromotionEnabled !== false
+    || strictText(value.source) === null
+    || strictText(value.instrument) === null
+    || nullableInstant(value.serverTime) === null
+    || nullableInstant(value.serverTime) === undefined
+    || !PREDICTIVE_LEADER_V7_PAPER_REASONS[value.status]?.has(value.reason)
+    || !["WAIT", "BET"].includes(value.action)
+  ) {
+    return null;
+  }
+
+  const campaign = value.campaign;
+  const model = campaign === null ? null : normalizedPredictiveLeaderV7PaperModel(campaign?.model);
+  const ladder = value.ladder === null || model === null
+    ? null
+    : normalizedPredictiveLeaderV7PaperLadder(value.ladder, model);
+  const stats = value.stats === null ? null : normalizedPredictiveLeaderV7PaperStats(value.stats);
+  const pendingBet = value.pendingBet === null || model === null
+    ? null
+    : normalizedPredictiveLeaderV7PaperPendingBet(value.pendingBet, model);
+  const account = value.account === null || !ladder || !stats || !model
+    ? null
+    : normalizedPredictiveLeaderV7PaperAccount(
+        value.account,
+        ladder,
+        stats,
+        pendingBet,
+        model,
+      );
+  const candidateNumber = value.candidateNumber === null
+    ? null
+    : strictNonNegativeInteger(value.candidateNumber);
+  const number = value.number === null ? null : strictNonNegativeInteger(value.number);
+  const stake = value.stake === null ? null : strictNonNegativeInteger(value.stake, 1);
+  const actionId = value.actionId === null ? null : strictText(value.actionId);
+  const hasCampaign = isPlainRecord(campaign);
+  if (
+    (value.campaign !== null && (
+      !hasCampaign
+      || campaign.schemaVersion !== PREDICTIVE_LEADER_V7_PAPER_API_SCHEMA_VERSION
+      || campaign.strategyVersion !== PREDICTIVE_LEADER_V7_PAPER_STRATEGY_VERSION
+      || campaign.campaignKey !== PREDICTIVE_LEADER_V7_PAPER_CAMPAIGN_KEY
+      || strictText(campaign.candidateId) === null
+      || campaign.promotionEligible !== false
+      || campaign.promotionPolicy !== "manual-override-paper-not-promoted"
+      || model === null
+    ))
+    || (value.ladder !== null && ladder === null)
+    || (value.stats !== null && stats === null)
+    || (value.pendingBet !== null && pendingBet === null)
+    || (value.account !== null && account === null)
+    || (account !== null) !== hasCampaign
+    || (account !== null) !== (ladder !== null)
+    || (account !== null) !== (stats !== null)
+    || (value.candidateNumber !== null && (candidateNumber === null || candidateNumber > 36))
+    || (value.status === "ready") !== (value.action === "BET")
+    || (value.action === "BET"
+      ? number === null
+        || number > 36
+        || stake === null
+        || actionId === null
+        || pendingBet === null
+        || account?.status !== "pending"
+        || number !== pendingBet.targetNumber
+        || stake !== pendingBet.stake
+        || candidateNumber !== number
+        || Date.parse(value.serverTime) < Date.parse(pendingBet.placedAt)
+        || Date.parse(value.serverTime) >= Date.parse(pendingBet.bettingClosesAt)
+      : value.number !== null || value.stake !== null || value.actionId !== null)
+    || (pendingBet === null && ladder?.pendingReset !== null)
+    || (pendingBet !== null && (
+      pendingBet.cycleNumber !== ladder?.cycleNumber
+      || pendingBet.cycleStakedBefore !== ladder?.cycleStaked
+      || pendingBet.ladderLossBefore !== ladder?.ladderLoss
+      || pendingBet.missCountBefore !== ladder?.missCount
+      || pendingBet.rawStake !== predictiveLeaderV7PaperRawStake(ladder.ladderLoss, model)
+      || pendingBet.stake !== ladder.nextStake
+      || ladder.pendingReset !== (
+        ladder.cycleStaked + pendingBet.stake === model.cycleSpendLimit
+          ? "cycle_spend_cap"
+          : null
+      )
+    ))
+  ) {
+    return null;
+  }
+
+  return {
+    schemaVersion: value.schemaVersion,
+    strategyVersion: value.strategyVersion,
+    algorithmVersion: value.algorithmVersion,
+    mode: value.mode,
+    strategyMode: value.strategyMode,
+    executionEnabled: value.executionEnabled,
+    advisoryOnly: value.advisoryOnly,
+    promotionEligible: value.promotionEligible,
+    source: value.source,
+    instrument: value.instrument,
+    serverTime: value.serverTime,
+    status: value.status,
+    reason: value.reason,
+    action: value.action,
+    actionId,
+    number,
+    stake,
+    candidateNumber,
+    campaign: hasCampaign ? {
+      schemaVersion: campaign.schemaVersion,
+      strategyVersion: campaign.strategyVersion,
+      campaignKey: campaign.campaignKey,
+      candidateId: campaign.candidateId,
+      model,
+    } : null,
+    account,
+    stats,
+    ladder,
+    pendingBet,
+  };
+}
+
+export function predictiveLeaderV7PaperContext({
+  loaded = false,
+  error = false,
+  requiresFreshSnapshot = false,
+  snapshot = null,
+  nowMs = null,
+} = {}) {
+  if (error) return { state: "error" };
+  if (!loaded) return { state: "loading" };
+  if (requiresFreshSnapshot) {
+    return { state: "paused", reason: "event_stream_disconnected" };
+  }
+  if (!snapshot || !["ready", "waiting", "paused"].includes(snapshot.status)) {
+    return { state: "error" };
+  }
+  if (
+    snapshot.status === "ready"
+    && Number.isFinite(nowMs)
+    && nowMs >= Date.parse(snapshot.pendingBet.bettingClosesAt)
+  ) {
+    return { state: "waiting", reason: "betting_closed", snapshot };
+  }
+  return snapshot.status === "ready"
+    ? { state: "ready", snapshot }
+    : { state: snapshot.status, reason: snapshot.reason, snapshot };
 }
 
 export function predictiveLeaderNumberContext({

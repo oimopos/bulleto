@@ -46,7 +46,7 @@ test("dashboard keeps the exact read-only fetch URL list", () => {
     "/api/pairs",
     "/api/forecasts/hits?limit=20",
     "/api/cycle-comparison",
-    "/api/predictive-leader",
+    "/api/predictive-leader/v7-paper",
     "/api/predictive-leader/v7-shadow",
     "/api/predictive-leader/current-cell-10s-shadow",
   ]);
@@ -118,27 +118,44 @@ test("server schedules incremental trajectory validation only after listen", () 
   );
 });
 
-test("dashboard wires predictive leader loading and SSE invalidation fail-closed", () => {
+test("dashboard wires V7 paper loading and SSE invalidation fail-closed", () => {
   const refreshStart = app.indexOf("async function refreshAll");
   const refreshEnd = app.indexOf("function renderFetchFailure", refreshStart);
   const refresh = app.slice(refreshStart, refreshEnd);
   assert.ok(refreshStart >= 0 && refreshEnd > refreshStart);
-  assert.match(refresh, /fetchJson\("\/api\/predictive-leader"\)/);
-  assert.match(refresh, /normalizePredictiveLeaderApiSnapshot\(requests\[7\]\.value\)/);
-  assert.match(refresh, /store\.predictiveLeaderSnapshot = snapshot/);
+  assert.match(refresh, /fetchJson\("\/api\/predictive-leader\/v7-paper"\)/);
+  assert.match(refresh, /normalizePredictiveLeaderV7PaperApiSnapshot\(requests\[7\]\.value\)/);
+  assert.match(refresh, /store\.predictiveV7PaperSnapshot = snapshot/);
   assert.doesNotMatch(refresh, /normalizedPredictiveLeaderAccount/);
-  assert.match(refresh, /store\.predictiveLeaderLoaded = true/);
-  assert.match(refresh, /store\.predictiveLeaderError = true/);
+  assert.match(refresh, /store\.predictiveV7PaperLoaded = true/);
+  assert.match(refresh, /store\.predictiveV7PaperError = true/);
   assert.match(
     refresh,
-    /store\.predictiveLeaderRequiresFreshSnapshot = !liveSnapshotIsCurrent/,
+    /store\.predictiveV7PaperRequiresFreshSnapshot = !liveSnapshotIsCurrent/,
   );
   assert.match(refresh, /const eventRevisionAtRequest = store\.eventRevision/);
+  assert.match(refresh, /const refreshClockStartedAt = window\.performance\.now\(\)/);
+  assert.match(
+    refresh,
+    /captureServerClock\(store\.state\?\.serverTime, refreshClockStartedAt\)/,
+  );
+  assert.match(
+    refresh,
+    /captureServerClock\(snapshot\.serverTime, refreshClockStartedAt\)/,
+  );
   assert.match(
     refresh,
     /store\.eventRevision === eventRevisionAtRequest/,
     "an SSE update during a request must keep the response stale",
   );
+
+  const clockStart = app.indexOf("function captureServerClock(value, observedAt");
+  const clockEnd = app.indexOf("function currentTimeMs()", clockStart);
+  const clock = app.slice(clockStart, clockEnd);
+  assert.ok(clockStart >= 0 && clockEnd > clockStart);
+  assert.match(clock, /candidateNowMs = date\.getTime\(\) \+ \(nowPerformance - observedAt\)/);
+  assert.match(clock, /candidateNowMs < store\.serverClockMs/);
+  assert.match(clock, /store\.serverClockCapturedAt = observedAt/);
 
   const eventErrorStart = app.indexOf('source.addEventListener("error"');
   const eventErrorEnd = app.indexOf("});", eventErrorStart);
@@ -179,7 +196,7 @@ test("dashboard polling retries partial or failed refreshes with one bounded exp
   const refreshBlock = app.slice(refreshStart, refreshEnd);
   assert.match(
     refreshBlock,
-    /retry: successfulRequests < requests\.length[\s\S]*?\|\| store\.stateRequiresFreshSnapshot[\s\S]*?\|\| store\.predictiveLeaderRequiresFreshSnapshot/,
+    /retry: successfulRequests < requests\.length[\s\S]*?\|\| store\.stateRequiresFreshSnapshot[\s\S]*?\|\| store\.predictiveV7PaperRequiresFreshSnapshot/,
   );
 
   const bootStart = app.indexOf("initializeFollowerSource();");
@@ -202,7 +219,7 @@ test("temporary API or SSE loss hides every actionable stale virtual bet", () =>
   const eventErrorEnd = app.indexOf("});", eventErrorStart);
   const eventError = app.slice(eventErrorStart, eventErrorEnd);
   assert.match(eventError, /invalidateLiveSnapshots\(\)/);
-  assert.match(eventError, /const hadFreshSnapshot = !store\.predictiveLeaderRequiresFreshSnapshot/);
+  assert.match(eventError, /const hadFreshSnapshot = !store\.predictiveV7PaperRequiresFreshSnapshot/);
   assert.match(eventError, /\|\| !store\.stateRequiresFreshSnapshot/);
   assert.match(eventError, /invalidateLiveSnapshots\(\)/);
   assert.match(eventError, /if \(hadFreshSnapshot\) scheduleRefresh\(\)/);
@@ -212,18 +229,18 @@ test("temporary API or SSE loss hides every actionable stale virtual bet", () =>
   const invalidation = app.slice(invalidationStart, invalidationEnd);
   assert.match(invalidation, /store\.eventRevision \+= 1/);
   assert.match(invalidation, /store\.stateRequiresFreshSnapshot = true/);
-  assert.match(invalidation, /renderPredictiveLeaderAccount\(\)/);
+  assert.match(invalidation, /renderPredictiveV7PaperAccount\(\)/);
   assert.match(invalidation, /renderFollowerTop5Tracker\(/);
   assert.match(invalidation, /renderVirtualBettor\(/);
   assert.match(invalidation, /renderPrecloseForecast\(\)/);
   assert.match(invalidation, /renderFollowerHitCurve\(\)/);
 
-  const accountContextStart = app.indexOf("function currentPredictiveLeaderAccountContext()");
-  const accountContextEnd = app.indexOf("function renderPredictiveLeaderAccount", accountContextStart);
+  const accountContextStart = app.indexOf("function currentPredictiveV7PaperContext()");
+  const accountContextEnd = app.indexOf("function renderPredictiveV7PaperAccount", accountContextStart);
   const accountContext = app.slice(accountContextStart, accountContextEnd);
   assert.match(
     accountContext,
-    /predictiveLeaderRequiresFreshSnapshot\) return \{ state: "stale" \}/,
+    /requiresFreshSnapshot: store\.predictiveV7PaperRequiresFreshSnapshot/,
   );
 
   const gatedStart = app.indexOf("function renderFollowerLiveGatedAccount");
@@ -267,7 +284,7 @@ test("temporary API or SSE loss hides every actionable stale virtual bet", () =>
   assert.match(warmAccountBlock, /if \(stale\) \{[\s\S]*?текущие числа и размер следующего виртуального билета скрыты/);
 });
 
-test("quality-gated leader is the first dashboard block and separates candidate from BET", () => {
+test("V7 paper is the first dashboard block and separates pending audit from live BET", () => {
   const rendererIds = [
     "combined-pick",
     "combined-pick-label",
@@ -286,23 +303,36 @@ test("quality-gated leader is the first dashboard block and separates candidate 
   const block = html.slice(blockStart, headingStart);
   assert.ok(gapStart >= 0 && blockStart > gapStart && headingStart > blockStart);
   assert.doesNotMatch(block, /\bhidden\b/);
-  assert.match(block, /data-algorithm="learned-predictive-family-index-v5"/);
+  assert.match(block, /data-algorithm="predictive-leader-v7-manual-override-paper-ladder-v2"/);
   assert.match(block, /id="combined-pick-status" role="status" aria-live="polite" aria-atomic="true"/);
   assert.equal([...block.matchAll(/<output\b/g)].length, 1);
   assert.match(block, /id="combined-pick-number"/);
   assert.doesNotMatch(block, /<(?:ol|ul)\b/);
-  assert.match(block, /Фильтр качества · явное решение WAIT \/ BET/);
-  assert.match(block, /Кандидат и условная ставка/);
-  assert.match(block, /нижняя граница Wilson для Top‑1/);
-  assert.match(block, /Brier — лучше равномерной модели/);
-  assert.match(block, /При WAIT кандидат остаётся только наблюдением, ставка не фиксируется/);
-  assert.match(block, /Текущий результат в проверку не попадает/);
+  assert.match(block, /V7 manual override · virtual paper · WAIT \/ BET/);
+  assert.match(block, /Сохранённая V7 paper-ставка/);
+  assert.match(block, /BET здесь только показывает уже записанную виртуальную ставку/);
+  assert.match(block, /При WAIT сохранённый pending может оставаться видимым как аудит/);
+  assert.match(block, /quality gate ниже остаётся отдельной диагностикой/);
   assert.match(block, /1 из 37 \(≈2,7%\)/);
-  assert.match(html, /<script type="module" src="\/app\.js\?v=48"><\/script>/);
+  assert.match(html, /<script type="module" src="\/app\.js\?v=49"><\/script>/);
 
-  assert.match(app, /from "\.\/combined-number\.js\?v=10"/);
-  assert.match(app, /normalizePredictiveLeaderApiSnapshot/);
-  assert.match(app, /predictiveLeaderNumberContext/);
+  assert.match(app, /from "\.\/combined-number\.js\?v=11"/);
+  assert.match(app, /normalizePredictiveLeaderV7PaperApiSnapshot/);
+  assert.match(app, /predictiveLeaderV7PaperContext/);
+  assert.match(combinedNumber, /export function normalizePredictiveLeaderV7PaperApiSnapshot\(value\)/);
+  assert.match(combinedNumber, /export function predictiveLeaderV7PaperContext\(/);
+  assert.match(combinedNumber, /PREDICTIVE_LEADER_V7_PAPER_API_SCHEMA_VERSION = 2/);
+  assert.match(combinedNumber, /value\.strategyMode !== "manual-override-paper"/);
+  assert.match(combinedNumber, /value\.executionEnabled !== false/);
+  assert.match(combinedNumber, /value\.advisoryOnly !== true/);
+  assert.match(combinedNumber, /value\.promotionEligible !== false/);
+  assert.match(combinedNumber, /model\.cycleSpendLimit - cycleStaked/);
+  assert.match(combinedNumber, /stake !== pendingBet\.stake/);
+  assert.match(combinedNumber, /value\.action === "BET"/);
+  assert.match(combinedNumber, /value\.number !== null \|\| value\.stake !== null/);
+  assert.match(combinedNumber, /requiresFreshSnapshot/);
+
+  // The legacy quality-gated normalizer remains available for its separate API/audit tests.
   assert.match(combinedNumber, /export function normalizePredictiveLeaderApiSnapshot\(value\)/);
   assert.match(combinedNumber, /export function predictiveLeaderNumberContext\(/);
   assert.match(combinedNumber, /value\.schemaVersion !== PREDICTIVE_LEADER_API_SCHEMA_VERSION/);
@@ -325,7 +355,7 @@ test("quality-gated leader is the first dashboard block and separates candidate 
   assert.match(app, /normalizedLearnedLeaderDistribution/);
   assert.match(app, /normalizedLearnedLeaderLearning/);
   assert.match(app, /function normalizedPredictiveLeaderMetrics\(value\)/);
-  assert.match(app, /function currentCombinedNumberContext\(\)/);
+  assert.match(app, /function currentPredictiveV7PaperContext\(\)/);
   assert.match(app, /function renderCombinedPick\(\)/);
   assert.match(app, /function currentPriceTrajectorySignals\(latestForecast\)/);
   assert.match(app, /combinedTrajectorySignals\(/);
@@ -335,15 +365,16 @@ test("quality-gated leader is the first dashboard block and separates candidate 
     "combined leader must render on normal and failed refresh paths",
   );
 
-  const contextStart = app.indexOf("function currentCombinedNumberContext()");
-  const contextEnd = app.indexOf("function renderCombinedPick", contextStart);
+  const contextStart = app.indexOf("function currentPredictiveV7PaperContext()");
+  const contextEnd = app.indexOf("function renderPredictiveV7PaperAccount", contextStart);
   const contextBlock = app.slice(contextStart, contextEnd);
   assert.ok(contextStart >= 0 && contextEnd > contextStart);
-  assert.match(contextBlock, /predictiveLeaderNumberContext\(/);
-  assert.match(contextBlock, /loaded: store\.predictiveLeaderLoaded/);
-  assert.match(contextBlock, /error: store\.predictiveLeaderError/);
-  assert.match(contextBlock, /requiresFreshSnapshot: store\.predictiveLeaderRequiresFreshSnapshot/);
-  assert.match(contextBlock, /snapshot: store\.predictiveLeaderSnapshot/);
+  assert.match(contextBlock, /predictiveLeaderV7PaperContext\(/);
+  assert.match(contextBlock, /loaded: store\.predictiveV7PaperLoaded/);
+  assert.match(contextBlock, /error: store\.predictiveV7PaperError/);
+  assert.match(contextBlock, /requiresFreshSnapshot: store\.predictiveV7PaperRequiresFreshSnapshot/);
+  assert.match(contextBlock, /snapshot: store\.predictiveV7PaperSnapshot/);
+  assert.match(contextBlock, /nowMs: currentTimeMs\(\)/);
   assert.doesNotMatch(contextBlock, /store\.state|precloseForecast|latestForecast/);
   assert.doesNotMatch(contextBlock, /combineNumberRankings|combinedTripleFollowerRanking/);
   assert.doesNotMatch(contextBlock, /rankedNumbers|trajectoryShadow|pairHistory|followerTop5Tracker|tripleFollowerSignal/);
@@ -360,19 +391,17 @@ test("quality-gated leader is the first dashboard block and separates candidate 
   const renderBlock = app.slice(renderStart, renderEnd);
   assert.ok(renderStart >= 0 && renderEnd > renderStart);
   assert.match(renderBlock, /const snapshot = context\.snapshot \?\? null/);
-  assert.match(renderBlock, /const \{ model, metrics, number, qualityGate \} = snapshot/);
-  assert.match(renderBlock, /Кандидат · WAIT/);
-  assert.match(renderBlock, /кандидат не является ставкой/);
-  assert.match(renderBlock, /Условная ставка · BET/);
-  assert.match(renderBlock, /фиксированная условная ставка 10 сохранена/);
-  assert.match(renderBlock, /ставка не фиксируется/);
-  assert.match(renderBlock, /обучение \$\{model\.trainingCount\}/);
-  assert.match(renderBlock, /вес цены/);
-  assert.match(renderBlock, /истории/);
-  assert.match(renderBlock, /Top‑1/);
-  assert.match(renderBlock, /нижняя граница Wilson/);
-  assert.match(renderBlock, /Brier/);
-  assert.doesNotMatch(renderBlock, /combineNumberRankings|leaderMass|score|вероятност/);
+  assert.match(renderBlock, /const \{ number, pendingBet, stake \} = snapshot/);
+  assert.match(renderBlock, /Pending paper · WAIT/);
+  assert.match(renderBlock, /это аудит pending, не команда/);
+  assert.match(renderBlock, /V7 кандидат · WAIT/);
+  assert.match(renderBlock, /кандидат без pending не является ставкой/);
+  assert.match(renderBlock, /V7 paper · BET/);
+  assert.match(renderBlock, /уже сохранена до результата/);
+  assert.match(renderBlock, /не команда на реальную ставку/);
+  assert.match(renderBlock, /paper\.ladder\.cycleNumber/);
+  assert.match(renderBlock, /model\.cycleSpendLimit/);
+  assert.doesNotMatch(renderBlock, /qualityGate|Wilson|Brier|combineNumberRankings|leaderMass|score/);
   assert.doesNotMatch(app, /\bcombineNumberRankings\b|\bcombinedTripleFollowerRanking\b/);
   assert.match(styles, /\.combined-pick\s*\{/);
   assert.match(styles, /\.combined-pick__result \.combined-pick__number\s*\{/);
@@ -382,7 +411,7 @@ test("quality-gated leader is the first dashboard block and separates candidate 
   );
 });
 
-test("predictive leader account is a strict quality-gated fixed-stake simulation", () => {
+test("top account renders the strict V7 paper recovery ladder without mixing the gate", () => {
   const accountIds = [
     "combined-pick-account",
     "combined-pick-account-status",
@@ -411,83 +440,75 @@ test("predictive leader account is a strict quality-gated fixed-stake simulation
   assert.equal([...block.matchAll(/<output\b/g)].length, 1);
   assert.equal([...accountBlock.matchAll(/<output\b/g)].length, 0);
   assert.equal([...accountBlock.matchAll(/<dd\b/g)].length, 4);
-  assert.match(accountBlock, /Проспективная симуляция · только подтверждённые сигналы/);
-  assert.match(accountBlock, /Виртуальный счёт фиксированных ставок/);
+  assert.match(accountBlock, /Отдельная durable-кампания · gate audit-only/);
+  assert.match(accountBlock, /V7 paper-счёт recovery-лестницы/);
   assert.match(accountBlock, /Текущий счёт/);
   assert.match(accountBlock, /Попадания \/ промахи/);
-  assert.match(accountBlock, /Наблюдаемая частота попаданий/);
-  assert.match(accountBlock, /Фиксированная ставка/);
-  assert.match(accountBlock, /Только при решении BET фиксируется ровно 10 условных единиц/);
-  assert.match(accountBlock, /после промаха сумма не повышается/i);
-  assert.match(accountBlock, /При WAIT кандидат не затрагивает счёт/);
-  assert.match(accountBlock, /Частота — прошлое наблюдение, не вероятность следующего результата/);
-  assert.match(accountBlock, /виртуальная \(«бумажная»\) симуляция; реальных ставок и действий нет/i);
+  assert.match(accountBlock, /Расход текущего цикла/);
+  assert.match(accountBlock, /Следующая ступень/);
+  assert.match(accountBlock, /Счёт начинается с 10 000/);
+  assert.match(accountBlock, /динамически покрывает накопленный расход/);
+  assert.match(accountBlock, /Расход цикла ограничен 1 000/);
+  assert.match(accountBlock, /Попадание и подтверждённый gap также начинают новый цикл/);
+  assert.match(accountBlock, /только virtual paper ledger/);
+  assert.match(accountBlock, /реальных ставок, автопополнения и автоматического promotion нет/);
 
-  assert.match(combinedNumber, /PREDICTIVE_LEADER_SIGNAL_ACCOUNT_STRATEGY_VERSION =\s*\n\s*"quality-gated-fixed10-v1"/);
-  assert.match(combinedNumber, /PREDICTIVE_LEADER_SIGNAL_STARTING_BALANCE = 1_000/);
-  assert.match(combinedNumber, /PREDICTIVE_LEADER_SIGNAL_FIXED_STAKE = 10/);
-  assert.match(combinedNumber, /PREDICTIVE_LEADER_SIGNAL_GROSS_PAYOUT_MULTIPLIER = 36/);
-
-  const normalizerStart = combinedNumber.indexOf("function normalizedPredictiveLeaderSignalAccount(value)");
-  const normalizerEnd = combinedNumber.indexOf("export function normalizePredictiveLeaderApiSnapshot", normalizerStart);
+  const normalizerStart = combinedNumber.indexOf("export function normalizePredictiveLeaderV7PaperApiSnapshot(value)");
+  const normalizerEnd = combinedNumber.indexOf("export function predictiveLeaderV7PaperContext", normalizerStart);
   const normalizer = combinedNumber.slice(normalizerStart, normalizerEnd);
   assert.ok(normalizerStart >= 0 && normalizerEnd > normalizerStart);
-  assert.match(normalizer, /value\.schemaVersion !== PREDICTIVE_LEADER_SIGNAL_ACCOUNT_SCHEMA_VERSION/);
-  assert.match(normalizer, /value\.strategyVersion !== PREDICTIVE_LEADER_SIGNAL_ACCOUNT_STRATEGY_VERSION/);
-  assert.match(normalizer, /value\.leaderAlgorithmVersion !== PREDICTIVE_LEADER_API_ALGORITHM_VERSION/);
-  assert.match(normalizer, /value\.mode !== "quality-gated-fixed-stake-simulation"/);
+  assert.match(normalizer, /value\.schemaVersion !== PREDICTIVE_LEADER_V7_PAPER_API_SCHEMA_VERSION/);
+  assert.match(normalizer, /value\.strategyVersion !== PREDICTIVE_LEADER_V7_PAPER_STRATEGY_VERSION/);
+  assert.match(normalizer, /value\.algorithmVersion !== PREDICTIVE_LEADER_V7_PAPER_ALGORITHM_VERSION/);
+  assert.match(normalizer, /value\.mode !== "simulation"/);
+  assert.match(normalizer, /value\.strategyMode !== "manual-override-paper"/);
   assert.match(normalizer, /value\.executionEnabled !== false/);
   assert.match(normalizer, /value\.advisoryOnly !== true/);
-  assert.match(normalizer, /value\.model\.fixedStake !== PREDICTIVE_LEADER_SIGNAL_FIXED_STAKE/);
-  assert.match(normalizer, /value\.model\.grossPayoutMultiplier/);
-  assert.match(
-    normalizer,
-    /value\.betCount !== value\.settledCount \+ value\.pendingCount \+ value\.voidCount/,
-  );
-  assert.match(normalizer, /voided\.reason !== "integrity_gap"/);
-  assert.match(normalizer, /\(latestVoid !== null\) !== \(value\.voidCount > 0\)/);
-  assert.match(normalizer, /value\.settledCount !== value\.hitCount \+ value\.missCount/);
-  assert.match(normalizer, /value\.currentBalance !== value\.initialBalance/);
-  assert.match(normalizer, /value\.nextStake !== PREDICTIVE_LEADER_SIGNAL_FIXED_STAKE/);
-  assert.match(normalizer, /value\.hitRate - value\.hitCount \/ value\.settledCount/);
-  assert.match(normalizer, /\(value\.status === "pending"\) !== \(pendingBet !== null\)/);
-  assert.match(
-    normalizer,
-    /\(value\.status === "exhausted"\)[\s\S]*value\.pendingCount === 0 && !value\.canAffordNext/,
-  );
+  assert.match(normalizer, /value\.promotionEligible !== false/);
+  assert.match(normalizer, /campaign\.campaignKey !== PREDICTIVE_LEADER_V7_PAPER_CAMPAIGN_KEY/);
+  assert.match(normalizer, /pendingBet\.stake !== ladder\.nextStake/);
+  assert.match(normalizer, /ladder\.cycleStaked \+ pendingBet\.stake === model\.cycleSpendLimit/);
+  assert.match(normalizer, /stake !== pendingBet\.stake/);
 
-  const contextStart = app.indexOf("function currentPredictiveLeaderAccountContext()");
-  const contextEnd = app.indexOf("function renderPredictiveLeaderAccount", contextStart);
+  const contextStart = app.indexOf("function currentPredictiveV7PaperContext()");
+  const contextEnd = app.indexOf("function renderPredictiveV7PaperAccount", contextStart);
   const context = app.slice(contextStart, contextEnd);
   assert.ok(contextStart >= 0 && contextEnd > contextStart);
-  assert.match(context, /store\.predictiveLeaderSnapshot\?\.account/);
+  assert.match(context, /store\.predictiveV7PaperSnapshot/);
   assert.doesNotMatch(context, /store\.state|precloseForecast/);
-  assert.doesNotMatch(app, /normalizedPredictiveLeaderAccount\(snapshot\?\.account\)/);
-  assert.doesNotMatch(context, /currentCombinedNumberContext|predictiveLeaderMetrics|latestForecast/);
+  assert.doesNotMatch(context, /predictiveLeaderMetrics|latestForecast/);
 
-  const rendererStart = app.indexOf("function renderPredictiveLeaderAccount()");
+  const rendererStart = app.indexOf("function renderPredictiveV7PaperAccount()");
   const rendererEnd = app.indexOf("function currentPriceTrajectorySignals", rendererStart);
   const renderer = app.slice(rendererStart, rendererEnd);
   assert.ok(rendererStart >= 0 && rendererEnd > rendererStart);
-  assert.match(renderer, /context\.state !== "ready"/);
+  assert.match(renderer, /!snapshot\?\.account/);
   assert.match(renderer, /combinedPickAccountBalance, "—"/);
   assert.match(renderer, /account\.currentBalance/);
-  assert.match(renderer, /account\.hitCount/);
-  assert.match(renderer, /account\.missCount/);
-  assert.match(renderer, /trajectoryShadowShareFormatter\.format\(account\.hitRate\)/);
+  assert.match(renderer, /stats\.hitCount/);
+  assert.match(renderer, /stats\.missCount/);
+  assert.match(renderer, /ladder\.cycleStaked/);
+  assert.match(renderer, /model\.cycleSpendLimit/);
+  assert.match(renderer, /ladder\.cycleNumber/);
+  assert.match(renderer, /ladder\.resetCount/);
   assert.match(renderer, /account\.nextStake/);
-  assert.match(renderer, /account\.model\.fixedStake/);
-  assert.match(renderer, /без повышения/);
-  assert.match(renderer, /account\.latestVoid/);
-  assert.match(renderer, /account\.voidCount/);
-  assert.match(renderer, /Последний сигнал аннулирован из-за разрыва данных/);
-  assert.match(renderer, /аннулировано из-за разрыва/);
-  assert.match(renderer, /не вероятность/);
-  assert.doesNotMatch(renderer, /account\.ladder|ступень/);
-  assert.doesNotMatch(renderer, /вероятность следующего|улучшит|повысит шанс/);
+  assert.match(renderer, /pendingBet\?\.stake \?\? account\.nextStake/);
+  assert.match(renderer, /pendingBet\.rawStake/);
+  assert.match(renderer, /model\.grossPayoutMultiplier/);
+  assert.match(renderer, /ladder\.pendingReset === "cycle_spend_cap"/);
+  assert.match(renderer, /при MISS новый цикл со ставки/);
+  assert.match(renderer, /API сейчас WAIT/);
+  assert.doesNotMatch(renderer, /qualityGate|подтверждённым качеством|фиксированные/);
   assert.ok(
-    [...app.matchAll(/renderPredictiveLeaderAccount\(\)/g)].length >= 3,
+    [...app.matchAll(/renderPredictiveV7PaperAccount\(\)/g)].length >= 3,
     "account must render on normal and failed refresh paths",
+  );
+  assert.match(app, /function refreshPredictiveV7PaperAtCutoff\(\)/);
+  assert.match(app, /currentPredictiveV7PaperContext\(\)\.reason !== "betting_closed"/);
+  assert.match(app, /predictiveV7PaperCutoffRefreshActionId === snapshot\.actionId/);
+  assert.match(
+    app,
+    /window\.setInterval\(\(\) => \{[\s\S]*?renderPrecloseForecast\(\);[\s\S]*?refreshPredictiveV7PaperAtCutoff\(\);[\s\S]*?\}, 1_000\);/,
   );
 
   assert.match(styles, /\.combined-pick-account\s*\{[\s\S]*?grid-column: 1 \/ -1/);
@@ -1149,7 +1170,7 @@ test("warm next-round forecast exposes a strict 5-percent walk-forward contract"
   assert.match(html, /id="follower-dynamic-next-title"[^>]*>[^<]*≥5%/);
   assert.match(html, /id="follower-dynamic-next-note"[^>]*>[\s\S]*?5%/);
   assert.match(html, /styles\.css\?v=31/);
-  assert.match(html, /app\.js\?v=48/);
+  assert.match(html, /app\.js\?v=49/);
   assert.match(styles, /\.follower-dynamic-next\s*\{/);
   assert.match(styles, /\.follower-warm-current\s*\{/);
   assert.match(styles, /\.follower-warm-picks\s*\{/);
@@ -1397,7 +1418,7 @@ test("cycle comparison language is descriptive, responsive, and cache-busted", (
   assert.match(block, /не предсказывает следующее число/);
   assert.doesNotMatch(block, /должн/iu);
   assert.match(html, /href="\/styles\.css\?v=31"/);
-  assert.match(html, /src="\/app\.js\?v=48"/);
+  assert.match(html, /src="\/app\.js\?v=49"/);
   assert.match(styles, /\.cycle-sequence-list\s*\{[\s\S]*?repeat\(auto-fill, minmax\(50px, 1fr\)\)/);
   assert.match(
     styles,

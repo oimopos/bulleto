@@ -8,7 +8,7 @@
     <meta name="description" content="Онлайн-монитор результатов рулетки и циклов исключения чисел от 0 до 36">
     <title>Круг 37 — монитор результатов</title>
     <link rel="stylesheet" href="/styles.css?v=31">
-    <script type="module" src="/app.js?v=48"></script>
+    <script type="module" src="/app.js?v=49"></script>
   </head>
   <body>
     <a class="skip-link" href="#main-content">Перейти к содержимому</a>
@@ -46,12 +46,12 @@
         </div>
       </section>
 
-      <section class="panel combined-pick" id="combined-pick" data-state="loading" data-algorithm="learned-predictive-family-index-v5" aria-labelledby="combined-pick-title" aria-describedby="combined-pick-status combined-pick-note" aria-busy="true">
+      <section class="panel combined-pick" id="combined-pick" data-state="loading" data-algorithm="predictive-leader-v7-manual-override-paper-ladder-v2" aria-labelledby="combined-pick-title" aria-describedby="combined-pick-status combined-pick-note" aria-busy="true">
         <div class="combined-pick__copy">
-          <p class="eyebrow">Фильтр качества · явное решение WAIT / BET</p>
-          <p class="combined-pick__title" id="combined-pick-title">Кандидат и условная ставка</p>
-          <p class="combined-pick__status" id="combined-pick-status" role="status" aria-live="polite" aria-atomic="true">Загружаем решение, зафиксированное сервером до результата.</p>
-          <p class="combined-pick__note" id="combined-pick-note">Сервер заранее фиксирует кандидата из ценовой траектории и условной истории, но разрешает условную ставку только при одновременном подтверждении качества на скользящем окне: нижняя граница Wilson для Top‑1 должна быть выше точки безубыточности, а Brier — лучше равномерной модели. При WAIT кандидат остаётся только наблюдением, ставка не фиксируется. Текущий результат в проверку не попадает. Это виртуальная симуляция, не рекомендация и не гарантия преимущества; базовый шанс числа — 1 из 37 (≈2,7%).</p>
+          <p class="eyebrow">V7 manual override · virtual paper · WAIT / BET</p>
+          <p class="combined-pick__title" id="combined-pick-title">Сохранённая V7 paper-ставка</p>
+          <p class="combined-pick__status" id="combined-pick-status" role="status" aria-live="polite" aria-atomic="true">Загружаем сохранённое решение V7 paper-кампании.</p>
+          <p class="combined-pick__note" id="combined-pick-note">BET здесь только показывает уже записанную виртуальную ставку; интерфейс ничего не отправляет букмекеру. При WAIT сохранённый pending может оставаться видимым как аудит, но не как призыв повторить действие. Статистический quality gate ниже остаётся отдельной диагностикой и не управляет этой вручную разрешённой paper-кампанией. Это симуляция, не рекомендация и не гарантия преимущества; базовый шанс числа — 1 из 37 (≈2,7%).</p>
         </div>
         <div class="combined-pick__result">
           <span class="combined-pick__label" id="combined-pick-label">Решение · WAIT</span>
@@ -61,16 +61,16 @@
         <section class="combined-pick-account" id="combined-pick-account" data-state="loading" aria-labelledby="combined-pick-account-title" aria-describedby="combined-pick-account-note" aria-busy="true">
           <div class="combined-pick-account__header">
             <div>
-              <p class="eyebrow">Проспективная симуляция · только подтверждённые сигналы</p>
-              <h3 id="combined-pick-account-title">Виртуальный счёт фиксированных ставок</h3>
+              <p class="eyebrow">Отдельная durable-кампания · gate audit-only</p>
+              <h3 id="combined-pick-account-title">V7 paper-счёт recovery-лестницы</h3>
             </div>
             <span class="combined-pick-account__status" id="combined-pick-account-status" role="status" aria-live="polite" aria-atomic="true">Загрузка…</span>
           </div>
-          <dl class="combined-pick-account__metrics" aria-label="Показатели виртуального счёта единого лидера">
+          <dl class="combined-pick-account__metrics" aria-label="Показатели V7 paper-счёта recovery-лестницы">
             <div class="combined-pick-account__metric" id="combined-pick-account-balance-card">
               <dt>Текущий счёт</dt>
               <dd id="combined-pick-account-balance">—</dd>
-              <small id="combined-pick-account-profit">старт 1 000 · результат —</small>
+              <small id="combined-pick-account-profit">старт 10 000 · результат —</small>
             </div>
             <div class="combined-pick-account__metric">
               <dt>Попадания / промахи</dt>
@@ -78,17 +78,17 @@
               <small id="combined-pick-account-settled">завершено —</small>
             </div>
             <div class="combined-pick-account__metric">
-              <dt>Наблюдаемая частота попаданий</dt>
-              <dd id="combined-pick-account-rate">—</dd>
-              <small id="combined-pick-account-rate-detail">по завершённым · не вероятность; база 1/37 ≈2,7%</small>
+              <dt>Расход текущего цикла</dt>
+              <dd id="combined-pick-account-rate">— / 1 000</dd>
+              <small id="combined-pick-account-rate-detail">цикл — · промахов — · сбросов —</small>
             </div>
             <div class="combined-pick-account__metric">
-              <dt id="combined-pick-account-stake-label">Фиксированная ставка</dt>
+              <dt id="combined-pick-account-stake-label">Следующая ступень</dt>
               <dd id="combined-pick-account-stake">—</dd>
-              <small id="combined-pick-account-model">по 10 на подтверждённый сигнал · без повышения</small>
+              <small id="combined-pick-account-model">динамическая recovery-лестница · gross ×36</small>
             </div>
           </dl>
-          <p class="combined-pick-account__note" id="combined-pick-account-note">Счёт начинается с 1 000. Только при решении BET фиксируется ровно 10 условных единиц; после промаха сумма не повышается. Валовая выплата ×36 включает возврат. При WAIT кандидат не затрагивает счёт. Частота — прошлое наблюдение, не вероятность следующего результата. Это виртуальная («бумажная») симуляция; реальных ставок и действий нет.</p>
+          <p class="combined-pick-account__note" id="combined-pick-account-note">Счёт начинается с 10 000. Ступень стартует с 10 и динамически покрывает накопленный расход чистой выплатой ×35; валовая выплата ×36 включает возврат. Расход цикла ограничен 1 000: финальная ступень уменьшается до остатка, затем курсор сбрасывается. Попадание и подтверждённый gap также начинают новый цикл, не обнуляя баланс и lifetime-статистику. Это только virtual paper ledger; реальных ставок, автопополнения и автоматического promotion нет.</p>
         </section>
       </section>
 

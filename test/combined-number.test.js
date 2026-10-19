@@ -13,10 +13,12 @@ import {
   combinedVirtualRecencySources,
   combineNumberRankings,
   normalizePredictiveLeaderApiSnapshot,
+  normalizePredictiveLeaderV7PaperApiSnapshot,
   normalizePredictiveShadowGateProgress,
   PREDICTIVE_LEADER_API_ALGORITHM_VERSION,
   PREDICTIVE_LEADER_API_SCHEMA_VERSION,
   predictiveLeaderNumberContext,
+  predictiveLeaderV7PaperContext,
   TRAJECTORY_RANK37_BASIS,
   TRAJECTORY_RANK37_EVIDENCE_MASS_THRESHOLD,
   TRAJECTORY_RANK37_VERSION,
@@ -223,6 +225,111 @@ function predictiveLeaderApiSnapshot() {
       persistencePendingResults: 0,
       persistencePendingGaps: 0,
       integrityOk: true,
+    },
+  };
+}
+
+function predictiveLeaderV7PaperApiSnapshot() {
+  const model = {
+    kind: "loss-recovery-ladder",
+    initialBalance: 10_000,
+    initialStake: 10,
+    stakeStep: 10,
+    maxStake: 2_500,
+    cycleSpendLimit: 1_000,
+    resetPolicy: "clamp-final-stake-reset-at-cycle-cap-v1",
+    grossPayoutMultiplier: 36,
+    payoutIncludesStake: true,
+  };
+  return {
+    schemaVersion: 2,
+    strategyVersion: "predictive-leader-v7-manual-override-paper-ladder-v2",
+    algorithmVersion: "learned-predictive-exact-calibrated-v7-shadow",
+    mode: "simulation",
+    strategyMode: "manual-override-paper",
+    executionEnabled: false,
+    advisoryOnly: true,
+    promotionEligible: false,
+    promotionPolicy: "manual-override-paper-not-promoted",
+    manualOverride: {
+      authorized: true,
+      reason: "operator-requested-virtual-api-2026-10-19",
+      qualityGateRequired: false,
+      automaticPromotionEnabled: false,
+    },
+    source: "buleto",
+    instrument: "default",
+    serverTime: "2026-10-19T02:00:22.000Z",
+    campaign: {
+      schemaVersion: 2,
+      strategyVersion: "predictive-leader-v7-manual-override-paper-ladder-v2",
+      campaignKey: "v7-manual-override-paper-ladder-20261019",
+      candidateId: "v7-candidate",
+      model,
+      promotionEligible: false,
+      promotionPolicy: "manual-override-paper-not-promoted",
+    },
+    status: "ready",
+    reason: "ready",
+    action: "BET",
+    actionId: "v7-paper-bet:41",
+    number: 7,
+    stake: 20,
+    candidateNumber: 7,
+    account: {
+      status: "pending",
+      reason: "bet_frozen",
+      initialBalance: 10_000,
+      currentBalance: 9_620,
+      deficit: 0,
+      accountingBalance: 9_620,
+      availableBalance: 9_620,
+      reservedStake: 20,
+      profit: -380,
+      nextStake: 20,
+      canAffordNext: false,
+      shortfall: 0,
+      ledgerRevision: 37,
+    },
+    stats: {
+      betCount: 37,
+      settledCount: 36,
+      pendingCount: 1,
+      voidCount: 0,
+      hitCount: 0,
+      missCount: 36,
+      hitRate: 0,
+      totalStaked: 380,
+      totalGrossPayout: 0,
+      peakBalance: 10_000,
+      minimumBalance: 9_620,
+      maximumDrawdown: 380,
+      continuityGapCount: 0,
+    },
+    ladder: {
+      cycleNumber: 1,
+      cycleStaked: 360,
+      ladderLoss: 360,
+      missCount: 36,
+      resetCount: 0,
+      nextStake: 20,
+      pendingReset: null,
+    },
+    pendingBet: {
+      id: 41,
+      forecastId: 1_001,
+      roundId: "101",
+      targetNumber: 7,
+      stake: 20,
+      rawStake: 20,
+      balanceBefore: 9_640,
+      cycleNumber: 1,
+      cycleStakedBefore: 360,
+      ladderLossBefore: 360,
+      missCountBefore: 36,
+      lockedAt: "2026-10-19T02:00:20.000Z",
+      bettingClosesAt: "2026-10-19T02:00:28.000Z",
+      placedAt: "2026-10-19T02:00:21.000Z",
     },
   };
 }
@@ -496,6 +603,216 @@ test("predictive leader SSE stale flag immediately hides a cached number", () =>
     requiresFreshSnapshot: true,
     snapshot: ready,
   }), { state: "paused", reason: "event_stream_disconnected" });
+});
+
+test("V7 paper browser contract exposes the persisted dynamic stake and 10k ladder", () => {
+  const normalized = normalizePredictiveLeaderV7PaperApiSnapshot(
+    predictiveLeaderV7PaperApiSnapshot(),
+  );
+
+  assert.equal(normalized?.schemaVersion, 2);
+  assert.equal(normalized?.strategyMode, "manual-override-paper");
+  assert.equal(normalized?.executionEnabled, false);
+  assert.equal(normalized?.campaign.model.initialBalance, 10_000);
+  assert.equal(normalized?.campaign.model.cycleSpendLimit, 1_000);
+  assert.equal(normalized?.account.currentBalance, 9_620);
+  assert.equal(normalized?.ladder.cycleNumber, 1);
+  assert.equal(normalized?.ladder.cycleStaked, 360);
+  assert.equal(normalized?.pendingBet.stake, 20);
+  assert.equal(normalized?.stake, normalized?.pendingBet.stake);
+  assert.deepEqual(predictiveLeaderV7PaperContext({
+    loaded: true,
+    snapshot: normalized,
+  }), {
+    state: "ready",
+    snapshot: normalized,
+  });
+});
+
+test("V7 paper WAIT keeps pending audit visible but never exposes an action stake", () => {
+  const payload = predictiveLeaderV7PaperApiSnapshot();
+  Object.assign(payload, {
+    status: "waiting",
+    reason: "betting_closed",
+    action: "WAIT",
+    actionId: null,
+    number: null,
+    stake: null,
+  });
+  const normalized = normalizePredictiveLeaderV7PaperApiSnapshot(payload);
+
+  assert.equal(normalized?.action, "WAIT");
+  assert.equal(normalized?.stake, null);
+  assert.equal(normalized?.pendingBet.stake, 20);
+  assert.deepEqual(predictiveLeaderV7PaperContext({
+    loaded: true,
+    snapshot: normalized,
+  }), {
+    state: "waiting",
+    reason: "betting_closed",
+    snapshot: normalized,
+  });
+  assert.deepEqual(predictiveLeaderV7PaperContext({
+    loaded: true,
+    requiresFreshSnapshot: true,
+    snapshot: normalized,
+  }), { state: "paused", reason: "event_stream_disconnected" });
+});
+
+test("V7 paper BET expires locally at the exact betting cutoff", () => {
+  const payload = predictiveLeaderV7PaperApiSnapshot();
+  const normalized = normalizePredictiveLeaderV7PaperApiSnapshot(payload);
+  const closesMs = Date.parse(payload.pendingBet.bettingClosesAt);
+
+  assert.equal(predictiveLeaderV7PaperContext({
+    loaded: true,
+    snapshot: normalized,
+    nowMs: closesMs - 1,
+  }).state, "ready");
+  assert.deepEqual(predictiveLeaderV7PaperContext({
+    loaded: true,
+    snapshot: normalized,
+    nowMs: closesMs,
+  }), {
+    state: "waiting",
+    reason: "betting_closed",
+    snapshot: normalized,
+  });
+
+  payload.serverTime = payload.pendingBet.bettingClosesAt;
+  assert.equal(normalizePredictiveLeaderV7PaperApiSnapshot(payload), null);
+});
+
+test("V7 paper browser contract preserves the clamped final stake at the cycle cap", () => {
+  const payload = predictiveLeaderV7PaperApiSnapshot();
+  Object.assign(payload, { stake: 10 });
+  Object.assign(payload.account, {
+    currentBalance: 9_000,
+    accountingBalance: 9_000,
+    availableBalance: 9_000,
+    reservedStake: 10,
+    profit: -1_000,
+    nextStake: 10,
+    ledgerRevision: 100,
+  });
+  Object.assign(payload.stats, {
+    betCount: 100,
+    settledCount: 99,
+    pendingCount: 1,
+    hitCount: 0,
+    missCount: 99,
+    hitRate: 0,
+    totalStaked: 1_000,
+    minimumBalance: 9_000,
+    maximumDrawdown: 1_000,
+  });
+  Object.assign(payload.ladder, {
+    cycleStaked: 990,
+    ladderLoss: 990,
+    missCount: 99,
+    nextStake: 10,
+    pendingReset: "cycle_spend_cap",
+  });
+  Object.assign(payload.pendingBet, {
+    stake: 10,
+    rawStake: 30,
+    balanceBefore: 9_010,
+    cycleStakedBefore: 990,
+    ladderLossBefore: 990,
+    missCountBefore: 99,
+  });
+
+  const normalized = normalizePredictiveLeaderV7PaperApiSnapshot(payload);
+  assert.equal(normalized?.pendingBet.rawStake, 30);
+  assert.equal(normalized?.pendingBet.stake, 10);
+  assert.equal(normalized?.ladder.pendingReset, "cycle_spend_cap");
+  assert.equal(normalized?.ladder.cycleStaked + normalized?.pendingBet.stake, 1_000);
+});
+
+test("V7 paper browser contract preserves a signed audit minimum after a late void deficit", () => {
+  const payload = predictiveLeaderV7PaperApiSnapshot();
+  Object.assign(payload, {
+    status: "waiting",
+    reason: "bankroll_exhausted",
+    action: "WAIT",
+    actionId: null,
+    number: null,
+    stake: null,
+  });
+  Object.assign(payload.account, {
+    status: "exhausted",
+    reason: "bankroll_exhausted",
+    currentBalance: 0,
+    deficit: 10,
+    accountingBalance: -10,
+    availableBalance: 0,
+    reservedStake: 0,
+    profit: -10_010,
+    nextStake: 10,
+    canAffordNext: false,
+    shortfall: 20,
+    ledgerRevision: 1_002,
+  });
+  Object.assign(payload.stats, {
+    betCount: 1_001,
+    settledCount: 1_001,
+    pendingCount: 0,
+    hitCount: 0,
+    missCount: 1_001,
+    hitRate: 0,
+    totalStaked: 10_010,
+    minimumBalance: -10,
+    maximumDrawdown: 10_010,
+  });
+  Object.assign(payload.ladder, {
+    cycleNumber: 2,
+    cycleStaked: 10,
+    ladderLoss: 10,
+    missCount: 1,
+    resetCount: 1,
+    nextStake: 10,
+    pendingReset: null,
+  });
+  payload.pendingBet = null;
+
+  const normalized = normalizePredictiveLeaderV7PaperApiSnapshot(payload);
+  assert.equal(normalized?.account.status, "exhausted");
+  assert.equal(normalized?.account.deficit, 10);
+  assert.equal(normalized?.account.accountingBalance, -10);
+  assert.equal(normalized?.stats.minimumBalance, -10);
+  assert.deepEqual(predictiveLeaderV7PaperContext({
+    loaded: true,
+    snapshot: normalized,
+  }), {
+    state: "waiting",
+    reason: "bankroll_exhausted",
+    snapshot: normalized,
+  });
+});
+
+test("V7 paper browser contract fails closed on unsafe or inconsistent ladder state", () => {
+  for (const mutate of [
+    (value) => { value.schemaVersion = 1; },
+    (value) => { value.executionEnabled = true; },
+    (value) => { value.manualOverride.qualityGateRequired = true; },
+    (value) => { value.campaign.model.initialBalance = 1_000; },
+    (value) => { value.campaign.model.cycleSpendLimit = 10_000; },
+    (value) => { value.ladder.nextStake = 10; },
+    (value) => { value.account.currentBalance = 10_000; },
+    (value) => { value.pendingBet.stake = 30; },
+    (value) => { value.stake = 30; },
+    (value) => {
+      value.action = "WAIT";
+      value.status = "waiting";
+      value.reason = "betting_closed";
+      value.actionId = null;
+      value.number = null;
+    },
+  ]) {
+    const malformed = predictiveLeaderV7PaperApiSnapshot();
+    mutate(malformed);
+    assert.equal(normalizePredictiveLeaderV7PaperApiSnapshot(malformed), null);
+  }
 });
 
 test("combined freshness pauses on collector or persistence backlog", () => {
