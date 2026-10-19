@@ -25,7 +25,7 @@ function bankForApi(testBank) {
   };
 }
 
-function activeSessionForApi(session, threshold, bank) {
+function activeSessionForApi(session, threshold, stopThreshold, bank) {
   if (!session) return null;
 
   const nextStake = session.nextStake;
@@ -45,6 +45,12 @@ function activeSessionForApi(session, threshold, bank) {
     targetNumber: session.targetNumber,
     triggerProgress: session.triggerRoundsMissed,
     threshold,
+    stopThreshold,
+    attemptBudget: session.attemptBudget ?? null,
+    remainingAttempts:
+      session.attemptBudget == null
+        ? null
+        : Math.max(0, session.attemptBudget - session.attemptCount),
     attemptCount: session.attemptCount,
     nextAttemptNumber: session.attemptCount + 1,
     missCount: session.missCount,
@@ -139,6 +145,7 @@ export function virtualBettorSnapshotForApi({
   const activeSession = activeSessionForApi(
     state.activeSession,
     state.triggerThreshold,
+    state.stopThreshold ?? null,
     bank,
   );
   const betting = virtualBettingForApi(collectorState, state.status, now);
@@ -147,6 +154,10 @@ export function virtualBettorSnapshotForApi({
     mode: state.mode,
     executionEnabled: state.executionEnabled,
     status: state.status,
+    strategyKey: state.strategyKey ?? null,
+    modelVersion: state.modelVersion ?? state.model?.modelVersion ?? null,
+    triggerThreshold: state.triggerThreshold ?? null,
+    stopThreshold: state.stopThreshold ?? null,
     currentBalance: bank.currentBalance,
     profit: bank.profit,
     bank,

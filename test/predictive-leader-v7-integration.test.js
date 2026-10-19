@@ -104,7 +104,7 @@ test("v31 freezes the production v7 config and export provenance in new tables",
     predictiveLeaderLegacyAccountEnabled: false,
   });
   try {
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 32);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 33);
     const cohort = database.sqlite.prepare(`
       SELECT * FROM predictive_leader_v7_cohorts
     `).get();

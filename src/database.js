@@ -12,6 +12,13 @@ import {
   settleVirtualBet,
 } from "./virtual-bettor.js";
 import {
+  VIRTUAL_WINDOW_BET_MODEL,
+  settleVirtualWindowBet,
+  virtualWindowAttemptBudget,
+  virtualWindowCandidateEligible,
+  virtualWindowStake,
+} from "./virtual-window-bettor.js";
+import {
   FORECAST_CONSENSUS_BORDA_ALGORITHM_VERSION,
   FORECAST_CONSENSUS_MODEL_AUTHORITATIVE_ALGORITHM_VERSION,
   combineFrozenTop3,
@@ -118,6 +125,8 @@ import {
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 500;
 const DEFAULT_VIRTUAL_STARTING_BALANCE = 87_700;
+const DEFAULT_VIRTUAL_WINDOW_STARTING_BALANCE =
+  VIRTUAL_WINDOW_BET_MODEL.initialBalance;
 const ROUND_TRAJECTORY_SCHEMA_VERSION = 1;
 const TRAJECTORY_SHADOW_SCHEMA_VERSION = 1;
 const TRAJECTORY_SHADOW_CANDIDATE_LIMIT = 500;
@@ -5161,6 +5170,8 @@ function mapVirtualBetSession(row) {
           ? "integrity_gap"
           : null),
     triggerRoundsMissed: Number(row.trigger_rounds_missed),
+    attemptBudget:
+      row.attempt_budget == null ? null : Number(row.attempt_budget),
     activatedAfterResultId: Number(row.activated_after_result_id),
     attemptCount: Number(row.attempt_count),
     missCount: Number(row.miss_count),
@@ -5233,6 +5244,7 @@ export class RouletteDatabase {
     logger = null,
     gapThresholdSeconds = 135,
     virtualStartingBalance = DEFAULT_VIRTUAL_STARTING_BALANCE,
+    virtualWindowStartingBalance = DEFAULT_VIRTUAL_WINDOW_STARTING_BALANCE,
     predictiveLeaderLegacyAccountEnabled = true,
     clock = () => new Date(),
   } = {}) {
@@ -5252,6 +5264,9 @@ export class RouletteDatabase {
     this.virtualStartingBalance = normalizedVirtualStartingBalance(
       virtualStartingBalance,
     );
+    this.virtualWindowStartingBalance = normalizedVirtualStartingBalance(
+      virtualWindowStartingBalance,
+    );
     this.predictiveLeaderLegacyAccountEnabled =
       predictiveLeaderLegacyAccountEnabled;
     this.followerTop5HitCurveCache = new Map();
@@ -5268,9 +5283,9 @@ export class RouletteDatabase {
       const existingSchemaVersion = Number(
         this.sqlite.prepare("PRAGMA user_version").get().user_version,
       );
-      if (!Number.isSafeInteger(existingSchemaVersion) || existingSchemaVersion > 32) {
+      if (!Number.isSafeInteger(existingSchemaVersion) || existingSchemaVersion > 33) {
         throw new Error(
-          `database schema version ${existingSchemaVersion} is newer than supported version 32`,
+          `database schema version ${existingSchemaVersion} is newer than supported version 33`,
         );
       }
       this.sqlite.function(
@@ -5472,9 +5487,9 @@ export class RouletteDatabase {
     const startingVersion = Number(
       this.sqlite.prepare("PRAGMA user_version").get().user_version,
     );
-    if (!Number.isSafeInteger(startingVersion) || startingVersion > 32) {
+    if (!Number.isSafeInteger(startingVersion) || startingVersion > 33) {
       throw new Error(
-        `database schema version ${startingVersion} is newer than supported version 32`,
+        `database schema version ${startingVersion} is newer than supported version 33`,
       );
     }
     this.sqlite.exec(`
@@ -5793,6 +5808,7 @@ export class RouletteDatabase {
     this.#migratePredictiveLeaderV7PaperCampaignV30(startingVersion);
     this.#migratePredictiveLeaderV7PaperLadderCampaignV31(startingVersion);
     this.#migratePredictiveLeaderWarmTop1PaperCampaignV32(startingVersion);
+    this.#migrateVirtualWindowBettorV33(startingVersion);
   }
 
   #migratePrecloseForecastsV10() {
@@ -9900,6 +9916,100 @@ export class RouletteDatabase {
     }
   }
 
+  #migrateVirtualWindowBettorV33(startingVersion) {
+    this.sqlite.exec("BEGIN IMMEDIATE");
+    try {
+      this.sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS virtual_window_bettor_bankrolls (
+          source TEXT NOT NULL,
+          instrument TEXT NOT NULL,
+          status TEXT NOT NULL CHECK (status IN ('running', 'exhausted')),
+          initial_balance INTEGER NOT NULL CHECK (initial_balance = ${this.virtualWindowStartingBalance}),
+          current_balance INTEGER NOT NULL CHECK (current_balance >= 0),
+          next_stake INTEGER CHECK (next_stake IS NULL OR next_stake > 0),
+          started_at TEXT NOT NULL,
+          exhausted_at TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY (source, instrument),
+          CHECK (
+            (status = 'running' AND exhausted_at IS NULL AND next_stake IS NULL)
+            OR
+            (status = 'exhausted' AND exhausted_at IS NOT NULL AND next_stake IS NOT NULL)
+          )
+        );
+
+        CREATE TABLE IF NOT EXISTS virtual_window_bet_sessions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          source TEXT NOT NULL,
+          instrument TEXT NOT NULL,
+          continuity_epoch INTEGER NOT NULL CHECK (continuity_epoch >= 0),
+          target_number INTEGER NOT NULL CHECK (target_number BETWEEN 0 AND 36),
+          status TEXT NOT NULL CHECK (status IN ('armed', 'active', 'completed', 'invalid_gap')),
+          trigger_rounds_missed INTEGER NOT NULL CHECK (trigger_rounds_missed BETWEEN 150 AND 199),
+          attempt_budget INTEGER NOT NULL CHECK (attempt_budget BETWEEN 1 AND 50),
+          activated_after_result_id INTEGER NOT NULL REFERENCES round_results(id),
+          model_version TEXT NOT NULL CHECK (model_version = '${VIRTUAL_WINDOW_BET_MODEL.modelVersion}'),
+          initial_stake INTEGER NOT NULL CHECK (initial_stake = ${VIRTUAL_WINDOW_BET_MODEL.initialStake}),
+          stake_step INTEGER NOT NULL CHECK (stake_step = ${VIRTUAL_WINDOW_BET_MODEL.stakeStep}),
+          max_stake INTEGER NOT NULL CHECK (max_stake = ${VIRTUAL_WINDOW_BET_MODEL.maxStake}),
+          gross_payout_multiplier INTEGER NOT NULL CHECK (gross_payout_multiplier = ${VIRTUAL_WINDOW_BET_MODEL.grossPayoutMultiplier}),
+          payout_includes_stake INTEGER NOT NULL CHECK (payout_includes_stake = 1),
+          attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+          miss_count INTEGER NOT NULL DEFAULT 0 CHECK (miss_count >= 0),
+          total_staked INTEGER NOT NULL DEFAULT 0 CHECK (total_staked >= 0),
+          next_stake INTEGER CHECK (next_stake IS NULL OR next_stake > 0),
+          last_bet_result_id INTEGER REFERENCES round_results(id),
+          completed_result_id INTEGER REFERENCES round_results(id),
+          gross_payout INTEGER NOT NULL DEFAULT 0 CHECK (gross_payout >= 0),
+          net_result INTEGER,
+          end_reason TEXT CHECK (end_reason IS NULL OR end_reason IN ('hit', 'window_expired', 'integrity_gap', 'bankroll_exhausted')),
+          armed_at TEXT NOT NULL,
+          last_event_at TEXT NOT NULL,
+          completed_at TEXT,
+          created_at TEXT NOT NULL,
+          CHECK (
+            (status IN ('armed', 'active') AND completed_at IS NULL AND next_stake IS NOT NULL AND end_reason IS NULL)
+            OR
+            (status IN ('completed', 'invalid_gap') AND completed_at IS NOT NULL AND next_stake IS NULL AND end_reason IS NOT NULL)
+          )
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS virtual_window_bettor_one_live_stream_idx
+          ON virtual_window_bet_sessions(source, instrument)
+          WHERE status IN ('armed', 'active');
+        CREATE INDEX IF NOT EXISTS virtual_window_bettor_session_history_idx
+          ON virtual_window_bet_sessions(source, instrument, id DESC);
+
+        CREATE TABLE IF NOT EXISTS virtual_window_bets (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          session_id INTEGER NOT NULL REFERENCES virtual_window_bet_sessions(id) ON DELETE CASCADE,
+          round_result_id INTEGER NOT NULL UNIQUE REFERENCES round_results(id),
+          attempt_number INTEGER NOT NULL CHECK (attempt_number > 0),
+          stake INTEGER NOT NULL CHECK (stake > 0),
+          result_number INTEGER NOT NULL CHECK (result_number BETWEEN 0 AND 36),
+          outcome TEXT NOT NULL CHECK (outcome IN ('miss', 'hit')),
+          gross_payout INTEGER NOT NULL CHECK (gross_payout >= 0),
+          total_staked_after INTEGER NOT NULL CHECK (total_staked_after > 0),
+          net_after INTEGER NOT NULL,
+          next_stake_after INTEGER CHECK (next_stake_after IS NULL OR next_stake_after > 0),
+          recovery_possible INTEGER NOT NULL CHECK (recovery_possible IN (0, 1)),
+          occurred_at TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          UNIQUE(session_id, attempt_number)
+        );
+        CREATE INDEX IF NOT EXISTS virtual_window_bets_session_idx
+          ON virtual_window_bets(session_id, attempt_number);
+
+        PRAGMA user_version = ${Math.max(33, startingVersion)};
+        COMMIT;
+      `);
+    } catch (error) {
+      try { this.sqlite.exec("ROLLBACK"); } catch { /* preserve migration error */ }
+      throw error;
+    }
+  }
+
   #migrateContinuityReconciliationV9() {
     this.sqlite.exec("BEGIN IMMEDIATE");
     try {
@@ -10725,6 +10835,8 @@ export class RouletteDatabase {
     instrument,
     continuityEpoch,
     excludeResultId = null,
+    triggerThreshold = VIRTUAL_BET_MODEL.triggerThreshold,
+    maxTriggerThreshold = null,
   ) {
     const rows = this.sqlite
       .prepare(`
@@ -10798,11 +10910,17 @@ export class RouletteDatabase {
         lastPosition:
           row.last_position === null ? null : Number(row.last_position),
         continuityEpoch,
-        eligible: roundsSinceLast >= VIRTUAL_BET_MODEL.triggerThreshold,
+        eligible: roundsSinceLast >= triggerThreshold,
       };
     });
-    const longestRounds = candidates[0].roundsSinceLast;
-    return candidates.filter(({ roundsSinceLast }) => (
+    const eligibleCandidates = maxTriggerThreshold === null
+      ? candidates
+      : candidates.filter(({ roundsSinceLast }) => (
+          roundsSinceLast < maxTriggerThreshold
+        ));
+    if (eligibleCandidates.length === 0) return [];
+    const longestRounds = eligibleCandidates[0].roundsSinceLast;
+    return eligibleCandidates.filter(({ roundsSinceLast }) => (
       roundsSinceLast === longestRounds
     ));
   }
@@ -10819,6 +10937,283 @@ export class RouletteDatabase {
       continuityEpoch,
       excludeResultId,
     )[0] ?? null;
+  }
+
+  #virtualWindowBankrollRow(source, instrument) {
+    return this.sqlite
+      .prepare(`
+        SELECT *
+        FROM virtual_window_bettor_bankrolls
+        WHERE source = ? AND instrument = ?
+      `)
+      .get(source, instrument);
+  }
+
+  #ensureVirtualWindowBankrollInTransaction(source, instrument, now) {
+    const existing = this.#virtualWindowBankrollRow(source, instrument);
+    if (existing) return existing;
+    const history = this.sqlite
+      .prepare(`
+        SELECT
+          COALESCE(SUM(bets.gross_payout - bets.stake), 0) AS net_result,
+          MIN(sessions.created_at) AS first_session_at
+        FROM virtual_window_bet_sessions AS sessions
+        LEFT JOIN virtual_window_bets AS bets ON bets.session_id = sessions.id
+        WHERE sessions.source = ? AND sessions.instrument = ?
+      `)
+      .get(source, instrument);
+    const currentBalance = clampedSafeBalance(
+      this.virtualWindowStartingBalance + Number(history.net_result),
+    );
+    const startedAt = history.first_session_at ?? now;
+    this.sqlite
+      .prepare(`
+        INSERT INTO virtual_window_bettor_bankrolls (
+          source, instrument, status, initial_balance, current_balance,
+          next_stake, started_at, exhausted_at, created_at, updated_at
+        ) VALUES (?, ?, 'running', ?, ?, NULL, ?, NULL, ?, ?)
+        ON CONFLICT(source, instrument) DO NOTHING
+      `)
+      .run(
+        source,
+        instrument,
+        this.virtualWindowStartingBalance,
+        currentBalance,
+        startedAt,
+        now,
+        now,
+      );
+    return this.#virtualWindowBankrollRow(source, instrument);
+  }
+
+  #liveVirtualWindowSessionRow(source, instrument) {
+    return this.sqlite
+      .prepare(`
+        SELECT sessions.*,
+          (
+            SELECT MIN(bets.occurred_at)
+            FROM virtual_window_bets AS bets
+            WHERE bets.session_id = sessions.id
+          ) AS started_at
+        FROM virtual_window_bet_sessions AS sessions
+        WHERE sessions.source = ? AND sessions.instrument = ?
+          AND sessions.status IN ('armed', 'active')
+        LIMIT 1
+      `)
+      .get(source, instrument);
+  }
+
+  #armVirtualWindowBettorInTransaction(
+    source,
+    instrument,
+    now,
+    { excludeResultId = null } = {},
+  ) {
+    const bankroll = this.#ensureVirtualWindowBankrollInTransaction(
+      source,
+      instrument,
+      now,
+    );
+    if (bankroll.status === 'exhausted') return null;
+    const live = this.#liveVirtualWindowSessionRow(source, instrument);
+    if (live) return live;
+    const continuityEpoch = this.#continuityEpoch(source, instrument);
+    const boundary = this.#latestResultInEpoch(
+      source,
+      instrument,
+      continuityEpoch,
+      excludeResultId,
+    );
+    if (!boundary) return null;
+    const candidate = this.#longestVirtualCandidates(
+      source,
+      instrument,
+      continuityEpoch,
+      excludeResultId,
+      VIRTUAL_WINDOW_BET_MODEL.triggerThreshold,
+      VIRTUAL_WINDOW_BET_MODEL.stopThreshold,
+    )[0];
+    if (!candidate?.eligible || candidate.roundsSinceLast >= VIRTUAL_WINDOW_BET_MODEL.stopThreshold) {
+      return null;
+    }
+    const attemptBudget = virtualWindowAttemptBudget(candidate.roundsSinceLast);
+    const initialStake = virtualWindowStake(0);
+    if (initialStake > Number(bankroll.current_balance)) {
+      this.sqlite.prepare(`
+        UPDATE virtual_window_bettor_bankrolls
+        SET status = 'exhausted', next_stake = ?, exhausted_at = ?, updated_at = ?
+        WHERE source = ? AND instrument = ? AND status = 'running'
+      `).run(initialStake, boundary.settled_at, boundary.settled_at, source, instrument);
+      return null;
+    }
+    const insertion = this.sqlite.prepare(`
+      INSERT INTO virtual_window_bet_sessions (
+        source, instrument, continuity_epoch, target_number, status,
+        trigger_rounds_missed, attempt_budget, activated_after_result_id,
+        model_version, initial_stake, stake_step, max_stake,
+        gross_payout_multiplier, payout_includes_stake, attempt_count,
+        miss_count, total_staked, next_stake, armed_at, last_event_at, created_at
+      ) VALUES (?, ?, ?, ?, 'armed', ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 0, 0, ?, ?, ?, ?)
+    `).run(
+      source,
+      instrument,
+      continuityEpoch,
+      candidate.number,
+      candidate.roundsSinceLast,
+      attemptBudget,
+      Number(boundary.id),
+      VIRTUAL_WINDOW_BET_MODEL.modelVersion,
+      VIRTUAL_WINDOW_BET_MODEL.initialStake,
+      VIRTUAL_WINDOW_BET_MODEL.stakeStep,
+      VIRTUAL_WINDOW_BET_MODEL.maxStake,
+      VIRTUAL_WINDOW_BET_MODEL.grossPayoutMultiplier,
+      initialStake,
+      boundary.settled_at,
+      boundary.settled_at,
+      now,
+    );
+    return this.sqlite
+      .prepare('SELECT * FROM virtual_window_bet_sessions WHERE id = ?')
+      .get(Number(insertion.lastInsertRowid));
+  }
+
+  #settleVirtualWindowBettorInTransaction(resultRow, now) {
+    const live = this.#liveVirtualWindowSessionRow(
+      resultRow.source,
+      resultRow.instrument,
+    );
+    if (
+      !live
+      || Number(live.continuity_epoch) !== Number(resultRow.continuity_epoch)
+      || Number(live.activated_after_result_id) === Number(resultRow.id)
+    ) return null;
+    const bankroll = this.#ensureVirtualWindowBankrollInTransaction(
+      resultRow.source,
+      resultRow.instrument,
+      now,
+    );
+    if (bankroll.status === 'exhausted') return null;
+    const stake = Number(live.next_stake);
+    if (stake > Number(bankroll.current_balance)) return null;
+    const settlement = settleVirtualWindowBet({
+      targetNumber: Number(live.target_number),
+      resultNumber: Number(resultRow.result_number),
+      stake,
+      priorTotalStaked: Number(live.total_staked),
+    });
+    const attemptNumber = Number(live.attempt_count) + 1;
+    this.sqlite.prepare(`
+      INSERT INTO virtual_window_bets (
+        session_id, round_result_id, attempt_number, stake, result_number,
+        outcome, gross_payout, total_staked_after, net_after, next_stake_after,
+        recovery_possible, occurred_at, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      Number(live.id),
+      Number(resultRow.id),
+      attemptNumber,
+      stake,
+      Number(resultRow.result_number),
+      settlement.outcome,
+      settlement.grossPayout,
+      settlement.totalStaked,
+      settlement.netResult,
+      settlement.nextStake,
+      settlement.recoveryPossible ? 1 : 0,
+      resultRow.settled_at,
+      now,
+    );
+    const currentBalance = clampedSafeBalance(
+      Number(bankroll.current_balance) - stake + settlement.grossPayout,
+    );
+    const expired = settlement.outcome === 'miss'
+      && attemptNumber >= Number(live.attempt_budget);
+    const bankrollExhausted = settlement.outcome === 'miss'
+      && settlement.nextStake > currentBalance;
+    const completed = settlement.outcome === 'hit' || expired || bankrollExhausted;
+    this.sqlite.prepare(`
+      UPDATE virtual_window_bettor_bankrolls
+      SET status = ?, current_balance = ?, next_stake = ?, exhausted_at = ?, updated_at = ?
+      WHERE source = ? AND instrument = ? AND status = 'running'
+    `).run(
+      bankrollExhausted ? 'exhausted' : 'running',
+      currentBalance,
+      bankrollExhausted ? settlement.nextStake : null,
+      bankrollExhausted ? resultRow.settled_at : null,
+      resultRow.settled_at,
+      resultRow.source,
+      resultRow.instrument,
+    );
+    const endReason = settlement.outcome === 'hit'
+      ? 'hit'
+      : bankrollExhausted
+        ? 'bankroll_exhausted'
+        : expired
+          ? 'window_expired'
+          : null;
+    if (completed) {
+      this.sqlite.prepare(`
+        UPDATE virtual_window_bet_sessions
+        SET status = 'completed', end_reason = ?, attempt_count = ?,
+          miss_count = miss_count + ?, total_staked = ?, next_stake = NULL,
+          last_bet_result_id = ?, completed_result_id = ?, gross_payout = ?,
+          net_result = ?, last_event_at = ?, completed_at = ?
+        WHERE id = ? AND status IN ('armed', 'active')
+      `).run(
+        endReason,
+        attemptNumber,
+        settlement.outcome === 'miss' ? 1 : 0,
+        settlement.totalStaked,
+        Number(resultRow.id),
+        Number(resultRow.id),
+        settlement.grossPayout,
+        settlement.netResult,
+        resultRow.settled_at,
+        resultRow.settled_at,
+        Number(live.id),
+      );
+    } else {
+      this.sqlite.prepare(`
+        UPDATE virtual_window_bet_sessions
+        SET status = 'active', attempt_count = ?, miss_count = miss_count + 1,
+          total_staked = ?, next_stake = ?, last_bet_result_id = ?,
+          net_result = ?, last_event_at = ?
+        WHERE id = ? AND status IN ('armed', 'active')
+      `).run(
+        attemptNumber,
+        settlement.totalStaked,
+        settlement.nextStake,
+        Number(resultRow.id),
+        settlement.netResult,
+        resultRow.settled_at,
+        Number(live.id),
+      );
+    }
+    return settlement;
+  }
+
+  #processVirtualWindowBettorResult(resultRow, now) {
+    const isTail = this.#isChronologicalTail(resultRow);
+    if (isTail && !this.#liveVirtualWindowSessionRow(resultRow.source, resultRow.instrument)) {
+      this.#armVirtualWindowBettorInTransaction(resultRow.source, resultRow.instrument, now, {
+        excludeResultId: Number(resultRow.id),
+      });
+    }
+    if (isTail) this.#settleVirtualWindowBettorInTransaction(resultRow, now);
+    if (!this.#liveVirtualWindowSessionRow(resultRow.source, resultRow.instrument)) {
+      this.#armVirtualWindowBettorInTransaction(resultRow.source, resultRow.instrument, now);
+    }
+  }
+
+  #invalidateVirtualWindowBettorForGap(source, instrument, detectedAt) {
+    this.sqlite.prepare(`
+      UPDATE virtual_window_bet_sessions
+      SET status = 'invalid_gap', end_reason = 'integrity_gap', next_stake = NULL,
+        completed_result_id = COALESCE(completed_result_id, last_bet_result_id),
+        net_result = -total_staked + gross_payout,
+        last_event_at = ?, completed_at = ?
+      WHERE source = ? AND instrument = ? AND status IN ('armed', 'active')
+    `).run(detectedAt, detectedAt, source, instrument);
   }
 
   #armVirtualBettorInTransaction(
@@ -11161,6 +11556,7 @@ export class RouletteDatabase {
           AND status IN ('armed', 'active')
       `)
       .run(detectedAt, detectedAt, source, instrument);
+    this.#invalidateVirtualWindowBettorForGap(source, instrument, detectedAt);
   }
 
   #liveFollowerTop5SessionRow(source, instrument) {
@@ -12302,6 +12698,7 @@ export class RouletteDatabase {
             `)
             .get(resultId);
           this.#processVirtualBettorResult(storedRow, now);
+          this.#processVirtualWindowBettorResult(storedRow, now);
           insertedResultRows.push(storedRow);
           insertedResults.push(mapRoundResult(storedRow));
         }
@@ -12952,6 +13349,201 @@ export class RouletteDatabase {
         misses: Number(lifetime.misses),
       },
       gatedAccount,
+    };
+  }
+
+  initializeVirtualWindowBettor(source = "buleto", instrument = "default") {
+    this.#assertOpen();
+    const safeSource = asNonEmptyText(source, undefined, "source");
+    const safeInstrument = asNonEmptyText(instrument, undefined, "instrument");
+    const now = new Date().toISOString();
+    this.#transaction(() => {
+      this.#armVirtualWindowBettorInTransaction(
+        safeSource,
+        safeInstrument,
+        now,
+      );
+    });
+    return this.getVirtualWindowBettorState(safeSource, safeInstrument);
+  }
+
+  getVirtualWindowBetSessions(
+    source = "buleto",
+    instrument = "default",
+    limit = 20,
+  ) {
+    this.#assertOpen();
+    const safeSource = asNonEmptyText(source, undefined, "source");
+    const safeInstrument = asNonEmptyText(instrument, undefined, "instrument");
+    const safeLimit = normalizedLimit(limit, 20);
+    return this.sqlite
+      .prepare(`
+        SELECT
+          sessions.*,
+          (
+            SELECT MIN(bets.occurred_at)
+            FROM virtual_window_bets AS bets
+            WHERE bets.session_id = sessions.id
+          ) AS started_at
+        FROM virtual_window_bet_sessions AS sessions
+        WHERE sessions.source = ? AND sessions.instrument = ?
+        ORDER BY sessions.id DESC
+        LIMIT ?
+      `)
+      .all(safeSource, safeInstrument, safeLimit)
+      .map(mapVirtualBetSession);
+  }
+
+  getVirtualWindowBettorState(source = "buleto", instrument = "default") {
+    this.#assertOpen();
+    const safeSource = asNonEmptyText(source, undefined, "source");
+    const safeInstrument = asNonEmptyText(instrument, undefined, "instrument");
+    const now = new Date().toISOString();
+    const bankroll = this.#transaction(() =>
+      this.#ensureVirtualWindowBankrollInTransaction(
+        safeSource,
+        safeInstrument,
+        now,
+      ),
+    );
+    const epochRow = this.sqlite
+      .prepare(`
+        SELECT continuity_epoch
+        FROM stream_state
+        WHERE source = ? AND instrument = ?
+      `)
+      .get(safeSource, safeInstrument);
+    const continuityEpoch = Number(epochRow?.continuity_epoch ?? 0);
+    const liveRow = this.#liveVirtualWindowSessionRow(safeSource, safeInstrument);
+    const recentRows = this.sqlite
+      .prepare(`
+        SELECT
+          sessions.*,
+          (
+            SELECT MIN(bets.occurred_at)
+            FROM virtual_window_bets AS bets
+            WHERE bets.session_id = sessions.id
+          ) AS started_at
+        FROM virtual_window_bet_sessions AS sessions
+        WHERE sessions.source = ?
+          AND sessions.instrument = ?
+          AND sessions.status IN ('completed', 'invalid_gap')
+        ORDER BY sessions.id DESC
+        LIMIT 10
+      `)
+      .all(safeSource, safeInstrument);
+    const latestOutcomeRow = this.sqlite
+      .prepare(`
+        SELECT
+          bets.id AS bet_id,
+          bets.round_result_id,
+          bets.session_id,
+          bets.attempt_number,
+          bets.stake,
+          bets.result_number,
+          bets.outcome,
+          bets.gross_payout,
+          bets.total_staked_after,
+          bets.net_after,
+          bets.next_stake_after,
+          bets.recovery_possible,
+          bets.occurred_at,
+          sessions.target_number,
+          results.external_round_id
+        FROM virtual_window_bets AS bets
+        JOIN virtual_window_bet_sessions AS sessions ON sessions.id = bets.session_id
+        JOIN round_results AS results ON results.id = bets.round_result_id
+        WHERE sessions.source = ? AND sessions.instrument = ?
+        ORDER BY bets.id DESC
+        LIMIT 1
+      `)
+      .get(safeSource, safeInstrument);
+    const lifetime = this.sqlite
+      .prepare(`
+        SELECT
+          COUNT(DISTINCT sessions.id) AS total_sessions,
+          COUNT(DISTINCT CASE WHEN sessions.status = 'completed' THEN sessions.id END)
+            AS completed_sessions,
+          COUNT(DISTINCT CASE WHEN sessions.status = 'invalid_gap' THEN sessions.id END)
+            AS invalidated_sessions,
+          COUNT(bets.id) AS total_bets,
+          COALESCE(SUM(CASE WHEN bets.outcome = 'hit' THEN 1 ELSE 0 END), 0)
+            AS winning_bets,
+          COALESCE(SUM(CASE WHEN bets.outcome = 'miss' THEN 1 ELSE 0 END), 0)
+            AS losing_bets,
+          COALESCE(SUM(bets.stake), 0) AS total_staked,
+          COALESCE(SUM(bets.gross_payout), 0) AS gross_payout
+        FROM virtual_window_bet_sessions AS sessions
+        LEFT JOIN virtual_window_bets AS bets ON bets.session_id = sessions.id
+        WHERE sessions.source = ? AND sessions.instrument = ?
+      `)
+      .get(safeSource, safeInstrument);
+    const totalStaked = Number(lifetime.total_staked);
+    const grossPayout = Number(lifetime.gross_payout);
+    const invalidGapSessions = Number(
+      this.sqlite
+        .prepare(`
+          SELECT COUNT(*) AS count
+          FROM virtual_window_bet_sessions
+          WHERE source = ? AND instrument = ?
+            AND (status = 'invalid_gap' OR end_reason = 'integrity_gap')
+        `)
+        .get(safeSource, safeInstrument).count,
+    );
+    const longestCandidates = this.#longestVirtualCandidates(
+      safeSource,
+      safeInstrument,
+      continuityEpoch,
+      null,
+      VIRTUAL_WINDOW_BET_MODEL.triggerThreshold,
+    );
+    const longestCandidate = longestCandidates[0] ?? null;
+    const nextStake = liveRow
+      ? Number(liveRow.next_stake)
+      : bankroll.status === 'exhausted'
+        ? Number(bankroll.next_stake)
+        : VIRTUAL_WINDOW_BET_MODEL.initialStake;
+    const initialBalance = Number(bankroll.initial_balance);
+    const currentBalance = Number(bankroll.current_balance);
+    return {
+      mode: 'simulation',
+      executionEnabled: false,
+      strategyKey: VIRTUAL_WINDOW_BET_MODEL.strategyKey,
+      modelVersion: VIRTUAL_WINDOW_BET_MODEL.modelVersion,
+      status: liveRow?.status
+        ?? (bankroll.status === 'exhausted' ? 'bankroll_exhausted' : 'waiting'),
+      triggerThreshold: VIRTUAL_WINDOW_BET_MODEL.triggerThreshold,
+      stopThreshold: VIRTUAL_WINDOW_BET_MODEL.stopThreshold,
+      model: { ...VIRTUAL_WINDOW_BET_MODEL },
+      testBank: {
+        mode: 'simulation',
+        status: bankroll.status,
+        initialBalance,
+        currentBalance,
+        netResult: currentBalance - initialBalance,
+        nextStake,
+        canAffordNext: currentBalance >= nextStake,
+        shortfall: Math.max(0, nextStake - currentBalance),
+        startedAt: bankroll.started_at,
+        exhaustedAt: bankroll.exhausted_at ?? null,
+        dataComplete: invalidGapSessions === 0,
+      },
+      longestCandidate,
+      longestCandidates,
+      activeSession: mapVirtualBetSession(liveRow),
+      latestOutcome: mapVirtualBetOutcome(latestOutcomeRow),
+      recentSessions: recentRows.map(mapVirtualBetSession),
+      lifetime: {
+        totalSessions: Number(lifetime.total_sessions),
+        completedSessions: Number(lifetime.completed_sessions),
+        invalidatedSessions: Number(lifetime.invalidated_sessions),
+        totalBets: Number(lifetime.total_bets),
+        winningBets: Number(lifetime.winning_bets),
+        losingBets: Number(lifetime.losing_bets),
+        totalStaked,
+        grossPayout,
+        netResult: grossPayout - totalStaked,
+      },
     };
   }
 

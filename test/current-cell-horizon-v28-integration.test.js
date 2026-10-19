@@ -121,7 +121,7 @@ test("v28 creates an immutable, empty, no-backfill prospective cohort", () => {
     predictiveLeaderLegacyAccountEnabled: false,
   });
   try {
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 32);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 33);
     const cohort = database.sqlite.prepare(`
       SELECT * FROM current_cell_horizon_shadow_cohorts
     `).get();

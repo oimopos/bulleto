@@ -250,10 +250,10 @@ function runtimeForForecast(forecast, anchor) {
   };
 }
 
-test("schema v32 creates the warm Top-1 campaign and rejects future v33", () => {
+test("schema v33 creates the warm Top-1 campaign and rejects future v34", () => {
   const database = databaseAt(":memory:", () => CAMPAIGN_STARTED_MS);
   try {
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 32);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 33);
     const tables = new Set(database.sqlite.prepare(`
       SELECT name FROM sqlite_master WHERE type = 'table'
     `).all().map(({ name }) => name));
@@ -269,24 +269,24 @@ test("schema v32 creates the warm Top-1 campaign and rejects future v33", () => 
     database.close();
   }
 
-  const directory = mkdtempSync(join(tmpdir(), "roulette-warm-top1-v33-"));
+  const directory = mkdtempSync(join(tmpdir(), "roulette-warm-top1-v34-"));
   const path = join(directory, "tracker.sqlite");
   const sentinel = new DatabaseSync(path);
   sentinel.exec(`
     CREATE TABLE future_schema_sentinel (value TEXT NOT NULL);
     INSERT INTO future_schema_sentinel (value) VALUES ('preserve-me');
     PRAGMA journal_mode = DELETE;
-    PRAGMA user_version = 33;
+    PRAGMA user_version = 34;
   `);
   sentinel.close();
   try {
     assert.throws(
       () => databaseAt(path, () => CAMPAIGN_STARTED_MS),
-      /schema version 33 is newer than supported version 32/,
+      /schema version 34 is newer than supported version 33/,
     );
     const reopened = new DatabaseSync(path, { readOnly: true });
     try {
-      assert.equal(reopened.prepare("PRAGMA user_version").get().user_version, 33);
+      assert.equal(reopened.prepare("PRAGMA user_version").get().user_version, 34);
       assert.equal(reopened.prepare("PRAGMA journal_mode").get().journal_mode, "delete");
       assert.equal(
         reopened.prepare("SELECT value FROM future_schema_sentinel").get().value,

@@ -30,6 +30,8 @@ services:
         value: "true"
       - key: VIRTUAL_STARTING_BALANCE
         value: "87700"
+      - key: VIRTUAL_WINDOW_STARTING_BALANCE
+        value: "10000"
       - key: GAP_THRESHOLD_SECONDS
         value: "135"
       - key: RECONNECT_MIN_MS

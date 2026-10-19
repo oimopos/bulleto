@@ -82,6 +82,10 @@ const config = {
     min: 0,
     max: Number.MAX_SAFE_INTEGER,
   }),
+  virtualWindowStartingBalance: integerEnv('VIRTUAL_WINDOW_STARTING_BALANCE', 10_000, {
+    min: 0,
+    max: Number.MAX_SAFE_INTEGER,
+  }),
 };
 
 if (config.reconnectMaxMs < config.reconnectMinMs) {
@@ -119,6 +123,7 @@ const db = createDatabase({
   logger: console,
   gapThresholdSeconds: config.gapThresholdSeconds,
   virtualStartingBalance: config.virtualStartingBalance,
+  virtualWindowStartingBalance: config.virtualWindowStartingBalance,
   predictiveLeaderLegacyAccountEnabled: false,
 });
 const collector = new BuletoCollector({
@@ -140,6 +145,7 @@ const resultPipeline = new ResultPipeline({
 // Paper bettors only record simulations in this local database. They have no
 // credentials, browser automation, payment access, or Buleto write calls.
 db.initializeVirtualBettor('buleto', config.instrument);
+db.initializeVirtualWindowBettor('buleto', config.instrument);
 const predictiveLeaderV7PaperStartup = db.reconcilePredictiveLeaderV7PaperCampaign(
   'buleto',
   config.instrument,
@@ -616,7 +622,7 @@ function followerTop5TrackerFromDatabase() {
 function virtualBettorStateFromDatabase() {
   return cachedDatabaseRead(
     'virtual-bettor-state',
-    () => db.getVirtualBettorState('buleto', config.instrument),
+    () => db.getVirtualWindowBettorState('buleto', config.instrument),
   );
 }
 
@@ -1141,7 +1147,11 @@ const server = createServer((request, response) => {
 
     if (pathname === '/api/virtual-bettor/sessions') {
       const limit = clampLimit(url.searchParams.get('limit'), 20, 100);
-      const readItems = () => db.getVirtualBetSessions('buleto', config.instrument, limit);
+      const readItems = () => db.getVirtualWindowBetSessions(
+        'buleto',
+        config.instrument,
+        limit,
+      );
       const items = limit === 20
         ? cachedDatabaseRead('virtual-bet-sessions:default', readItems)
         : readItems();
