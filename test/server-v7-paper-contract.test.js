@@ -35,11 +35,12 @@ test('server exposes the read-only V7 paper view from durable and live state', (
   );
 });
 
-test('server initializes V7 paper once and leaves placement and settlement in database lifecycle', () => {
-  const initialization = server.indexOf('db.initializePredictiveLeaderV7PaperCampaign(');
+test('server only reconciles retired V7 paper and never recovers a new V7 bet', () => {
+  const reconciliation = server.indexOf('db.reconcilePredictiveLeaderV7PaperCampaign(');
   const listen = server.indexOf('server.listen(');
 
-  assert.ok(initialization >= 0 && initialization < listen);
+  assert.ok(reconciliation >= 0 && reconciliation < listen);
+  assert.doesNotMatch(server, /db\.initializePredictiveLeaderV7PaperCampaign\(/);
   assert.doesNotMatch(server, /db\.placePredictiveLeaderV7PaperBet\(/);
   assert.doesNotMatch(server, /db\.settlePredictiveLeaderV7PaperCampaign\(/);
   assert.match(server, /db\.recordPrecloseForecast\(/);

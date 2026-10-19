@@ -22,6 +22,9 @@ import { followerTop5GatedSnapshotForApi } from './follower-top5-gated-api.js';
 import { predictiveLeaderSnapshotForApi } from './predictive-leader-api.js';
 import { runPredictiveLeaderNeighborBacktest } from './predictive-leader-neighbor-backtest.js';
 import { predictiveLeaderV7PaperSnapshotForApi } from './predictive-leader-v7-paper-api.js';
+import {
+  predictiveLeaderWarmTop1PaperSnapshotForApi,
+} from './predictive-leader-warm-top1-paper-api.js';
 import { ResultPipeline } from './result-pipeline.js';
 import { runTrajectoryRangeBacktest } from './trajectory-range-backtest.js';
 import { virtualBettorSnapshotForApi } from './virtual-bettor-api.js';
@@ -137,7 +140,7 @@ const resultPipeline = new ResultPipeline({
 // Paper bettors only record simulations in this local database. They have no
 // credentials, browser automation, payment access, or Buleto write calls.
 db.initializeVirtualBettor('buleto', config.instrument);
-const predictiveLeaderV7PaperStartup = db.initializePredictiveLeaderV7PaperCampaign(
+const predictiveLeaderV7PaperStartup = db.reconcilePredictiveLeaderV7PaperCampaign(
   'buleto',
   config.instrument,
 );
@@ -146,6 +149,18 @@ console.info(
     + `settled=${predictiveLeaderV7PaperStartup.settled}; `
     + `voided=${predictiveLeaderV7PaperStartup.voided}; `
     + `reason=${predictiveLeaderV7PaperStartup.reason}`,
+);
+const predictiveLeaderWarmTop1PaperStartup =
+  db.initializePredictiveLeaderWarmTop1PaperCampaign(
+    'buleto',
+    config.instrument,
+  );
+console.info(
+  '[predictive-leader-warm-top1-paper] startup reconciliation: '
+    + `placed=${predictiveLeaderWarmTop1PaperStartup.placed ?? 0}; `
+    + `settled=${predictiveLeaderWarmTop1PaperStartup.settled ?? 0}; `
+    + `voided=${predictiveLeaderWarmTop1PaperStartup.voided ?? 0}; `
+    + `reason=${predictiveLeaderWarmTop1PaperStartup.reason}`,
 );
 const followerTop5Deposit = db.applyFollowerTop5GatedDeposit(
   'buleto',
@@ -174,12 +189,14 @@ const DATABASE_WRITE_UPDATE_REASONS = new Set([
   'predictive-leader-signal-account',
   'predictive-leader-account',
   'predictive-leader-v7-paper',
+  'predictive-leader-warm-top1-paper',
 ]);
 const MAX_DATABASE_READ_CACHE_ENTRIES = 32;
 const databaseReadCache = new Map();
 let databaseReadGeneration = 0;
 const sseClients = new Set();
 let predictiveLeaderV7PaperRevision = null;
+let predictiveLeaderWarmTop1PaperRevision = null;
 
 function cachedDatabaseRead(key, read) {
   const cached = databaseReadCache.get(key);
@@ -343,6 +360,68 @@ function broadcastPredictiveLeaderV7PaperUpdateIfChanged() {
 predictiveLeaderV7PaperRevision = predictiveLeaderV7PaperRevisionFor(
   db.getPredictiveLeaderV7PaperState('buleto', config.instrument),
 );
+
+function predictiveLeaderWarmTop1PaperRevisionFor(state) {
+  const account = state?.account ?? state;
+  const gate = state?.qualityGate ?? null;
+  const pendingBet = state?.pendingBet ?? account?.pendingBet ?? null;
+  return JSON.stringify([
+    state?.strategyVersion ?? null,
+    state?.algorithmVersion ?? null,
+    account?.ledgerRevision ?? null,
+    account?.updatedAt ?? state?.updatedAt ?? null,
+    account?.status ?? state?.status ?? null,
+    account?.currentBalance ?? state?.currentBalance ?? null,
+    account?.deficit ?? state?.deficit ?? null,
+    account?.accountingBalance ?? state?.accountingBalance ?? null,
+    account?.nextStake ?? state?.nextStake ?? null,
+    gate?.version ?? null,
+    gate?.status ?? null,
+    gate?.eligible ?? null,
+    gate?.selectedCount ?? null,
+    gate?.settledCount ?? null,
+    gate?.sampleSize ?? null,
+    gate?.hitCount ?? null,
+    gate?.windowEndForecastId ?? null,
+    gate?.evidenceSha256 ?? null,
+    state?.forecast?.id ?? null,
+    state?.candidateEvidence?.evidenceSha256 ?? null,
+    pendingBet?.id ?? null,
+    pendingBet?.forecastId ?? null,
+    pendingBet?.status ?? null,
+    state?.latestOutcome?.betId ?? null,
+    state?.latestOutcome?.resultId ?? null,
+    state?.latestVoid?.betId ?? null,
+    state?.latestVoid?.voidedAt ?? null,
+    state?.latestReset?.id ?? null,
+    state?.latestReset?.occurredAt ?? null,
+  ]);
+}
+
+function broadcastPredictiveLeaderWarmTop1PaperUpdateIfChanged() {
+  try {
+    const state = db.getPredictiveLeaderWarmTop1PaperState(
+      'buleto',
+      config.instrument,
+    );
+    const revision = predictiveLeaderWarmTop1PaperRevisionFor(state);
+    if (revision === predictiveLeaderWarmTop1PaperRevision) return false;
+    predictiveLeaderWarmTop1PaperRevision = revision;
+    broadcastUpdate('predictive-leader-warm-top1-paper');
+    return true;
+  } catch (error) {
+    console.error(
+      '[predictive-leader-warm-top1-paper] state refresh failed',
+      error,
+    );
+    return false;
+  }
+}
+
+predictiveLeaderWarmTop1PaperRevision =
+  predictiveLeaderWarmTop1PaperRevisionFor(
+    db.getPredictiveLeaderWarmTop1PaperState('buleto', config.instrument),
+  );
 
 async function runTrajectoryValidationWarmup() {
   if (
@@ -721,6 +800,26 @@ function predictiveLeaderV7PaperForApi() {
   });
 }
 
+function predictiveLeaderWarmTop1PaperForApi() {
+  const source = 'buleto';
+  const instrument = config.instrument;
+  const paperState = cachedDatabaseRead(
+    'predictive-leader-warm-top1-paper-state',
+    () => db.getPredictiveLeaderWarmTop1PaperState(source, instrument),
+  );
+  return predictiveLeaderWarmTop1PaperSnapshotForApi({
+    paperState,
+    runtimeState: {
+      collector: collector.getStatus(),
+      latestResult: resultForApi(latestResultFromDatabase()),
+      pipelinePending: resultPipeline.getPendingCounts(),
+    },
+    source,
+    instrument,
+    now: new Date(),
+  });
+}
+
 function currentCellHorizonShadowForApi() {
   const source = 'buleto';
   const instrument = config.instrument;
@@ -942,6 +1041,11 @@ const server = createServer((request, response) => {
       return;
     }
 
+    if (pathname === '/api/predictive-leader/warm-top1-paper') {
+      sendJson(response, 200, predictiveLeaderWarmTop1PaperForApi());
+      return;
+    }
+
     if (pathname === '/api/predictive-leader/current-cell-10s-shadow') {
       sendJson(response, 200, currentCellHorizonShadowForApi());
       return;
@@ -1139,6 +1243,7 @@ const metadataConflictRetryQueue = createCurrentCellMetadataConflictRetryQueue({
   onDatabaseChanged() {
     broadcastUpdate('predictive-shadow-metadata-conflict');
     broadcastPredictiveLeaderV7PaperUpdateIfChanged();
+    broadcastPredictiveLeaderWarmTop1PaperUpdateIfChanged();
   },
   onTransientError(error, conflict, failureCount) {
     console.error(
@@ -1173,6 +1278,7 @@ const currentCellHorizonScheduler = createCurrentCellHorizonScheduler({
       if (outcome.databaseChanged) {
         broadcastUpdate('predictive-shadow-metadata-conflict');
         broadcastPredictiveLeaderV7PaperUpdateIfChanged();
+        broadcastPredictiveLeaderWarmTop1PaperUpdateIfChanged();
       } else if (outcome.inserted) {
         broadcastUpdate('current-cell-horizon-captured');
       }
@@ -1229,6 +1335,7 @@ function drainRoundTrajectoryQueue({ retry = true } = {}) {
         if (outcome.databaseChanged) {
           broadcastUpdate('predictive-shadow-metadata-conflict');
           broadcastPredictiveLeaderV7PaperUpdateIfChanged();
+          broadcastPredictiveLeaderWarmTop1PaperUpdateIfChanged();
         }
       } catch (error) {
         pending.failureCount += 1;
@@ -1298,6 +1405,7 @@ function publishPipelineOutcome(outcome) {
     retryError ??= error;
   }
   broadcastPredictiveLeaderV7PaperUpdateIfChanged();
+  broadcastPredictiveLeaderWarmTop1PaperUpdateIfChanged();
   try {
     const signalOutcome = db.settlePredictiveLeaderSignalAccount(
       'buleto',
@@ -1469,6 +1577,7 @@ collector.on('preclose-forecast', (forecast) => {
       broadcastUpdate('forecast');
     }
     broadcastPredictiveLeaderV7PaperUpdateIfChanged();
+    broadcastPredictiveLeaderWarmTop1PaperUpdateIfChanged();
   } catch (error) {
     console.error('[forecast] persistence failed; waiting for the next pre-close tick', error);
   }

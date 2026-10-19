@@ -356,17 +356,17 @@ test("a newer database schema is rejected without touching its data", () => {
     CREATE TABLE future_schema_sentinel (value TEXT NOT NULL);
     INSERT INTO future_schema_sentinel (value) VALUES ('preserve-me');
     PRAGMA journal_mode = DELETE;
-    PRAGMA user_version = 32;
+    PRAGMA user_version = 33;
   `);
   sentinel.close();
   try {
     assert.throws(
       () => databaseAt(path, () => CAMPAIGN_STARTED_MS),
-      /schema version 32 is newer than supported version 31/,
+      /schema version 33 is newer than supported version 32/,
     );
     const reopened = new DatabaseSync(path, { readOnly: true });
     try {
-      assert.equal(reopened.prepare("PRAGMA user_version").get().user_version, 32);
+      assert.equal(reopened.prepare("PRAGMA user_version").get().user_version, 33);
       assert.equal(reopened.prepare("PRAGMA journal_mode").get().journal_mode, "delete");
       assert.equal(
         reopened.prepare("SELECT value FROM future_schema_sentinel").get().value,
