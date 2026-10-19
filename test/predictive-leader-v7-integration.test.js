@@ -96,7 +96,7 @@ function seedPairHistory(database, baseMs) {
   `).run();
 }
 
-test("v27 freezes the production v7 config and export provenance in new tables", () => {
+test("v31 freezes the production v7 config and export provenance in new tables", () => {
   const database = createDatabase({
     path: ":memory:",
     clock: () => new Date(LIVE_BASE),
@@ -104,7 +104,7 @@ test("v27 freezes the production v7 config and export provenance in new tables",
     predictiveLeaderLegacyAccountEnabled: false,
   });
   try {
-    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 30);
+    assert.equal(database.sqlite.prepare("PRAGMA user_version").get().user_version, 31);
     const cohort = database.sqlite.prepare(`
       SELECT * FROM predictive_leader_v7_cohorts
     `).get();
@@ -173,6 +173,13 @@ test("v27 starts at MAX(forecast)+1 and never backfills an older forecast", () =
     nowMs = oldBase + 52_000;
     assert.equal(database.recordPrecloseForecast(forecast("legacy", oldBase)).inserted, true);
     database.sqlite.exec(`
+      DROP TRIGGER predictive_leader_v7_paper_fixed_v1_retired;
+      DROP TRIGGER predictive_leader_v7_paper_fixed_v1_void_chronology;
+      DROP TRIGGER predictive_leader_v7_paper_ladder_epoch_no_rollback;
+      DROP TABLE predictive_leader_v7_paper_ladder_resets;
+      DROP TABLE predictive_leader_v7_paper_ladder_voids;
+      DROP TABLE predictive_leader_v7_paper_ladder_bets;
+      DROP TABLE predictive_leader_v7_paper_ladder_campaigns;
       DROP TABLE predictive_leader_v7_paper_voids;
       DROP TABLE predictive_leader_v7_paper_bets;
       DROP TABLE predictive_leader_v7_paper_campaigns;

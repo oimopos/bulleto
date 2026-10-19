@@ -2,16 +2,30 @@ import {
   LEARNED_LEADER_V7_ALGORITHM_VERSION,
   LEARNED_LEADER_V7_SCHEMA_VERSION,
 } from './learned-leader-v7.js';
+import {
+  PREDICTIVE_LEADER_V7_PAPER_LADDER_CAMPAIGN_KEY,
+  PREDICTIVE_LEADER_V7_PAPER_LADDER_MODEL,
+  PREDICTIVE_LEADER_V7_PAPER_LADDER_PENDING_RESET_REASON,
+  PREDICTIVE_LEADER_V7_PAPER_LADDER_RESET_POLICY,
+  PREDICTIVE_LEADER_V7_PAPER_LADDER_RESET_REASONS,
+  PREDICTIVE_LEADER_V7_PAPER_LADDER_SCHEMA_VERSION,
+  PREDICTIVE_LEADER_V7_PAPER_LADDER_STRATEGY_VERSION,
+  calculatePredictiveLeaderV7PaperNextStake,
+  calculatePredictiveLeaderV7PaperRawStake,
+} from './predictive-leader-v7-paper-ladder.js';
 
-export const PREDICTIVE_LEADER_V7_PAPER_API_SCHEMA_VERSION = 1;
+export const PREDICTIVE_LEADER_V7_PAPER_API_SCHEMA_VERSION =
+  PREDICTIVE_LEADER_V7_PAPER_LADDER_SCHEMA_VERSION;
 export const PREDICTIVE_LEADER_V7_PAPER_STRATEGY_VERSION =
-  'predictive-leader-v7-manual-override-paper-v1';
+  PREDICTIVE_LEADER_V7_PAPER_LADDER_STRATEGY_VERSION;
 export const PREDICTIVE_LEADER_V7_PAPER_STRATEGY_MODE =
   'manual-override-paper';
 
-const INITIAL_BALANCE = 1_000;
-const FIXED_STAKE = 10;
-const GROSS_PAYOUT_MULTIPLIER = 36;
+const AUTHORIZATION_REASON = 'operator-requested-virtual-api-2026-10-19';
+const ACCOUNT_RESET_REASONS = new Set([
+  ...Object.values(PREDICTIVE_LEADER_V7_PAPER_LADDER_RESET_REASONS),
+  'integrity_gap',
+]);
 
 const ACCOUNT_REASONS = Object.freeze({
   waiting: new Set([
@@ -75,21 +89,144 @@ function nextRoundMatches(previous, current) {
   return previous !== current;
 }
 
-function pendingBetForApi(value) {
+function exactModelForApi(value) {
+  const expected = PREDICTIVE_LEADER_V7_PAPER_LADDER_MODEL;
+  if (
+    !isPlainObject(value)
+    || value.kind !== expected.kind
+    || value.initialBalance !== expected.initialBalance
+    || value.initialStake !== expected.initialStake
+    || value.stakeStep !== expected.stakeStep
+    || value.maxStake !== expected.maxStake
+    || value.grossPayoutMultiplier !== expected.grossPayoutMultiplier
+    || value.payoutIncludesStake !== expected.payoutIncludesStake
+    || value.cycleSpendLimit !== expected.cycleSpendLimit
+    || value.resetPolicy !== PREDICTIVE_LEADER_V7_PAPER_LADDER_RESET_POLICY
+  ) {
+    return null;
+  }
+  return {
+    kind: value.kind,
+    initialBalance: value.initialBalance,
+    initialStake: value.initialStake,
+    stakeStep: value.stakeStep,
+    maxStake: value.maxStake,
+    grossPayoutMultiplier: value.grossPayoutMultiplier,
+    payoutIncludesStake: value.payoutIncludesStake,
+    cycleSpendLimit: value.cycleSpendLimit,
+    resetPolicy: value.resetPolicy,
+  };
+}
+
+function expectedRawStake(ladderLoss, model) {
+  try {
+    return calculatePredictiveLeaderV7PaperRawStake(ladderLoss, model);
+  } catch {
+    return null;
+  }
+}
+
+function expectedNextStake(ladderLoss, cycleStaked, model) {
+  try {
+    return calculatePredictiveLeaderV7PaperNextStake(
+      ladderLoss,
+      cycleStaked,
+      model,
+    );
+  } catch {
+    return null;
+  }
+}
+
+function validMissCursor(ladderLoss, missCount, model) {
+  return ladderLoss % model.stakeStep === 0
+    && (missCount === 0) === (ladderLoss === 0)
+    && ladderLoss >= missCount * model.initialStake;
+}
+
+function ladderForApi(value, model) {
+  if (!isPlainObject(value)) return null;
+  const cycleNumber = safeInteger(value.cycleNumber, { minimum: 1 });
+  const cycleStaked = safeInteger(value.cycleStaked);
+  const ladderLoss = safeInteger(value.ladderLoss);
+  const missCount = safeInteger(value.missCount);
+  const resetCount = safeInteger(value.resetCount);
+  const nextStake = safeInteger(value.nextStake, { minimum: model.initialStake });
+  const pendingReset = value.pendingReset === null
+    ? null
+    : canonicalText(value.pendingReset);
+  const calculatedNextStake = expectedNextStake(ladderLoss, cycleStaked, model);
+  if (
+    cycleNumber === null
+    || cycleStaked === null
+    || ladderLoss === null
+    || missCount === null
+    || resetCount === null
+    || nextStake === null
+    || cycleStaked >= model.cycleSpendLimit
+    || ladderLoss !== cycleStaked
+    || !validMissCursor(ladderLoss, missCount, model)
+    || resetCount !== cycleNumber - 1
+    || calculatedNextStake === null
+    || nextStake !== calculatedNextStake
+    || ![null, PREDICTIVE_LEADER_V7_PAPER_LADDER_PENDING_RESET_REASON]
+      .includes(pendingReset)
+  ) {
+    return null;
+  }
+  return {
+    cycleNumber,
+    cycleStaked,
+    ladderLoss,
+    missCount,
+    resetCount,
+    nextStake,
+    pendingReset,
+  };
+}
+
+function pendingBetForApi(value, model) {
   if (!isPlainObject(value)) return null;
   const id = safeInteger(value.id, { minimum: 1 });
   const forecastId = safeInteger(value.forecastId, { minimum: 1 });
   const normalizedRoundId = roundId(value.roundId);
   const targetNumber = safeRouletteNumber(value.targetNumber);
+  const stake = safeInteger(value.stake, { minimum: model.initialStake });
+  const rawStake = safeInteger(value.rawStake, { minimum: model.initialStake });
+  const balanceBefore = safeInteger(value.balanceBefore);
+  const cycleNumber = safeInteger(value.cycleNumber, { minimum: 1 });
+  const cycleStakedBefore = safeInteger(value.cycleStakedBefore);
+  const ladderLossBefore = safeInteger(value.ladderLossBefore);
+  const missCountBefore = safeInteger(value.missCountBefore);
   const lockedAt = instant(value.lockedAt);
   const bettingClosesAt = instant(value.bettingClosesAt);
   const placedAt = instant(value.placedAt);
+  const calculatedRawStake = expectedRawStake(ladderLossBefore, model);
+  const calculatedStake = expectedNextStake(
+    ladderLossBefore,
+    cycleStakedBefore,
+    model,
+  );
   if (
     id === null
     || forecastId === null
     || normalizedRoundId === null
     || targetNumber === null
-    || value.stake !== FIXED_STAKE
+    || stake === null
+    || rawStake === null
+    || balanceBefore === null
+    || cycleNumber === null
+    || cycleStakedBefore === null
+    || ladderLossBefore === null
+    || missCountBefore === null
+    || ladderLossBefore !== cycleStakedBefore
+    || !validMissCursor(ladderLossBefore, missCountBefore, model)
+    || calculatedRawStake === null
+    || calculatedStake === null
+    || rawStake !== calculatedRawStake
+    || stake !== calculatedStake
+    || stake > balanceBefore
+    || cycleStakedBefore + stake > model.cycleSpendLimit
     || lockedAt === null
     || bettingClosesAt === null
     || placedAt === null
@@ -103,14 +240,20 @@ function pendingBetForApi(value) {
     forecastId,
     roundId: normalizedRoundId,
     targetNumber,
-    stake: value.stake,
+    stake,
+    rawStake,
+    balanceBefore,
+    cycleNumber,
+    cycleStakedBefore,
+    ladderLossBefore,
+    missCountBefore,
     lockedAt,
     bettingClosesAt,
     placedAt,
   };
 }
 
-function latestOutcomeForApi(value) {
+function latestOutcomeForApi(value, model) {
   if (!isPlainObject(value)) return null;
   const betId = safeInteger(value.betId, { minimum: 1 });
   const forecastId = safeInteger(value.forecastId, { minimum: 1 });
@@ -118,12 +261,53 @@ function latestOutcomeForApi(value) {
   const normalizedRoundId = roundId(value.roundId);
   const targetNumber = safeRouletteNumber(value.targetNumber);
   const resultNumber = safeRouletteNumber(value.resultNumber);
+  const stake = safeInteger(value.stake, { minimum: model.initialStake });
+  const balanceBefore = safeInteger(value.balanceBefore);
   const balanceAfter = safeInteger(value.balanceAfter);
+  const cycleNumberBefore = safeInteger(value.cycleNumberBefore, { minimum: 1 });
+  const cycleNumberAfter = safeInteger(value.cycleNumberAfter, { minimum: 1 });
+  const cycleStakedBefore = safeInteger(value.cycleStakedBefore);
+  const cycleStakedAfter = safeInteger(value.cycleStakedAfter);
+  const ladderLossBefore = safeInteger(value.ladderLossBefore);
+  const ladderLossAfter = safeInteger(value.ladderLossAfter);
+  const missCountBefore = safeInteger(value.missCountBefore);
+  const missCountAfter = safeInteger(value.missCountAfter);
+  const nextStakeAfter = safeInteger(
+    value.nextStakeAfter,
+    { minimum: model.initialStake },
+  );
   const occurredAt = instant(value.occurredAt);
   const outcome = targetNumber === resultNumber ? 'hit' : 'miss';
   const grossPayout = outcome === 'hit'
-    ? FIXED_STAKE * GROSS_PAYOUT_MULTIPLIER
+    ? stake * model.grossPayoutMultiplier
     : 0;
+  const calculatedStake = expectedNextStake(
+    ladderLossBefore,
+    cycleStakedBefore,
+    model,
+  );
+  const settlesAtCap = cycleStakedBefore + stake === model.cycleSpendLimit;
+  const resetReason = outcome === 'hit'
+    ? PREDICTIVE_LEADER_V7_PAPER_LADDER_RESET_REASONS.hit
+    : settlesAtCap
+      ? PREDICTIVE_LEADER_V7_PAPER_LADDER_RESET_REASONS.cycleSpendCap
+      : null;
+  const resetApplied = resetReason !== null;
+  const expectedCycleNumberAfter = cycleNumberBefore + Number(resetApplied);
+  const expectedCycleStakedAfter = resetApplied ? 0 : cycleStakedBefore + stake;
+  const expectedLadderLossAfter = outcome === 'hit'
+    ? 0
+    : resetApplied
+      ? 0
+      : ladderLossBefore + stake;
+  const expectedMissCountAfter = outcome === 'hit' || resetApplied
+    ? 0
+    : missCountBefore + 1;
+  const calculatedNextStakeAfter = expectedNextStake(
+    expectedLadderLossAfter,
+    expectedCycleStakedAfter,
+    model,
+  );
   if (
     betId === null
     || forecastId === null
@@ -131,10 +315,36 @@ function latestOutcomeForApi(value) {
     || normalizedRoundId === null
     || targetNumber === null
     || resultNumber === null
-    || value.outcome !== outcome
-    || value.stake !== FIXED_STAKE
-    || value.grossPayout !== grossPayout
+    || stake === null
+    || balanceBefore === null
     || balanceAfter === null
+    || cycleNumberBefore === null
+    || cycleNumberAfter === null
+    || cycleStakedBefore === null
+    || cycleStakedAfter === null
+    || ladderLossBefore === null
+    || ladderLossAfter === null
+    || missCountBefore === null
+    || missCountAfter === null
+    || nextStakeAfter === null
+    || ladderLossBefore !== cycleStakedBefore
+    || !validMissCursor(ladderLossBefore, missCountBefore, model)
+    || calculatedStake === null
+    || stake !== calculatedStake
+    || stake > balanceBefore
+    || cycleStakedBefore + stake > model.cycleSpendLimit
+    || !Number.isSafeInteger(grossPayout)
+    || value.outcome !== outcome
+    || value.grossPayout !== grossPayout
+    || balanceAfter !== balanceBefore - stake + grossPayout
+    || value.resetApplied !== resetApplied
+    || value.resetReason !== resetReason
+    || cycleNumberAfter !== expectedCycleNumberAfter
+    || cycleStakedAfter !== expectedCycleStakedAfter
+    || ladderLossAfter !== expectedLadderLossAfter
+    || missCountAfter !== expectedMissCountAfter
+    || calculatedNextStakeAfter === null
+    || nextStakeAfter !== calculatedNextStakeAfter
     || occurredAt === null
   ) {
     return null;
@@ -148,26 +358,59 @@ function latestOutcomeForApi(value) {
     targetNumber,
     resultNumber,
     outcome: outcome.toUpperCase(),
-    stake: value.stake,
+    stake,
     grossPayout,
+    balanceBefore,
     balanceAfter,
+    cycleNumberBefore,
+    cycleNumberAfter,
+    cycleStakedBefore,
+    cycleStakedAfter,
+    ladderLossBefore,
+    ladderLossAfter,
+    missCountBefore,
+    missCountAfter,
+    nextStakeAfter,
+    resetApplied,
+    resetReason,
     occurredAt,
   };
 }
 
-function latestVoidForApi(value) {
+function latestVoidForApi(value, model) {
   if (!isPlainObject(value)) return null;
   const betId = safeInteger(value.betId, { minimum: 1 });
   const forecastId = safeInteger(value.forecastId, { minimum: 1 });
   const normalizedRoundId = roundId(value.roundId);
   const targetNumber = safeRouletteNumber(value.targetNumber);
+  const stake = safeInteger(value.stake, { minimum: model.initialStake });
+  const balanceBefore = safeInteger(value.balanceBefore);
+  const cycleNumber = safeInteger(value.cycleNumber, { minimum: 1 });
+  const cycleStakedBefore = safeInteger(value.cycleStakedBefore);
+  const ladderLossBefore = safeInteger(value.ladderLossBefore);
+  const missCountBefore = safeInteger(value.missCountBefore);
   const voidedAt = instant(value.voidedAt);
+  const calculatedStake = expectedNextStake(
+    ladderLossBefore,
+    cycleStakedBefore,
+    model,
+  );
   if (
     betId === null
     || forecastId === null
     || normalizedRoundId === null
     || targetNumber === null
-    || value.stake !== FIXED_STAKE
+    || stake === null
+    || balanceBefore === null
+    || cycleNumber === null
+    || cycleStakedBefore === null
+    || ladderLossBefore === null
+    || missCountBefore === null
+    || ladderLossBefore !== cycleStakedBefore
+    || !validMissCursor(ladderLossBefore, missCountBefore, model)
+    || calculatedStake === null
+    || stake !== calculatedStake
+    || stake > balanceBefore
     || !['integrity_gap', 'round_metadata_conflict'].includes(value.reason)
     || voidedAt === null
   ) {
@@ -179,34 +422,146 @@ function latestVoidForApi(value) {
     forecastId,
     roundId: normalizedRoundId,
     targetNumber,
-    stake: value.stake,
+    stake,
+    balanceBefore,
+    cycleNumber,
+    cycleStakedBefore,
+    ladderLossBefore,
+    missCountBefore,
     reason: value.reason,
     voidedAt,
   };
 }
 
+function latestResetForApi(value, model) {
+  if (!isPlainObject(value)) return null;
+  const id = safeInteger(value.id, { minimum: 1 });
+  const betId = value.betId === null
+    ? null
+    : safeInteger(value.betId, { minimum: 1 });
+  const incidentId = value.incidentId === null
+    ? null
+    : safeInteger(value.incidentId, { minimum: 1 });
+  const continuityEpoch = value.continuityEpoch === null
+    ? null
+    : safeInteger(value.continuityEpoch, { minimum: 1 });
+  const cycleNumberBefore = safeInteger(value.cycleNumberBefore, { minimum: 1 });
+  const cycleNumberAfter = safeInteger(value.cycleNumberAfter, { minimum: 2 });
+  const cycleStakedBefore = safeInteger(value.cycleStakedBefore);
+  const ladderLossBefore = safeInteger(value.ladderLossBefore);
+  const missCountBefore = safeInteger(value.missCountBefore);
+  const nextStakeBefore = safeInteger(
+    value.nextStakeBefore,
+    { minimum: model.initialStake },
+  );
+  const nextStakeAfter = safeInteger(
+    value.nextStakeAfter,
+    { minimum: model.initialStake },
+  );
+  const occurredAt = instant(value.occurredAt);
+  const isIntegrityGap = value.reason === 'integrity_gap';
+  const provenanceValid = isIntegrityGap
+    ? value.betId === null
+      && incidentId !== null
+      && continuityEpoch !== null
+    : betId !== null
+      && value.incidentId === null
+      && value.continuityEpoch === null;
+  let reasonValid = false;
+  if (
+    ACCOUNT_RESET_REASONS.has(value.reason)
+    && cycleStakedBefore !== null
+    && ladderLossBefore !== null
+    && missCountBefore !== null
+    && nextStakeBefore !== null
+  ) {
+    if (value.reason === PREDICTIVE_LEADER_V7_PAPER_LADDER_RESET_REASONS.hit) {
+      const hitStake = cycleStakedBefore - ladderLossBefore;
+      reasonValid = hitStake === nextStakeBefore
+        && hitStake === expectedNextStake(
+          ladderLossBefore,
+          ladderLossBefore,
+          model,
+        );
+    } else if (
+      value.reason
+        === PREDICTIVE_LEADER_V7_PAPER_LADDER_RESET_REASONS.cycleSpendCap
+    ) {
+      const cursorBeforeFinalBet = model.cycleSpendLimit - nextStakeBefore;
+      reasonValid = cycleStakedBefore === model.cycleSpendLimit
+        && ladderLossBefore === model.cycleSpendLimit
+        && nextStakeBefore === expectedNextStake(
+          cursorBeforeFinalBet,
+          cursorBeforeFinalBet,
+          model,
+        );
+    } else {
+      reasonValid = cycleStakedBefore === ladderLossBefore
+        && nextStakeBefore === expectedNextStake(
+          ladderLossBefore,
+          cycleStakedBefore,
+          model,
+        );
+    }
+  }
+  if (
+    id === null
+    || !provenanceValid
+    || cycleNumberBefore === null
+    || cycleNumberAfter === null
+    || cycleStakedBefore === null
+    || ladderLossBefore === null
+    || missCountBefore === null
+    || nextStakeBefore === null
+    || nextStakeAfter === null
+    || cycleNumberAfter !== cycleNumberBefore + 1
+    || cycleStakedBefore > model.cycleSpendLimit
+    || ladderLossBefore > cycleStakedBefore
+    || !validMissCursor(ladderLossBefore, missCountBefore, model)
+    || nextStakeAfter !== model.initialStake
+    || !reasonValid
+    || occurredAt === null
+  ) {
+    return null;
+  }
+  return {
+    id,
+    betId,
+    incidentId,
+    continuityEpoch,
+    cycleNumberBefore,
+    cycleNumberAfter,
+    reason: value.reason,
+    cycleStakedBefore,
+    ladderLossBefore,
+    missCountBefore,
+    nextStakeBefore,
+    nextStakeAfter,
+    occurredAt,
+  };
+}
+
 function accountStateForApi(value, source, instrument) {
+  const model = exactModelForApi(value?.model);
   if (
     !isPlainObject(value)
-    || value.schemaVersion !== 1
+    || value.schemaVersion !== PREDICTIVE_LEADER_V7_PAPER_LADDER_SCHEMA_VERSION
     || value.strategyVersion !== PREDICTIVE_LEADER_V7_PAPER_STRATEGY_VERSION
     || value.algorithmVersion !== LEARNED_LEADER_V7_ALGORITHM_VERSION
     || canonicalText(value.candidateId) === null
-    || canonicalText(value.campaignKey) === null
+    || value.campaignKey !== PREDICTIVE_LEADER_V7_PAPER_LADDER_CAMPAIGN_KEY
     || value.mode !== PREDICTIVE_LEADER_V7_PAPER_STRATEGY_MODE
     || value.executionEnabled !== false
     || value.advisoryOnly !== true
     || value.promotionEligible !== false
     || value.promotionPolicy !== 'manual-override-paper-not-promoted'
-    || value.authorizationReason !== 'operator-requested-virtual-api-2026-10-19'
+    || value.authorizationReason !== AUTHORIZATION_REASON
     || value.source !== source
     || value.instrument !== instrument
-    || value.initialBalance !== INITIAL_BALANCE
+    || value.initialBalance !== PREDICTIVE_LEADER_V7_PAPER_LADDER_MODEL.initialBalance
     || !ACCOUNT_REASONS[value.status]?.has(value.reason)
-    || !isPlainObject(value.model)
-    || value.model.fixedStake !== FIXED_STAKE
-    || value.model.grossPayoutMultiplier !== GROSS_PAYOUT_MULTIPLIER
-    || value.model.payoutIncludesStake !== true
+    || model === null
+    || value.initialBalance !== model.initialBalance
     || !isPlainObject(value.activationBoundary)
   ) {
     return null;
@@ -236,6 +591,7 @@ function accountStateForApi(value, source, instrument) {
     'peakBalance',
     'maximumDrawdown',
     'continuityGapCount',
+    'ledgerRevision',
   ];
   if (nonNegativeIntegerFields.some((key) => safeInteger(value[key]) === null)) {
     return null;
@@ -246,56 +602,80 @@ function accountStateForApi(value, source, instrument) {
     || !Number.isSafeInteger(value.profit)
   ) return null;
 
+  const ladder = ladderForApi(value.ladder, model);
+  if (ladder === null) return null;
   const pendingBet = value.pendingBet === null
     ? null
-    : pendingBetForApi(value.pendingBet);
+    : pendingBetForApi(value.pendingBet, model);
   const latestOutcome = value.latestOutcome === null
     ? null
-    : latestOutcomeForApi(value.latestOutcome);
+    : latestOutcomeForApi(value.latestOutcome, model);
   const latestVoid = value.latestVoid === null
     ? null
-    : latestVoidForApi(value.latestVoid);
+    : latestVoidForApi(value.latestVoid, model);
+  const latestReset = value.latestReset === null
+    ? null
+    : latestResetForApi(value.latestReset, model);
   const expectedSettledCount = value.hitCount + value.missCount;
   const expectedBetCount = value.settledCount + value.pendingCount + value.voidCount;
-  const expectedTotalStaked = (value.settledCount + value.pendingCount) * FIXED_STAKE;
-  const expectedGrossPayout = value.hitCount * FIXED_STAKE
-    * GROSS_PAYOUT_MULTIPLIER;
   const expectedAccountingBalance = value.initialBalance
-    - expectedTotalStaked
-    + expectedGrossPayout;
+    - value.totalStaked
+    + value.totalGrossPayout;
   const expectedCanAfford = value.pendingCount === 0
     && value.deficit === 0
-    && value.currentBalance >= FIXED_STAKE;
+    && value.currentBalance >= ladder.nextStake;
   const campaignExhausted = value.deficit > 0
-    || (value.pendingCount === 0 && value.currentBalance < FIXED_STAKE);
+    || (value.pendingCount === 0 && value.currentBalance < ladder.nextStake);
+  const expectedReservedStake = pendingBet?.stake ?? 0;
+  const expectedPendingReset = pendingBet !== null
+    && ladder.cycleStaked + pendingBet.stake === model.cycleSpendLimit
+    ? PREDICTIVE_LEADER_V7_PAPER_LADDER_PENDING_RESET_REASON
+    : null;
+  const latestResetIsGap = latestReset?.reason === 'integrity_gap';
+  const minimumNonGapResetCount = latestReset !== null && !latestResetIsGap ? 1 : 0;
   if (
     value.availableBalance !== value.currentBalance
-    || value.reservedStake !== value.pendingCount * FIXED_STAKE
+    || value.reservedStake !== expectedReservedStake
     || value.currentBalance - value.deficit !== value.accountingBalance
     || (value.currentBalance > 0 && value.deficit > 0)
     || value.accountingBalance !== expectedAccountingBalance
     || value.profit !== value.accountingBalance - value.initialBalance
-    || value.nextStake !== FIXED_STAKE
-    || value.shortfall !== Math.max(0, FIXED_STAKE - value.accountingBalance)
+    || value.nextStake !== ladder.nextStake
+    || value.shortfall !== Math.max(0, ladder.nextStake - value.accountingBalance)
     || value.settledCount !== expectedSettledCount
     || value.betCount !== expectedBetCount
     || value.pendingCount > 1
-    || value.totalStaked !== expectedTotalStaked
-    || value.totalGrossPayout !== expectedGrossPayout
+    || value.totalStaked % model.stakeStep !== 0
+    || value.totalGrossPayout
+      % (model.stakeStep * model.grossPayoutMultiplier) !== 0
     || value.canAffordNext !== expectedCanAfford
     || value.peakBalance < Math.max(value.initialBalance, value.currentBalance)
     || value.minimumBalance > Math.min(value.initialBalance, value.currentBalance)
     || value.maximumDrawdown < value.peakBalance - value.currentBalance
     || value.maximumDrawdown > value.peakBalance - value.minimumBalance
-    || value.continuityGapCount > value.voidCount
+    || value.continuityGapCount
+      > ladder.resetCount - minimumNonGapResetCount
+    || (latestResetIsGap && value.continuityGapCount === 0)
     || (value.settledCount === 0
       ? value.hitRate !== null
       : value.hitRate !== value.hitCount / value.settledCount)
     || (pendingBet !== null) !== (value.pendingCount === 1)
     || (value.latestOutcome !== null) !== (latestOutcome !== null)
     || (value.latestVoid !== null) !== (latestVoid !== null)
+    || (value.latestReset !== null) !== (latestReset !== null)
     || (latestOutcome !== null) !== (value.settledCount > 0)
     || (latestVoid !== null) !== (value.voidCount > 0)
+    || (latestReset !== null) !== (ladder.resetCount > 0)
+    || (latestReset !== null
+      && latestReset.cycleNumberAfter !== ladder.cycleNumber)
+    || ladder.pendingReset !== expectedPendingReset
+    || (pendingBet !== null && (
+      pendingBet.cycleNumber !== ladder.cycleNumber
+      || pendingBet.cycleStakedBefore !== ladder.cycleStaked
+      || pendingBet.ladderLossBefore !== ladder.ladderLoss
+      || pendingBet.missCountBefore !== ladder.missCount
+      || pendingBet.stake !== ladder.nextStake
+    ))
     || (value.status === 'pending') !== (pendingBet !== null)
     || (value.status === 'exhausted') !== (campaignExhausted && pendingBet === null)
   ) {
@@ -336,8 +716,17 @@ function accountStateForApi(value, source, instrument) {
       || Date.parse(latestVoid.voidedAt) > Date.parse(updatedAt)
     )
   ) return null;
+  if (
+    latestReset !== null
+    && (
+      Date.parse(latestReset.occurredAt) < Date.parse(startedAt)
+      || Date.parse(latestReset.occurredAt) > Date.parse(updatedAt)
+    )
+  ) return null;
 
   return {
+    schemaVersion: value.schemaVersion,
+    strategyVersion: value.strategyVersion,
     campaignKey: value.campaignKey,
     candidateId: value.candidateId,
     promotionPolicy: value.promotionPolicy,
@@ -346,11 +735,7 @@ function accountStateForApi(value, source, instrument) {
       firstForecastId,
       startedAt: activationStartedAt,
     },
-    model: {
-      fixedStake: value.model.fixedStake,
-      grossPayoutMultiplier: value.model.grossPayoutMultiplier,
-      payoutIncludesStake: value.model.payoutIncludesStake,
-    },
+    model,
     status: value.status,
     reason: value.reason,
     initialBalance: value.initialBalance,
@@ -363,6 +748,8 @@ function accountStateForApi(value, source, instrument) {
     nextStake: value.nextStake,
     canAffordNext: value.canAffordNext,
     shortfall: value.shortfall,
+    ledgerRevision: value.ledgerRevision,
+    ladder,
     stats: {
       betCount: value.betCount,
       settledCount: value.settledCount,
@@ -381,6 +768,7 @@ function accountStateForApi(value, source, instrument) {
     pendingBet,
     latestOutcome,
     latestVoid,
+    latestReset,
     startedAt,
     updatedAt,
     exhaustedAt,
@@ -551,7 +939,7 @@ function baseResponse({
     manualOverride: {
       authorized: true,
       reason: account?.authorizationReason
-        ?? 'operator-requested-virtual-api-2026-10-19',
+        ?? AUTHORIZATION_REASON,
       qualityGateRequired: false,
       automaticPromotionEnabled: false,
     },
@@ -560,7 +948,8 @@ function baseResponse({
     serverTime,
     campaign: account
       ? {
-          schemaVersion: 1,
+          schemaVersion: account.schemaVersion,
+          strategyVersion: account.strategyVersion,
           campaignKey: account.campaignKey,
           candidateId: account.candidateId,
           activationBoundary: account.activationBoundary,
@@ -575,6 +964,7 @@ function baseResponse({
     action: 'WAIT',
     actionId: null,
     number: null,
+    stake: null,
     candidateNumber: audit?.latest?.candidate?.number ?? null,
     forecast: audit?.latest
       ? {
@@ -600,15 +990,18 @@ function baseResponse({
           nextStake: account.nextStake,
           canAffordNext: account.canAffordNext,
           shortfall: account.shortfall,
+          ledgerRevision: account.ledgerRevision,
           startedAt: account.startedAt,
           updatedAt: account.updatedAt,
           exhaustedAt: account.exhaustedAt,
         }
       : null,
     stats: account?.stats ?? null,
+    ladder: account?.ladder ?? null,
     pendingBet: account?.pendingBet ?? null,
     latestOutcome: account?.latestOutcome ?? null,
     latestVoid: account?.latestVoid ?? null,
+    latestReset: account?.latestReset ?? null,
     qualityGateDiagnostic: audit?.qualityGateDiagnostic ?? null,
     freshness,
   };
@@ -768,5 +1161,6 @@ export function predictiveLeaderV7PaperSnapshotForApi({
     action: 'BET',
     actionId: `v7-paper-bet:${account.pendingBet.id}`,
     number: account.pendingBet.targetNumber,
+    stake: account.pendingBet.stake,
   });
 }

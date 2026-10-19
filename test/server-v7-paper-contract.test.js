@@ -47,6 +47,7 @@ test('server initializes V7 paper once and leaves placement and settlement in da
 });
 
 test('V7 paper ledger revisions invalidate cached GETs and emit SSE after DB lifecycle writes', () => {
+  const revision = functionSource('predictiveLeaderV7PaperRevisionFor');
   const refresh = functionSource('broadcastPredictiveLeaderV7PaperUpdateIfChanged');
   const pipeline = functionSource('publishPipelineOutcome');
   const precloseStart = server.indexOf("collector.on('preclose-forecast'");
@@ -54,6 +55,12 @@ test('V7 paper ledger revisions invalidate cached GETs and emit SSE after DB lif
   const preclose = server.slice(precloseStart, precloseEnd);
 
   assert.match(server, /'predictive-leader-v7-paper',/);
+  assert.match(revision, /state\.strategyVersion/);
+  assert.match(revision, /state\.ledgerRevision/);
+  assert.match(revision, /state\.nextStake/);
+  assert.match(revision, /state\.ladder\?\.cycleNumber/);
+  assert.match(revision, /state\.ladder\?\.resetCount/);
+  assert.match(revision, /state\.latestReset\?\.id/);
   assert.match(refresh, /db\.getPredictiveLeaderV7PaperState\('buleto', config\.instrument\)/);
   assert.match(refresh, /broadcastUpdate\('predictive-leader-v7-paper'\)/);
   assert.match(

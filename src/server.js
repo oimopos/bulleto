@@ -298,11 +298,20 @@ function broadcastUpdate(reason) {
 
 function predictiveLeaderV7PaperRevisionFor(state) {
   return JSON.stringify([
+    state.strategyVersion,
+    state.ledgerRevision,
     state.updatedAt,
     state.status,
     state.currentBalance,
     state.deficit,
     state.accountingBalance,
+    state.nextStake,
+    state.ladder?.cycleNumber ?? null,
+    state.ladder?.cycleStaked ?? null,
+    state.ladder?.ladderLoss ?? null,
+    state.ladder?.missCount ?? null,
+    state.ladder?.resetCount ?? null,
+    state.ladder?.pendingReset ?? null,
     state.betCount,
     state.settledCount,
     state.pendingCount,
@@ -312,6 +321,8 @@ function predictiveLeaderV7PaperRevisionFor(state) {
     state.latestOutcome?.resultId ?? null,
     state.latestVoid?.betId ?? null,
     state.latestVoid?.voidedAt ?? null,
+    state.latestReset?.id ?? null,
+    state.latestReset?.occurredAt ?? null,
   ]);
 }
 

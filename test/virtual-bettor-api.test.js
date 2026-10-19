@@ -299,7 +299,10 @@ test(
       assert.equal(v7PaperPayload.promotionEligible, false);
       assert.equal(v7PaperPayload.action, "WAIT");
       assert.equal(v7PaperPayload.number, null);
-      assert.equal(v7PaperPayload.account.currentBalance, 1_000);
+      assert.equal(v7PaperPayload.stake, null);
+      assert.equal(v7PaperPayload.campaign.model.kind, "loss-recovery-ladder");
+      assert.equal(v7PaperPayload.campaign.model.cycleSpendLimit, 1_000);
+      assert.equal(v7PaperPayload.account.currentBalance, 10_000);
       assert.equal(v7PaperPayload.account.deficit, 0);
       assert.equal(v7PaperPayload.stats.betCount, 0);
       assert.equal(v7PaperPayload.pendingBet, null);
